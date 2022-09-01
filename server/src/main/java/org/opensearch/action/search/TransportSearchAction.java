@@ -627,6 +627,8 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                     }
                 }
             });
+
+            logger.info(remoteClusterClient.toString());
         } else {
             SearchResponseMerger searchResponseMerger = createSearchResponseMerger(
                 searchRequest.source(),
