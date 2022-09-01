@@ -413,6 +413,11 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                     searchRequest.indices(),
                     idx -> indexNameExpressionResolver.hasIndexAbstraction(idx, clusterState)
                 );
+                logger.info("trying to fetch remote cluster indices");
+                logger.info(searchRequest.indices());
+                logger.info(searchRequest.indicesOptions());
+                logger.info(remoteClusterIndices);
+                logger.info("printing element wise");
                 remoteClusterIndices.entrySet().forEach(entry -> {
                     logger.info(entry.getKey() + " " + entry.getValue());
                 });
