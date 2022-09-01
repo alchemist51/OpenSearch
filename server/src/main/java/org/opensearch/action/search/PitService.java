@@ -89,7 +89,10 @@ public class PitService {
 
             for (Map.Entry<String, List<PitSearchContextIdForNode>> entry : nodeToContextsMap.entrySet()) {
                 String clusterAlias = entry.getValue().get(0).getSearchContextIdForNode().getClusterAlias();
-                final DiscoveryNode node = nodeLookup.apply(clusterAlias, entry.getValue().get(0).getSearchContextIdForNode().getNode());
+                DiscoveryNode node = nodeLookup.apply(clusterAlias, entry.getValue().get(0).getSearchContextIdForNode().getNode());
+                if(node == null){
+                    node = this.clusterService.state().getNodes().get(entry.getValue().get(0).getSearchContextIdForNode().getNode());
+                }
                 if (node == null) {
                     logger.error(
                         () -> new ParameterizedMessage("node [{}] not found", entry.getValue().get(0).getSearchContextIdForNode().getNode())
@@ -104,7 +107,8 @@ public class PitService {
                         final Transport.Connection connection = searchTransportService.getConnection(clusterAlias, node);
                         searchTransportService.sendFreePITContexts(connection, entry.getValue(), groupedListener);
                     } catch (Exception e) {
-                        logger.error(() -> new ParameterizedMessage("Delete PITs failed on node [{}]", node.getName()), e);
+                        DiscoveryNode finalNode = node;
+                        logger.error(() -> new ParameterizedMessage("Delete PITs failed on node [{}]", finalNode.getName()), e);
                         List<DeletePitInfo> deletePitInfos = new ArrayList<>();
                         for (PitSearchContextIdForNode pitSearchContextIdForNode : entry.getValue()) {
                             deletePitInfos.add(new DeletePitInfo(false, pitSearchContextIdForNode.getPitId()));
