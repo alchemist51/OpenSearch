@@ -120,7 +120,7 @@ public class CreatePitController {
      * Creates PIT reader context with temporary keep alive
      */
     void executeCreatePit(Task task, SearchRequest searchRequest, StepListener<SearchResponse> createPitListener) {
-        logger.debug(
+        logger.info(
             () -> new ParameterizedMessage("Executing creation of PIT context for indices [{}]", Arrays.toString(searchRequest.indices()))
         );
         transportSearchAction.executeRequest(
@@ -136,6 +136,7 @@ public class CreatePitController {
                     Transport.Connection connection,
                     ActionListener<SearchPhaseResult> searchPhaseResultActionListener
                 ) {
+                    logger.info("executing on the Shard Target");
                     searchTransportService.createPitContext(
                         connection,
                         new TransportCreatePitAction.CreateReaderContextRequest(
@@ -160,7 +161,7 @@ public class CreatePitController {
         SearchResponse searchResponse,
         ActionListener<CreatePitResponse> updatePitIdListener
     ) {
-        logger.debug(
+        logger.info(
             () -> new ParameterizedMessage(
                 "Updating PIT context with PIT ID [{}], creation time and keep alive",
                 searchResponse.pointInTimeId()
@@ -177,6 +178,7 @@ public class CreatePitController {
             System::nanoTime
         );
         final long creationTime = timeProvider.getAbsoluteStartMillis();
+        logger.info("search response string:"+searchResponse.toString());
         CreatePitResponse createPITResponse = new CreatePitResponse(
             searchResponse.pointInTimeId(),
             creationTime,
@@ -278,14 +280,14 @@ public class CreatePitController {
                     .stream()
                     .filter(r -> !r.isSuccessful())
                     .forEach(r -> failedPitsStringBuilder.append(r.getPitId()).append(","));
-                logger.warn(() -> new ParameterizedMessage("Failed to delete PIT IDs {}", failedPitsStringBuilder.toString()));
-                if (logger.isDebugEnabled()) {
+                logger.info(() -> new ParameterizedMessage("Failed to delete PIT IDs {}", failedPitsStringBuilder.toString()));
+                if (true) {
                     final StringBuilder successfulPitsStringBuilder = new StringBuilder();
                     response.getDeletePitResults()
                         .stream()
                         .filter(r -> r.isSuccessful())
                         .forEach(r -> successfulPitsStringBuilder.append(r.getPitId()).append(","));
-                    logger.debug(() -> new ParameterizedMessage("Deleted PIT with IDs {}", successfulPitsStringBuilder.toString()));
+                    logger.info(() -> new ParameterizedMessage("Deleted PIT with IDs {}", successfulPitsStringBuilder.toString()));
                 }
             }
 
