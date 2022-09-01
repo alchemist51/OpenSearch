@@ -32,6 +32,8 @@
 
 package org.opensearch.action.search;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.Version;
 import org.opensearch.common.Strings;
 import org.opensearch.common.bytes.BytesReference;
@@ -65,7 +67,7 @@ import java.util.Set;
 public class SearchContextId {
     private final Map<ShardId, SearchContextIdForNode> shards;
     private final Map<String, AliasFilter> aliasFilter;
-
+    private static final Logger logger = LogManager.getLogger(SearchContextId.class);
     private SearchContextId(Map<ShardId, SearchContextIdForNode> shards, Map<String, AliasFilter> aliasFilter) {
         this.shards = shards;
         this.aliasFilter = aliasFilter;
@@ -80,6 +82,7 @@ public class SearchContextId {
     }
 
     public static String encode(List<SearchPhaseResult> searchPhaseResults, Map<String, AliasFilter> aliasFilter, Version version) {
+        logger.info("Inside the encode 1");
         final Map<ShardId, SearchContextIdForNode> shards = new HashMap<>();
         for (SearchPhaseResult searchPhaseResult : searchPhaseResults) {
             final SearchShardTarget target = searchPhaseResult.getSearchShardTarget();
@@ -104,6 +107,7 @@ public class SearchContextId {
         try {
             byteBuffer = ByteBuffer.wrap(Base64.getUrlDecoder().decode(id));
         } catch (Exception e) {
+            logger.info("Error in the byteBuffer wrap");
             throw new IllegalArgumentException("invalid id: [" + id + "]", e);
         }
         try (StreamInput in = new NamedWriteableAwareStreamInput(new ByteBufferStreamInput(byteBuffer), namedWriteableRegistry)) {
@@ -116,6 +120,7 @@ public class SearchContextId {
             }
             return new SearchContextId(Collections.unmodifiableMap(shards), Collections.unmodifiableMap(aliasFilters));
         } catch (IOException e) {
+            logger.info("Error in the reading");
             throw new IllegalArgumentException("invalid id: [" + id + "]", e);
         }
     }

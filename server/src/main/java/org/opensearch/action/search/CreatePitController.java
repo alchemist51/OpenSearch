@@ -107,7 +107,10 @@ public class CreatePitController {
          * Phase 2 of create PIT where we update pit id in pit contexts
          */
         createPitListener.whenComplete(
-            searchResponse -> { executeUpdatePitId(request, searchRequest, searchResponse, updatePitIdListener); },
+
+            searchResponse -> {
+                logger.info("create pit has been completed");
+                executeUpdatePitId(request, searchRequest, searchResponse, updatePitIdListener); },
             updatePitIdListener::onFailure
         );
     }
@@ -182,6 +185,7 @@ public class CreatePitController {
             searchResponse.getFailedShards(),
             searchResponse.getShardFailures()
         );
+        logger.info("goona decode the context ID");
         SearchContextId contextId = SearchContextId.decode(namedWriteableRegistry, createPITResponse.getId());
         final StepListener<BiFunction<String, String, DiscoveryNode>> lookupListener = getConnectionLookupListener(contextId);
         lookupListener.whenComplete(nodelookup -> {
