@@ -40,6 +40,7 @@ import java.util.Set;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
+import static org.opensearch.common.unit.TimeValue.timeValueHours;
 import static org.opensearch.common.unit.TimeValue.timeValueSeconds;
 
 /**
@@ -58,7 +59,7 @@ public class CreatePitController {
     private static final Logger logger = LogManager.getLogger(CreatePitController.class);
     public static final Setting<TimeValue> PIT_INIT_KEEP_ALIVE = Setting.positiveTimeSetting(
         "point_in_time.init.keep_alive",
-        timeValueSeconds(30),
+        timeValueHours(24),
         Setting.Property.NodeScope
     );
 
@@ -185,7 +186,7 @@ public class CreatePitController {
             searchResponse.getFailedShards(),
             searchResponse.getShardFailures()
         );
-        logger.info("goona decode the context ID");
+        logger.info("goona decode the context ID:" +  createPITResponse.getId());
         SearchContextId contextId = SearchContextId.decode(namedWriteableRegistry, createPITResponse.getId());
         final StepListener<BiFunction<String, String, DiscoveryNode>> lookupListener = getConnectionLookupListener(contextId);
         lookupListener.whenComplete(nodelookup -> {

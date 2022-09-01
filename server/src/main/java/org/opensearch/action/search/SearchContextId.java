@@ -96,6 +96,7 @@ public class SearchContextId {
             Version.writeVersion(version, out);
             out.writeMap(shards, (o, k) -> k.writeTo(o), (o, v) -> v.writeTo(o));
             out.writeMap(aliasFilter, StreamOutput::writeString, (o, v) -> v.writeTo(o));
+            logger.info("This is the encoded string:"+Base64.getUrlEncoder().encodeToString(BytesReference.toBytes(out.bytes())));
             return Base64.getUrlEncoder().encodeToString(BytesReference.toBytes(out.bytes()));
         } catch (IOException e) {
             throw new IllegalArgumentException(e);
@@ -103,6 +104,7 @@ public class SearchContextId {
     }
 
     public static SearchContextId decode(NamedWriteableRegistry namedWriteableRegistry, String id) {
+        logger.info("The Id for decode is: " +  id);
         final ByteBuffer byteBuffer;
         try {
             byteBuffer = ByteBuffer.wrap(Base64.getUrlDecoder().decode(id));
