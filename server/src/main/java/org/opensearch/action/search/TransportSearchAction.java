@@ -563,6 +563,9 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         ActionListener<SearchResponse> listener,
         BiConsumer<SearchRequest, ActionListener<SearchResponse>> localSearchConsumer
     ) {
+        logger.info("ccs-remote-reduce");
+        logger.info(localIndices);
+        logger.info(remoteIndices.size());
 
         if (localIndices == null && remoteIndices.size() == 1) {
             // if we are searching against a single remote cluster, we simply forward the original search request to such cluster
@@ -572,6 +575,10 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             String clusterAlias = entry.getKey();
             boolean skipUnavailable = remoteClusterService.isSkipUnavailable(clusterAlias);
             OriginalIndices indices = entry.getValue();
+            logger.info("ccsSearchRequest:");
+            logger.info(searchRequest);
+            logger.info(clusterAlias);
+            logger.info("indices.indices()"+indices.indices());
             SearchRequest ccsSearchRequest = SearchRequest.subSearchRequest(
                 searchRequest,
                 indices.indices(),
