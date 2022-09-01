@@ -87,6 +87,9 @@ public class CreatePitController {
         StepListener<SearchResponse> createPitListener,
         ActionListener<CreatePitResponse> updatePitIdListener
     ) {
+        logger.info("inside execute create PIT");
+        logger.info(this.clusterService.getClusterName() + " inside-create-pit-1 "+ this.clusterService.getNodeName());
+        logger.info("Get Indices: "+ request.getIndices());
         SearchRequest searchRequest = new SearchRequest(request.getIndices());
         searchRequest.preference(request.getPreference());
         searchRequest.routing(request.getRouting());
@@ -123,6 +126,7 @@ public class CreatePitController {
         logger.info(
             () -> new ParameterizedMessage("Executing creation of PIT context for indices [{}]", Arrays.toString(searchRequest.indices()))
         );
+        logger.info(this.clusterService.getClusterName() + "  "+ this.clusterService.getNodeName());
         transportSearchAction.executeRequest(
             task,
             searchRequest,
@@ -179,6 +183,7 @@ public class CreatePitController {
         );
         final long creationTime = timeProvider.getAbsoluteStartMillis();
         logger.info("search response string:"+searchResponse.toString());
+        logger.info(searchResponse.pointInTimeId());
         CreatePitResponse createPITResponse = new CreatePitResponse(
             searchResponse.pointInTimeId(),
             creationTime,
@@ -188,7 +193,7 @@ public class CreatePitController {
             searchResponse.getFailedShards(),
             searchResponse.getShardFailures()
         );
-        logger.info("goona decode the context ID:" +  createPITResponse.getId());
+        logger.info("gonna decode the context ID:" +  createPITResponse.getId());
         SearchContextId contextId = SearchContextId.decode(namedWriteableRegistry, createPITResponse.getId());
         final StepListener<BiFunction<String, String, DiscoveryNode>> lookupListener = getConnectionLookupListener(contextId);
         lookupListener.whenComplete(nodelookup -> {
@@ -202,6 +207,7 @@ public class CreatePitController {
                 DiscoveryNode node = nodelookup.apply(entry.getValue().getClusterAlias(), entry.getValue().getNode());
                 try {
                     final Transport.Connection connection = searchTransportService.getConnection(entry.getValue().getClusterAlias(), node);
+                    logger.info("Moving to update the PIT context");
                     searchTransportService.updatePitContext(
                         connection,
                         new UpdatePitContextRequest(

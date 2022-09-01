@@ -168,6 +168,7 @@ public class SearchTransportService {
         SearchTask task,
         ActionListener<TransportCreatePitAction.CreateReaderContextResponse> actionListener
     ) {
+
         transportService.sendChildRequest(
             connection,
             CREATE_READER_CONTEXT_ACTION_NAME,
