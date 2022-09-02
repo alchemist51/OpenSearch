@@ -716,8 +716,10 @@ public class SearchTransportService {
      */
     public Transport.Connection getConnection(@Nullable String clusterAlias, DiscoveryNode node) {
         if (clusterAlias == null) {
+            logger.info("Cluster alias is null");
             return transportService.getConnection(node);
         } else {
+            logger.info("cluster ALias is not null");
             return transportService.getRemoteClusterService().getConnection(node, clusterAlias);
         }
     }

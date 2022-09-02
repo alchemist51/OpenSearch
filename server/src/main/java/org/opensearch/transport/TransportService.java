@@ -796,8 +796,10 @@ public class TransportService extends AbstractLifecycleComponent
      */
     public Transport.Connection getConnection(DiscoveryNode node) {
         if (isLocalNode(node)) {
+            logger.info("it is a local node");
             return localNodeConnection;
         } else {
+            logger.info("it is not a local node");
             return connectionManager.getConnection(node);
         }
     }
