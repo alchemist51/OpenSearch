@@ -89,7 +89,7 @@ public class CreatePitController {
     ) {
         logger.info("inside execute create PIT");
         logger.info(this.clusterService.getClusterName() + " inside-create-pit-1 "+ this.clusterService.getNodeName());
-        logger.info("Get Indices: "+ request.getIndices());
+        logger.info("Get Indices: "+ request.getIndices().toString());
         SearchRequest searchRequest = new SearchRequest(request.getIndices());
         searchRequest.preference(request.getPreference());
         searchRequest.routing(request.getRouting());

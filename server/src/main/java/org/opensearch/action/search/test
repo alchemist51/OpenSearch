@@ -1,0 +1,41 @@
+[2022-09-02T06:40:31,439][INFO ][o.o.s.p.PrivilegesEvaluator] [node-2] Security roles: [own_index, all_access]
+[2022-09-02T06:40:31,440][INFO ][o.o.a.s.CreatePitController] [node-2] inside execute create PIT
+[2022-09-02T06:40:31,440][INFO ][o.o.a.s.CreatePitController] [node-2] Cluster [opensearch] inside-create-pit-1 node-2
+[2022-09-02T06:40:31,440][INFO ][o.o.a.s.CreatePitController] [node-2] Get Indices: [Ljava.lang.String;@afd1a6e
+[2022-09-02T06:40:31,441][INFO ][o.o.a.s.CreatePitController] [node-2] Executing creation of PIT context for indices [[node-1:books]]
+[2022-09-02T06:40:31,441][INFO ][o.o.a.s.CreatePitController] [node-2] Cluster [opensearch]  node-2
+[2022-09-02T06:40:31,442][INFO ][o.o.a.s.TransportSearchAction] [node-2] Cluster [opensearch] inside-execute-request-312 node-2
+[2022-09-02T06:40:31,442][INFO ][o.o.a.s.TransportSearchAction] [node-2] Cluster [opensearch] execute request - 390 node-2
+[2022-09-02T06:40:31,442][INFO ][o.o.a.s.TransportSearchAction] [node-2] line 390 execute request
+[2022-09-02T06:40:31,443][INFO ][o.o.a.s.TransportSearchAction] [node-2] search request source is not null
+[2022-09-02T06:40:31,443][INFO ][o.o.a.s.TransportSearchAction] [node-2] point in Time Builder:null
+[2022-09-02T06:40:31,443][INFO ][o.o.a.s.TransportSearchAction] [node-2] Cluster [opensearch] when search request point in time builder is not null node-2
+[2022-09-02T06:40:31,443][INFO ][o.o.a.s.TransportSearchAction] [node-2] trying to fetch remote cluster indices
+[2022-09-02T06:40:31,443][INFO ][o.o.a.s.TransportSearchAction] [node-2] [Ljava.lang.String;@afd1a6e
+[2022-09-02T06:40:31,443][INFO ][o.o.a.s.TransportSearchAction] [node-2] IndicesOptions[ignore_unavailable=false, allow_no_indices=true, expand_wildcards_open=true, expand_wildcards_closed=false, expand_wildcards_hidden=false, allow_aliases_to_multiple_indices=true, forbid_closed_indices=true, ignore_aliases=false, ignore_throttled=true]
+[2022-09-02T06:40:31,443][INFO ][o.o.a.s.TransportSearchAction] [node-2] {node-1=OriginalIndices{indices=[books], indicesOptions=IndicesOptions[ignore_unavailable=false, allow_no_indices=true, expand_wildcards_open=true, expand_wildcards_closed=false, expand_wildcards_hidden=false, allow_aliases_to_multiple_indices=true, forbid_closed_indices=true, ignore_aliases=false, ignore_throttled=true]}}
+[2022-09-02T06:40:31,443][INFO ][o.o.a.s.TransportSearchAction] [node-2] printing element wise remote cluster indices
+[2022-09-02T06:40:31,443][INFO ][o.o.a.s.TransportSearchAction] [node-2] node-1 OriginalIndices{indices=[books], indicesOptions=IndicesOptions[ignore_unavailable=false, allow_no_indices=true, expand_wildcards_open=true, expand_wildcards_closed=false, expand_wildcards_hidden=false, allow_aliases_to_multiple_indices=true, forbid_closed_indices=true, ignore_aliases=false, ignore_throttled=true]}
+[2022-09-02T06:40:31,443][INFO ][o.o.a.s.TransportSearchAction] [node-2] Cluster [opensearch] after decalring local indices node-2
+[2022-09-02T06:40:31,444][INFO ][o.o.a.s.TransportSearchAction] [node-2]  local Indices is NULL
+[2022-09-02T06:40:31,444][INFO ][o.o.a.s.TransportSearchAction] [node-2] Cluster [opensearch] when remote cluster indices is NOT Empty node-2
+[2022-09-02T06:40:31,444][INFO ][o.o.a.s.TransportSearchAction] [node-2] true
+[2022-09-02T06:40:31,444][INFO ][o.o.a.s.TransportSearchAction] [node-2] Cluster [opensearch] should minimize round trips is true node-2
+[2022-09-02T06:40:31,444][INFO ][o.o.a.s.TransportSearchAction] [node-2] inside ccs-remote-reduce
+[2022-09-02T06:40:31,444][INFO ][o.o.a.s.TransportSearchAction] [node-2] {node-1=OriginalIndices{indices=[books], indicesOptions=IndicesOptions[ignore_unavailable=false, allow_no_indices=true, expand_wildcards_open=true, expand_wildcards_closed=false, expand_wildcards_hidden=false, allow_aliases_to_multiple_indices=true, forbid_closed_indices=true, ignore_aliases=false, ignore_throttled=true]}}
+[2022-09-02T06:40:31,444][INFO ][o.o.a.s.TransportSearchAction] [node-2] skipunavaiblefalse
+[2022-09-02T06:40:31,444][INFO ][o.o.a.s.TransportSearchAction] [node-2] ccsSearchRequest:
+[2022-09-02T06:40:31,449][INFO ][o.o.a.s.TransportSearchAction] [node-2] SearchRequest{searchType=QUERY_THEN_FETCH, indices=[node-1:books], indicesOptions=IndicesOptions[ignore_unavailable=false, allow_no_indices=true, expand_wildcards_open=true, expand_wildcards_closed=false, expand_wildcards_hidden=false, allow_aliases_to_multiple_indices=true, forbid_closed_indices=true, ignore_aliases=false, ignore_throttled=true], routing='null', preference='null', requestCache=null, scroll=null, maxConcurrentShardRequests=0, batchedReduceSize=512, preFilterShardSize=null, allowPartialSearchResults=true, localClusterAlias=null, getOrCreateAbsoluteStartMillis=-1, ccsMinimizeRoundtrips=true, source={}, cancelAfterTimeInterval=null}
+[2022-09-02T06:40:31,450][INFO ][o.o.a.s.TransportSearchAction] [node-2] cluster alias node-1
+[2022-09-02T06:40:31,450][INFO ][o.o.a.s.TransportSearchAction] [node-2] indices.indices() [Ljava.lang.String;@5c0d439f
+[2022-09-02T06:40:31,451][INFO ][o.o.a.s.TransportSearchAction] [node-2] org.opensearch.transport.RemoteClusterAwareClient@2f90e08e
+[2022-09-02T06:40:31,469][INFO ][o.o.a.s.CreatePitController] [node-2] create pit has been completed
+[2022-09-02T06:40:31,470][INFO ][o.o.a.s.CreatePitController] [node-2] Updating PIT context with PIT ID [null], creation time and keep alive
+[2022-09-02T06:40:31,470][INFO ][o.o.a.s.CreatePitController] [node-2] search response string:{"took":26,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"_clusters":{"total":1,"successful":1,"skipped":0},"hits":{"total":{"value":1,"relation":"eq"},"max_score":1.0,"hits":[{"_index":"node-1:books","_id":"2","_score":1.0,"_source":{"Dracula": "Arpit Bandejiya-2"}}]}}
+[2022-09-02T06:40:31,470][INFO ][o.o.a.s.CreatePitController] [node-2] null
+[2022-09-02T06:40:31,471][INFO ][o.o.a.s.CreatePitController] [node-2] gonna decode the context ID:null
+[2022-09-02T06:40:31,471][INFO ][o.o.a.s.SearchContextId  ] [node-2] The Id for decode is: null
+[2022-09-02T06:40:31,471][INFO ][o.o.a.s.SearchContextId  ] [node-2] Error in the byteBuffer wrap
+[2022-09-02T06:40:31,471][ERROR][o.o.a.s.TransportCreatePitAction] [node-2] PIT creation failed while updating PIT ID for indices [[node-1:books]]
+
+

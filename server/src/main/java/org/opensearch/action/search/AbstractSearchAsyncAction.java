@@ -279,8 +279,10 @@ abstract class AbstractSearchAsyncAction<Result extends SearchPhaseResult> exten
                 ? pendingExecutionsPerNode.computeIfAbsent(shard.getNodeId(), n -> new PendingExecutions(maxConcurrentRequestsPerNode))
                 : null;
             Runnable r = () -> {
+                logger.info("Inside the runnable");
                 final Thread thread = Thread.currentThread();
                 try {
+                    logger.info("gonna execute phase on shard");
                     executePhaseOnShard(shardIt, shard, new SearchActionListener<Result>(shard, shardIndex) {
                         @Override
                         public void innerOnResponse(Result result) {

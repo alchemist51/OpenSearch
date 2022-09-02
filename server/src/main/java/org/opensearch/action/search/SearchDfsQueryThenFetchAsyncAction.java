@@ -115,6 +115,7 @@ final class SearchDfsQueryThenFetchAsyncAction extends AbstractSearchAsyncAction
         final SearchShardTarget shard,
         final SearchActionListener<DfsSearchResult> listener
     ) {
+        getLogger().info("Search DFS Query Then Fetch Async Action execute phase on Shard");
         getSearchTransport().sendExecuteDfs(
             getConnection(shard.getClusterAlias(), shard.getNodeId()),
             buildShardSearchRequest(shardIt),

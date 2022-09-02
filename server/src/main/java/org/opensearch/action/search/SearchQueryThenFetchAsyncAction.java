@@ -125,9 +125,11 @@ class SearchQueryThenFetchAsyncAction extends AbstractSearchAsyncAction<SearchPh
         final SearchShardTarget shard,
         final SearchActionListener<SearchPhaseResult> listener
     ) {
+        getLogger().info("inside Search Query and Fetch Async Action execute phase on shard");
         ShardSearchRequest request = rewriteShardSearchRequest(super.buildShardSearchRequest(shardIt));
         // update inbound network time with current time before sending request over n/w to data node
         if (request != null) {
+            getLogger().info("request is not null");
             request.setInboundNetworkTime(System.currentTimeMillis());
         }
         getSearchTransport().sendExecuteQuery(getConnection(shard.getClusterAlias(), shard.getNodeId()), request, getTask(), listener);

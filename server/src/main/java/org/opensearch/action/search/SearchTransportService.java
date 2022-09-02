@@ -32,6 +32,8 @@
 
 package org.opensearch.action.search;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.LegacyESVersion;
 import org.opensearch.Version;
 import org.opensearch.action.ActionListener;
@@ -105,6 +107,7 @@ public class SearchTransportService {
     private final TransportService transportService;
     private final BiFunction<Transport.Connection, SearchActionListener, ActionListener> responseWrapper;
     private final Map<String, Long> clientConnections = ConcurrentCollections.newConcurrentMapWithAggressiveConcurrency();
+    private static final Logger logger = LogManager.getLogger(SearchTransportService.class);
 
     public SearchTransportService(
         TransportService transportService,
@@ -240,6 +243,7 @@ public class SearchTransportService {
         SearchTask task,
         final SearchActionListener<SearchPhaseResult> listener
     ) {
+        logger.info("send Execute query 246");
         // we optimize this and expect a QueryFetchSearchResult if we only have a single shard in the search request
         // this used to be the QUERY_AND_FETCH which doesn't exist anymore.
         final boolean fetchDocuments = request.numberOfShards() == 1;

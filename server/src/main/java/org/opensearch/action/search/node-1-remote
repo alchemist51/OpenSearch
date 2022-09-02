@@ -1,0 +1,26 @@
+[2022-09-02T06:40:31,459][INFO ][o.o.a.s.TransportSearchAction] [node-1] Cluster [opensearch] execute request - 390 node-1
+[2022-09-02T06:40:31,459][INFO ][o.o.a.s.TransportSearchAction] [node-1] line 390 execute request
+[2022-09-02T06:40:31,459][INFO ][o.o.a.s.TransportSearchAction] [node-1] search request source is not null
+[2022-09-02T06:40:31,459][INFO ][o.o.a.s.TransportSearchAction] [node-1] point in Time Builder:null
+[2022-09-02T06:40:31,460][INFO ][o.o.a.s.TransportSearchAction] [node-1] Cluster [opensearch] when search request point in time builder is not null node-1
+[2022-09-02T06:40:31,460][INFO ][o.o.a.s.TransportSearchAction] [node-1] trying to fetch remote cluster indices
+[2022-09-02T06:40:31,460][INFO ][o.o.a.s.TransportSearchAction] [node-1] [Ljava.lang.String;@5e99e6e7
+[2022-09-02T06:40:31,460][INFO ][o.o.a.s.TransportSearchAction] [node-1] IndicesOptions[ignore_unavailable=false, allow_no_indices=true, expand_wildcards_open=true, expand_wildcards_closed=false, expand_wildcards_hidden=false, allow_aliases_to_multiple_indices=true, forbid_closed_indices=true, ignore_aliases=false, ignore_throttled=true]
+[2022-09-02T06:40:31,460][INFO ][o.o.a.s.TransportSearchAction] [node-1] {=OriginalIndices{indices=[books], indicesOptions=IndicesOptions[ignore_unavailable=false, allow_no_indices=true, expand_wildcards_open=true, expand_wildcards_closed=false, expand_wildcards_hidden=false, allow_aliases_to_multiple_indices=true, forbid_closed_indices=true, ignore_aliases=false, ignore_throttled=true]}}
+[2022-09-02T06:40:31,460][INFO ][o.o.a.s.TransportSearchAction] [node-1] printing element wise remote cluster indices
+[2022-09-02T06:40:31,460][INFO ][o.o.a.s.TransportSearchAction] [node-1]  OriginalIndices{indices=[books], indicesOptions=IndicesOptions[ignore_unavailable=false, allow_no_indices=true, expand_wildcards_open=true, expand_wildcards_closed=false, expand_wildcards_hidden=false, allow_aliases_to_multiple_indices=true, forbid_closed_indices=true, ignore_aliases=false, ignore_throttled=true]}
+[2022-09-02T06:40:31,461][INFO ][o.o.a.s.TransportSearchAction] [node-1] Cluster [opensearch] after decalring local indices node-1
+[2022-09-02T06:40:31,461][INFO ][o.o.a.s.TransportSearchAction] [node-1] OriginalIndices{indices=[books], indicesOptions=IndicesOptions[ignore_unavailable=false, allow_no_indices=true, expand_wildcards_open=true, expand_wildcards_closed=false, expand_wildcards_hidden=false, allow_aliases_to_multiple_indices=true, forbid_closed_indices=true, ignore_aliases=false, ignore_throttled=true]}
+[2022-09-02T06:40:31,461][INFO ][o.o.a.s.TransportSearchAction] [node-1] Cluster [opensearch] when remote cluster indices is Empty node-1
+[2022-09-02T06:40:31,461][INFO ][o.o.a.s.TransportSearchAction] [node-1] Cluster [opensearch] inside execute Local search node-1
+[2022-09-02T06:40:31,461][INFO ][o.o.a.s.TransportSearchAction] [node-1] Cluster [opensearch] execute search 968 node-1
+[2022-09-02T06:40:31,462][INFO ][o.o.a.s.TransportSearchAction] [node-1] Cluster [opensearch] search context is null node-1
+[2022-09-02T06:40:31,462][INFO ][o.o.a.s.TransportSearchAction] [node-1] Cluster [opensearch] after creating routing map node-1
+[2022-09-02T06:40:31,462][INFO ][o.o.a.s.TransportSearchAction] [node-1] [Ljava.lang.String;@2d91aa00
+[2022-09-02T06:40:31,462][INFO ][o.o.a.s.TransportSearchAction] [node-1] shard iteratior size is 1
+[2022-09-02T06:40:31,463][INFO ][o.o.a.s.TransportSearchAction] [node-1] This is Async Search Executor
+[2022-09-02T06:40:31,463][INFO ][o.o.a.s.TransportSearchAction] [node-1] Cluster [opensearch] after preFilterSearchShards node-1
+[2022-09-02T06:40:31,463][INFO ][o.o.a.s.TransportSearchAction] [node-1] This is the start of ASAA.java
+[2022-09-02T06:40:31,463][INFO ][o.o.a.s.TransportSearchAction] [node-1] Search phase results:org.opensearch.action.search.QueryPhaseResultConsumer@5f0edba4
+[2022-09-02T06:40:31,463][INFO ][o.o.a.s.TransportSearchAction] [node-1] No of shards:1
+[2022-09-02T06:40:31,464][INFO ][o.o.a.s.TransportSearchAction] [node-1] Performing Phase on shard
