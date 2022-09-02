@@ -374,13 +374,21 @@ public final class RemoteClusterService extends RemoteClusterAware implements Cl
      * function on success.
      */
     public void collectNodes(Set<String> clusters, ActionListener<BiFunction<String, String, DiscoveryNode>> listener) {
+        logger.info("inside collect Node");
         if (enabled == false) {
+            logger.info("enabled is false");
             throw new IllegalArgumentException(
                 "this node does not have the " + DiscoveryNodeRole.REMOTE_CLUSTER_CLIENT_ROLE.roleName() + " role"
             );
         }
+        logger.info("logger is not false it seems");
         Map<String, RemoteClusterConnection> remoteClusters = this.remoteClusters;
+        remoteClusters.forEach( (cluster,connection) -> {
+            logger.info(cluster);
+        });
+        logger.info("remote clusters");
         for (String cluster : clusters) {
+            logger.info("clusters cluster"+cluster);
             if (remoteClusters.containsKey(cluster) == false) {
                 listener.onFailure(new NoSuchRemoteClusterException(cluster));
                 return;
@@ -389,9 +397,11 @@ public final class RemoteClusterService extends RemoteClusterAware implements Cl
 
         final Map<String, Function<String, DiscoveryNode>> clusterMap = new HashMap<>();
         CountDown countDown = new CountDown(clusters.size());
+        logger.info(clusters.size());
         Function<String, DiscoveryNode> nullFunction = s -> null;
         for (final String cluster : clusters) {
             RemoteClusterConnection connection = remoteClusters.get(cluster);
+            logger.info("Was able to create connection with:" + cluster + " " + (connection!=null));
             connection.collectNodes(new ActionListener<Function<String, DiscoveryNode>>() {
                 @Override
                 public void onResponse(Function<String, DiscoveryNode> nodeLookup) {

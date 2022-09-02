@@ -195,6 +195,7 @@ public class CreatePitController {
         );
         logger.info("gonna decode the context ID:" +  createPITResponse.getId());
         SearchContextId contextId = SearchContextId.decode(namedWriteableRegistry, createPITResponse.getId());
+        logger.info("actual indices: "+contextId.getActualIndices().toString());
         final StepListener<BiFunction<String, String, DiscoveryNode>> lookupListener = getConnectionLookupListener(contextId);
         lookupListener.whenComplete(nodelookup -> {
             final ActionListener<UpdatePitContextResponse> groupedActionListener = getGroupedListener(
@@ -205,6 +206,8 @@ public class CreatePitController {
             );
             for (Map.Entry<ShardId, SearchContextIdForNode> entry : contextId.shards().entrySet()) {
                 DiscoveryNode node = nodelookup.apply(entry.getValue().getClusterAlias(), entry.getValue().getNode());
+                logger.info("getNode"+ entry.getValue().getNode());
+                logger.info("cluster Alias"+entry.getValue().getClusterAlias());
                 try {
                     final Transport.Connection connection = searchTransportService.getConnection(entry.getValue().getClusterAlias(), node);
                     logger.info("Moving to update the PIT context");
@@ -240,12 +243,14 @@ public class CreatePitController {
 
     private StepListener<BiFunction<String, String, DiscoveryNode>> getConnectionLookupListener(SearchContextId contextId) {
         ClusterState state = clusterService.state();
+        logger.info("context ID:"+contextId);
         final Set<String> clusters = contextId.shards()
             .values()
             .stream()
             .filter(ctx -> Strings.isEmpty(ctx.getClusterAlias()) == false)
             .map(SearchContextIdForNode::getClusterAlias)
             .collect(Collectors.toSet());
+        logger.info("clusters is:"+ clusters.toString());
         return (StepListener<BiFunction<String, String, DiscoveryNode>>) SearchUtils.getConnectionLookupListener(
             searchTransportService.getRemoteClusterService(),
             state,

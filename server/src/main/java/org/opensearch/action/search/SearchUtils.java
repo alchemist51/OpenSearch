@@ -8,6 +8,8 @@
 
 package org.opensearch.action.search;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionListener;
 import org.opensearch.action.StepListener;
 import org.opensearch.cluster.ClusterState;
@@ -22,6 +24,7 @@ import java.util.function.BiFunction;
  */
 public class SearchUtils {
 
+    private static final Logger logger = LogManager.getLogger(SearchUtils.class);
     public SearchUtils() {}
 
     /**
@@ -35,8 +38,14 @@ public class SearchUtils {
         final StepListener<BiFunction<String, String, DiscoveryNode>> lookupListener = new StepListener<>();
 
         if (clusters.isEmpty()) {
-            lookupListener.onResponse((cluster, nodeId) -> state.getNodes().get(nodeId));
+
+            lookupListener.onResponse((cluster, nodeId) -> {
+                logger.info("cluster"+ cluster);
+                logger.info("lookup Listneer"+ nodeId);
+                return state.getNodes().get(nodeId);
+            });
         } else {
+            logger.info("clusters is not empty");
             remoteClusterService.collectNodes(clusters, lookupListener);
         }
         return lookupListener;
