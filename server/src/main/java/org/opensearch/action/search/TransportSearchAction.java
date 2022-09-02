@@ -284,6 +284,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                 listener
             );
         }
+        logger.info("Inside the do Execute at 287");
         executeRequest(task, searchRequest, this::searchAsyncAction, listener);
     }
 
@@ -455,7 +456,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             } else {
                 logger.info(this.clusterService.getClusterName() + " when remote cluster indices is NOT Empty "+ this.clusterService.getNodeName());
                 logger.info(shouldMinimizeRoundtrips(searchRequest));
-                if (shouldMinimizeRoundtrips(searchRequest)) {
+                if (false) {
                     logger.info(this.clusterService.getClusterName() + " should minimize round trips is true "+ this.clusterService.getNodeName());
                     ccsRemoteReduce(
                         searchRequest,
