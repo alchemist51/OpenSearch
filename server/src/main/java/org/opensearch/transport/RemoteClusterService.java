@@ -406,10 +406,15 @@ public final class RemoteClusterService extends RemoteClusterAware implements Cl
                 @Override
                 public void onResponse(Function<String, DiscoveryNode> nodeLookup) {
                     synchronized (clusterMap) {
+                        logger.info("cluster: "+cluster);
+                        logger.info("Node lookup is: " + nodeLookup);
                         clusterMap.put(cluster, nodeLookup);
                     }
                     if (countDown.countDown()) {
-                        listener.onResponse((clusterAlias, nodeId) -> clusterMap.getOrDefault(clusterAlias, nullFunction).apply(nodeId));
+                        listener.onResponse((clusterAlias, nodeId) -> {
+                            logger.info("cluster Alias: "+clusterAlias);
+                            logger.info("Node id is: " + nodeId);
+                            return clusterMap.getOrDefault(clusterAlias, nullFunction).apply(nodeId);});
                     }
                 }
 
