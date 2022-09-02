@@ -435,7 +435,11 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             }
             OriginalIndices localIndices = remoteClusterIndices.remove(RemoteClusterAware.LOCAL_CLUSTER_GROUP_KEY);
             logger.info(this.clusterService.getClusterName() + " after decalring local indices "+ this.clusterService.getNodeName());
-            logger.info(localIndices.toString());
+            if (localIndices!= null) {
+                logger.info(localIndices.toString());
+            } else {
+                logger.info(" local Indices is NULL");
+            }
             if (remoteClusterIndices.isEmpty()) {
                 logger.info(this.clusterService.getClusterName() + " when remote cluster indices is Empty "+ this.clusterService.getNodeName());
                 executeLocalSearch(
