@@ -588,8 +588,12 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         BiConsumer<SearchRequest, ActionListener<SearchResponse>> localSearchConsumer
     ) {
         logger.info("inside ccs-remote-reduce");
-        logger.info(localIndices.toString());
-        logger.info(remoteIndices.toString());
+        if(localIndices!=null) {
+            logger.info(localIndices.toString());
+        }
+        if(remoteIndices!=null){
+            logger.info(remoteIndices.toString());
+        }
 
         if (localIndices == null && remoteIndices.size() == 1) {
             // if we are searching against a single remote cluster, we simply forward the original search request to such cluster
