@@ -87,6 +87,9 @@ public class PitService {
                     String clusterAlias = entry.getValue().get(0).getSearchContextIdForNode().getClusterAlias();
 
                     DiscoveryNode node = nodeLookup.apply(clusterAlias, entry.getValue().get(0).getSearchContextIdForNode().getNode());
+                    if(node == null){
+                        node = this.clusterService.state().getNodes().get(entry.getValue().get(0).getSearchContextIdForNode().getNode());
+                    }
 
                     if (node == null) {
                         logger.error(
