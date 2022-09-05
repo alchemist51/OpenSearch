@@ -76,17 +76,8 @@ public class PitService {
                 clusters
             );
         logger.info(lookupListener.toString());
-        StepListener<BiFunction<String, String, DiscoveryNode>> lookupListener1 = (StepListener<
-            BiFunction<String, String, DiscoveryNode>>) SearchUtils.getConnectionLookupListener(
-            searchTransportService.getRemoteClusterService(),
-            clusterService.state(),
-            new HashSet<>()
-        );
-        logger.info("The lookup lister 1");
-        logger.info(lookupListener1.toString());
-        lookupListener.whenComplete(nodeLookup -> {
 
-            lookupListener1.whenComplete(nodeLookup1 -> {
+        lookupListener.whenComplete(nodeLookup -> {
                 final GroupedActionListener<DeletePitResponse> groupedListener = getDeletePitGroupedListener(
                     listener,
                     nodeToContextsMap.size()
@@ -97,44 +88,32 @@ public class PitService {
 
                     DiscoveryNode node = nodeLookup.apply(clusterAlias, entry.getValue().get(0).getSearchContextIdForNode().getNode());
 
-                    if(node == null) {
-                        logger.info("The node is nulll right now");
-                        node = nodeLookup1.apply(clusterAlias, entry.getValue().get(0).getSearchContextIdForNode().getNode());
-                    }
-
                     if (node == null) {
-
                         logger.error(
                             () -> new ParameterizedMessage("node [{}] not found", entry.getValue().get(0).getSearchContextIdForNode().getNode())
                         );
                         List<DeletePitInfo> deletePitInfos = new ArrayList<>();
-                        logger.info("delete pit info");
-                        logger.info(deletePitInfos.toString());
                         for (PitSearchContextIdForNode pitSearchContextIdForNode : entry.getValue()) {
                             deletePitInfos.add(new DeletePitInfo(false, pitSearchContextIdForNode.getPitId()));
                         }
                         groupedListener.onResponse(new DeletePitResponse(deletePitInfos));
                     } else {
-                        logger.info(" node is not null now");
+                        logger.info("Node is found it is not nulll");
                         try {
                             final Transport.Connection connection = searchTransportService.getConnection(clusterAlias, node);
-                            logger.info(" was able to make a connection" + connection.toString());
+                            logger.info("Was avble to form a connection");
                             searchTransportService.sendFreePITContexts(connection, entry.getValue(), groupedListener);
                         } catch (Exception e) {
                             DiscoveryNode finalNode = node;
-                            logger.info("Final Node"+ finalNode.toString());
                             logger.error(() -> new ParameterizedMessage("Delete PITs failed on node [{}]", finalNode.getName()), e);
                             List<DeletePitInfo> deletePitInfos = new ArrayList<>();
                             for (PitSearchContextIdForNode pitSearchContextIdForNode : entry.getValue()) {
-
                                 deletePitInfos.add(new DeletePitInfo(false, pitSearchContextIdForNode.getPitId()));
                             }
                             groupedListener.onResponse(new DeletePitResponse(deletePitInfos));
                         }
                     }
                 }
-            }, listener::onFailure);
-
         }, listener::onFailure);
     }
 

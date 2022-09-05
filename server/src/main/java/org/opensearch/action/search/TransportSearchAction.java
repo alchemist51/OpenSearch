@@ -456,7 +456,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             } else {
                 logger.info(this.clusterService.getClusterName() + " when remote cluster indices is NOT Empty "+ this.clusterService.getNodeName());
                 logger.info(shouldMinimizeRoundtrips(searchRequest));
-                if (false) {
+                if (shouldMinimizeRoundtrips(searchRequest)) {
                     logger.info(this.clusterService.getClusterName() + " should minimize round trips is true "+ this.clusterService.getNodeName());
                     ccsRemoteReduce(
                         searchRequest,

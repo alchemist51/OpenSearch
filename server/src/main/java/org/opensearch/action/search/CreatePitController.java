@@ -95,6 +95,7 @@ public class CreatePitController {
         searchRequest.routing(request.getRouting());
         searchRequest.indicesOptions(request.getIndicesOptions());
         searchRequest.allowPartialSearchResults(request.shouldAllowPartialPitCreation());
+        searchRequest.setCcsMinimizeRoundtrips(false);
         SearchTask searchTask = searchRequest.createTask(
             task.getId(),
             task.getType(),
@@ -206,6 +207,9 @@ public class CreatePitController {
             );
             for (Map.Entry<ShardId, SearchContextIdForNode> entry : contextId.shards().entrySet()) {
                 DiscoveryNode node = nodelookup.apply(entry.getValue().getClusterAlias(), entry.getValue().getNode());
+                if (node == null){
+                    node = this.clusterService.state().getNodes().get(entry.getValue().getNode());
+                }
                 logger.info("getNode"+ entry.getValue().getNode());
                 logger.info("cluster Alias"+entry.getValue().getClusterAlias());
                 try {
@@ -222,11 +226,12 @@ public class CreatePitController {
                         groupedActionListener
                     );
                 } catch (Exception e) {
+                    DiscoveryNode finalNode = node;
                     logger.error(
                         () -> new ParameterizedMessage(
                             "Create pit update phase failed for PIT ID [{}] on node [{}]",
                             searchResponse.pointInTimeId(),
-                            node
+                            finalNode
                         ),
                         e
                     );
