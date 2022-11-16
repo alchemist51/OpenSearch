@@ -53,12 +53,7 @@ import org.opensearch.action.fieldcaps.FieldCapabilitiesRequest;
 import org.opensearch.action.get.GetRequest;
 import org.opensearch.action.get.MultiGetRequest;
 import org.opensearch.action.index.IndexRequest;
-import org.opensearch.action.search.ClearScrollRequest;
-import org.opensearch.action.search.CreatePitRequest;
-import org.opensearch.action.search.DeletePitRequest;
-import org.opensearch.action.search.MultiSearchRequest;
-import org.opensearch.action.search.SearchRequest;
-import org.opensearch.action.search.SearchScrollRequest;
+import org.opensearch.action.search.*;
 import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.action.support.WriteRequest;
@@ -502,6 +497,11 @@ final class RequestConverters {
         return new Request(HttpGet.METHOD_NAME, "/_search/point_in_time/_all");
     }
 
+    static Request updatePit(UpdatePitRequest updatePitRequest) throws IOException {
+        Request request = new Request(HttpDelete.METHOD_NAME, "/_search/point_in_time");
+        request.setEntity(createEntity(updatePitRequest, REQUEST_BODY_CONTENT_TYPE));
+        return request;
+    }
     static Request multiSearch(MultiSearchRequest multiSearchRequest) throws IOException {
         Request request = new Request(HttpPost.METHOD_NAME, "/_msearch");
 

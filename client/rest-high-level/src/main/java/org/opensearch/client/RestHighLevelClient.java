@@ -1403,6 +1403,16 @@ public class RestHighLevelClient implements Closeable {
         );
     }
 
+    public final CreatePitResponse updatePit(CreatePitRequest createPitRequest, RequestOptions options) throws IOException {
+        return performRequestAndParseEntity(
+            createPitRequest,
+            RequestConverters::createPit,
+            options,
+            CreatePitResponse::fromXContent,
+            emptySet()
+        );
+    }
+
     /**
      * Clears one or more scroll ids using the Clear Scroll API.
      *
