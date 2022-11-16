@@ -13,6 +13,8 @@ import org.opensearch.common.ParseField;
 import org.opensearch.common.io.stream.StreamInput;
 import org.opensearch.common.io.stream.StreamOutput;
 import org.opensearch.common.xcontent.StatusToXContentObject;
+import org.opensearch.common.xcontent.XContentBuilder;
+import org.opensearch.common.xcontent.XContentParser;
 import org.opensearch.rest.RestStatus;
 
 import java.io.IOException;
@@ -27,15 +29,24 @@ public class UpdatePitResponse extends ActionResponse implements StatusToXConten
     private static final ParseField SUCCESS_FULL = new ParseField("successfull");
 
     private final String id;
-    private final int totalShards;
-    private final int successfullShards;
-    private final int failedShards;
-    public UpdatePitRequest(StreamInput in) throws IOException {
+    private final long creationTime;
+    private final long expiryTime;
+    public UpdatePitResponse(StreamInput in) throws IOException {
         super(in);
         id = in.readString();
-        totalShards = in.readVInt();
-        successfullShards = in.readVInt();
-        failedShards = in.readVInt();
+        creationTime = in.readLong();
+        expiryTime = in.readLong();
+
+    }
+
+    public UpdatePitResponse(
+        String id,
+        long creationTime,
+        long expiryTime
+    ) {
+        this.id = id;
+        this.creationTime = creationTime;
+        this.expiryTime = expiryTime;
     }
 
     @Override
@@ -46,6 +57,14 @@ public class UpdatePitResponse extends ActionResponse implements StatusToXConten
     @Override
     public void writeTo(StreamOutput out) throws IOException{
         out.writeString(id);
+        out.writeLong(creationTime);
+        out.writeLong(expiryTime);
+    }
+
+    @Override
+    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+        builder.startObject();
+        builder.field(ID.getPreferredName(), id);
 
     }
 }
