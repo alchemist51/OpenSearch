@@ -65,6 +65,8 @@ public class UpdatePitResponse extends ActionResponse implements StatusToXConten
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
         builder.startObject();
         builder.field(ID.getPreferredName(), id);
-
+        builder.endObject();
+        return builder;
     }
 }
+//

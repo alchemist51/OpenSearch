@@ -606,7 +606,7 @@ public abstract class AbstractClient implements Client {
 
     @Override
     public void updatePit(final UpdatePitRequest updatePitRequest, final ActionListener<UpdatePitResponse> listener){
-
+        execute(UpdatePitAction.INSTANCE, updatePitRequest, listener);
     }
 
     @Override

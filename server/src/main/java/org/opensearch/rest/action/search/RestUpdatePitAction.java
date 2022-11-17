@@ -13,6 +13,7 @@ import org.opensearch.client.node.NodeClient;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.rest.action.RestStatusToXContentListener;
 
 import java.io.IOException;
 import java.util.List;
@@ -42,7 +43,7 @@ public class RestUpdatePitAction extends BaseRestHandler {
             }
         }));
 
-        return channel -> client.
+        return channel -> client.updatePit(updatePitRequest, new RestStatusToXContentListener<>(channel));
     }
 
     @Override
