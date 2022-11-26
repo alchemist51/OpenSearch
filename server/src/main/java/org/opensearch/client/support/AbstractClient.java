@@ -349,30 +349,7 @@ import org.opensearch.action.ingest.SimulatePipelineAction;
 import org.opensearch.action.ingest.SimulatePipelineRequest;
 import org.opensearch.action.ingest.SimulatePipelineRequestBuilder;
 import org.opensearch.action.ingest.SimulatePipelineResponse;
-import org.opensearch.action.search.ClearScrollAction;
-import org.opensearch.action.search.ClearScrollRequest;
-import org.opensearch.action.search.ClearScrollRequestBuilder;
-import org.opensearch.action.search.ClearScrollResponse;
-import org.opensearch.action.search.CreatePitAction;
-import org.opensearch.action.search.CreatePitRequest;
-import org.opensearch.action.search.CreatePitResponse;
-import org.opensearch.action.search.DeletePitAction;
-import org.opensearch.action.search.DeletePitRequest;
-import org.opensearch.action.search.DeletePitResponse;
-import org.opensearch.action.search.GetAllPitNodesRequest;
-import org.opensearch.action.search.GetAllPitNodesResponse;
-import org.opensearch.action.search.MultiSearchAction;
-import org.opensearch.action.search.MultiSearchRequest;
-import org.opensearch.action.search.MultiSearchRequestBuilder;
-import org.opensearch.action.search.MultiSearchResponse;
-import org.opensearch.action.search.GetAllPitsAction;
-import org.opensearch.action.search.SearchAction;
-import org.opensearch.action.search.SearchRequest;
-import org.opensearch.action.search.SearchRequestBuilder;
-import org.opensearch.action.search.SearchResponse;
-import org.opensearch.action.search.SearchScrollAction;
-import org.opensearch.action.search.SearchScrollRequest;
-import org.opensearch.action.search.SearchScrollRequestBuilder;
+import org.opensearch.action.search.*;
 import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.action.support.master.AcknowledgedResponse;
 import org.opensearch.action.termvectors.MultiTermVectorsAction;
@@ -625,6 +602,11 @@ public abstract class AbstractClient implements Client {
     @Override
     public void getAllPits(final GetAllPitNodesRequest getAllPitNodesRequest, final ActionListener<GetAllPitNodesResponse> listener) {
         execute(GetAllPitsAction.INSTANCE, getAllPitNodesRequest, listener);
+    }
+
+    @Override
+    public void updatePit(final UpdatePitRequest updatePitRequest, final ActionListener<UpdatePitResponse> listener){
+        execute(UpdatePitAction.INSTANCE, updatePitRequest, listener);
     }
 
     @Override
