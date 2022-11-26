@@ -247,20 +247,7 @@ import org.opensearch.action.ingest.SimulatePipelineAction;
 import org.opensearch.action.ingest.SimulatePipelineTransportAction;
 import org.opensearch.action.main.MainAction;
 import org.opensearch.action.main.TransportMainAction;
-import org.opensearch.action.search.ClearScrollAction;
-import org.opensearch.action.search.CreatePitAction;
-import org.opensearch.action.search.DeletePitAction;
-import org.opensearch.action.search.MultiSearchAction;
-import org.opensearch.action.search.GetAllPitsAction;
-import org.opensearch.action.search.SearchAction;
-import org.opensearch.action.search.SearchScrollAction;
-import org.opensearch.action.search.TransportClearScrollAction;
-import org.opensearch.action.search.TransportCreatePitAction;
-import org.opensearch.action.search.TransportDeletePitAction;
-import org.opensearch.action.search.TransportGetAllPitsAction;
-import org.opensearch.action.search.TransportMultiSearchAction;
-import org.opensearch.action.search.TransportSearchAction;
-import org.opensearch.action.search.TransportSearchScrollAction;
+import org.opensearch.action.search.*;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.AutoCreateIndex;
 import org.opensearch.action.support.DestructiveOperations;
@@ -699,7 +686,7 @@ public class ActionModule extends AbstractModule {
         actions.register(DeletePitAction.INSTANCE, TransportDeletePitAction.class);
         actions.register(PitSegmentsAction.INSTANCE, TransportPitSegmentsAction.class);
         actions.register(GetAllPitsAction.INSTANCE, TransportGetAllPitsAction.class);
-
+        // TODO: register the api here
         // Remote Store
         actions.register(RestoreRemoteStoreAction.INSTANCE, TransportRestoreRemoteStoreAction.class);
 
@@ -890,6 +877,7 @@ public class ActionModule extends AbstractModule {
         registerHandler.accept(new RestGetAllPitsAction(nodesInCluster));
         registerHandler.accept(new RestPitSegmentsAction(nodesInCluster));
         registerHandler.accept(new RestDeleteDecommissionStateAction());
+        // TODO: add update api here
 
         for (ActionPlugin plugin : actionPlugins) {
             for (RestHandler handler : plugin.getRestHandlers(
