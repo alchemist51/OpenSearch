@@ -20,6 +20,7 @@ import org.opensearch.rest.action.RestActions;
 
 import java.io.IOException;
 
+import static org.opensearch.common.xcontent.XContentParserUtils.ensureExpectedToken;
 import static org.opensearch.rest.RestStatus.OK;
 
 public class UpdatePitResponse extends ActionResponse implements StatusToXContentObject {
@@ -27,7 +28,6 @@ public class UpdatePitResponse extends ActionResponse implements StatusToXConten
     private static final ParseField ID = new ParseField("pit_id");
     private static final ParseField CREATION_TIME = new ParseField("creation_time");
     private static final ParseField EXPIRY_TIME = new ParseField("expiry_time");
-    private static final ParseField SUCCESS_FULL = new ParseField("successfull");
 
     private final String id;
     private final int totalShards;
@@ -78,11 +78,28 @@ public class UpdatePitResponse extends ActionResponse implements StatusToXConten
         this.shardFailures = shardFailures;
     }
 
+    public static CreatePitResponse fromXContent(XContentParser parser) throws IOException{
+        ensureExpectedToken(XContentParser.Token.START_OBJECT, parser.nextToken(), parser);
+        parser.nextToken();
+        return innerFromXContent(parser);
+    }
+
+    public static CreatePitResponse innerFromXContent(XContentParser parser) throws IOException {
+
+    }
     @Override
     public void writeTo(StreamOutput out) throws IOException{
         out.writeString(id);
+        out.writeVInt(totalShards);
+        out.writeVInt(successfulShards);
+        out.writeVInt(failedShards);
+        out.writeVInt(skippedShards);
         out.writeLong(creationTime);
         out.writeLong(expiryTime);
+        out.writeVInt(shardFailures.length);
+        for (ShardSearchFailure shardSearchFailure : shardFailures) {
+            shardSearchFailure.writeTo(out);
+        }
     }
 
     @Override
@@ -98,6 +115,8 @@ public class UpdatePitResponse extends ActionResponse implements StatusToXConten
             getFailedShards(),
             getShardFailures()
         );
+        builder.field(CREATION_TIME.getPreferredName(), creationTime);
+        builder.field(EXPIRY_TIME.getPreferredName(), expiryTime);
         builder.endObject();
         return builder;
     }
