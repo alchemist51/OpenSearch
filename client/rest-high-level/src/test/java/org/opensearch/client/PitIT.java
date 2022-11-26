@@ -32,7 +32,7 @@ import java.util.stream.Collectors;
  * Tests point in time API with rest high level client
  */
 public class PitIT extends OpenSearchRestHighLevelClientTestCase {
-
+//--this is is PITIT
     @Before
     public void indexDocuments() throws IOException {
         Request doc1 = new Request(HttpPut.METHOD_NAME, "/index/_doc/1");
