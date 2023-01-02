@@ -160,6 +160,22 @@ public class SearchTransportService {
         );
     }
 
+    public void updatePitContext(
+        Transport.Connection connection,
+        TransportUpdatePitAction.UpdateReaderContextRequest request,
+        SearchTask task,
+        ActionListener<TransportUpdatePitAction.UpdateReaderContextResponse> actionListener
+    ) {
+        transportService.sendChildRequest(
+            connection,
+            UPDATE_READER_CONTEXT_ACTION_NAME,
+            request,
+            task,
+            TransportRequestOptions.EMPTY,
+            new ActionListenerResponseHandler<>(actionListener, TransportUpdatePitAction.UpdateReaderContextResponse::new)
+        );
+    }
+
     public void createPitContext(
         Transport.Connection connection,
         TransportCreatePitAction.CreateReaderContextRequest request,

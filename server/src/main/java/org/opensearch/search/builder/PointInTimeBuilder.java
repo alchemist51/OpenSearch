@@ -80,6 +80,11 @@ public final class PointInTimeBuilder implements Writeable, ToXContentObject {
         this.id = Objects.requireNonNull(id);
     }
 
+    public  PointInTimeBuilder(String id, TimeValue keepAlive){
+        this.id = Objects.requireNonNull(id);
+        this.keepAlive = Objects.requireNonNull(keepAlive);
+    }
+
     public PointInTimeBuilder(StreamInput in) throws IOException {
         id = in.readString();
         keepAlive = in.readOptionalTimeValue();

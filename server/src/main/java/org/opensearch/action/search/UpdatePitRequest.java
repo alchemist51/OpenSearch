@@ -46,6 +46,9 @@ public class UpdatePitRequest extends ActionRequest implements ToXContentObject 
         this.updatePitRequests = new ArrayList<>();
     }
 
+    public UpdatePitRequestInfo getPitRequestInfo(){
+        return updatePitRequests.get(0);
+    }
 
     @Override
     public ActionRequestValidationException validate() {

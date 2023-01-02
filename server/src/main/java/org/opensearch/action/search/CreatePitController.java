@@ -254,6 +254,7 @@ public class CreatePitController {
         }, updatePitIdListener::onFailure);
     }
 
+
     private StepListener<BiFunction<String, String, DiscoveryNode>> getConnectionLookupListener(SearchContextId contextId) {
         ClusterState state = clusterService.state();
         final Set<String> clusters = contextId.shards()
