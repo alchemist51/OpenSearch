@@ -158,12 +158,17 @@ public class PitService {
     /**
      * This method returns indices associated for each pit
      */
-    public Map<String, String[]> getIndicesForPits(List<String> pitIds) {
+
+    public Map<String, String[]> getIndicesForPit(List<ListPitInfo> pitIds) {
         Map<String, String[]> pitToIndicesMap = new HashMap<>();
-        for (String pitId : pitIds) {
-            pitToIndicesMap.put(pitId, SearchContextId.decode(nodeClient.getNamedWriteableRegistry(), pitId).getActualIndices());
+        for (ListPitInfo pitId : pitIds) {
+            pitToIndicesMap.put(pitId.getPitId(), SearchContextId.decode(nodeClient.getNamedWriteableRegistry(), pitId.getPitId()).getActualIndices());
         }
         return pitToIndicesMap;
+    }
+
+    public String[] getIndicesForPitId(String pitId) {
+        return SearchContextId.decode(nodeClient.getNamedWriteableRegistry(), pitId).getActualIndices();
     }
 
     /**

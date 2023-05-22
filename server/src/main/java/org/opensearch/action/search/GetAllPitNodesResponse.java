@@ -20,11 +20,7 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Collectors;
 
 import static org.opensearch.core.xcontent.ConstructingObjectParser.constructorArg;
@@ -55,6 +51,12 @@ public class GetAllPitNodesResponse extends BaseNodesResponse<GetAllPitNodeRespo
                 .flatMap(p -> p.getPitInfos().stream().filter(t -> uniquePitIds.add(t.getPitId())))
                 .collect(Collectors.toList())
         );
+
+//        Map<String, String[]> pitToIndicesMap = new HashMap<>();
+//        for(ListPitInfo pitinfo: pitInfos) {
+//            String pitId = pitinfo.getPitId();
+//            pitToIndicesMap.put(pitId, SearchContextId.decode(nodeClient.getNamedWriteableRegistry(), pitId).getActualIndices());
+//        }
     }
 
     /**

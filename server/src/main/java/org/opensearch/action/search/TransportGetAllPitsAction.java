@@ -30,14 +30,15 @@ public class TransportGetAllPitsAction extends TransportNodesAction<
     GetAllPitNodeRequest,
     GetAllPitNodeResponse> {
     private final SearchService searchService;
-
+    private PitService pitService;
     @Inject
     public TransportGetAllPitsAction(
         ThreadPool threadPool,
         ClusterService clusterService,
         TransportService transportService,
         ActionFilters actionFilters,
-        SearchService searchService
+        SearchService searchService,
+        PitService pitService
     ) {
         super(
             GetAllPitsAction.NAME,
@@ -51,6 +52,7 @@ public class TransportGetAllPitsAction extends TransportNodesAction<
             GetAllPitNodeResponse.class
         );
         this.searchService = searchService;
+        this.pitService = pitService;
     }
 
     @Override
@@ -79,7 +81,7 @@ public class TransportGetAllPitsAction extends TransportNodesAction<
     protected GetAllPitNodeResponse nodeOperation(GetAllPitNodeRequest request) {
         GetAllPitNodeResponse nodeResponse = new GetAllPitNodeResponse(
             transportService.getLocalNode(),
-            searchService.getAllPITReaderContexts()
+            searchService.getAllPITReaderContexts(this.pitService)
         );
         return nodeResponse;
     }
