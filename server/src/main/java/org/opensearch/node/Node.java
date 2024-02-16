@@ -1054,6 +1054,8 @@ public class Node implements Closeable {
                 transportService.getTaskManager(),
                 taskCancellationMonitoringSettings
             );
+            final PeerRecoveryTargetService peerRecoveryTargetService = new PeerRecoveryTargetService(threadPool, transportService, recoverySettings, clusterService);
+
             this.nodeService = new NodeService(
                 settings,
                 threadPool,
@@ -1075,7 +1077,8 @@ public class Node implements Closeable {
                 searchBackpressureService,
                 searchPipelineService,
                 fileCache,
-                taskCancellationMonitoringService
+                taskCancellationMonitoringService,
+                peerRecoveryTargetService
             );
 
             final SearchService searchService = newSearchService(
@@ -1167,7 +1170,7 @@ public class Node implements Closeable {
                     b.bind(PeerRecoverySourceService.class)
                         .toInstance(new PeerRecoverySourceService(transportService, indicesService, recoverySettings));
                     b.bind(PeerRecoveryTargetService.class)
-                        .toInstance(new PeerRecoveryTargetService(threadPool, transportService, recoverySettings, clusterService));
+                        .toInstance(peerRecoveryTargetService);
                     b.bind(SegmentReplicationTargetService.class)
                         .toInstance(
                             new SegmentReplicationTargetService(

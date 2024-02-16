@@ -50,6 +50,7 @@ import org.opensearch.index.stats.IndexingPressureStats;
 import org.opensearch.index.stats.ShardIndexingPressureStats;
 import org.opensearch.index.store.remote.filecache.FileCacheStats;
 import org.opensearch.indices.NodeIndicesStats;
+import org.opensearch.indices.recovery.PeerRecoveryStats;
 import org.opensearch.ingest.IngestStats;
 import org.opensearch.monitor.fs.FsInfo;
 import org.opensearch.monitor.jvm.JvmStats;
@@ -142,6 +143,9 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
     @Nullable
     private SearchPipelineStats searchPipelineStats;
 
+    @Nullable
+    private PeerRecoveryStats peerRecoveryStats;
+
     public NodeStats(StreamInput in) throws IOException {
         super(in);
         timestamp = in.readVLong();
@@ -198,6 +202,11 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
         } else {
             searchPipelineStats = null;
         }
+        if (in.getVersion().onOrAfter(Version.V_2_11_0)) {
+            peerRecoveryStats = in.readOptionalWriteable(PeerRecoveryStats::new);
+        } else {
+            peerRecoveryStats = null;
+        }
     }
 
     public NodeStats(
@@ -224,8 +233,9 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
         @Nullable WeightedRoutingStats weightedRoutingStats,
         @Nullable FileCacheStats fileCacheStats,
         @Nullable TaskCancellationStats taskCancellationStats,
-        @Nullable SearchPipelineStats searchPipelineStats
-    ) {
+        @Nullable SearchPipelineStats searchPipelineStats,
+        @Nullable PeerRecoveryStats peerRecoveryStats
+        ) {
         super(node);
         this.timestamp = timestamp;
         this.indices = indices;
@@ -250,6 +260,7 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
         this.fileCacheStats = fileCacheStats;
         this.taskCancellationStats = taskCancellationStats;
         this.searchPipelineStats = searchPipelineStats;
+        this.peerRecoveryStats = peerRecoveryStats;
     }
 
     public long getTimestamp() {
@@ -387,6 +398,9 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
         return searchPipelineStats;
     }
 
+    @Nullable
+    public PeerRecoveryStats getPeerRecoveryStats() { return peerRecoveryStats; }
+
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
@@ -429,6 +443,9 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
         }
         if (out.getVersion().onOrAfter(Version.V_2_9_0)) {
             out.writeOptionalWriteable(searchPipelineStats);
+        }
+        if (out.getVersion().onOrAfter(Version.V_2_11_0)) {
+            out.writeOptionalWriteable(peerRecoveryStats);
         }
     }
 
@@ -520,7 +537,9 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
         if (getSearchPipelineStats() != null) {
             getSearchPipelineStats().toXContent(builder, params);
         }
-
+        if (getPeerRecoveryStats() != null) {
+            getPeerRecoveryStats().toXContent(builder, params);
+        }
         return builder;
     }
 }

@@ -50,6 +50,7 @@ import org.opensearch.http.HttpServerTransport;
 import org.opensearch.index.IndexingPressureService;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.indices.recovery.PeerRecoveryTargetService;
 import org.opensearch.ingest.IngestService;
 import org.opensearch.monitor.MonitorService;
 import org.opensearch.plugins.PluginsService;
@@ -92,6 +93,7 @@ public class NodeService implements Closeable {
     private final Discovery discovery;
     private final FileCache fileCache;
     private final TaskCancellationMonitoringService taskCancellationMonitoringService;
+    private final PeerRecoveryTargetService peerRecoveryTargetService;
 
     NodeService(
         Settings settings,
@@ -114,7 +116,8 @@ public class NodeService implements Closeable {
         SearchBackpressureService searchBackpressureService,
         SearchPipelineService searchPipelineService,
         FileCache fileCache,
-        TaskCancellationMonitoringService taskCancellationMonitoringService
+        TaskCancellationMonitoringService taskCancellationMonitoringService,
+        PeerRecoveryTargetService peerRecoveryTargetService
     ) {
         this.settings = settings;
         this.threadPool = threadPool;
@@ -137,6 +140,7 @@ public class NodeService implements Closeable {
         this.clusterService = clusterService;
         this.fileCache = fileCache;
         this.taskCancellationMonitoringService = taskCancellationMonitoringService;
+        this.peerRecoveryTargetService = peerRecoveryTargetService;
         clusterService.addStateApplier(ingestService);
         clusterService.addStateApplier(searchPipelineService);
     }
@@ -217,7 +221,8 @@ public class NodeService implements Closeable {
         boolean weightedRoutingStats,
         boolean fileCacheStats,
         boolean taskCancellation,
-        boolean searchPipelineStats
+        boolean searchPipelineStats,
+        boolean peerRecoveryStats
     ) {
         // for indices stats we want to include previous allocated shards stats as well (it will
         // only be applied to the sensible ones to use, like refresh/merge/flush/indexing stats)
@@ -245,7 +250,8 @@ public class NodeService implements Closeable {
             weightedRoutingStats ? WeightedRoutingStats.getInstance() : null,
             fileCacheStats && fileCache != null ? fileCache.fileCacheStats() : null,
             taskCancellation ? this.taskCancellationMonitoringService.stats() : null,
-            searchPipelineStats ? this.searchPipelineService.stats() : null
+            searchPipelineStats ? this.searchPipelineService.stats() : null,
+            peerRecoveryStats? this.peerRecoveryTargetService.stats() : null
         );
     }
 

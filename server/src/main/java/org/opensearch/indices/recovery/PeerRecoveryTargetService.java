@@ -121,6 +121,8 @@ public class PeerRecoveryTargetService implements IndexEventListener {
 
     private final ReplicationCollection<RecoveryTarget> onGoingRecoveries;
 
+    private final PeerRecoveryTargetStatsTracker peerRecoveryTargetStatsTracker;
+
     public PeerRecoveryTargetService(
         ThreadPool threadPool,
         TransportService transportService,
@@ -132,6 +134,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
         this.recoverySettings = recoverySettings;
         this.clusterService = clusterService;
         this.onGoingRecoveries = new ReplicationCollection<>(logger, threadPool);
+        this.peerRecoveryTargetStatsTracker = new PeerRecoveryTargetStatsTracker();
 
         transportService.registerRequestHandler(
             Actions.FILES_INFO,
@@ -748,5 +751,11 @@ public class PeerRecoveryTargetService implements IndexEventListener {
         public RecoveryResponse read(StreamInput in) throws IOException {
             return new RecoveryResponse(in);
         }
+    }
+
+    public PeerRecoveryStats stats() {
+        return new PeerRecoveryStats(
+            peerRecoveryTargetStatsTracker.getTotalShardRelocation()
+        );
     }
 }
