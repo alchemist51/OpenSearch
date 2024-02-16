@@ -121,7 +121,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
 
     private final ReplicationCollection<RecoveryTarget> onGoingRecoveries;
 
-    private final PeerRecoveryTargetStatsTracker peerRecoveryTargetStatsTracker;
+    private final PeerRecoveryTargetStatsTracker tracker;
 
     public PeerRecoveryTargetService(
         ThreadPool threadPool,
@@ -134,7 +134,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
         this.recoverySettings = recoverySettings;
         this.clusterService = clusterService;
         this.onGoingRecoveries = new ReplicationCollection<>(logger, threadPool);
-        this.peerRecoveryTargetStatsTracker = new PeerRecoveryTargetStatsTracker();
+        this.tracker = new PeerRecoveryTargetStatsTracker();
 
         transportService.registerRequestHandler(
             Actions.FILES_INFO,
@@ -184,6 +184,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
     public void beforeIndexShardClosed(ShardId shardId, @Nullable IndexShard indexShard, Settings indexSettings) {
         if (indexShard != null) {
             onGoingRecoveries.cancelForShard(shardId, "shard closed");
+            tracker.incrementTotalCancelledRelocation(1);
         }
     }
 
@@ -193,6 +194,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
             new RecoveryTarget(indexShard, sourceNode, listener),
             recoverySettings.activityTimeout()
         );
+        tracker.incrementTotalStartedRelocation(1);
         // we fork off quickly here and go async but this is called from the cluster state applier thread too and that can cause
         // assertions to trip if we executed it on the same thread hence we fork off to the generic threadpool.
         threadPool.generic().execute(new RecoveryRunner(recoveryId));
@@ -210,6 +212,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
 
     private void retryRecovery(final long recoveryId, final TimeValue retryAfter, final TimeValue activityTimeout) {
         RecoveryTarget newTarget = onGoingRecoveries.reset(recoveryId, activityTimeout);
+        tracker.incrementTotalRetriedRelocation(1);
         if (newTarget != null) {
             threadPool.scheduleUnlessShuttingDown(retryAfter, ThreadPool.Names.GENERIC, new RecoveryRunner(newTarget.getId()));
         }
@@ -273,6 +276,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
                         new RecoveryFailedException(recoveryTarget.state(), "failed to prepare shard for recovery", e),
                         true
                     );
+                    tracker.incrementTotalFailedRelocation(1);
                     return;
                 }
                 logger.trace("{} starting recovery from {}", startRequest.shardId(), startRequest.sourceNode());
@@ -593,6 +597,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
                         new RecoveryFailedException(recoveryRef.get().state(), "unexpected error", e),
                         true // be safe
                     );
+                    tracker.incrementTotalFailedRelocation(1);
                 } else {
                     logger.debug(
                         () -> new ParameterizedMessage("unexpected error during recovery, but recovery id [{}] is finished", recoveryId),
@@ -625,6 +630,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
             final TimeValue recoveryTime = new TimeValue(timer.time());
             // do this through ongoing recoveries to remove it from the collection
             onGoingRecoveries.markAsDone(recoveryId);
+            tracker.incrementTotalCompletedRelocation(1);
             if (logger.isTraceEnabled()) {
                 StringBuilder sb = new StringBuilder();
                 sb.append('[')
@@ -686,6 +692,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
             if (cause instanceof CancellableThreads.ExecutionCancelledException) {
                 // this can also come from the source wrapped in a RemoteTransportException
                 onGoingRecoveries.fail(recoveryId, new RecoveryFailedException(request, "source has canceled the recovery", cause), false);
+                tracker.incrementTotalFailedRelocation(1);
                 return;
             }
             if (cause instanceof RecoveryEngineException) {
@@ -735,10 +742,12 @@ public class PeerRecoveryTargetService implements IndexEventListener {
 
             if (cause instanceof AlreadyClosedException) {
                 onGoingRecoveries.fail(recoveryId, new RecoveryFailedException(request, "source shard is closed", cause), false);
+                tracker.incrementTotalFailedRelocation(1);
                 return;
             }
 
             onGoingRecoveries.fail(recoveryId, new RecoveryFailedException(request, e), true);
+            tracker.incrementTotalFailedRelocation(1);
         }
 
         @Override
@@ -755,7 +764,11 @@ public class PeerRecoveryTargetService implements IndexEventListener {
 
     public PeerRecoveryStats stats() {
         return new PeerRecoveryStats(
-            peerRecoveryTargetStatsTracker.getTotalShardRelocation()
+            tracker.getTotalStartedRecoveries(),
+            tracker.getTotalFailedRecoveries(),
+            tracker.getTotalCompletedRecoveries(),
+            tracker.getTotalRetriedRecoveries(),
+            tracker.getTotalCancelledRecoveries()
         );
     }
 }

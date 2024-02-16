@@ -48,7 +48,6 @@ import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.xcontent.ToXContentFragment;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.discovery.DiscoveryModule;
-import org.opensearch.indices.recovery.PeerRecoveryStats;
 import org.opensearch.monitor.fs.FsInfo;
 import org.opensearch.monitor.jvm.JvmInfo;
 import org.opensearch.monitor.os.OsInfo;
@@ -854,12 +853,26 @@ public class ClusterStatsNodes implements ToXContentFragment {
 
     static class PeerRecoveryStats implements ToXContentFragment {
 
-        private long total_relocation_count;
+        private long total_started_recoveries;
+        private long total_failed_recoveries;
+        private long total_completed_recoveries;
+        private long total_retried_recoveries;
+        private long total_cancelled_recoveries;
+
+        private static final String TotalStartedRecoveries = "total_started_recoveries";
+        private static final String TotalFailedRecoveries = "total_failed_recoveries";
+        private static final String TotalCompletedRecoveries = "total_completed_recoveries";
+        private static final String TotalRetriedRecoveries = "total_retried_recoveries";
+        private static final String TotalCancelledRecoveries = "total_cancelled_recoveries";
 
         PeerRecoveryStats(List<NodeStats> nodeStats) {
             for (NodeStats nodeStat : nodeStats) {
                 if (nodeStat.getPeerRecoveryStats() != null) {
-                    total_relocation_count += nodeStat.getPeerRecoveryStats().getTotalRelocation();
+                    total_started_recoveries += nodeStat.getPeerRecoveryStats().getTotalStartedRecoveries();
+                    total_failed_recoveries += nodeStat.getPeerRecoveryStats().getTotalFailedRecoveries();
+                    total_completed_recoveries += nodeStat.getPeerRecoveryStats().getTotalCompletedRecoveries();
+                    total_retried_recoveries += nodeStat.getPeerRecoveryStats().getTotalRetriedRecoveries();
+                    total_cancelled_recoveries += nodeStat.getPeerRecoveryStats().getTotalCancelledRecoveries();
                 }
             }
         }
@@ -868,7 +881,11 @@ public class ClusterStatsNodes implements ToXContentFragment {
         public XContentBuilder toXContent(final XContentBuilder builder, final Params params) throws IOException {
             builder.startObject("peer_recovery_stats");
             {
-                builder.field("number_of_relocations", total_relocation_count);
+                builder.field(TotalStartedRecoveries, total_started_recoveries);
+                builder.field(TotalFailedRecoveries, total_failed_recoveries);
+                builder.field(TotalCompletedRecoveries, total_completed_recoveries);
+                builder.field(TotalRetriedRecoveries, total_retried_recoveries);
+                builder.field(TotalCancelledRecoveries, total_cancelled_recoveries);
 
             }
             builder.endObject();

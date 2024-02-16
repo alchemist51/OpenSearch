@@ -17,32 +17,74 @@ import org.opensearch.core.xcontent.ToXContentFragment;
 import org.opensearch.core.xcontent.XContentBuilder;
 
 import java.io.IOException;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class PeerRecoveryStats implements Writeable, ToXContentFragment {
 
-    private final long totalRelocation;
+    private final long total_started_recoveries;
+    private final long total_failed_recoveries;
+    private final long total_completed_recoveries;
+    private final long total_retried_recoveries;
+    private final long total_cancelled_recoveries;
+
 
     public PeerRecoveryStats(StreamInput in) throws IOException {
-        totalRelocation = in.readVLong();
+        total_started_recoveries = in.readVLong();
+        total_failed_recoveries = in.readVLong();
+        total_completed_recoveries = in.readVLong();
+        total_retried_recoveries = in.readVLong();
+        total_cancelled_recoveries = in.readVLong();
     }
 
-    public PeerRecoveryStats(long totalRelocation) {
-        this.totalRelocation = totalRelocation;
+    public PeerRecoveryStats(long total_started_recoveries, long total_failed_recoveries,long total_completed_recoveries,long total_retried_recoveries,long total_cancelled_recoveries) {
+        this.total_started_recoveries = total_started_recoveries;
+        this.total_failed_recoveries = total_failed_recoveries;
+        this.total_completed_recoveries = total_completed_recoveries;
+        this.total_retried_recoveries = total_retried_recoveries;
+        this.total_cancelled_recoveries = total_cancelled_recoveries;
     }
 
     public void writeTo(StreamOutput out) throws IOException {
-        out.writeVLong(totalRelocation);
+        out.writeVLong(total_started_recoveries);
+        out.writeVLong(total_failed_recoveries);
+        out.writeVLong(total_completed_recoveries);
+        out.writeVLong(total_retried_recoveries);
+        out.writeVLong(total_cancelled_recoveries);
     }
 
-    public long getTotalRelocation() {
-        return totalRelocation;
+    public long getTotalStartedRecoveries() {
+        return total_started_recoveries;
+    }
+    public long getTotalFailedRecoveries() {
+        return total_failed_recoveries;
     }
 
-    private static final String TOTAL_RELOCATION = "total_relocation";
+    public long getTotalCompletedRecoveries() {
+        return total_completed_recoveries;
+    }
+
+    public long getTotalRetriedRecoveries() {
+        return total_retried_recoveries;
+    }
+
+    public long getTotalCancelledRecoveries() {
+        return total_cancelled_recoveries;
+    }
+
+
+    private static final String TotalStartedRecoveries = "total_started_recoveries";
+    private static final String TotalFailedRecoveries = "total_failed_recoveries";
+    private static final String TotalCompletedRecoveries = "total_completed_recoveries";
+    private static final String TotalRetriedRecoveries = "total_retried_recoveries";
+    private static final String TotalCancelledRecoveries = "total_cancelled_recoveries";
 
     public XContentBuilder toXContent(XContentBuilder builder, ToXContent.Params params) throws IOException {
-        builder.startObject("PeerRecoveryStats");
-        builder.field(TOTAL_RELOCATION, totalRelocation);
+        builder.startObject("peer_recovery_stats");
+        builder.field(TotalStartedRecoveries, total_started_recoveries);
+        builder.field(TotalFailedRecoveries, total_failed_recoveries);
+        builder.field(TotalCompletedRecoveries, total_completed_recoveries);
+        builder.field(TotalRetriedRecoveries, total_retried_recoveries);
+        builder.field(TotalCancelledRecoveries, total_cancelled_recoveries);
         return builder.endObject();
     }
 }
