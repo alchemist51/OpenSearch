@@ -169,7 +169,7 @@ public class TransportClusterStatsAction extends TransportNodesAction<
             false,
             false,
             false,
-            false
+            true
         );
         List<ShardStats> shardsStats = new ArrayList<>();
         for (IndexService indexService : indicesService) {

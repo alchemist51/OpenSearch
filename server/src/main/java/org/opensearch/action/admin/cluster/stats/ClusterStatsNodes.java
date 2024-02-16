@@ -48,6 +48,7 @@ import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.xcontent.ToXContentFragment;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.discovery.DiscoveryModule;
+import org.opensearch.indices.recovery.PeerRecoveryStats;
 import org.opensearch.monitor.fs.FsInfo;
 import org.opensearch.monitor.jvm.JvmInfo;
 import org.opensearch.monitor.os.OsInfo;
@@ -86,6 +87,7 @@ public class ClusterStatsNodes implements ToXContentFragment {
     private final DiscoveryTypes discoveryTypes;
     private final PackagingTypes packagingTypes;
     private final IngestStats ingestStats;
+    private final PeerRecoveryStats peerRecoveryStats;
 
     ClusterStatsNodes(List<ClusterStatsNodeResponse> nodeResponses) {
         this.versions = new HashSet<>();
@@ -119,6 +121,7 @@ public class ClusterStatsNodes implements ToXContentFragment {
         this.discoveryTypes = new DiscoveryTypes(nodeInfos);
         this.packagingTypes = new PackagingTypes(nodeInfos);
         this.ingestStats = new IngestStats(nodeStats);
+        this.peerRecoveryStats = new PeerRecoveryStats(nodeStats);
     }
 
     public Counts getCounts() {
@@ -207,6 +210,8 @@ public class ClusterStatsNodes implements ToXContentFragment {
         packagingTypes.toXContent(builder, params);
 
         ingestStats.toXContent(builder, params);
+
+        peerRecoveryStats.toXContent(builder, params);
 
         return builder;
     }
@@ -847,4 +852,27 @@ public class ClusterStatsNodes implements ToXContentFragment {
 
     }
 
+    static class PeerRecoveryStats implements ToXContentFragment {
+
+        private long total_relocation_count;
+
+        PeerRecoveryStats(List<NodeStats> nodeStats) {
+            for (NodeStats nodeStat : nodeStats) {
+                if (nodeStat.getPeerRecoveryStats() != null) {
+                    total_relocation_count += nodeStat.getPeerRecoveryStats().getTotalRelocation();
+                }
+            }
+        }
+
+        @Override
+        public XContentBuilder toXContent(final XContentBuilder builder, final Params params) throws IOException {
+            builder.startObject("peer_recovery_stats");
+            {
+                builder.field("number_of_relocations", total_relocation_count);
+
+            }
+            builder.endObject();
+            return builder;
+        }
+    }
 }
