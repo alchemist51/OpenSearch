@@ -372,9 +372,9 @@ public class BalancedShardsAllocator implements ShardsAllocator {
             float balancerWeight = weight(balancer, node, index);
             float extraWt = 0;
             int primaryShardCount = node.numPrimaryShards();
-            int allowedPrimaryShardCount = (int) Math.ceil(balancer.avgPrimaryShardsPerNode());
-
-            if(primaryShardCount > allowedPrimaryShardCount) {
+            float avgPrimaryShardsPerNode = balancer.avgPrimaryShardsPerNode();
+            int allowedReplicaShardCountWithDelta = (int) (avgPrimaryShardsPerNode + 0.05 * avgPrimaryShardsPerNode);
+            if(primaryShardCount > allowedReplicaShardCountWithDelta) {
                 extraWt += 1000000L;
             }
 
