@@ -58,9 +58,9 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
-@Fork(3)
-@Warmup(iterations = 10)
-@Measurement(iterations = 10)
+@Fork(5)
+@Warmup(iterations = 3)
+@Measurement(iterations = 3)
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 @State(Scope.Benchmark)
@@ -74,38 +74,18 @@ public class AllocationBenchmark {
     // need its own main method and we cannot execute more than one class with a main method per JAR.
     @Param({
         // indices| shards| replicas| source| target| concurrentRecoveries
-        "      100|      1|        0|       1|      1|     10|",
-        "      100|      3|        0|       1|      1|     10|",
-        "      100|     10|        0|       1|      1|     10|",
-        "      100|      1|        0|       5|     10|      5|",
-        "      100|      3|        0|      10|      5|      5|",
-        "      100|     10|        0|      10|     20|      6|",
-        "      100|      1|        1|      10|     10|      6|",
-        "      100|      3|        1|      10|      5|      8|",
-        "      100|     10|        1|       8|     17|      8|",
-        "      100|      1|        2|      10|      8|      7|",
-        "      100|      3|        2|      13|     17|      5|",
-        "      100|     10|        2|      10|     20|      8|",
-        "      100|      1|        1|      20|      5|      5|",
-        "      100|      3|        1|      20|     23|      6|",
         "      100|     10|        1|      40|     20|      8|",
-        "      100|      1|        1|      40|     50|      2|",
         "      100|      3|        1|      50|     70|      3|",
-        "      100|     10|        1|      60|     50|      3|",
-        "      100|      1|        2|      40|     50|      2|",
         "      100|      3|        2|      50|     30|      6|",
         "      100|     10|        2|      33|     55|      6|",
 
         "       50|      60|       1|     100|    100|      6|",
         "       50|      60|       1|     100|     40|      6|",
-        "       50|      60|       1|      40|    100|      6|",
 
         "       500|     60|       1|     100|    100|     12|",
         "       500|     60|       1|     100|     40|     12|",
-        "       500|     60|       1|      40|    100|     12|",
 
         "       1000|     50|       1|     1000|    1000|     12|",
-        "       1000|     50|       1|     1000|     700|     12|",
         "       1000|     50|       1|      700|    1000|     12|"})
     public String indicesShardsReplicasSourceTargetRecoveries = "10|1|0|1|1|1";
 
