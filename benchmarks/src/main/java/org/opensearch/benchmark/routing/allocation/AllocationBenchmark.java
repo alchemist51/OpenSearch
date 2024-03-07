@@ -58,9 +58,9 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
-@Fork(3)
-@Warmup(iterations = 10)
-@Measurement(iterations = 10)
+@Fork(5)
+@Warmup(iterations = 2)
+@Measurement(iterations = 2)
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 @State(Scope.Benchmark)
@@ -74,62 +74,19 @@ public class AllocationBenchmark {
     // need its own main method and we cannot execute more than one class with a main method per JAR.
     @Param({
         // indices| shards| replicas| source| target| concurrentRecoveries
-        "       10|      2|        0|       1|      1|      1|",
-        "       10|      3|        0|       1|      1|      2|",
-        "       10|     10|        0|       1|      1|      5|",
-        "      100|      1|        0|       1|      1|     10|",
-        "      100|      3|        0|       1|      1|     10|",
-        "      100|     10|        0|       1|      1|     10|",
-
-        "       10|      2|        0|      10|     10|      1|",
-        "       10|      3|        0|      10|      5|      2|",
-        "       10|     10|        0|      10|      5|      5|",
-        "      100|      1|        0|       5|     10|      5|",
-        "      100|      3|        0|      10|      5|      5|",
-        "      100|     10|        0|      10|     20|      6|",
-
-        "       10|      1|        1|      10|     10|      1|",
-        "       10|      3|        1|      10|      3|      3|",
-        "       10|     10|        1|       5|     12|      5|",
-        "      100|      1|        1|      10|     10|      6|",
-        "      100|      3|        1|      10|      5|      8|",
-        "      100|     10|        1|       8|     17|      8|",
-
-        "       10|      1|        2|      10|     10|      1|",
-        "       10|      3|        2|      10|      5|      3|",
-        "       10|     10|        2|       5|     10|      5|",
-        "      100|      1|        2|      10|      8|      7|",
-        "      100|      3|        2|      13|     17|      5|",
-        "      100|     10|        2|      10|     20|      8|",
-
-        "       10|      2|        1|      20|     20|      1|",
-        "       10|      3|        1|      20|     30|      1|",
-        "       10|     10|        1|      20|     10|      3|",
-        "      100|      1|        1|      20|      5|      5|",
-        "      100|      3|        1|      20|     23|      6|",
         "      100|     10|        1|      40|     20|      8|",
-
-        "       10|      3|        2|      50|     30|      1|",
-        "       10|      3|        2|      50|     25|      1|",
-        "       10|     10|        1|      50|     33|      2|",
-        "      100|      1|        1|      40|     50|      2|",
         "      100|      3|        1|      50|     70|      3|",
-        "      100|     10|        1|      60|     50|      3|",
-
-        "       10|     10|        2|      50|     50|      1|",
-        "       10|      3|        2|      50|     30|      1|",
-        "       10|     10|        2|      50|     40|      2|",
-        "      100|      1|        2|      40|     50|      2|",
         "      100|      3|        2|      50|     30|      6|",
         "      100|     10|        2|      33|     55|      6|",
 
-        "       500|     60|       1|     100|    100|     12|",
-        "       500|     60|       1|     100|     40|     12|",
-        "       500|     60|       1|      40|    100|     12|",
-
         "       50|      60|       1|     100|    100|      6|",
         "       50|      60|       1|     100|     40|      6|",
-        "       50|      60|       1|      40|    100|      6|" })
+
+        "       500|     60|       1|     100|    100|     12|",
+        "       500|     60|       1|     100|     40|     12|",
+
+        "       1000|     50|       1|     1000|    1000|     12|",
+        "       1000|     50|       1|      700|    1000|     12|"})
     public String indicesShardsReplicasSourceTargetRecoveries = "10|1|0|1|1|1";
 
     public int numTags = 2;
@@ -222,20 +179,6 @@ public class AllocationBenchmark {
         return Integer.valueOf(v.trim());
     }
 
-    @Benchmark
-    public ClusterState measureExclusionOnZoneAwareStartedShard() throws Exception {
-        ClusterState clusterState = initialClusterState;
-        clusterZoneAwareExcludeStrategy = Allocators.createAllocationService(
-            Settings.builder()
-                .put("cluster.routing.allocation.awareness.attributes", "zone")
-                .put("cluster.routing.allocation.cluster_concurrent_recoveries", String.valueOf(clusterConcurrentRecoveries))
-                .put("cluster.routing.allocation.node_concurrent_recoveries", String.valueOf(concurrentRecoveries))
-                .put("cluster.routing.allocation.exclude.tag", "tag_1")
-                .build()
-        );
-        clusterState = clusterZoneAwareExcludeStrategy.reroute(clusterState, "reroute");
-        return clusterState;
-    }
 
     @Benchmark
     public ClusterState measureShardRelocationComplete() throws Exception {
@@ -245,6 +188,7 @@ public class AllocationBenchmark {
                 .put("cluster.routing.allocation.awareness.attributes", "zone")
                 .put("cluster.routing.allocation.node_concurrent_recoveries", String.valueOf(concurrentRecoveries))
                 .put("cluster.routing.allocation.cluster_concurrent_recoveries", String.valueOf(clusterConcurrentRecoveries))
+                .put("cluster.routing.allocation.balance.prefer_primary", true)
                 .put("cluster.routing.allocation.exclude.tag", "tag_1")
                 .build()
         );
