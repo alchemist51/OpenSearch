@@ -59,8 +59,8 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 @Fork(5)
-@Warmup(iterations = 3)
-@Measurement(iterations = 3)
+@Warmup(iterations = 2)
+@Measurement(iterations = 2)
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 @State(Scope.Benchmark)
