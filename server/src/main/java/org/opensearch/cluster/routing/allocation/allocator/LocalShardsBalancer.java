@@ -1008,11 +1008,11 @@ public class LocalShardsBalancer extends ShardsBalancer {
             }
         }
 
-        if (minNodes.isEmpty()){
-            minNode = null;
-        } else {
-            minNode = minNodes.get(new Random().nextInt(minNodes.size()));
-        }
+//        if (minNodes.isEmpty()){
+//            minNode = null;
+//        } else {
+//            minNode = minNodes.get(new Random().nextInt(minNodes.size()));
+//        }
         return AllocateUnassignedDecision.fromDecision(decision, minNode != null ? minNode.getRoutingNode().node() : null, nodeDecisions);
     }
 
