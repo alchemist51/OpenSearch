@@ -496,38 +496,12 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
         }
 
         if (metrics.contains(Metric.BLOCKS)) {
-            builder.startObject("blocks");
-
-            if (blocks().global().isEmpty() == false) {
-                builder.startObject("global");
-                for (ClusterBlock block : blocks().global()) {
-                    block.toXContent(builder, params);
-                }
-                builder.endObject();
-            }
-
-            if (blocks().indices().isEmpty() == false) {
-                builder.startObject("indices");
-                for (final Map.Entry<String, Set<ClusterBlock>> entry : blocks().indices().entrySet()) {
-                    builder.startObject(entry.getKey());
-                    for (ClusterBlock block : entry.getValue()) {
-                        block.toXContent(builder, params);
-                    }
-                    builder.endObject();
-                }
-                builder.endObject();
-            }
-
-            builder.endObject();
+            blocks().toXContent(builder, params);
         }
 
         // nodes
         if (metrics.contains(Metric.NODES)) {
-            builder.startObject("nodes");
-            for (DiscoveryNode node : nodes) {
-                node.toXContent(builder, params);
-            }
-            builder.endObject();
+            nodes.toXContent(builder, params);
         }
 
         // meta data

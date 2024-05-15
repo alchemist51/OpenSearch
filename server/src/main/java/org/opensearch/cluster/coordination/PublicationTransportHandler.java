@@ -31,6 +31,7 @@
 
 package org.opensearch.cluster.coordination;
 
+import java.util.Optional;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
@@ -47,6 +48,8 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.transport.TransportResponse;
+import org.opensearch.gateway.remote.ClusterMetadataManifest;
+import org.opensearch.gateway.remote.RemoteClusterStateService;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.BytesTransportRequest;
 import org.opensearch.transport.TransportChannel;
@@ -97,16 +100,19 @@ public class PublicationTransportHandler {
     private final TransportRequestOptions stateRequestOptions = TransportRequestOptions.builder()
         .withType(TransportRequestOptions.Type.STATE)
         .build();
+    private final RemoteClusterStateService remoteClusterStateService;
 
     public PublicationTransportHandler(
         TransportService transportService,
         NamedWriteableRegistry namedWriteableRegistry,
         Function<PublishRequest, PublishWithJoinResponse> handlePublishRequest,
-        BiConsumer<ApplyCommitRequest, ActionListener<Void>> handleApplyCommit
+        BiConsumer<ApplyCommitRequest, ActionListener<Void>> handleApplyCommit,
+        RemoteClusterStateService remoteClusterStateService
     ) {
         this.transportService = transportService;
         this.namedWriteableRegistry = namedWriteableRegistry;
         this.handlePublishRequest = handlePublishRequest;
+        this.remoteClusterStateService = remoteClusterStateService;
 
         transportService.registerRequestHandler(
             PUBLISH_STATE_ACTION_NAME,
@@ -208,6 +214,40 @@ public class PublicationTransportHandler {
                     return response;
                 }
             }
+        }
+    }
+
+    private PublishWithJoinResponse handleIncomingRemotePublishRequest(RemotePublishRequest request) throws IOException {
+        final Optional<ClusterMetadataManifest> manifestOptional = remoteClusterStateService.getClusterMetadataManifestByTermVersion(request.getClusterName(), request.getClusterUUID(), request.term, request.version);
+        if (manifestOptional.isPresent() == false) {
+            // todo change exception
+            throw new IncompatibleClusterStateVersionException("No remote state for term version");
+        }
+        ClusterMetadataManifest manifest = manifestOptional.get();
+        boolean applyFullState = false;
+        final ClusterState lastSeen = lastSeenClusterState.get();
+        if (lastSeen == null) {
+            logger.debug("Diff cannot be applied as there is not last cluster state");
+            applyFullState = true;
+        } else if (manifest.getDiffManifest() == null) {
+            logger.debug("There is no diff in the manifest");
+            applyFullState = true;
+        } else if (manifest.getDiffManifest().getFromStateUUID().equals(lastSeen.stateUUID()) == false) {
+            logger.debug("Last cluster state not compatible with the diff");
+            applyFullState = true;
+        } else {
+            ClusterState clusterState = remoteClusterStateService.getClusterStateUsingDiff(request.getClusterName(), manifest, lastSeenClusterState.get());
+            final PublishWithJoinResponse response = acceptState(clusterState);
+            lastSeenClusterState.compareAndSet(lastSeen, clusterState);
+            return response;
+        }
+
+        if (applyFullState == true) {
+            ClusterState clusterState = remoteClusterStateService.getClusterStateForManifest(request.getClusterName(), manifest);
+            logger.debug("Downloaded full cluster state version [{}]", clusterState.version());
+            final PublishWithJoinResponse response = acceptState(clusterState);
+            lastSeenClusterState.set(clusterState);
+            return response;
         }
     }
 

@@ -40,6 +40,8 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.core.xcontent.XContentParserUtils;
 import org.opensearch.repositories.RepositoryOperation;
 import org.opensearch.snapshots.SnapshotId;
 
@@ -51,6 +53,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+
+import static org.opensearch.core.xcontent.XContentParserUtils.ensureExpectedToken;
+import static org.opensearch.core.xcontent.XContentParserUtils.ensureFieldName;
 
 /**
  * A class that represents the snapshot deletions that are in progress in the cluster.
@@ -201,6 +206,52 @@ public class SnapshotDeletionsInProgress extends AbstractNamedDiffable<Custom> i
         builder.endArray();
         return builder;
     }
+
+    public static SnapshotDeletionsInProgress fromXContent(XContentParser parser) throws IOException {
+        if (parser.currentToken() == null) {
+            parser.nextToken();
+        }
+        ensureFieldName(parser, parser.currentToken(), TYPE);
+        parser.nextToken();
+        ensureExpectedToken(XContentParser.Token.START_ARRAY, parser.currentToken(), parser);
+        List<Entry> entries = new ArrayList<>();
+        while ((parser.nextToken()) != XContentParser.Token.END_ARRAY) {
+            ensureExpectedToken(XContentParser.Token.START_OBJECT, parser.currentToken(), parser);
+            String repository, repositoryStateId;
+            List<String> snapshotNames = new ArrayList<>();
+            TimeValue startTime;
+            while ((parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                ensureExpectedToken(XContentParser.Token.FIELD_NAME, parser.currentToken(), parser);
+                final String fieldName = parser.currentName();
+                parser.nextToken();
+                switch (fieldName) {
+                    case "repository":
+                        repository = parser.text();
+                        break;
+                    case "snapshots":
+                        ensureExpectedToken(XContentParser.Token.START_ARRAY, parser.currentToken(), parser);
+                        while ((parser.nextToken()) != XContentParser.Token.END_ARRAY) {
+                            snapshotNames.add(parser.text());
+                        }
+                        break;
+                    case "start_time_millis":
+                        startTime = TimeValue.timeValueMillis(parser.longValue());
+                        break;
+                    case "start_time":
+                        startTime = TimeValue.parseTimeValue(parser.text(), "start_time");
+                        break;
+                    case "repository_state_id":
+                        repositoryStateId = parser.text();
+                        break;
+                    default:
+                        throw new IllegalArgumentException("unknown field [" + fieldName + "]");
+                }
+            }
+//            entries.add(new Entry())
+        }
+        return SnapshotDeletionsInProgress.of(entries);
+    }
+
 
     @Override
     public String toString() {

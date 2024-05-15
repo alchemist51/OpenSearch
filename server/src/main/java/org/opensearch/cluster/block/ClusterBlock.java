@@ -34,17 +34,22 @@ package org.opensearch.cluster.block;
 
 import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.PublicApi;
+import org.opensearch.common.util.set.Sets;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.ToXContentFragment;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.core.xcontent.XContentParseException;
+import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.core.xcontent.XContentParserUtils;
 
 import java.io.IOException;
 import java.util.EnumSet;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Blocks the cluster for concurrency
@@ -54,6 +59,12 @@ import java.util.Objects;
 @PublicApi(since = "1.0.0")
 public class ClusterBlock implements Writeable, ToXContentFragment {
 
+    static final String KEY_UUID = "uuid";
+    static final String KEY_DESCRIPTION = "description";
+    static final String KEY_RETRYABLE = "retryable";
+    static final String KEY_DISABLE_STATE_PERSISTENCE = "disable_state_persistence";
+    static final String KEY_LEVELS = "levels";
+    private static final Set<String> VALID_FIELDS = Sets.newHashSet(KEY_UUID, KEY_DESCRIPTION, KEY_RETRYABLE, KEY_DISABLE_STATE_PERSISTENCE, KEY_LEVELS);
     private final int id;
     @Nullable
     private final String uuid;
@@ -156,20 +167,82 @@ public class ClusterBlock implements Writeable, ToXContentFragment {
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
         builder.startObject(Integer.toString(id));
         if (uuid != null) {
-            builder.field("uuid", uuid);
+            builder.field(KEY_UUID, uuid);
         }
-        builder.field("description", description);
-        builder.field("retryable", retryable);
+        builder.field(KEY_DESCRIPTION, description);
+        builder.field(KEY_RETRYABLE, retryable);
         if (disableStatePersistence) {
-            builder.field("disable_state_persistence", disableStatePersistence);
+            builder.field(KEY_DISABLE_STATE_PERSISTENCE, disableStatePersistence);
         }
-        builder.startArray("levels");
+        builder.startArray(KEY_LEVELS);
         for (ClusterBlockLevel level : levels) {
             builder.value(level.name().toLowerCase(Locale.ROOT));
         }
         builder.endArray();
         builder.endObject();
         return builder;
+    }
+
+    public static ClusterBlock fromXContent(XContentParser parser, int id) throws IOException {
+        String uuid = null;
+        String description = null;
+        boolean retryable = false;
+        boolean disableStatePersistence = false;
+        EnumSet<ClusterBlockLevel> levels = EnumSet.noneOf(ClusterBlockLevel.class);
+        String currentFieldName = skipBlockID(parser);
+        XContentParser.Token token;
+        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+            if (token == XContentParser.Token.FIELD_NAME) {
+                currentFieldName = parser.currentName();
+            } else if (token.isValue()) {
+                switch (Objects.requireNonNull(currentFieldName)) {
+                    case KEY_UUID:
+                        uuid = parser.text();
+                        break;
+                    case KEY_DESCRIPTION:
+                        description = parser.text();
+                        break;
+                    case KEY_RETRYABLE:
+                        retryable = parser.booleanValue();
+                        break;
+                    case KEY_DISABLE_STATE_PERSISTENCE:
+                        disableStatePersistence = parser.booleanValue();
+                        break;
+                    default:
+                        throw new IllegalArgumentException("unknown field [" + currentFieldName + "]");
+                }
+            } else if (token == XContentParser.Token.START_ARRAY) {
+                if (currentFieldName.equals(KEY_LEVELS)) {
+                    while ((token = parser.nextToken()) != XContentParser.Token.END_ARRAY) {
+                        levels.add(ClusterBlockLevel.fromString(parser.text(), Locale.ROOT));
+                    }
+                } else {
+                    throw new IllegalArgumentException("unknown field [" + currentFieldName + "]");
+                }
+            } else {
+                throw new IllegalArgumentException("unexpected token [" + token + "]");
+            }
+        }
+        return new ClusterBlock(id, uuid, description, retryable, disableStatePersistence, false, null, levels);
+    }
+
+    private static String skipBlockID(XContentParser parser) throws IOException {
+        if (parser.currentToken() == null) {
+            parser.nextToken();
+        }
+        if (parser.currentToken() == XContentParser.Token.START_OBJECT) {
+            parser.nextToken();
+            if (parser.currentToken() == XContentParser.Token.FIELD_NAME) {
+                String currentFieldName = parser.currentName();
+                if (VALID_FIELDS.contains(currentFieldName)) {
+                    return currentFieldName;
+                } else {
+                    // we have hit block id, just move on
+                    parser.nextToken();
+                }
+            }
+        }
+        return null;
     }
 
     @Override

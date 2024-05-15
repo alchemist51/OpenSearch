@@ -270,7 +270,8 @@ public class NodeJoinTests extends OpenSearchTestCase {
             ElectionStrategy.DEFAULT_INSTANCE,
             nodeHealthService,
             persistedStateRegistry,
-            Mockito.mock(RemoteStoreNodeService.class)
+            Mockito.mock(RemoteStoreNodeService.class),
+            null
         );
         transportService.start();
         transportService.acceptIncomingRequests();

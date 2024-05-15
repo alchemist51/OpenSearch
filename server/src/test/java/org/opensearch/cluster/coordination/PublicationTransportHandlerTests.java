@@ -76,7 +76,8 @@ public class PublicationTransportHandlerTests extends OpenSearchTestCase {
             transportService,
             writableRegistry(),
             pu -> null,
-            (pu, l) -> {}
+            (pu, l) -> {},
+            null
         );
         transportService.start();
         transportService.acceptIncomingRequests();
