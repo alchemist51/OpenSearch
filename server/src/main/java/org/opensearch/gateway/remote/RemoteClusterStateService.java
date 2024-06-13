@@ -277,7 +277,7 @@ public class RemoteClusterStateService implements Closeable {
         ClusterState clusterState,
         ClusterMetadataManifest previousManifest
     ) throws IOException {
-        logger.info("WRITING INCREMENTAL STATE");
+        logger.trace("WRITING INCREMENTAL STATE");
 
         final long startTimeNanos = relativeTimeNanosSupplier.getAsLong();
         if (clusterState.nodes().isLocalNodeElectedClusterManager() == false) {
@@ -767,7 +767,7 @@ public class RemoteClusterStateService implements Closeable {
                 throw new IllegalStateException("Unknown metadata component name " + name);
             }
         });
-        logger.info("response {}", response.uploadedIndicesRoutingMetadata.toString());
+        logger.trace("response {}", response.uploadedIndicesRoutingMetadata.toString());
         return response;
     }
 
