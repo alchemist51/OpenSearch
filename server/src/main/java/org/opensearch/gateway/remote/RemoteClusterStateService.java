@@ -200,6 +200,7 @@ public class RemoteClusterStateService implements Closeable {
             clusterSettings,
             threadPool
         );
+        assert remoteRoutingTableService instanceof InternalRemoteRoutingTableService : "Remote Routing Table is not enabled";
         this.remoteClusterStateCleanupManager = new RemoteClusterStateCleanupManager(this, clusterService, remoteRoutingTableService);
     }
 
