@@ -572,6 +572,8 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
                 RemoteStoreNodeAttribute joiningRemoteStoreNodeAttribute = new RemoteStoreNodeAttribute(joiningNode);
                 RemoteStoreNodeAttribute existingRemoteStoreNodeAttribute = new RemoteStoreNodeAttribute(existingNode);
                 if (existingRemoteStoreNodeAttribute.equalsWithRepoSkip(joiningRemoteStoreNodeAttribute, reposToSkip) == false) {
+                    logger.error("Joining Node Attribute {}", joiningRemoteStoreNodeAttribute.toString());
+                    logger.error("Existing Node Attribute {}", existingRemoteStoreNodeAttribute.toString());
                     throw new IllegalStateException(
                         "a remote store node ["
                             + joiningNode

@@ -1911,21 +1911,23 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             builder.put(TelemetrySettings.TRACER_FEATURE_ENABLED_SETTING.getKey(), true);
             builder.put(TelemetrySettings.TRACER_ENABLED_SETTING.getKey(), true);
         }
-
+        if (remoteStoreRepositoryPath == null) {
+                    remoteStoreRepositoryPath = randomRepoPath().toAbsolutePath();
+        }
         // Randomly set a Replication Strategy and storage type for the node. Both Replication Strategy and Storage Type can still be
         // manually overridden by subclass if needed.
-        if (useRandomReplicationStrategy()) {
-            if (randomReplicationType.equals(ReplicationType.SEGMENT) && randomStorageType.equals("REMOTE_STORE")) {
-                logger.info("Randomly using Replication Strategy as {} and Storage Type as {}.", randomReplicationType, randomStorageType);
-                if (remoteStoreRepositoryPath == null) {
-                    remoteStoreRepositoryPath = randomRepoPath().toAbsolutePath();
-                }
-                builder.put(remoteStoreClusterSettings(REMOTE_BACKED_STORAGE_REPOSITORY_NAME, remoteStoreRepositoryPath));
-            } else {
-                logger.info("Randomly using Replication Strategy as {} and Storage Type as {}.", randomReplicationType, randomStorageType);
-                builder.put(CLUSTER_REPLICATION_TYPE_SETTING.getKey(), randomReplicationType);
-            }
-        }
+//        if (useRandomReplicationStrategy()) {
+//            if (randomReplicationType.equals(ReplicationType.SEGMENT) && randomStorageType.equals("REMOTE_STORE")) {
+//                logger.info("Randomly using Replication Strategy as {} and Storage Type as {}.", randomReplicationType, randomStorageType);
+//                if (remoteStoreRepositoryPath == null) {
+//                    remoteStoreRepositoryPath = randomRepoPath().toAbsolutePath();
+//                }
+//                builder.put(remoteStoreClusterSettings(REMOTE_BACKED_STORAGE_REPOSITORY_NAME, remoteStoreRepositoryPath));
+//            } else {
+//                logger.info("Randomly using Replication Strategy as {} and Storage Type as {}.", randomReplicationType, randomStorageType);
+//                builder.put(CLUSTER_REPLICATION_TYPE_SETTING.getKey(), randomReplicationType);
+//            }
+//        }
         builder.put(remoteStatePublicationSettings());
 
         return builder.build();
@@ -2536,7 +2538,6 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
 
     public Settings remoteStatePublicationSettings() {
         final String REPOSITORY_NAME = "test-remote-store-repo";
-        final Path remoteStoreRepositoryPath = randomRepoPath().toAbsolutePath();
         final String REPO_TYPE = ReloadableFsRepository.TYPE;
         String segmentRepoTypeAttributeKey = String.format(
             Locale.getDefault(),
@@ -2548,37 +2549,25 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
             REPOSITORY_NAME
         );
-        String translogRepoTypeAttributeKey = String.format(
-            Locale.getDefault(),
-            "node.attr." + REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT,
-            REPOSITORY_NAME
-        );
-        String translogRepoSettingsAttributeKeyPrefix = String.format(
-            Locale.getDefault(),
-            "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
-            REPOSITORY_NAME
-        );
-        String stateRepoTypeAttributeKey = String.format(
-            Locale.getDefault(),
-            "node.attr." + REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT,
-            REPOSITORY_NAME
-        );
-        String stateRepoSettingsAttributeKeyPrefix = String.format(
-            Locale.getDefault(),
-            "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
-            REPOSITORY_NAME
-        );
+//        String translogRepoSettingsAttributeKeyPrefix = String.format(
+//            Locale.getDefault(),
+//            "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
+//            REPOSITORY_NAME
+//        );
+//        String stateRepoSettingsAttributeKeyPrefix = String.format(
+//            Locale.getDefault(),
+//            "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
+//            REPOSITORY_NAME
+//        );
 
         Settings.Builder settings = Settings.builder()
             .put("node.attr." + REMOTE_STORE_SEGMENT_REPOSITORY_NAME_ATTRIBUTE_KEY, REPOSITORY_NAME)
             .put(segmentRepoTypeAttributeKey, REPO_TYPE)
             .put(segmentRepoSettingsAttributeKeyPrefix + "location", remoteStoreRepositoryPath)
             .put("node.attr." + REMOTE_STORE_TRANSLOG_REPOSITORY_NAME_ATTRIBUTE_KEY, REPOSITORY_NAME)
-            .put(translogRepoTypeAttributeKey, REPO_TYPE)
-            .put(translogRepoSettingsAttributeKeyPrefix + "location", remoteStoreRepositoryPath)
+            //.put(translogRepoSettingsAttributeKeyPrefix + "location", remoteStoreRepositoryPath)
             .put("node.attr." + REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY, REPOSITORY_NAME)
-            .put(stateRepoTypeAttributeKey, REPO_TYPE)
-            .put(stateRepoSettingsAttributeKeyPrefix + "location", remoteStoreRepositoryPath)
+            //.put(stateRepoSettingsAttributeKeyPrefix + "location", remoteStoreRepositoryPath)
             .put("node.attr." + REMOTE_STORE_ROUTING_TABLE_REPOSITORY_NAME_ATTRIBUTE_KEY, REPOSITORY_NAME);
 
         settings.put(REMOTE_CLUSTER_STATE_ENABLED_SETTING.getKey(), true);
