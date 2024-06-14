@@ -105,8 +105,7 @@ public class CoordinationState {
             .getLastAcceptedConfiguration();
         this.publishVotes = new VoteCollection();
         this.isRemoteStateEnabled = isRemoteStoreClusterStateEnabled(settings);
-        this.isRemotePublicationEnabled = FeatureFlags.isEnabled(REMOTE_PUBLICATION_EXPERIMENTAL)
-            && localNode.isRemoteStatePublicationEnabled();
+        this.isRemotePublicationEnabled = localNode.isRemoteStatePublicationEnabled();
     }
 
     public boolean isRemotePublicationEnabled() {
