@@ -53,7 +53,7 @@ import java.util.Collections;
 import java.util.Locale;
 import java.util.Objects;
 
-import static org.opensearch.gateway.remote.RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING;
+import static org.opensearch.gateway.remote.RemoteClusterStateSettings.REMOTE_CLUSTER_STATE_ENABLED_SETTING;
 
 /**
  * Tool to run an unsafe bootstrap

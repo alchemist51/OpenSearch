@@ -34,6 +34,7 @@ import org.opensearch.core.compress.Compressor;
 import org.opensearch.core.compress.NoneCompressor;
 import org.opensearch.core.index.Index;
 import org.opensearch.gateway.remote.ClusterMetadataManifest;
+import org.opensearch.gateway.remote.RemoteClusterStateSettings;
 import org.opensearch.gateway.remote.RemoteClusterStateUtils;
 import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.remote.RemoteStorePathStrategy;
@@ -63,8 +64,8 @@ import java.util.function.Supplier;
 import org.mockito.Mockito;
 
 import static org.opensearch.gateway.remote.ClusterMetadataManifestTests.randomUploadedIndexMetadataList;
-import static org.opensearch.gateway.remote.RemoteClusterStateService.REMOTE_PUBLICATION_SETTING_KEY;
 import static org.opensearch.gateway.remote.RemoteClusterStateServiceTests.generateClusterStateWithOneIndex;
+import static org.opensearch.gateway.remote.RemoteClusterStateSettings.REMOTE_PUBLICATION_SETTING_KEY;
 import static org.opensearch.gateway.remote.RemoteClusterStateUtils.CLUSTER_STATE_PATH_TOKEN;
 import static org.opensearch.gateway.remote.RemoteClusterStateUtils.DELIMITER;
 import static org.opensearch.gateway.remote.RemoteClusterStateUtils.PATH_DELIMITER;
@@ -103,6 +104,7 @@ public class RemoteRoutingTableServiceTests extends OpenSearchTestCase {
     private ClusterService clusterService;
     private Compressor compressor;
     private BlobStoreTransferService blobStoreTransferService;
+    private RemoteClusterStateSettings remoteClusterStateSettings;
     private final ThreadPool threadPool = new TestThreadPool(getClass().getName());
 
     @Before
@@ -129,10 +131,12 @@ public class RemoteRoutingTableServiceTests extends OpenSearchTestCase {
         compressor = new NoneCompressor();
         basePath = BlobPath.cleanPath().add("base-path");
         when(blobStoreRepository.basePath()).thenReturn(basePath);
+        remoteClusterStateSettings = mock(RemoteClusterStateSettings.class);
         remoteRoutingTableService = new InternalRemoteRoutingTableService(
             repositoriesServiceSupplier,
             settings,
             new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS),
+            remoteClusterStateSettings,
             threadPool,
             "test-cluster"
         );
@@ -148,12 +152,17 @@ public class RemoteRoutingTableServiceTests extends OpenSearchTestCase {
 
     public void testFailInitializationWhenRemoteRoutingDisabled() {
         final Settings settings = Settings.builder().build();
+        remoteClusterStateSettings = new RemoteClusterStateSettings(
+            Settings.EMPTY,
+            new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)
+        );
         assertThrows(
             AssertionError.class,
             () -> new InternalRemoteRoutingTableService(
                 repositoriesServiceSupplier,
                 settings,
                 new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS),
+                remoteClusterStateSettings,
                 threadPool,
                 "test-cluster"
             )

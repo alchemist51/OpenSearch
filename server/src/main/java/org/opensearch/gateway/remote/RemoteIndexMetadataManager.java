@@ -79,6 +79,7 @@ public class RemoteIndexMetadataManager extends AbstractRemoteWritableEntityMana
 
     public RemoteIndexMetadataManager(
         ClusterSettings clusterSettings,
+        RemoteClusterStateSettings remoteClusterStateSettings,
         String clusterName,
         BlobStoreRepository blobStoreRepository,
         BlobStoreTransferService blobStoreTransferService,
@@ -100,6 +101,7 @@ public class RemoteIndexMetadataManager extends AbstractRemoteWritableEntityMana
         this.indexMetadataUploadTimeout = clusterSettings.get(INDEX_METADATA_UPLOAD_TIMEOUT_SETTING);
         this.pathType = clusterSettings.get(REMOTE_INDEX_METADATA_PATH_TYPE_SETTING);
         this.pathHashAlgo = clusterSettings.get(REMOTE_INDEX_METADATA_PATH_HASH_ALGO_SETTING);
+        this.remoteClusterStateSettings = remoteClusterStateSettings;
         clusterSettings.addSettingsUpdateConsumer(INDEX_METADATA_UPLOAD_TIMEOUT_SETTING, this::setIndexMetadataUploadTimeout);
         clusterSettings.addSettingsUpdateConsumer(REMOTE_INDEX_METADATA_PATH_TYPE_SETTING, this::setPathTypeSetting);
         clusterSettings.addSettingsUpdateConsumer(REMOTE_INDEX_METADATA_PATH_HASH_ALGO_SETTING, this::setPathHashAlgoSetting);

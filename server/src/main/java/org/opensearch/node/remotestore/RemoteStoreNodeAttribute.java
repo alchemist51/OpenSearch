@@ -13,7 +13,6 @@ import org.opensearch.cluster.metadata.RepositoriesMetadata;
 import org.opensearch.cluster.metadata.RepositoryMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.gateway.remote.RemoteClusterStateService;
 import org.opensearch.node.Node;
 import org.opensearch.repositories.blobstore.BlobStoreRepository;
 
@@ -27,6 +26,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
+
+import static org.opensearch.gateway.remote.RemoteClusterStateSettings.REMOTE_CLUSTER_STATE_ENABLED_SETTING;
 
 /**
  * This is an abstraction for validating and storing information specific to remote backed storage nodes.
@@ -194,8 +195,7 @@ public class RemoteStoreNodeAttribute {
     }
 
     public static boolean isRemoteStoreClusterStateEnabled(Settings settings) {
-        return RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING.get(settings)
-            && isRemoteClusterStateAttributePresent(settings);
+        return REMOTE_CLUSTER_STATE_ENABLED_SETTING.get(settings) && isRemoteClusterStateAttributePresent(settings);
     }
 
     private static boolean isRemoteRoutingTableAttributePresent(Settings settings) {

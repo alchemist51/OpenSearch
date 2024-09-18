@@ -20,8 +20,10 @@ import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.TemplatesMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.network.NetworkModule;
+import org.opensearch.common.remote.RemoteWritableEntityStore;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.TestCapturingListener;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
@@ -53,6 +55,8 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.function.Function;
 import java.util.stream.Stream;
+
+import org.mockito.ArgumentCaptor;
 
 import static java.util.stream.Collectors.toList;
 import static org.opensearch.cluster.metadata.Metadata.isGlobalStateEquals;
@@ -93,6 +97,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 public class RemoteGlobalMetadataManagerTests extends OpenSearchTestCase {
@@ -128,6 +133,7 @@ public class RemoteGlobalMetadataManagerTests extends OpenSearchTestCase {
         when(blobStoreRepository.basePath()).thenReturn(blobPath);
         remoteGlobalMetadataManager = new RemoteGlobalMetadataManager(
             clusterSettings,
+            new RemoteClusterStateSettings(Settings.EMPTY, new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)),
             CLUSTER_NAME,
             blobStoreRepository,
             blobStoreTransferService,
@@ -348,6 +354,33 @@ public class RemoteGlobalMetadataManagerTests extends OpenSearchTestCase {
         assertEquals(TRANSIENT_SETTING_METADATA, splitFileName[0]);
         assertEquals(RemoteStoreUtils.invertLong(METADATA_VERSION), splitFileName[1]);
         assertEquals(GLOBAL_METADATA_CURRENT_CODEC_VERSION, Integer.parseInt(splitFileName[3]));
+    }
+
+    public void testRemoteIndexMetadataManager_ReadAsyncWithDelay() {
+        RemoteClusterStateSettings remoteClusterStateSettings = mock(RemoteClusterStateSettings.class);
+        TimeValue maxJitter = TimeValue.timeValueMillis(100);
+        when(remoteClusterStateSettings.getRemoteStateReadMaxJitter()).thenReturn(maxJitter);
+        remoteGlobalMetadataManager = new RemoteGlobalMetadataManager(
+            clusterSettings,
+            remoteClusterStateSettings,
+            CLUSTER_NAME,
+            blobStoreRepository,
+            blobStoreTransferService,
+            writableRegistry(),
+            threadPool
+        );
+        RemoteGlobalMetadata remoteEntity = mock(RemoteGlobalMetadata.class);
+        when(remoteEntity.getType()).thenReturn(GLOBAL_METADATA);
+        ActionListener<RemoteReadResult> listener = mock(ActionListener.class);
+        ArgumentCaptor<Long> delayCaptor = ArgumentCaptor.forClass(Long.class);
+        RemoteWritableEntityStore mockRemoteWritableEntityStore = mock(RemoteWritableEntityStore.class);
+        remoteGlobalMetadataManager.addRemoteWritableEntityStore(GLOBAL_METADATA, mockRemoteWritableEntityStore);
+        remoteGlobalMetadataManager.readAsync("testComponent", remoteEntity, listener);
+
+        verify(mockRemoteWritableEntityStore).readAsyncWithDelay(delayCaptor.capture(), eq(remoteEntity), any(ActionListener.class));
+        long capturedDelay = delayCaptor.getValue();
+        assertTrue("Delay should be non-negative", capturedDelay >= 0);
+        assertTrue("Delay should not exceed max jitter", capturedDelay < TimeValue.timeValueMillis(100).millis());
     }
 
     public void testGetAsyncReadRunnable_HashesOfConsistentSettings() throws Exception {

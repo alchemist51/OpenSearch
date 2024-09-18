@@ -18,8 +18,10 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.stream.write.WritePriority;
+import org.opensearch.common.remote.RemoteWritableEntityStore;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.TestCapturingListener;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.compress.Compressor;
@@ -39,6 +41,8 @@ import org.junit.Before;
 import java.io.IOException;
 import java.util.concurrent.CountDownLatch;
 
+import org.mockito.ArgumentCaptor;
+
 import static org.opensearch.gateway.remote.RemoteClusterStateService.FORMAT_PARAMS;
 import static org.opensearch.gateway.remote.RemoteClusterStateUtils.DELIMITER;
 import static org.opensearch.gateway.remote.RemoteClusterStateUtils.PATH_DELIMITER;
@@ -53,6 +57,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 public class RemoteIndexMetadataManagerTests extends OpenSearchTestCase {
@@ -75,6 +80,7 @@ public class RemoteIndexMetadataManagerTests extends OpenSearchTestCase {
         when(blobStoreRepository.getCompressor()).thenReturn(compressor);
         remoteIndexMetadataManager = new RemoteIndexMetadataManager(
             clusterSettings,
+            new RemoteClusterStateSettings(Settings.EMPTY, new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)),
             "test-cluster",
             blobStoreRepository,
             blobStoreTransferService,
@@ -143,6 +149,41 @@ public class RemoteIndexMetadataManagerTests extends OpenSearchTestCase {
         assertNull(listener.getResult());
         assertNotNull(listener.getFailure());
         assertTrue(listener.getFailure() instanceof RemoteStateTransferException);
+    }
+
+    public void testRemoteIndexMetadataManager_ReadAsync() {
+        RemoteClusterStateSettings remoteClusterStateSettings = mock(RemoteClusterStateSettings.class);
+        TimeValue maxJitter = TimeValue.timeValueMillis(100);
+        when(remoteClusterStateSettings.getRemoteStateReadMaxJitter()).thenReturn(maxJitter);
+
+        remoteIndexMetadataManager = new RemoteIndexMetadataManager(
+            clusterSettings,
+            remoteClusterStateSettings,
+            "test-cluster",
+            blobStoreRepository,
+            blobStoreTransferService,
+            threadPool
+        );
+
+        RemoteWritableEntityStore mockRemoteWritableEntityStore = mock(RemoteWritableEntityStore.class);
+        remoteIndexMetadataManager.addRemoteWritableEntityStore(RemoteIndexMetadata.INDEX, mockRemoteWritableEntityStore);
+
+        RemoteIndexMetadata remoteEntity = mock(RemoteIndexMetadata.class);
+        when(remoteEntity.getType()).thenReturn(RemoteIndexMetadata.INDEX);
+
+        ActionListener<RemoteReadResult> listener = mock(ActionListener.class);
+
+        ArgumentCaptor<Long> delayCaptor = ArgumentCaptor.forClass(Long.class);
+
+        remoteIndexMetadataManager.readAsync("testComponent", remoteEntity, listener);
+        verify(mockRemoteWritableEntityStore).readAsyncWithDelay(delayCaptor.capture(), eq(remoteEntity), any(ActionListener.class));
+
+        long capturedDelay = delayCaptor.getValue();
+
+        // Assert that the delay is within the expected range (0 to max jitter)
+        assertTrue("Delay should be non-negative", capturedDelay >= 0);
+        assertTrue("Delay should not exceed max jitter", capturedDelay < TimeValue.timeValueMillis(100).millis());
+
     }
 
     public void testGetAsyncReadRunnable_Success() throws Exception {

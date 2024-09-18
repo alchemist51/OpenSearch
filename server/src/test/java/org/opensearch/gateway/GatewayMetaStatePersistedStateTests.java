@@ -68,6 +68,7 @@ import org.opensearch.gateway.GatewayMetaState.RemotePersistedState;
 import org.opensearch.gateway.PersistedClusterStateService.Writer;
 import org.opensearch.gateway.remote.ClusterMetadataManifest;
 import org.opensearch.gateway.remote.RemoteClusterStateService;
+import org.opensearch.gateway.remote.RemoteClusterStateSettings;
 import org.opensearch.gateway.remote.RemoteUploadStats;
 import org.opensearch.gateway.remote.model.RemoteClusterStateManifestInfo;
 import org.opensearch.index.recovery.RemoteStoreRestoreService;
@@ -1043,7 +1044,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
                 .put("node.attr." + REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY, "randomRepoName")
                 .put(stateRepoTypeAttributeKey, FsRepository.TYPE)
                 .put(stateRepoSettingsAttributeKeyPrefix + "location", "randomRepoPath")
-                .put(RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING.getKey(), true)
+                .put(RemoteClusterStateSettings.REMOTE_CLUSTER_STATE_ENABLED_SETTING.getKey(), true)
                 .build();
             gateway.start(settings, nodeEnvironment, xContentRegistry(), persistedStateRegistry);
 
@@ -1268,7 +1269,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
             .put("node.attr." + REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY, randomRepoName)
             .put(stateRepoTypeAttributeKey, FsRepository.TYPE)
             .put(stateRepoSettingsAttributeKeyPrefix + "location", "randomRepoPath")
-            .put(RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING.getKey(), true)
+            .put(RemoteClusterStateSettings.REMOTE_CLUSTER_STATE_ENABLED_SETTING.getKey(), true)
             .build();
         final TransportService transportService = mock(TransportService.class);
         ClusterService clusterService = mock(ClusterService.class);

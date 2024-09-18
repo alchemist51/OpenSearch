@@ -10,10 +10,15 @@ package org.opensearch.common.remote;
 
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.gateway.remote.ClusterMetadataManifest;
+import org.opensearch.gateway.remote.DefaultRandomObject;
+import org.opensearch.gateway.remote.RemoteClusterStateSettings;
 import org.opensearch.gateway.remote.model.RemoteReadResult;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Random;
+
+import static org.opensearch.gateway.remote.RemoteClusterStateUtils.getRandomDownloadJitterDelay;
 
 /**
  * An abstract class that provides a base implementation for managing remote entities in the remote store.
@@ -23,6 +28,14 @@ public abstract class AbstractRemoteWritableEntityManager implements RemoteWrita
      * A map that stores the remote writable entity stores, keyed by the entity type.
      */
     protected final Map<String, RemoteWritableEntityStore> remoteWritableEntityStores = new HashMap<>();
+
+    /**
+     * RemoteClusterStateSettings to add jitter in the download calls.
+     * Intentionally set to null to make sure the inheriting class configure it correctly.
+     */
+    protected RemoteClusterStateSettings remoteClusterStateSettings = null;
+
+    protected final Random random = DefaultRandomObject.INSTANCE;
 
     /**
      * Retrieves the remote writable entity store for the given entity.
@@ -68,6 +81,10 @@ public abstract class AbstractRemoteWritableEntityManager implements RemoteWrita
         ActionListener<RemoteReadResult> listener
     );
 
+    public void addRemoteWritableEntityStore(String EntityName, RemoteWritableEntityStore remoteWritableEntityStore) {
+        remoteWritableEntityStores.put(EntityName, remoteWritableEntityStore);
+    }
+
     @Override
     public void writeAsync(
         String component,
@@ -79,6 +96,11 @@ public abstract class AbstractRemoteWritableEntityManager implements RemoteWrita
 
     @Override
     public void readAsync(String component, AbstractClusterMetadataWriteableBlobEntity entity, ActionListener<RemoteReadResult> listener) {
-        getStore(entity).readAsync(entity, getWrappedReadListener(component, entity, listener));
+        getStore(entity).readAsyncWithDelay(
+            getRandomDownloadJitterDelay(remoteClusterStateSettings),
+            entity,
+            getWrappedReadListener(component, entity, listener)
+        );
     }
+
 }

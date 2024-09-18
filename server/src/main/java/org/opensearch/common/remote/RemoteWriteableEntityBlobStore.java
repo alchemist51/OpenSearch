@@ -10,6 +10,7 @@ package org.opensearch.common.remote;
 
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.stream.write.WritePriority;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.translog.transfer.BlobStoreTransferService;
 import org.opensearch.repositories.blobstore.BlobStoreRepository;
@@ -32,8 +33,10 @@ public class RemoteWriteableEntityBlobStore<T, U extends RemoteWriteableBlobEnti
     private final BlobStoreTransferService transferService;
     private final BlobStoreRepository blobStoreRepository;
     private final String clusterName;
+    private final String executor;
     private final ExecutorService executorService;
     private final String pathToken;
+    private final ThreadPool threadPool;
 
     public RemoteWriteableEntityBlobStore(
         final BlobStoreTransferService blobStoreTransferService,
@@ -46,6 +49,8 @@ public class RemoteWriteableEntityBlobStore<T, U extends RemoteWriteableBlobEnti
         this.transferService = blobStoreTransferService;
         this.blobStoreRepository = blobStoreRepository;
         this.clusterName = clusterName;
+        this.threadPool = threadPool;
+        this.executor = executor;
         this.executorService = threadPool.executor(executor);
         this.pathToken = pathToken;
     }
@@ -89,6 +94,17 @@ public class RemoteWriteableEntityBlobStore<T, U extends RemoteWriteableBlobEnti
         });
     }
 
+    public void readAsyncWithDelay(final long delayMillis, final U entity, final ActionListener<T> listener) {
+        Runnable runnable = () -> {
+            try {
+                listener.onResponse(read(entity));
+            } catch (Exception e) {
+                listener.onFailure(e);
+            }
+        };
+        threadPool.scheduleUnlessShuttingDown(TimeValue.timeValueMillis(delayMillis), executor, runnable);
+    }
+
     public String getClusterName() {
         return clusterName;
     }
@@ -121,5 +137,4 @@ public class RemoteWriteableEntityBlobStore<T, U extends RemoteWriteableBlobEnti
     private static String encodeString(String content) {
         return Base64.getUrlEncoder().withoutPadding().encodeToString(content.getBytes(StandardCharsets.UTF_8));
     }
-
 }

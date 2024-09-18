@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
+import static org.opensearch.cluster.coordination.ElectionSchedulerFactory.nonNegative;
 import static org.opensearch.gateway.remote.ClusterMetadataManifest.CODEC_V1;
 
 /**
@@ -71,6 +72,21 @@ public class RemoteClusterStateUtils {
                     .add(Base64.getUrlEncoder().withoutPadding().encodeToString(clusterName.getBytes(StandardCharsets.UTF_8)))
                     .add(CLUSTER_STATE_PATH_TOKEN)
             );
+    }
+
+    public static long getRandomDownloadJitterDelay(RemoteClusterStateSettings remoteClusterStateSettings) {
+        long maxDelayInMillis = remoteClusterStateSettings.getRemoteStateReadMaxJitter().getMillis();
+        return toPositiveLongAtMost(DefaultRandomObject.INSTANCE.nextLong(), maxDelayInMillis);
+    }
+
+    /**
+     * @param randomNumber a randomly-chosen long
+     * @param upperBound   inclusive upper bound
+     * @return a number in the range (0, upperBound]
+     */
+    static long toPositiveLongAtMost(long randomNumber, long upperBound) {
+        assert 0 < upperBound : upperBound;
+        return nonNegative(randomNumber) % upperBound + 1;
     }
 
     /**

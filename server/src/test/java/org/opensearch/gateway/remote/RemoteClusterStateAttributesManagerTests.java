@@ -16,8 +16,10 @@ import org.opensearch.cluster.DiffableUtils;
 import org.opensearch.cluster.block.ClusterBlocks;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.remote.RemoteWritableEntityStore;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.TestCapturingListener;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
@@ -41,6 +43,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+
+import org.mockito.ArgumentCaptor;
 
 import static org.opensearch.common.blobstore.stream.write.WritePriority.URGENT;
 import static org.opensearch.gateway.remote.RemoteClusterStateAttributesManager.CLUSTER_STATE_ATTRIBUTE;
@@ -71,6 +75,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 public class RemoteClusterStateAttributesManagerTests extends OpenSearchTestCase {
@@ -93,6 +98,7 @@ public class RemoteClusterStateAttributesManagerTests extends OpenSearchTestCase
         compressor = new NoneCompressor();
 
         remoteClusterStateAttributesManager = new RemoteClusterStateAttributesManager(
+            new RemoteClusterStateSettings(Settings.EMPTY, new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)),
             CLUSTER_NAME,
             blobStoreRepository,
             blobStoreTransferService,
@@ -281,6 +287,48 @@ public class RemoteClusterStateAttributesManagerTests extends OpenSearchTestCase
         assertEquals(custom, capturingListener.getResult().getObj());
         assertEquals(CLUSTER_STATE_ATTRIBUTE, capturingListener.getResult().getComponent());
         assertEquals(CLUSTER_STATE_CUSTOM, capturingListener.getResult().getComponentName());
+    }
+
+    public void testRemoteClusterStateAttributesManager_ReadAsyncWithDelay() {
+
+        RemoteClusterStateSettings remoteClusterStateSettings = mock(RemoteClusterStateSettings.class);
+        TimeValue maxJitter = TimeValue.timeValueMillis(100);
+        when(remoteClusterStateSettings.getRemoteStateReadMaxJitter()).thenReturn(maxJitter);
+
+        remoteClusterStateAttributesManager = new RemoteClusterStateAttributesManager(
+            remoteClusterStateSettings,
+            "test-cluster",
+            mock(BlobStoreRepository.class),
+            blobStoreTransferService,
+            namedWriteableRegistry,
+            threadPool
+        );
+
+        RemoteWritableEntityStore mockRemoteWritableEntityStore = mock(RemoteWritableEntityStore.class);
+        remoteClusterStateAttributesManager.addRemoteWritableEntityStore(
+            RemoteDiscoveryNodes.DISCOVERY_NODES,
+            mockRemoteWritableEntityStore
+        );
+
+        RemoteDiscoveryNodes remoteDiscoveryNodes = mock(RemoteDiscoveryNodes.class);
+        when(remoteDiscoveryNodes.getType()).thenReturn(RemoteDiscoveryNodes.DISCOVERY_NODES);
+
+        ActionListener<RemoteReadResult> listener = mock(ActionListener.class);
+
+        ArgumentCaptor<Long> delayCaptor = ArgumentCaptor.forClass(Long.class);
+
+        remoteClusterStateAttributesManager.readAsync("testComponent", remoteDiscoveryNodes, listener);
+        verify(mockRemoteWritableEntityStore).readAsyncWithDelay(
+            delayCaptor.capture(),
+            eq(remoteDiscoveryNodes),
+            any(ActionListener.class)
+        );
+
+        long capturedDelay = delayCaptor.getValue();
+
+        // assert
+        assertTrue("Delay should be non-negative", capturedDelay >= 0);
+        assertTrue("Delay should not exceed max jitter", capturedDelay < TimeValue.timeValueMillis(100).millis());
     }
 
     public void testGetAsyncWriteRunnable_Exception() throws IOException, InterruptedException {
