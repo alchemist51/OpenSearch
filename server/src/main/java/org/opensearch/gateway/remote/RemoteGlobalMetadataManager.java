@@ -73,6 +73,7 @@ public class RemoteGlobalMetadataManager extends AbstractRemoteWritableEntityMan
 
     RemoteGlobalMetadataManager(
         ClusterSettings clusterSettings,
+        RemoteClusterStateSettings remoteClusterStateSettings,
         String clusterName,
         BlobStoreRepository blobStoreRepository,
         BlobStoreTransferService blobStoreTransferService,
@@ -83,6 +84,7 @@ public class RemoteGlobalMetadataManager extends AbstractRemoteWritableEntityMan
         this.compressor = blobStoreRepository.getCompressor();
         this.namedXContentRegistry = blobStoreRepository.getNamedXContentRegistry();
         this.namedWriteableRegistry = namedWriteableRegistry;
+        this.remoteClusterStateSettings = remoteClusterStateSettings;
         this.remoteWritableEntityStores.put(
             RemoteGlobalMetadata.GLOBAL_METADATA,
             new RemoteWriteableEntityBlobStore<>(

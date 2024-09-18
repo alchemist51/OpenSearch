@@ -58,7 +58,7 @@ import static org.opensearch.cluster.coordination.ClusterBootstrapService.INITIA
 import static org.opensearch.cluster.metadata.IndexMetadata.INDEX_READ_ONLY_SETTING;
 import static org.opensearch.cluster.metadata.Metadata.CLUSTER_READ_ONLY_BLOCK;
 import static org.opensearch.cluster.metadata.Metadata.SETTING_READ_ONLY_SETTING;
-import static org.opensearch.gateway.remote.RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING;
+import static org.opensearch.gateway.remote.RemoteClusterStateSettings.REMOTE_CLUSTER_STATE_ENABLED_SETTING;
 import static org.opensearch.gateway.remote.RemoteClusterStateUtils.encodeString;
 import static org.opensearch.indices.ShardLimitValidator.SETTING_CLUSTER_MAX_SHARDS_PER_NODE;
 import static org.opensearch.repositories.blobstore.BlobStoreRepository.SYSTEM_REPOSITORY_SETTING;

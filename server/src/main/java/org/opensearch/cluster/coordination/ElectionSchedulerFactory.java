@@ -156,7 +156,7 @@ public class ElectionSchedulerFactory {
     }
 
     @SuppressForbidden(reason = "Argument to Math.abs() is definitely not Long.MIN_VALUE")
-    private static long nonNegative(long n) {
+    public static long nonNegative(long n) {
         return n == Long.MIN_VALUE ? 0 : Math.abs(n);
     }
 

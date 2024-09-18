@@ -39,12 +39,14 @@ public class RemoteClusterStateAttributesManager extends AbstractRemoteWritableE
     public static final int CLUSTER_STATE_ATTRIBUTES_CURRENT_CODEC_VERSION = 1;
 
     RemoteClusterStateAttributesManager(
+        RemoteClusterStateSettings remoteClusterStateSettings,
         String clusterName,
         BlobStoreRepository blobStoreRepository,
         BlobStoreTransferService blobStoreTransferService,
         NamedWriteableRegistry namedWriteableRegistry,
         ThreadPool threadpool
     ) {
+        this.remoteClusterStateSettings = remoteClusterStateSettings;
         this.remoteWritableEntityStores.put(
             RemoteDiscoveryNodes.DISCOVERY_NODES,
             new RemoteWriteableEntityBlobStore<>(

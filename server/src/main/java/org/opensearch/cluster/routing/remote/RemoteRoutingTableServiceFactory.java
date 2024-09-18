@@ -10,6 +10,7 @@ package org.opensearch.cluster.routing.remote;
 
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.gateway.remote.RemoteClusterStateSettings;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -34,11 +35,19 @@ public class RemoteRoutingTableServiceFactory {
         Supplier<RepositoriesService> repositoriesService,
         Settings settings,
         ClusterSettings clusterSettings,
+        RemoteClusterStateSettings remoteClusterStateSettings,
         ThreadPool threadPool,
         String clusterName
     ) {
         if (isRemoteRoutingTableEnabled(settings)) {
-            return new InternalRemoteRoutingTableService(repositoriesService, settings, clusterSettings, threadPool, clusterName);
+            return new InternalRemoteRoutingTableService(
+                repositoriesService,
+                settings,
+                clusterSettings,
+                remoteClusterStateSettings,
+                threadPool,
+                clusterName
+            );
         }
         return new NoopRemoteRoutingTableService();
     }
