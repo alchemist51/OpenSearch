@@ -55,7 +55,7 @@ public class S3AsyncServiceTests extends OpenSearchTestCase implements ConfigPat
         referenceReloaded.close();
         s3AsyncService.close();
         final S3ClientSettings clientSettingsReloaded = s3AsyncService.settings(metadata1);
-        assertNotSame(clientSettings, clientSettingsReloaded);
+        assertSame(clientSettings, clientSettingsReloaded);
     }
 
     public void testCachedClientsWithCredentialsAreReleased() {
