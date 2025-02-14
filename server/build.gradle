@@ -73,6 +73,9 @@ dependencies {
   compileOnly project(':libs:opensearch-plugin-classloader')
   testRuntimeOnly project(':libs:opensearch-plugin-classloader')
 
+  implementation project(':libs:opensearch-arrow-spi')
+  implementation 'org.checkerframework:checker-qual:3.44.0'
+
   api libs.bundles.lucene
 
   // utilities
@@ -377,7 +380,7 @@ tasks.named("licenseHeaders").configure {
 tasks.test {
     environment "node.roles.test", "[]"
     if (BuildParams.runtimeJavaVersion > JavaVersion.VERSION_1_8) {
-        jvmArgs += ["--add-opens", "java.base/java.nio.file=ALL-UNNAMED"]
+        jvmArgs += ["--add-opens", "java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"]
     }
 }
 

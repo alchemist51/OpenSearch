@@ -195,4 +195,14 @@ grant {
   permission java.io.FilePermission "/sys/fs/cgroup/cpuacct/-", "read";
   permission java.io.FilePermission "/sys/fs/cgroup/memory", "read";
   permission java.io.FilePermission "/sys/fs/cgroup/memory/-", "read";
+
+    // Needed for netty based arrow flight server for netty configs related to buffer allocator
+    permission java.security.AllPermission "modifyThreadGroup";
+
+        permission java.lang.RuntimePermission "accessClassInPackage.sun.misc";
+        permission java.lang.RuntimePermission "accessClassInPackage.sun.nio.ch";
+        permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
+        // For Arrow memory management
+        permission java.lang.RuntimePermission "loadLibrary.*";
+        permission java.lang.RuntimePermission "getClassLoader";
 };

@@ -126,6 +126,7 @@ import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.internal.ShardSearchContextId;
 import org.opensearch.search.internal.ShardSearchRequest;
 import org.opensearch.search.lookup.SearchLookup;
+import org.opensearch.search.parquet.ArrowQueryContext;
 import org.opensearch.search.pipeline.PipelinedRequest;
 import org.opensearch.search.profile.Profilers;
 import org.opensearch.search.query.QueryPhase;
@@ -1543,6 +1544,20 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         context.evaluateRequestShouldUseConcurrentSearch();
         if (source.profile()) {
             context.setProfilers(new Profilers(context.searcher(), context.shouldUseConcurrentSearch()));
+        }
+
+        // Add Arrow context if needed
+        if (this.indicesService.getCompositeIndexSettings().isStarTreeIndexCreationEnabled()) {
+            String parquetPath = "file://"
+                + "/Users/gbh/Documents/BKD/opensearch-3.0.0-SNAPSHOT/data/nodes/0/indices/"
+                + "setEruFZTR68hF1MH51mNQ/0/index/1728892707_zstd_32mb_rg_v2.parquet";
+            ArrowQueryContext arrowContext = new ArrowQueryContext(context, source.query(), parquetPath
+            // getParquetPath(context)
+
+            );
+            if (arrowContext.consolidateAllFilters(context)) {
+                queryShardContext.setArrowQueryContext(arrowContext);
+            }
         }
 
         if (this.indicesService.getCompositeIndexSettings() != null

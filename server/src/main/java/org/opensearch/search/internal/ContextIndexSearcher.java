@@ -32,6 +32,19 @@
 
 package org.opensearch.search.internal;
 
+import org.apache.arrow.dataset.file.FileFormat;
+import org.apache.arrow.dataset.file.FileSystemDatasetFactory;
+import org.apache.arrow.dataset.jni.NativeMemoryPool;
+import org.apache.arrow.dataset.scanner.ScanOptions;
+import org.apache.arrow.dataset.scanner.Scanner;
+import org.apache.arrow.dataset.source.Dataset;
+import org.apache.arrow.dataset.source.DatasetFactory;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.ValueVector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DirectoryReader;
@@ -48,6 +61,7 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.LeafCollector;
+import org.apache.lucene.search.MultiCollector;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryCache;
 import org.apache.lucene.search.QueryCachingPolicy;
@@ -55,6 +69,7 @@ import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
+import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TermStatistics;
 import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.search.TotalHits;
@@ -72,6 +87,10 @@ import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.approximate.ApproximateScoreQuery;
 import org.opensearch.search.dfs.AggregatedDfs;
+import org.opensearch.search.parquet.ArrowBatchCollector;
+import org.opensearch.search.parquet.ArrowFilter;
+import org.opensearch.search.parquet.ArrowQueryContext;
+import org.opensearch.search.parquet.substrait.SubstraitFilterProvider;
 import org.opensearch.search.profile.ContextualProfileBreakdown;
 import org.opensearch.search.profile.Timer;
 import org.opensearch.search.profile.query.ProfileWeight;
@@ -88,8 +107,12 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Executor;
+
+import io.substrait.proto.ExtendedExpression;
+import org.roaringbitmap.RoaringBitmap;
 
 /**
  * Context-aware extension of {@link IndexSearcher}.
@@ -305,6 +328,106 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         searchContext.indexShard().getSearchOperationListener().onSliceExecution(searchContext);
     }
 
+    private void searchParquet(String parquetPath, LeafCollector leafCollector) throws IOException {
+        try (BufferAllocator allocator = new RootAllocator()) {
+            // Create dataset factory for Parquet file
+            DatasetFactory factory = new FileSystemDatasetFactory(
+                allocator,
+                NativeMemoryPool.getDefault(),
+                FileFormat.PARQUET,
+                parquetPath
+            );
+
+            // Get the dataset
+            Dataset dataset = factory.finish();
+
+            // Create scan options
+            ScanOptions options = new ScanOptions(/*batchSize=*/32768, /*columns=*/Optional.of(getRequiredColumns()) // List of columns you
+                                                                                                                     // need
+            // /*filter=*/createFilter() // Your search criteria
+            );
+
+            // Create scanner
+            Scanner scanner = dataset.newScan(options);
+            ArrowReader reader = scanner.scanBatches();
+            // Process batches
+            int rowCount = 0;
+            while (reader.loadNextBatch()) {
+                try (VectorSchemaRoot root = reader.getVectorSchemaRoot()) {
+                    processArrowBatch(root, leafCollector, rowCount);
+                    rowCount += root.getRowCount();
+                }
+
+            }
+
+        } catch (Exception e) {
+            logger.error("Error reading Parquet file with Arrow: " + e.getMessage(), e);
+            throw new IOException("Failed to read Parquet file", e);
+        }
+    }
+
+    private void processArrowBatch(VectorSchemaRoot batch, LeafCollector collector, int rowCount) throws IOException {
+
+        // Get vectors for each field you need
+        var backendIpVector = batch.getVector("backend_ip");
+        var backendPortVector = batch.getVector("backend_port");
+        var timestampVector = batch.getVector("timestamp");
+        // ... get other vectors
+
+        // Process each row in the batch
+        for (int i = 0; i < batch.getRowCount(); i++) {
+            if (matchesSearchCriteria(batch, i)) {
+                // Create a scorer for the current row
+                // Scorer scorer = new ArrowScorer(batch, i);
+                // collector.setScorer(scorer);
+
+                // Generate a document ID for this row
+                int docId = rowCount++;
+                collector.collect(docId);
+            }
+        }
+    }
+
+    private boolean matchesSearchCriteria(VectorSchemaRoot batch, int rowIndex) {
+        try {
+            if (searchContext.query() != null) {
+                return evaluateQueryOnArrowRow(batch, rowIndex, searchContext.query());
+            }
+            return true;
+        } catch (Exception e) {
+            logger.error("Error evaluating search criteria: " + e.getMessage(), e);
+            return false;
+        }
+    }
+
+    private boolean evaluateQueryOnArrowRow(VectorSchemaRoot batch, int rowIndex, Query query) {
+        // Implement query evaluation logic
+        if (query instanceof TermQuery) {
+            TermQuery termQuery = (TermQuery) query;
+            String field = termQuery.getTerm().field();
+            String value = termQuery.getTerm().text();
+
+            ValueVector vector = batch.getVector(field);
+            if (vector instanceof VarCharVector) {
+                VarCharVector varCharVector = (VarCharVector) vector;
+                return value.equals(new String(varCharVector.get(rowIndex)));
+            }
+            // Add handling for other vector types
+        }
+        // Add handling for other query types
+        return false;
+    }
+
+    private String[] getRequiredColumns() {
+        // Return list of columns needed for the query
+        String[] a = new String[2];
+        return List.of("target_status_code", "target_port").toArray(a);
+    }
+
+    private ArrowQueryContext getArrowQueryContext() {
+        return searchContext.getQueryShardContext().getArrowQueryContext();
+    }
+
     /**
      * Lower-level search API.
      * <p>
@@ -313,6 +436,25 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
      */
     @Override
     protected void searchLeaf(LeafReaderContext ctx, int minDocId, int maxDocId, Weight weight, Collector collector) throws IOException {
+
+        // Check if we have an Arrow context and early terminate
+        // TODO : only sum aggs is currently supported
+        // TODO : only range and terms query is currently supported
+        ArrowQueryContext arrowCtx = getArrowQueryContext();
+        if (arrowCtx != null) {
+            if (collector instanceof MultiCollector) {
+                for (Collector c : ((MultiCollector) collector).getCollectors()) {
+                    if (c instanceof ArrowBatchCollector) {
+                        if (arrowCtx.isUsingSubstrait()) {
+                            searchWithSubstrait(arrowCtx, c);
+                        } else {
+                            searchWithArrow(arrowCtx, c);
+                        }
+                    }
+                }
+            }
+            return;
+        }
 
         // Check if at all we need to call this leaf for collecting results.
         if (canMatch(ctx) == false) {
@@ -337,6 +479,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             searchContext.setSearchTimedOut(true);
             return;
         }
+
         // catch early terminated exception and rethrow?
         Bits liveDocs = ctx.reader().getLiveDocs();
         BitSet liveDocsBitSet = getSparseBitSetOrNull(liveDocs);
@@ -379,6 +522,195 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         // Note: this is called if collection ran successfully, including the above special cases of
         // CollectionTerminatedException and TimeExceededException, but no other exception.
         leafCollector.finish();
+    }
+
+    private void searchWithSubstrait(ArrowQueryContext arrowCtx, Collector collector) throws IOException {
+        try (BufferAllocator allocator = new RootAllocator()) {
+            DatasetFactory factory = new FileSystemDatasetFactory(
+                allocator,
+                NativeMemoryPool.getDefault(),
+                FileFormat.PARQUET,
+                arrowCtx.getParquetPath()
+            );
+
+            Dataset dataset = factory.finish();
+
+            // Get the Substrait provider and expressions
+            SubstraitFilterProvider provider = SubstraitFilterProvider.SingletonFactory.getProvider(arrowCtx.getBaseQueryBuilder());
+            if (provider == null) {
+                // Fall back to Arrow-based filtering
+                searchWithArrow(arrowCtx, collector);
+                return;
+            }
+
+            // Create scan options with Substrait expressions
+            ScanOptions.Builder optionsBuilder = new ScanOptions.Builder(32768);
+
+            // Add filter and projection if available
+            ExtendedExpression filter = arrowCtx.getSubstraitFilter();
+            ExtendedExpression projection = arrowCtx.getSubstraitProjection();
+            String[] columns = arrowCtx.getBaseQueryArrowFilter().getFilteredFields().toArray(new String[0]);
+            optionsBuilder.columns(Optional.of(columns));
+            if (filter != null) {
+                optionsBuilder.substraitFilter(arrowCtx.convertToByteBuffer(filter));
+            }
+            if (projection != null) {
+                optionsBuilder.substraitProjection(arrowCtx.convertToByteBuffer(projection));
+            }
+
+            try (Scanner scanner = dataset.newScan(optionsBuilder.build()); ArrowReader reader = scanner.scanBatches()) {
+
+                while (reader.loadNextBatch()) {
+                    try (VectorSchemaRoot root = reader.getVectorSchemaRoot()) {
+                        if (collector instanceof ArrowBatchCollector) {
+                            // for(int i=0; i<root.getRowCount();i++) {
+                            // ((ArrowBatchCollector) collector).collect(root, i);
+                            // }
+                            ((ArrowBatchCollector) collector).collectBatch(root);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Error processing data with Substrait: " + e.getMessage(), e);
+            throw new IOException("Failed to process data with Substrait", e);
+        }
+    }
+
+    private void searchWithArrow(ArrowQueryContext arrowCtx, Collector collector) throws IOException {
+        try (BufferAllocator allocator = new RootAllocator()) {
+            DatasetFactory factory = new FileSystemDatasetFactory(
+                allocator,
+                NativeMemoryPool.getDefault(),
+                FileFormat.PARQUET,
+                arrowCtx.getParquetPath()
+            );
+
+            Dataset dataset = factory.finish();
+            ArrowFilter baseFilter = arrowCtx.getBaseQueryArrowFilter();
+
+            // Create scan options
+            String[] columns = baseFilter.getFilteredFields().toArray(new String[0]);
+            ScanOptions options = new ScanOptions(32768, Optional.of(columns));
+
+            try (Scanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+
+                int rowCount = 0;
+                while (reader.loadNextBatch()) {
+                    try (VectorSchemaRoot root = reader.getVectorSchemaRoot()) {
+                        processArrowBatchWithFilter(root, collector, rowCount, baseFilter);
+                        rowCount += root.getRowCount();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Error processing data with Arrow: " + e.getMessage(), e);
+            throw new IOException("Failed to process data with Arrow", e);
+        }
+    }
+
+    // Modify ContextIndexSearcher to use Substrait
+    private void searchArrowSubstrait(ArrowQueryContext arrowCtx, Collector collector, LeafReaderContext ctx) throws IOException {
+        try (BufferAllocator allocator = new RootAllocator()) {
+            DatasetFactory factory = new FileSystemDatasetFactory(
+                allocator,
+                NativeMemoryPool.getDefault(),
+                FileFormat.PARQUET,
+                arrowCtx.getParquetPath()
+            );
+
+            Dataset dataset = factory.finish();
+
+            // Create scan options with Substrait expressions
+            ScanOptions options = new ScanOptions.Builder(32768).columns(Optional.of(new String[] { "target_status_code" })) // TODO
+                .substraitFilter(/*arrowCtx.getSubstraitFilter()*/null)
+                .substraitProjection(/*arrowCtx.getSubstraitProjection()*/null)
+                .build();
+            try (Scanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+
+                int rowCount = 0;
+                while (reader.loadNextBatch()) {
+                    try (VectorSchemaRoot root = reader.getVectorSchemaRoot()) {
+                        // With Substrait, filtering is done at storage layer
+                        // Just collect all rows in the batch
+                        ((ArrowBatchCollector) collector).collectBatch(root);
+                        rowCount += root.getRowCount();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Error processing Arrow/Parquet data: " + e.getMessage(), e);
+            throw new IOException("Failed to process Arrow/Parquet data", e);
+        }
+    }
+
+    // Add new method for Arrow-based search
+    private void searchArrow(ArrowQueryContext arrowCtx, Collector collector) throws IOException {
+        try (BufferAllocator allocator = new RootAllocator()) {
+            DatasetFactory factory = new FileSystemDatasetFactory(
+                allocator,
+                NativeMemoryPool.getDefault(),
+                FileFormat.PARQUET,
+                arrowCtx.getParquetPath()
+            );
+
+            Dataset dataset = factory.finish();
+
+            // Get base filter from ArrowQueryContext
+            ArrowFilter baseFilter = arrowCtx.getBaseQueryArrowFilter();
+
+            String[] arr = new String[baseFilter.getFilteredFields().size()];
+            baseFilter.getFilteredFields().toArray(arr);
+            // Create scan options with filter
+            ScanOptions options = new ScanOptions(/*batchSize=*/32768, /*columns=*/Optional.of(baseFilter.getFilteredFields().toArray(arr))
+            );
+
+            try (Scanner scanner = dataset.newScan(options)) {
+                ArrowReader reader = scanner.scanBatches();
+                int rowCount = 0;
+
+                while (reader.loadNextBatch()) {
+                    try (VectorSchemaRoot root = reader.getVectorSchemaRoot()) {
+                        // Apply filter and collect results
+                        processArrowBatchWithFilter(root, collector, rowCount, baseFilter);
+                        rowCount += root.getRowCount();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Error processing Arrow/Parquet data: " + e.getMessage(), e);
+            throw new IOException("Failed to process Arrow/Parquet data", e);
+        }
+    }
+
+    private void processArrowBatchWithFilter(VectorSchemaRoot batch, Collector collector, int rowCount, ArrowFilter filter)
+        throws IOException {
+        // TODO : this is not needed , if we collect batch as we pass batch inside
+        searchContext.getQueryShardContext().getArrowQueryContext().setCurrentBatch(batch);
+        try {
+            // Create combined bitmap of all matching rows
+            RoaringBitmap matches = null;
+            // Apply filters for each field
+            for (String field : filter.getFilteredFields()) {
+                matches = filter.evaluate(field, batch);
+            }
+
+            if (collector instanceof ArrowBatchCollector) {
+                ((ArrowBatchCollector) collector).collectBatch(batch, matches, rowCount);
+            } else {
+                // Use explicit IntConsumer
+                // matches.forEach((IntConsumer) i -> {
+                // try {
+                // collector.collect(i);
+                // } catch (IOException e) {
+                // throw new RuntimeException(e);
+                // }
+                // });
+            }
+        } finally {
+            // Clear the batch reference
+            searchContext.getQueryShardContext().getArrowQueryContext().setCurrentBatch(null);
+        }
     }
 
     private Weight wrapWeight(Weight weight) {

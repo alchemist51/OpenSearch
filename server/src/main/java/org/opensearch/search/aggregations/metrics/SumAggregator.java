@@ -31,6 +31,9 @@
 
 package org.opensearch.search.aggregations.metrics;
 
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.ValueVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.util.NumericUtils;
@@ -50,10 +53,15 @@ import org.opensearch.search.aggregations.StarTreePreComputeCollector;
 import org.opensearch.search.aggregations.support.ValuesSource;
 import org.opensearch.search.aggregations.support.ValuesSourceConfig;
 import org.opensearch.search.internal.SearchContext;
+import org.opensearch.search.parquet.ArrowBatchCollector;
+import org.opensearch.search.parquet.ArrowQueryContext;
 import org.opensearch.search.startree.StarTreeQueryHelper;
 
 import java.io.IOException;
 import java.util.Map;
+
+import org.roaringbitmap.IntConsumer;
+import org.roaringbitmap.RoaringBitmap;
 
 import static org.opensearch.search.startree.StarTreeQueryHelper.getSupportedStarTree;
 
@@ -62,7 +70,7 @@ import static org.opensearch.search.startree.StarTreeQueryHelper.getSupportedSta
  *
  * @opensearch.internal
  */
-public class SumAggregator extends NumericMetricsAggregator.SingleValue implements StarTreePreComputeCollector {
+public class SumAggregator extends NumericMetricsAggregator.SingleValue implements StarTreePreComputeCollector, ArrowBatchCollector {
 
     private final ValuesSource.Numeric valuesSource;
     private final DocValueFormat format;
@@ -116,6 +124,11 @@ public class SumAggregator extends NumericMetricsAggregator.SingleValue implemen
         if (valuesSource == null) {
             return LeafBucketCollector.NO_OP_COLLECTOR;
         }
+        // Check if we're using Arrow
+        ArrowQueryContext arrowCtx = context.getQueryShardContext().getArrowQueryContext();
+        if (arrowCtx != null) {
+            return getArrowLeafCollector(sub);
+        }
         final BigArrays bigArrays = context.bigArrays();
         final SortedNumericDoubleValues values = valuesSource.doubleValues(ctx);
         final CompensatedSum kahanSummation = new CompensatedSum(0, 0);
@@ -140,6 +153,113 @@ public class SumAggregator extends NumericMetricsAggregator.SingleValue implemen
 
                     compensations.set(bucket, kahanSummation.delta());
                     sums.set(bucket, kahanSummation.value());
+                }
+            }
+        };
+    }
+
+    @Override
+    public void collectBatch(VectorSchemaRoot root, RoaringBitmap matchedRows, long baseDocId) throws IOException {
+        ValueVector vector = root.getVector("target_status_code");
+        if (vector instanceof IntVector) {
+            IntVector intVector = (IntVector) vector;
+
+            // Get values for bucket 0 (since this is a single-bucket aggregation)
+            sums = context.bigArrays().grow(sums, 1);
+            compensations = context.bigArrays().grow(compensations, 1);
+
+            CompensatedSum kahanSummation = new CompensatedSum(sums.get(0), compensations.get(0));
+
+            // Process all matching rows in one go
+            matchedRows.forEach((IntConsumer) row -> {
+                try {
+                    kahanSummation.add(intVector.get(row));
+                } catch (IllegalStateException e) {
+                    System.out.println("Value is null for : " + row);
+                }
+            });
+
+            // Store final results
+            sums.set(0, kahanSummation.value());
+            compensations.set(0, kahanSummation.delta());
+        }
+    }
+
+    public void collectBatch(VectorSchemaRoot root) throws IOException {
+        ValueVector vector = root.getVector("target_status_code");
+        if (root.getFieldVectors().getFirst() instanceof IntVector) {
+            IntVector intVector = (IntVector) root.getFieldVectors().getFirst();
+
+            // Get values for bucket 0 (since this is a single-bucket aggregation)
+            sums = context.bigArrays().grow(sums, 1);
+            compensations = context.bigArrays().grow(compensations, 1);
+
+            CompensatedSum kahanSummation = new CompensatedSum(sums.get(0), compensations.get(0));
+
+            for (int i = 0; i < root.getRowCount(); i++) {
+                try {
+                    kahanSummation.add(intVector.get(i));
+                } catch (IllegalStateException e) {
+                    System.out.println("Value is null for : " + i);
+                }
+            }
+
+            // Store final results
+            sums.set(0, kahanSummation.value());
+            compensations.set(0, kahanSummation.delta());
+        }
+    }
+
+    public void collect(VectorSchemaRoot root, int doc) throws IOException {
+
+        // IntVector intVector = (IntVector) root.getFieldVectors().getFirst();
+
+        // Get values for bucket 0 (since this is a single-bucket aggregation)
+        sums = context.bigArrays().grow(sums, 1);
+        compensations = context.bigArrays().grow(compensations, 1);
+
+        CompensatedSum kahanSummation = new CompensatedSum(sums.get(0), compensations.get(0));
+
+        // for (int i = 0; i < root.getRowCount(); i++) {
+        try {
+            kahanSummation.add(((IntVector) root.getVector(0)).get(doc));
+        } catch (IllegalStateException e) {
+            System.out.println("Value is null for : " + doc);
+        }
+        // }
+
+        // Store final results
+        sums.set(0, kahanSummation.value());
+        compensations.set(0, kahanSummation.delta());
+    }
+
+    private LeafBucketCollector getArrowLeafCollector(final LeafBucketCollector sub) {
+        final CompensatedSum kahanSummation = new CompensatedSum(0, 0);
+
+        return new LeafBucketCollector() {
+            @Override
+            public void collect(int doc, long bucket) throws IOException {
+                sums = context.bigArrays().grow(sums, bucket + 1);
+                compensations = context.bigArrays().grow(compensations, bucket + 1);
+
+                // Get the current VectorSchemaRoot from context
+                VectorSchemaRoot root = context.getQueryShardContext().getArrowQueryContext().getCurrentBatch();
+                if (root != null) {
+                    // Get the vector for target_status_code
+                    ValueVector vector = root.getVector("target_status_code");
+                    if (vector instanceof IntVector) {
+                        IntVector intVector = (IntVector) vector;
+                        if (!intVector.isNull(doc)) {
+                            double value = intVector.get(doc);
+
+                            // Use Kahan summation for accuracy
+                            kahanSummation.reset(sums.get(bucket), compensations.get(bucket));
+                            kahanSummation.add(value);
+
+                            compensations.set(bucket, kahanSummation.delta());
+                            sums.set(bucket, kahanSummation.value());
+                        }
+                    }
                 }
             }
         };

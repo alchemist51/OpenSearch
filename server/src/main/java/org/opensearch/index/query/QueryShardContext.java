@@ -75,6 +75,7 @@ import org.opensearch.script.ScriptService;
 import org.opensearch.search.aggregations.support.AggregationUsageService;
 import org.opensearch.search.aggregations.support.ValuesSourceRegistry;
 import org.opensearch.search.lookup.SearchLookup;
+import org.opensearch.search.parquet.ArrowQueryContext;
 import org.opensearch.search.startree.StarTreeQueryContext;
 import org.opensearch.transport.RemoteClusterAware;
 import org.opensearch.transport.client.Client;
@@ -130,6 +131,8 @@ public class QueryShardContext extends BaseQueryRewriteContext {
     private boolean isInnerHitQuery;
 
     private StarTreeQueryContext starTreeQueryContext;
+
+    private ArrowQueryContext arrowQueryContext;
 
     public QueryShardContext(
         int shardId,
@@ -388,6 +391,14 @@ public class QueryShardContext extends BaseQueryRewriteContext {
 
     public void setStarTreeQueryContext(StarTreeQueryContext starTreeQueryContext) {
         this.starTreeQueryContext = starTreeQueryContext;
+    }
+
+    public void setArrowQueryContext(ArrowQueryContext context) {
+        this.arrowQueryContext = context;
+    }
+
+    public ArrowQueryContext getArrowQueryContext() {
+        return arrowQueryContext;
     }
 
     public void addNamedQuery(String name, Query query) {
