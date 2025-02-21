@@ -57,6 +57,8 @@ import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.similarities.Similarity;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.parquet.example.data.Group;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.common.Nullable;
@@ -1143,25 +1145,26 @@ public abstract class Engine implements LifecycleAware, Closeable {
     public abstract List<Segment> segments(boolean verbose);
 
     public boolean refreshNeeded() {
-        if (store.tryIncRef()) {
-            /*
-              we need to inc the store here since we acquire a searcher and that might keep a file open on the
-              store. this violates the assumption that all files are closed when
-              the store is closed so we need to make sure we increment it here
-             */
-            try {
-                try (Searcher searcher = acquireSearcher("refresh_needed", SearcherScope.EXTERNAL)) {
-                    return searcher.getDirectoryReader().isCurrent() == false;
-                }
-            } catch (IOException e) {
-                logger.error("failed to access searcher manager", e);
-                failEngine("failed to access searcher manager", e);
-                throw new EngineException(shardId, "failed to access searcher manager", e);
-            } finally {
-                store.decRef();
-            }
-        }
-        return false;
+//        if (store.tryIncRef()) {
+//            /*
+//              we need to inc the store here since we acquire a searcher and that might keep a file open on the
+//              store. this violates the assumption that all files are closed when
+//              the store is closed so we need to make sure we increment it here
+//             */
+//            try {
+//                try (Searcher searcher = acquireSearcher("refresh_needed", SearcherScope.EXTERNAL)) {
+//                    return searcher.getDirectoryReader().isCurrent() == false;
+//                }
+//            } catch (IOException e) {
+//                logger.error("failed to access searcher manager", e);
+//                failEngine("failed to access searcher manager", e);
+//                throw new EngineException(shardId, "failed to access searcher manager", e);
+//            } finally {
+//                store.decRef();
+//            }
+//        }
+//        return false;
+        return pendingParquet();
     }
 
     /**
@@ -1670,6 +1673,10 @@ public abstract class Engine implements LifecycleAware, Closeable {
             return this.doc.docs();
         }
 
+        public Group columnGroup() {
+            return this.doc.getColumnGroup();
+        }
+
         public BytesReference source() {
             return this.doc.source();
         }
@@ -2140,4 +2147,11 @@ public abstract class Engine implements LifecycleAware, Closeable {
      */
     public abstract void advanceMaxSeqNoOfUpdatesOrDeletes(long maxSeqNoOfUpdatesOnPrimary);
 
+    public List<String> getFlushPoint() {
+        throw new UnsupportedOperationException();
+    }
+
+    public boolean pendingParquet() {
+        throw new UnsupportedOperationException();
+    }
 }

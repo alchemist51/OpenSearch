@@ -103,4 +103,5 @@ public class PerFieldMappingPostingFormatCodec extends Lucene101Codec {
     public DocValuesFormat getDocValuesFormatForField(String field) {
         return dvFormat;
     }
+
 }

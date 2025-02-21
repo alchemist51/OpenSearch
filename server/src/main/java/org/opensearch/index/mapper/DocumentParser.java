@@ -185,7 +185,8 @@ final class DocumentParser {
             context.docs(),
             context.sourceToParse().source(),
             context.sourceToParse().getMediaType(),
-            update
+            update,
+            context.columnGroup()
         );
     }
 

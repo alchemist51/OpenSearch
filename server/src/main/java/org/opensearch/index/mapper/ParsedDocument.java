@@ -33,10 +33,13 @@
 package org.opensearch.index.mapper;
 
 import org.apache.lucene.document.Field;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.example.data.simple.SimpleGroup;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.xcontent.MediaType;
+import org.opensearch.index.engine.ParquetRecordWriter;
 import org.opensearch.index.mapper.MapperService.MergeReason;
 import org.opensearch.index.mapper.ParseContext.Document;
 
@@ -64,6 +67,8 @@ public class ParsedDocument {
 
     private Mapping dynamicMappingsUpdate;
 
+    private final Group columnGroup;
+
     public ParsedDocument(
         Field version,
         SeqNoFieldMapper.SequenceIDFields seqID,
@@ -72,7 +77,8 @@ public class ParsedDocument {
         List<Document> documents,
         BytesReference source,
         MediaType mediaType,
-        Mapping dynamicMappingsUpdate
+        Mapping dynamicMappingsUpdate,
+        Group group
     ) {
         this.version = version;
         this.seqID = seqID;
@@ -82,6 +88,11 @@ public class ParsedDocument {
         this.source = source;
         this.dynamicMappingsUpdate = dynamicMappingsUpdate;
         this.mediaType = mediaType;
+        this.columnGroup = group;
+    }
+
+    public Group getColumnGroup() {
+        return columnGroup;
     }
 
     public String id() {

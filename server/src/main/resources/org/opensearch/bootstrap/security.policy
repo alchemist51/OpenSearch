@@ -115,7 +115,7 @@ grant {
   permission jdk.net.NetworkPermission "setOption.TCP_KEEPCOUNT";
 
   // Allow read access to all system properties
-  permission java.util.PropertyPermission "*", "read";
+  permission java.util.PropertyPermission "*", "read,write";
 
   // TODO: clean all these property writes up, and don't allow any more in. these are all bogus!
 
@@ -128,6 +128,7 @@ grant {
   // messiness in LuceneTestCase: do the above, or clean this up, or simply allow to fail if its denied
   permission java.util.PropertyPermission "solr.solr.home", "write";
   permission java.util.PropertyPermission "solr.data.dir", "write";
+  permission java.util.PropertyPermission "solr.directoryFactory", "write";
   permission java.util.PropertyPermission "solr.directoryFactory", "write";
 
   // set by OpenSearchTestCase to improve test reproducibility
@@ -144,6 +145,7 @@ grant {
 
   // needed by Settings
   permission java.lang.RuntimePermission "getenv.*";
+  permission java.lang.RuntimePermission "accessDeclaredMembers";
 
   // thread permission for the same thread group and ancestor groups
   // (this logic is more strict than the JDK, see SecureSM)
@@ -174,6 +176,7 @@ grant {
 
   // load averages on Linux
   permission java.io.FilePermission "/proc/loadavg", "read";
+  permission java.io.FilePermission "<<ALL FILES>>", "read,write";
 
   // read max virtual memory areas
   permission java.io.FilePermission "/proc/sys/vm/max_map_count", "read";
@@ -195,6 +198,9 @@ grant {
   permission java.io.FilePermission "/sys/fs/cgroup/cpuacct/-", "read";
   permission java.io.FilePermission "/sys/fs/cgroup/memory", "read";
   permission java.io.FilePermission "/sys/fs/cgroup/memory/-", "read";
+  permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
+  permission java.lang.RuntimePermission "loadLibrary.*";
+
 
     // Needed for netty based arrow flight server for netty configs related to buffer allocator
     permission java.security.AllPermission "modifyThreadGroup";

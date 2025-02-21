@@ -278,29 +278,29 @@ public class SourceFieldMapper extends MetadataFieldMapper {
 
     @Override
     public void preParse(ParseContext context) throws IOException {
-        BytesReference originalSource = context.sourceToParse().source();
-        MediaType contentType = context.sourceToParse().getMediaType();
-        final BytesReference adaptedSource = applyFilters(originalSource, contentType);
-
-        if (adaptedSource != null) {
-            final BytesRef ref = adaptedSource.toBytesRef();
-            context.doc().add(new StoredField(fieldType().name(), ref.bytes, ref.offset, ref.length));
-        }
-
-        if (recoverySourceEnabled) {
-            if (originalSource != null && adaptedSource != originalSource) {
-                final BytesReference adaptedRecoverySource = applyFilters(
-                    originalSource,
-                    contentType,
-                    recoverySourceEnabled,
-                    recoverySourceFilter
-                );
-                // if we omitted source or modified it we add the _recovery_source to ensure we have it for ops based recovery
-                BytesRef ref = adaptedRecoverySource.toBytesRef();
-                context.doc().add(new StoredField(RECOVERY_SOURCE_NAME, ref.bytes, ref.offset, ref.length));
-                context.doc().add(new NumericDocValuesField(RECOVERY_SOURCE_NAME, 1));
-            }
-        }
+//        BytesReference originalSource = context.sourceToParse().source();
+//        MediaType contentType = context.sourceToParse().getMediaType();
+//        final BytesReference adaptedSource = applyFilters(originalSource, contentType);
+//
+//        if (adaptedSource != null) {
+//            final BytesRef ref = adaptedSource.toBytesRef();
+//            context.doc().add(new StoredField(fieldType().name(), ref.bytes, ref.offset, ref.length));
+//        }
+//
+//        if (recoverySourceEnabled) {
+//            if (originalSource != null && adaptedSource != originalSource) {
+//                final BytesReference adaptedRecoverySource = applyFilters(
+//                    originalSource,
+//                    contentType,
+//                    recoverySourceEnabled,
+//                    recoverySourceFilter
+//                );
+//                // if we omitted source or modified it we add the _recovery_source to ensure we have it for ops based recovery
+//                BytesRef ref = adaptedRecoverySource.toBytesRef();
+//                context.doc().add(new StoredField(RECOVERY_SOURCE_NAME, ref.bytes, ref.offset, ref.length));
+//                context.doc().add(new NumericDocValuesField(RECOVERY_SOURCE_NAME, 1));
+//            }
+//        }
     }
 
     @Nullable

@@ -782,10 +782,12 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
                 createFieldNamesField(context);
             }
         }
+//
+//        if (fieldType().hasDocValues()) {
+//            context.doc().add(new SortedSetDocValuesField(fieldType().name(), binaryValue));
+//        }
 
-        if (fieldType().hasDocValues()) {
-            context.doc().add(new SortedSetDocValuesField(fieldType().name(), binaryValue));
-        }
+        context.columnGroup().add(fieldType().name(), value);
     }
 
     static String normalizeValue(NamedAnalyzer normalizer, String field, String value) throws IOException {

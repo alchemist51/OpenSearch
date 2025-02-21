@@ -1766,7 +1766,29 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
             numericValue = fieldType().type.parse(value, coerce.value());
         }
 
-        context.doc().addAll(fieldType().type.createFields(fieldType().name(), numericValue, indexed, hasDocValues, stored));
+//        context.doc().addAll(fieldType().type.createFields(fieldType().name(), numericValue, indexed, hasDocValues, stored));
+
+        switch (fieldType().type) {
+            case INTEGER:
+                context.columnGroup().add(fieldType().name(), numericValue.intValue());
+                break;
+            case SHORT:
+                context.columnGroup().add(fieldType().name(), numericValue.shortValue());
+                break;
+            case BYTE:
+                context.columnGroup().add(fieldType().name(), numericValue.byteValue());
+                break;
+            case LONG:
+                context.columnGroup().add(fieldType().name(), numericValue.longValue());
+                break;
+            case FLOAT:
+            case HALF_FLOAT:
+                context.columnGroup().add(fieldType().name(), numericValue.floatValue());
+                break;
+            case DOUBLE:
+                context.columnGroup().add(fieldType().name(), numericValue.doubleValue());
+                break;
+        }
 
         if (hasDocValues == false && (stored || indexed)) {
             createFieldNamesField(context);

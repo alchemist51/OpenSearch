@@ -173,6 +173,10 @@ public class JarHell {
         return Collections.unmodifiableSet(urlElements);
     }
 
+    public static void checkJarHell(Set<URL> urls, Consumer<String> output) throws URISyntaxException, IOException {
+
+    }
+
     /**
      * Checks the set of URLs for duplicate classes
      * @param urls A set of URLs from the classpath to be checked for conflicting jars
@@ -180,7 +184,7 @@ public class JarHell {
      * @throws IllegalStateException if jar hell was found
      */
     @SuppressForbidden(reason = "needs JarFile for speed, just reading entries")
-    public static void checkJarHell(Set<URL> urls, Consumer<String> output) throws URISyntaxException, IOException {
+    public static void checkJarHell(Set<URL> urls, Consumer<String> output, int x) throws URISyntaxException, IOException {
         // we don't try to be sneaky and use deprecated/internal/not portable stuff
         // like sun.boot.class.path, and with jigsaw we don't yet have a way to get
         // a "list" at all. So just exclude any elements underneath the java home

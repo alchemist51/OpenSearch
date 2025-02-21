@@ -49,6 +49,7 @@ import org.apache.lucene.search.PointRangeQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.BytesRef;
+import org.apache.parquet.io.api.Binary;
 import org.opensearch.Version;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.collect.Tuple;
@@ -630,6 +631,7 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
         if (stored) {
             context.doc().add(new StoredField(fieldType().name(), new BytesRef(InetAddressPoint.encode(address))));
         }
+        context.columnGroup().add(fieldType().name(), Binary.fromConstantByteArray(InetAddressPoint.encode(address)));
     }
 
     public static InetAddressField buildInetAddressField(String name, InetAddress value) {

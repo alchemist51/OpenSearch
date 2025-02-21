@@ -42,6 +42,7 @@ import org.apache.lucene.search.Query;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.util.BytesRef;
+import org.apache.parquet.io.api.Binary;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.logging.DeprecationLogger;
 import org.opensearch.common.lucene.Lucene;
@@ -106,7 +107,6 @@ public class IdFieldMapper extends MetadataFieldMapper {
         static {
             FIELD_TYPE.setTokenized(false);
             FIELD_TYPE.setIndexOptions(IndexOptions.DOCS);
-            FIELD_TYPE.setStored(true);
             FIELD_TYPE.setOmitNorms(true);
             FIELD_TYPE.freeze();
 
@@ -301,6 +301,7 @@ public class IdFieldMapper extends MetadataFieldMapper {
     public void preParse(ParseContext context) {
         BytesRef id = Uid.encodeId(context.sourceToParse().id());
         context.doc().add(new Field(NAME, id, Defaults.FIELD_TYPE));
+        context.columnGroup().add(IdFieldMapper.NAME, Binary.fromConstantByteArray(id.bytes));
     }
 
     @Override

@@ -1103,7 +1103,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         if (indexSettings.isSegRepEnabledOrRemoteNode() && routingEntry().primary() == false) {
             Engine.Index index = new Engine.Index(
                 new Term(IdFieldMapper.NAME, Uid.encodeId(id)),
-                new ParsedDocument(null, null, id, null, null, sourceToParse.source(), sourceToParse.getMediaType(), null),
+                new ParsedDocument(null, null, id, null, null, sourceToParse.source(), sourceToParse.getMediaType(), null, null),
                 seqNo,
                 opPrimaryTerm,
                 version,
@@ -5419,5 +5419,9 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             return shouldSeed ? REMOTE_MIGRATING_UNSEEDED : REMOTE_MIGRATING_SEEDED;
         }
         return ShardMigrationState.DOCREP_NON_MIGRATING;
+    }
+
+    public List<String> getFlushPoint() {
+        return getEngine().getFlushPoint();
     }
 }

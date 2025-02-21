@@ -35,10 +35,13 @@ package org.opensearch.index.mapper;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.util.BytesRef;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.example.data.simple.SimpleGroup;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.index.engine.ParquetRecordWriter;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -190,6 +193,11 @@ public abstract class ParseContext implements Iterable<ParseContext.Document> {
 
         private FilterParseContext(ParseContext in) {
             this.in = in;
+        }
+
+        @Override
+        public Group columnGroup() {
+            return in.columnGroup();
         }
 
         @Override
@@ -392,6 +400,13 @@ public abstract class ParseContext implements Iterable<ParseContext.Document> {
         private boolean docsReversed = false;
 
         private final Set<String> ignoredFields = new HashSet<>();
+
+        public Group columnGroup = new SimpleGroup(ParquetRecordWriter.schema);
+
+        @Override
+        public Group columnGroup() {
+            return columnGroup;
+        }
 
         public InternalParseContext(
             IndexSettings indexSettings,
@@ -800,4 +815,7 @@ public abstract class ParseContext implements Iterable<ParseContext.Document> {
 
     public abstract void checkFieldArrayDepthLimit();
 
+    public Group columnGroup() {
+        return null;
+    }
 }
