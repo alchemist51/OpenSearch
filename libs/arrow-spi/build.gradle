@@ -62,7 +62,7 @@ dependencies {
   runtimeOnly "com.jayway.jsonpath:json-path:2.8.0"  // Use appropriate version
 
   // If you need the JSON-smart implementation
-  runtimeOnly "net.minidev:json-smart:2.4.11"  // Use appropriate version
+  runtimeOnly "net.minidev:json-smart:2.5.1"  // Use appropriate version
   runtimeOnly "org.codehaus.janino:janino:3.1.10"  // Use appropriate version
   runtimeOnly "org.codehaus.janino:commons-compiler:3.1.10"  // Same version as janinos
   // Keep your existing dependencies

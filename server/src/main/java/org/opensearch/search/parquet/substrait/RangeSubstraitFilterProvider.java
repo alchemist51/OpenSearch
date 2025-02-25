@@ -8,6 +8,8 @@
 
 package org.opensearch.search.parquet.substrait;
 
+import org.opensearch.index.mapper.DateFieldMapper;
+import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.search.internal.SearchContext;
@@ -22,17 +24,27 @@ public class RangeSubstraitFilterProvider implements SubstraitFilterProvider {
     public ExtendedExpression getFilter(SearchContext context, QueryBuilder rawFilter) {
         RangeQueryBuilder rangeQuery = (RangeQueryBuilder) rawFilter;
         StringBuilder filterExpression = new StringBuilder();
-        filterExpression.append(rangeQuery.fieldName());
 
-        if (rangeQuery.from() != null) {
-            filterExpression.append(rangeQuery.includeLower() ? " >= " : " > ").append(rangeQuery.from());
-        }
-
-        if (rangeQuery.to() != null) {
+        // TODO : hardcoded date
+        if(rangeQuery.fieldName().equals("timestamp")) {
+            filterExpression.append(rangeQuery.fieldName() + "_col");
+            long from = ((DateFieldMapper.DateFieldType) context.mapperService().fieldType(rangeQuery.fieldName())).parse(rangeQuery.from().toString());
+            long to = ((DateFieldMapper.DateFieldType) context.mapperService().fieldType(rangeQuery.fieldName())).parse(rangeQuery.to().toString());
+            filterExpression.append(rangeQuery.includeLower() ? " >= " : " > ").append(from/1000);
+            filterExpression.append(" AND ").append(rangeQuery.fieldName() + "_col");
+            filterExpression.append(rangeQuery.includeUpper() ? " <= " : " < ").append(to/1000);
+        } else {
+            filterExpression.append(rangeQuery.fieldName());
             if (rangeQuery.from() != null) {
-                filterExpression.append(" AND ").append(rangeQuery.fieldName());
+                filterExpression.append(rangeQuery.includeLower() ? " >= " : " > ").append(rangeQuery.from());
             }
-            filterExpression.append(rangeQuery.includeUpper() ? " <= " : " < ").append(rangeQuery.to());
+
+            if (rangeQuery.to() != null) {
+                if (rangeQuery.from() != null) {
+                    filterExpression.append(" AND ").append(rangeQuery.fieldName());
+                }
+                filterExpression.append(rangeQuery.includeUpper() ? " <= " : " < ").append(rangeQuery.to());
+            }
         }
 
         return convertToSubstrait(filterExpression.toString(), context);
@@ -41,7 +53,7 @@ public class RangeSubstraitFilterProvider implements SubstraitFilterProvider {
     @Override
     public ExtendedExpression getProjection(SearchContext context, QueryBuilder rawFilter) {
         RangeQueryBuilder rangeQuery = (RangeQueryBuilder) rawFilter;
-        return convertToSubstrait(rangeQuery.fieldName(), context);
+        return convertToSubstraitCols(rangeQuery.fieldName(), context);
     }
 
     private String formatValue(Object value) {
@@ -55,6 +67,16 @@ public class RangeSubstraitFilterProvider implements SubstraitFilterProvider {
         try {
             SqlExpressionToSubstrait converter = new SqlExpressionToSubstrait();
             return converter.convert(new String[] { expression }, List.of(SchemaDefinition.createSchemaDefinition()));
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to convert to Substrait expression", e);
+        }
+    }
+
+    private ExtendedExpression convertToSubstraitCols(String expression, SearchContext context) {
+        try {
+            SqlExpressionToSubstrait converter = new SqlExpressionToSubstrait();
+            // TODO : HARDCODED
+            return converter.convert(new String[] { "target_status_code", "timestamp_col" }, List.of(SchemaDefinition.createSchemaDefinition()));
         } catch (Exception e) {
             throw new RuntimeException("Failed to convert to Substrait expression", e);
         }

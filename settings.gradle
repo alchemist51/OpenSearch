@@ -25,6 +25,12 @@ rootProject.name = "OpenSearch"
 
 include 'doc-tools'
 includeBuild("doc-tools/missing-doclet")
+includeBuild('/Users/gbh/Documents/collab/datafusion-java') {
+  dependencySubstitution {
+    substitute(module('io.github.datafusion-contrib:datafusion-java'))
+      .using(project(':datafusion-java'))  // This refers to the nested project
+  }
+}
 
 List projects = [
   'build-tools',

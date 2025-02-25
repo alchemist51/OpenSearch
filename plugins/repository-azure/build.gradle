@@ -81,9 +81,9 @@ dependencies {
   api "com.fasterxml.jackson.dataformat:jackson-dataformat-xml:${versions.jackson}"
   api "com.fasterxml.jackson.module:jackson-module-jaxb-annotations:${versions.jackson}"
   api 'org.codehaus.woodstox:stax2-api:4.2.2'
-  implementation "com.fasterxml.woodstox:woodstox-core:${versions.woodstox}"
+  implementation "com.fasterxml.woodstox:woodstox-core:6.4.0"
   runtimeOnly "com.google.guava:guava:${versions.guava}"
-  api "org.apache.commons:commons-lang3:${versions.commonslang}"
+  api "org.apache.commons:commons-lang3:3.17.0"
   testImplementation project(':test:fixtures:azure-fixture')
 }
 

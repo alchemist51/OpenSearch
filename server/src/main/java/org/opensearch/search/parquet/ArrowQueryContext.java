@@ -11,6 +11,7 @@ package org.opensearch.search.parquet;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.parquet.substrait.SubstraitFilterProvider;
 
@@ -29,15 +30,23 @@ public class ArrowQueryContext {
     private ExtendedExpression substraitFilter;
     private ExtendedExpression substraitProjection;
     private boolean useSubstrait;
+    private boolean useParquetExec;
+    private final ParquetExecQueryContext parquetExecContext;
 
     public ArrowQueryContext(SearchContext context, QueryBuilder baseQueryBuilder, String parquetPath) {
         this.baseQueryBuilder = baseQueryBuilder;
         this.parquetPath = parquetPath;
+        this.parquetExecContext = new ParquetExecQueryContext(context, parquetPath);
+
         initializeFilters(context);
     }
 
     private void initializeFilters(SearchContext context) {
         // Try Substrait first
+        if (canUseParquetExec(baseQueryBuilder)) {
+            this.useParquetExec = true;
+            return;
+        }
         SubstraitFilterProvider substraitProvider = SubstraitFilterProvider.SingletonFactory.getProvider(baseQueryBuilder);
         if (substraitProvider != null) {
             this.substraitFilter = substraitProvider.getFilter(context, baseQueryBuilder);
@@ -49,8 +58,18 @@ public class ArrowQueryContext {
         }
     }
 
+    private boolean canUseParquetExec(QueryBuilder query) {
+        // Add logic to determine if query can use ParquetExec
+        return query instanceof TermQueryBuilder;
+    }
+
     public boolean isUsingSubstrait() {
         return useSubstrait;
+    }
+
+    public boolean isUsingParquetExec() {
+        return useParquetExec;
+        //return false;
     }
 
     public VectorSchemaRoot getCurrentBatch() {
@@ -187,5 +206,9 @@ public class ArrowQueryContext {
 
     public String getParquetPath() {
         return parquetPath;
+    }
+
+    public ParquetExecQueryContext getParquetExecContext() {
+        return parquetExecContext;
     }
 }

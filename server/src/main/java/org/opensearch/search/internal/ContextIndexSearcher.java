@@ -32,6 +32,11 @@
 
 package org.opensearch.search.internal;
 
+import org.apache.arrow.datafusion.DataFrame;
+import org.apache.arrow.datafusion.ParquetExec;
+import org.apache.arrow.datafusion.RecordBatchStream;
+import org.apache.arrow.datafusion.SessionContext;
+import org.apache.arrow.datafusion.SessionContexts;
 import org.apache.arrow.dataset.file.FileFormat;
 import org.apache.arrow.dataset.file.FileSystemDatasetFactory;
 import org.apache.arrow.dataset.jni.NativeMemoryPool;
@@ -41,6 +46,8 @@ import org.apache.arrow.dataset.source.Dataset;
 import org.apache.arrow.dataset.source.DatasetFactory;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.ValueVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -82,6 +89,9 @@ import org.apache.lucene.util.SparseFixedBitSet;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
+import org.opensearch.index.mapper.NumberFieldMapper;
+import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.lucene.util.CombinedBitSet;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchService;
@@ -90,6 +100,7 @@ import org.opensearch.search.dfs.AggregatedDfs;
 import org.opensearch.search.parquet.ArrowBatchCollector;
 import org.opensearch.search.parquet.ArrowFilter;
 import org.opensearch.search.parquet.ArrowQueryContext;
+import org.opensearch.search.parquet.ParquetExecQueryContext;
 import org.opensearch.search.parquet.substrait.SubstraitFilterProvider;
 import org.opensearch.search.profile.ContextualProfileBreakdown;
 import org.opensearch.search.profile.Timer;
@@ -102,6 +113,9 @@ import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.search.sort.MinAndMax;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -109,6 +123,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
 import io.substrait.proto.ExtendedExpression;
@@ -428,6 +443,66 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         return searchContext.getQueryShardContext().getArrowQueryContext();
     }
 
+    public static void testParquetExec() throws Exception {
+        try (SessionContext context = SessionContexts.create();
+             BufferAllocator allocator = new RootAllocator()) {
+            ParquetExec exec = new ParquetExec(context, context.getPointer());
+            CompletableFuture<RecordBatchStream> result =
+                exec.execute(
+                    "/Users/gbh/Documents/1728892707_zstd_32mb_rg_v2.parquet",
+                    "target_status_code",
+                    404,
+                    allocator);
+            RecordBatchStream stream = result.join();
+            VectorSchemaRoot root = stream.getVectorSchemaRoot();
+            while (stream.loadNextBatch().get()) {
+                List<FieldVector> vectors = root.getFieldVectors();
+                for (FieldVector vector : vectors) {
+                    logger.info(
+                        "Field - {}, {}, {}, {}",
+                        vector.getField().getName(),
+                        vector.getField().getType(),
+                        vector.getValueCount(),
+                        vector);
+                }
+            }
+            stream.close();
+        }
+    }
+
+    private static void consumeReader(ArrowReader reader) {
+        try {
+            VectorSchemaRoot root = reader.getVectorSchemaRoot();
+            while (reader.loadNextBatch()) {
+                VarCharVector nameVector = (VarCharVector) root.getVector(0);
+                logger.info(
+                    "name vector size {}, row count {}, value={}",
+                    nameVector.getValueCount(),
+                    root.getRowCount(),
+                    nameVector);
+                BigIntVector ageVector = (BigIntVector) root.getVector(1);
+                logger.info(
+                    "age vector size {}, row count {}, value={}",
+                    ageVector.getValueCount(),
+                    root.getRowCount(),
+                    ageVector);
+            }
+            reader.close();
+        } catch (IOException e) {
+            logger.warn("got IO Exception", e);
+        }
+    }
+
+    private static CompletableFuture<Void> loadConstant(SessionContext context) {
+        return context
+            .sql("select 1 + 2")
+            .thenComposeAsync(
+                dataFrame -> {
+                    logger.info("successfully loaded data frame {}", dataFrame);
+                    return dataFrame.show();
+                });
+    }
+
     /**
      * Lower-level search API.
      * <p>
@@ -440,12 +515,24 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         // Check if we have an Arrow context and early terminate
         // TODO : only sum aggs is currently supported
         // TODO : only range and terms query is currently supported
+//        try {
+//            testParquetExec();
+//        } catch (Exception e) {
+//            throw new RuntimeException(e);
+//        }
+//        logger.info("arrow.enable_unsafe_memory_access: {}",
+//            System.getProperty("arrow.enable_unsafe_memory_access"));
+//        logger.info("arrow.enable_null_check_for_get: {}",
+//            System.getProperty("arrow.enable_null_check_for_get"));
         ArrowQueryContext arrowCtx = getArrowQueryContext();
         if (arrowCtx != null) {
             if (collector instanceof MultiCollector) {
                 for (Collector c : ((MultiCollector) collector).getCollectors()) {
                     if (c instanceof ArrowBatchCollector) {
-                        if (arrowCtx.isUsingSubstrait()) {
+                        if(arrowCtx.isUsingParquetExec()) {
+                            searchWithParquetExec(arrowCtx, c);
+                        }
+                        else if (arrowCtx.isUsingSubstrait()) {
                             searchWithSubstrait(arrowCtx, c);
                         } else {
                             searchWithArrow(arrowCtx, c);
@@ -524,6 +611,64 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         leafCollector.finish();
     }
 
+
+
+    private void searchWithParquetExec(ArrowQueryContext arrowCtx, Collector collector) throws IOException {
+        try {
+            ParquetExecQueryContext parquetCtx = arrowCtx.getParquetExecContext();
+            ParquetExec exec = parquetCtx.getParquetExec();
+
+            // Execute query using ParquetExec
+//            CompletableFuture<RecordBatchStream> result = exec.execute(
+//                parquetCtx.getParquetPath(),
+//                getTargetField(arrowCtx.getBaseQueryBuilder()),
+//                Integer.parseInt((String)getTargetValue(arrowCtx.getBaseQueryBuilder())),
+//                parquetCtx.getAllocator()
+//            );
+
+            // Execute query using ParquetExec
+            CompletableFuture<RecordBatchStream> result = exec.execute(
+                "/Users/gbh/Documents/1728892707_zstd_32mb_rg_v2.parquet",
+                getTargetField(arrowCtx.getBaseQueryBuilder()),
+                (Integer) NumberFieldMapper.NumberType.INTEGER.parse(getTargetValue(arrowCtx.getBaseQueryBuilder()), true),
+                parquetCtx.getAllocator());
+
+            // Process results
+            RecordBatchStream stream = result.join();
+            try {
+                VectorSchemaRoot root = stream.getVectorSchemaRoot();
+                while (stream.loadNextBatch().get()) {
+                    if (collector instanceof ArrowBatchCollector) {
+                        if(root.getRowCount() == 0) continue;
+                        ((ArrowBatchCollector) collector).collectBatch(root);
+//                         for(int i=0; i<root.getRowCount();i++) {
+//                         ((ArrowBatchCollector) collector).collect(root, i);
+//                         }
+                    }
+                }
+            } finally {
+                stream.close();
+            }
+        } catch (Exception e) {
+            logger.error("Error processing data with ParquetExec: " + e.getMessage(), e);
+            throw new IOException("Failed to process data with ParquetExec", e);
+        }
+    }
+
+    private String getTargetField(QueryBuilder query) {
+        if (query instanceof TermQueryBuilder) {
+            return ((TermQueryBuilder) query).fieldName();
+        }
+        throw new IllegalArgumentException("Unsupported query type for ParquetExec");
+    }
+
+    private Object getTargetValue(QueryBuilder query) {
+        if (query instanceof TermQueryBuilder) {
+            return ((TermQueryBuilder) query).value();
+        }
+        throw new IllegalArgumentException("Unsupported query type for ParquetExec");
+    }
+
     private void searchWithSubstrait(ArrowQueryContext arrowCtx, Collector collector) throws IOException {
         try (BufferAllocator allocator = new RootAllocator()) {
             DatasetFactory factory = new FileSystemDatasetFactory(
@@ -549,8 +694,10 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             // Add filter and projection if available
             ExtendedExpression filter = arrowCtx.getSubstraitFilter();
             ExtendedExpression projection = arrowCtx.getSubstraitProjection();
-            String[] columns = arrowCtx.getBaseQueryArrowFilter().getFilteredFields().toArray(new String[0]);
-            optionsBuilder.columns(Optional.of(columns));
+            List<String> columns = new ArrayList();
+            columns.add("target_status_code");
+            columns.add("timestamp");
+            optionsBuilder.columns(Optional.of(columns.toArray(new String[0])));
             if (filter != null) {
                 optionsBuilder.substraitFilter(arrowCtx.convertToByteBuffer(filter));
             }
@@ -563,10 +710,11 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 while (reader.loadNextBatch()) {
                     try (VectorSchemaRoot root = reader.getVectorSchemaRoot()) {
                         if (collector instanceof ArrowBatchCollector) {
-                            // for(int i=0; i<root.getRowCount();i++) {
-                            // ((ArrowBatchCollector) collector).collect(root, i);
-                            // }
-                            ((ArrowBatchCollector) collector).collectBatch(root);
+                             for(int i=0; i<root.getRowCount();i++) {
+                             ((ArrowBatchCollector) collector).collect(root, i);
+                             }
+//                            if(root.getRowCount() == 0) continue;
+//                            ((ArrowBatchCollector) collector).collectBatch(root);
                         }
                     }
                 }

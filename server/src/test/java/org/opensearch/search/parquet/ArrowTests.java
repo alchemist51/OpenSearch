@@ -119,10 +119,10 @@ public class ArrowTests extends OpenSearchSingleNodeTestCase {
             .execute()
             .actionGet();
 
-        for (int i = 0; i < 100; i++) {
+        for (int i = 0; i < 1000; i++) {
             SearchResponse response = client().prepareSearch("logs")
                 .setSize(0)
-                .setQuery(termQuery("target_status_code", 200))
+                .setQuery(termQuery("target_status_code", 500))
                 .addAggregation(AggregationBuilders.sum("sum_status").field("target_status_code"))
                 .setRequestCache(false)
                 .get();

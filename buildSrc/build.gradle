@@ -37,6 +37,22 @@ plugins {
   id 'java-test-fixtures'
 }
 
+// Add the configuration here
+allprojects {
+  tasks.withType(JavaExec) {
+    jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
+    systemProperty "arrow.enable_unsafe_memory_access", "true"
+    systemProperty "arrow.enable_null_check_for_get", "false"
+  }
+
+  tasks.withType(Test) {
+    jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
+    systemProperty "arrow.enable_unsafe_memory_access", "true"
+    systemProperty "arrow.enable_null_check_for_get", "false"
+  }
+}
+
+
 group = 'org.opensearch.gradle'
 
 String minimumGradleVersion = file('src/main/resources/minimumGradleVersion').text.trim()
@@ -191,6 +207,7 @@ if (project != rootProject) {
     test.enabled = false
     testingConventions.enabled = false
   }
+
 
   configurations.register("distribution")
   configurations.register("reaper")

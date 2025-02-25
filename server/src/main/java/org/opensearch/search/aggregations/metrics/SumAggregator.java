@@ -31,6 +31,8 @@
 
 package org.opensearch.search.aggregations.metrics;
 
+import org.apache.arrow.flatbuf.Int;
+import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.ValueVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -186,7 +188,6 @@ public class SumAggregator extends NumericMetricsAggregator.SingleValue implemen
     }
 
     public void collectBatch(VectorSchemaRoot root) throws IOException {
-        ValueVector vector = root.getVector("target_status_code");
         if (root.getFieldVectors().getFirst() instanceof IntVector) {
             IntVector intVector = (IntVector) root.getFieldVectors().getFirst();
 
@@ -212,7 +213,7 @@ public class SumAggregator extends NumericMetricsAggregator.SingleValue implemen
 
     public void collect(VectorSchemaRoot root, int doc) throws IOException {
 
-        // IntVector intVector = (IntVector) root.getFieldVectors().getFirst();
+        //IntVector intVector = ((IntVector) root.getVector(0));
 
         // Get values for bucket 0 (since this is a single-bucket aggregation)
         sums = context.bigArrays().grow(sums, 1);

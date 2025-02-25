@@ -74,10 +74,12 @@ dependencies {
   testRuntimeOnly project(':libs:opensearch-plugin-classloader')
 
   implementation project(':libs:opensearch-arrow-spi')
+  //implementation project(':libs:opensearch-datafusion-java')
+
   implementation 'org.checkerframework:checker-qual:3.44.0'
 
   api libs.bundles.lucene
-
+  implementation('io.github.datafusion-contrib:datafusion-java:0.17.0-SNAPSHOT')
   // utilities
   api project(":libs:opensearch-cli")
 
@@ -125,6 +127,45 @@ dependencies {
     exclude group: 'org.opensearch', module: 'server'
   }
 }
+
+// Add JNI support
+def datafusionRoot = '/Users/gbh/Documents/collab/datafusion-java'
+def jniPath = "$datafusionRoot/datafusion-java/build/jni_libs/dev"
+
+tasks.named('compileJava') {
+  doFirst {
+    // Ensure JNI libraries are built
+    exec {
+      workingDir = file("$datafusionRoot/datafusion-jni")
+      executable = "${System.getProperty('user.home')}/.cargo/bin/cargo"
+      args = ['build', '--release']
+    }
+  }
+}
+
+tasks.named('test') {
+  systemProperty "java.library.path", jniPath
+  jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
+  // For vectorized reads
+  // Allow unsafe memory access to avoid the costly check arrow does to check if index is within bounds
+  systemProperty("arrow.enable_unsafe_memory_access", "true")
+  // Disable expensive null check for every get(index) call.
+  // Iceberg manages nullability checks itself instead of relying on arrow.
+  systemProperty("arrow.enable_null_check_for_get", "false")
+
+}
+// For OpenSearch test clusters
+testClusters.all {
+  systemProperty "java.library.path", jniPath
+  jvmArgs "--add-opens=java.base/java.nio=ALL-UNNAMED"
+  // For vectorized reads
+  // Allow unsafe memory access to avoid the costly check arrow does to check if index is within bounds
+  systemProperty("arrow.enable_unsafe_memory_access", "true")
+  // Disable expensive null check for every get(index) call.
+  // Iceberg manages nullability checks itself instead of relying on arrow.
+  systemProperty("arrow.enable_null_check_for_get", "false")
+}
+
 
 tasks.withType(JavaCompile).configureEach {
   options.compilerArgs -= '-Xlint:cast'
