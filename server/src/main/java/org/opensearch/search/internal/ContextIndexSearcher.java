@@ -58,6 +58,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BulkScorer;
 import org.apache.lucene.search.CollectionStatistics;
@@ -89,6 +90,7 @@ import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.SparseFixedBitSet;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.lease.Releasable;
+import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
 import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
@@ -569,6 +571,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             return;
         }
 
+        String filePath = Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.getAttribute("parquet_file");
+        logger.info("searching for {}", filePath);
         // catch early terminated exception and rethrow?
         Bits liveDocs = ctx.reader().getLiveDocs();
         BitSet liveDocsBitSet = getSparseBitSetOrNull(liveDocs);
@@ -586,6 +590,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                             if (c instanceof ArrowBatchCollector) {
                                 arrowSearch = true;
                                 leafFroggingWithParquetExec(
+                                    filePath,
                                     arrowQueryContext,
                                     (ArrowBatchCollector) c,
                                     scorer,
@@ -641,6 +646,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
 
     private void leafFroggingWithParquetExec(
+        String filePath,
         ArrowQueryContext arrowQueryContext,
         ArrowBatchCollector collector,
         Scorer scorer,
@@ -654,7 +660,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
             DocIdSetIterator iterator = scorer.iterator();
             CompletableFuture<RecordBatchStream> result = exec.execute(
-                "/Users/abandeji/Downloads/compact_zstd_v2.parquet", parquetCtx.getAllocator());
+                filePath, parquetCtx.getAllocator());
             RecordBatchStream stream = result.join();
             long total_count = 0;
             try {

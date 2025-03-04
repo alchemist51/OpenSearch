@@ -11,7 +11,7 @@ package org.opensearch.index.engine;
 import org.apache.lucene.codecs.Codec;
 import org.apache.lucene.codecs.FilterCodec;
 import org.apache.lucene.codecs.SegmentInfoFormat;
-import org.apache.lucene.codecs.lucene912.Lucene912Codec;
+import org.apache.lucene.codecs.lucene101.Lucene101Codec;
 import org.apache.lucene.index.SegmentInfo;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
@@ -23,7 +23,7 @@ public class TempIndexCodec extends FilterCodec {
     private final String parquetPath;
 
     public TempIndexCodec() {
-        super("ParquetCodec", new Lucene912Codec());
+        super("ParquetCodec", new Lucene101Codec());
         parquetPath = null;
     }
 

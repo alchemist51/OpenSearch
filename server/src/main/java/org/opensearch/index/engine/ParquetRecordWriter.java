@@ -107,7 +107,7 @@ public class ParquetRecordWriter {
                 .withRowGroupSize((long) ParquetWriter.DEFAULT_BLOCK_SIZE)
                 .withPageSize(ParquetWriter.DEFAULT_PAGE_SIZE)
                 .withDictionaryEncoding(true)
-                .withWriterVersion(ParquetProperties.WriterVersion.PARQUET_1_0)
+                .withWriterVersion(ParquetProperties.WriterVersion.PARQUET_2_0)
                 .build(), fileName, config));
         };
     }

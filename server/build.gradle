@@ -95,7 +95,7 @@ dependencies {
   api libs.spatial4j, optional
   api libs.jtscore, optional
 
-  api group: 'org.apache.lucene', name: 'lucene-codecs', version: '9.12.1'
+  api group: 'org.apache.lucene', name: 'lucene-codecs', version: '10.1.0'
 
   // logging
   api libs.log4japi
