@@ -48,6 +48,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.ValueVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -124,6 +125,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 
 import io.substrait.proto.ExtendedExpression;
@@ -514,7 +516,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
         // Check if we have an Arrow context and early terminate
         // TODO : only sum aggs is currently supported
-        // TODO : only range and terms query is currently supported
+        // TODO : only range and terms query is currently supportedw
 //        try {
 //            testParquetExec();
 //        } catch (Exception e) {
@@ -524,24 +526,24 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 //            System.getProperty("arrow.enable_unsafe_memory_access"));
 //        logger.info("arrow.enable_null_check_for_get: {}",
 //            System.getProperty("arrow.enable_null_check_for_get"));
-        ArrowQueryContext arrowCtx = getArrowQueryContext();
-        if (arrowCtx != null) {
-            if (collector instanceof MultiCollector) {
-                for (Collector c : ((MultiCollector) collector).getCollectors()) {
-                    if (c instanceof ArrowBatchCollector) {
-                        if(arrowCtx.isUsingParquetExec()) {
-                            searchWithParquetExec(arrowCtx, c);
-                        }
-                        else if (arrowCtx.isUsingSubstrait()) {
-                            searchWithSubstrait(arrowCtx, c);
-                        } else {
-                            searchWithArrow(arrowCtx, c);
-                        }
-                    }
-                }
-            }
-            return;
-        }
+//        ArrowQueryContext arrowCtx = getArrowQueryContext();
+//        if (arrowCtx != null) {
+//            if (collector instanceof MultiCollector) {
+//                for (Collector c : ((MultiCollector) collector).getCollectors()) {
+//                    if (c instanceof ArrowBatchCollector) {
+//                        if(arrowCtx.isUsingParquetExec()) {
+//                            searchWithParquetExec(arrowCtx, c);
+//                        }
+//                        else if (arrowCtx.isUsingSubstrait()) {
+//                            searchWithSubstrait(arrowCtx, c);
+//                        } else {
+//                            searchWithArrow(arrowCtx, c);
+//                        }
+//                    }
+//                }
+//            }
+//            return;
+//        }
 
         // Check if at all we need to call this leaf for collecting results.
         if (canMatch(ctx) == false) {
@@ -570,7 +572,33 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         // catch early terminated exception and rethrow?
         Bits liveDocs = ctx.reader().getLiveDocs();
         BitSet liveDocsBitSet = getSparseBitSetOrNull(liveDocs);
-        if (liveDocsBitSet == null) {
+
+
+        // Add logic for parquet context:
+        Scorer scorer = weight.scorer(ctx);
+        boolean arrowSearch = false;
+        if(scorer != null) {
+            ArrowQueryContext arrowQueryContext = getArrowQueryContext();
+            if(arrowQueryContext != null) {
+                if(arrowQueryContext.isUsingParquetExec()) {
+                    if (collector instanceof MultiCollector) {
+                        for (Collector c : ((MultiCollector) collector).getCollectors()) {
+                            if (c instanceof ArrowBatchCollector) {
+                                arrowSearch = true;
+                                leafFroggingWithParquetExec(
+                                    arrowQueryContext,
+                                    (ArrowBatchCollector) c,
+                                    scorer,
+                                    minDocId,
+                                    maxDocId);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (liveDocsBitSet == null && !arrowSearch) {
             BulkScorer bulkScorer = weight.bulkScorer(ctx);
             if (bulkScorer != null) {
                 try {
@@ -583,9 +611,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     return;
                 }
             }
-        } else {
+        } else if(liveDocsBitSet!= null && !arrowSearch) {
             // if the role query result set is sparse then we should use the SparseFixedBitSet for advancing:
-            Scorer scorer = weight.scorer(ctx);
+            //Scorer scorer = weight.scorer(ctx);
             if (scorer != null) {
                 try {
                     intersectScorerAndBitSet(
@@ -611,6 +639,90 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         leafCollector.finish();
     }
 
+
+    private void leafFroggingWithParquetExec(
+        ArrowQueryContext arrowQueryContext,
+        ArrowBatchCollector collector,
+        Scorer scorer,
+        int minDocId,
+        int maxDocId
+    ) {
+
+        try {
+            ParquetExecQueryContext parquetCtx = arrowQueryContext.getParquetExecContext();
+            ParquetExec exec = parquetCtx.getParquetExec();
+
+            DocIdSetIterator iterator = scorer.iterator();
+            CompletableFuture<RecordBatchStream> result = exec.execute(
+                "/Users/abandeji/Downloads/compact_zstd_v2.parquet", parquetCtx.getAllocator());
+            RecordBatchStream stream = result.join();
+            long total_count = 0;
+            try {
+               VectorSchemaRoot root = stream.getVectorSchemaRoot();
+                boolean load_batch = true;
+                int doc = iterator.nextDoc();
+                BigIntVector rowIdVector;
+                while(doc != Integer.MAX_VALUE) {
+                     if(load_batch && !stream.loadNextBatch().get()) {
+                         break;
+                     }
+
+                     rowIdVector = (BigIntVector) root.getFieldVectors().getFirst();
+                     if(doc > rowIdVector.get(root.getRowCount() - 1)) {
+                         load_batch = true;
+                         continue;
+                     }
+
+                     if(doc < rowIdVector.get(0)) {
+                         doc = iterator.nextDoc();
+                         load_batch = false;
+                         continue;
+                     }
+
+                    int rowCount = root.getRowCount();
+                     IntVector intVector = (IntVector) root.getVector(1);
+                    for (int i = 0; i < rowCount; i++) {
+                        try {
+                            long rowId = (rowIdVector.get(i));
+                            if(rowId == doc) {
+                                collector.collect(intVector, i);
+                                doc = iterator.nextDoc();
+                                if(doc == Integer.MAX_VALUE) {
+                                    // end of iterator;
+                                    break;
+                                }
+                            } else if (rowId > doc) {
+                                doc = iterator.advance((int)rowId);
+                                if(doc == Integer.MAX_VALUE) break;
+                                if(doc == rowId) {
+                                    collector.collect(intVector, i);
+                                    doc = iterator.nextDoc();
+                                    if(doc == Integer.MAX_VALUE) break;
+                                }
+                            }
+                        } catch (IllegalStateException e) {
+                            System.out.println("Value is null for : " + i);
+                        } catch (IndexOutOfBoundsException e) {
+                            logger.info("Index is out bound :{} , docID : {}", i, doc);
+                        }
+                    }
+
+                    if(!load_batch) {
+                        continue;
+                    }
+                    load_batch = true;
+                 }
+
+            } finally {
+                logger.info("Total matches are: {}", total_count);
+                stream.close();
+            }
+        } catch (Exception e) {
+            logger.error("Error processing data with ParquetExec: " + e.getMessage());
+            throw new RuntimeException(e);
+        }
+
+    }
 
 
     private void searchWithParquetExec(ArrowQueryContext arrowCtx, Collector collector) throws IOException {

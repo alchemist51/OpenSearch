@@ -8,10 +8,12 @@
 
 package org.opensearch.search.parquet;
 
+import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
 import java.io.IOException;
 
+import org.opensearch.search.internal.ParquetBitSet;
 import org.roaringbitmap.RoaringBitmap;
 
 /**
@@ -29,4 +31,9 @@ public interface ArrowBatchCollector {
     void collectBatch(VectorSchemaRoot root) throws IOException;
 
     void collect(VectorSchemaRoot root, int doc) throws IOException;
+
+    void collect(int value) throws IOException;
+
+    void collect(IntVector intVector, int idx) throws IOException;
+    int collectBatch(VectorSchemaRoot root, ParquetBitSet bitSet) throws IOException;
 }

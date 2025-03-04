@@ -10,6 +10,8 @@ package org.opensearch.search.parquet;
 
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.search.internal.SearchContext;
@@ -31,6 +33,7 @@ public class ArrowQueryContext {
     private ExtendedExpression substraitProjection;
     private boolean useSubstrait;
     private boolean useParquetExec;
+    private boolean useFilterExec;
     private final ParquetExecQueryContext parquetExecContext;
 
     public ArrowQueryContext(SearchContext context, QueryBuilder baseQueryBuilder, String parquetPath) {
@@ -43,6 +46,11 @@ public class ArrowQueryContext {
 
     private void initializeFilters(SearchContext context) {
         // Try Substrait first
+        if(baseQueryBuilder instanceof MatchQueryBuilder) {
+            this.useParquetExec = true;
+            return;
+        }
+
         if (canUseParquetExec(baseQueryBuilder)) {
             this.useParquetExec = true;
             return;
@@ -60,7 +68,7 @@ public class ArrowQueryContext {
 
     private boolean canUseParquetExec(QueryBuilder query) {
         // Add logic to determine if query can use ParquetExec
-        return query instanceof TermQueryBuilder;
+        return query instanceof TermQueryBuilder || query instanceof BoolQueryBuilder || query instanceof MatchQueryBuilder;
     }
 
     public boolean isUsingSubstrait() {
@@ -72,6 +80,10 @@ public class ArrowQueryContext {
         //return false;
     }
 
+    public boolean isUsingFilterExec() {
+        return useFilterExec;
+    }
+
     public VectorSchemaRoot getCurrentBatch() {
         return currentBatch;
     }
@@ -81,6 +93,10 @@ public class ArrowQueryContext {
     }
 
     public boolean consolidateAllFilters(SearchContext context) {
+        if(baseQueryBuilder instanceof MatchQueryBuilder) {
+            return true;
+        }
+
         if (baseQueryBuilder != null) {
             baseArrowFilter = getArrowFilter(context, baseQueryBuilder);
             return baseArrowFilter != null;

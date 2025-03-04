@@ -1551,10 +1551,17 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
             String parquetPath = "file://"
                 + "/Users/gbh/Documents/BKD/opensearch-3.0.0-SNAPSHOT/data/nodes/0/indices/"
                 + "setEruFZTR68hF1MH51mNQ/0/index/1728892707_zstd_32mb_rg_v2.parquet";
-            ArrowQueryContext arrowContext = new ArrowQueryContext(context, source.query(), parquetPath
+            String parquetPath2 = "file://"
+                + "/Users/abandeji/Public/work-dump/experiments/data/nodes/0/indices/TaQYEzAFTP6VM2CVszs02Q/0/index"
+                + "/compact_zstd_v2.parquet";
+            ArrowQueryContext arrowContext = new ArrowQueryContext(
+                context,
+                source.query(),
+                parquetPath2
             // getParquetPath(context)
 
             );
+
             if (arrowContext.consolidateAllFilters(context)) {
                 queryShardContext.setArrowQueryContext(arrowContext);
             }

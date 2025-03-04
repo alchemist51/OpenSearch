@@ -36,9 +36,12 @@ import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.ValueVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.util.NumericUtils;
+import org.opensearch.action.bulk.TransportShardBulkAction;
 import org.opensearch.common.lease.Releasables;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.util.DoubleArray;
@@ -54,6 +57,7 @@ import org.opensearch.search.aggregations.StarTreeBucketCollector;
 import org.opensearch.search.aggregations.StarTreePreComputeCollector;
 import org.opensearch.search.aggregations.support.ValuesSource;
 import org.opensearch.search.aggregations.support.ValuesSourceConfig;
+import org.opensearch.search.internal.ParquetBitSet;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.parquet.ArrowBatchCollector;
 import org.opensearch.search.parquet.ArrowQueryContext;
@@ -73,6 +77,8 @@ import static org.opensearch.search.startree.StarTreeQueryHelper.getSupportedSta
  * @opensearch.internal
  */
 public class SumAggregator extends NumericMetricsAggregator.SingleValue implements StarTreePreComputeCollector, ArrowBatchCollector {
+
+    private static final Logger logger = LogManager.getLogger(SumAggregator.class);
 
     private final ValuesSource.Numeric valuesSource;
     private final DocValueFormat format;
@@ -209,6 +215,75 @@ public class SumAggregator extends NumericMetricsAggregator.SingleValue implemen
             sums.set(0, kahanSummation.value());
             compensations.set(0, kahanSummation.delta());
         }
+    }
+
+    public int collectBatch(VectorSchemaRoot root, ParquetBitSet bitset) throws IOException {
+        if (root.getFieldVectors().get(1) instanceof IntVector) {
+            BigIntVector rowIdVector = (BigIntVector) root.getFieldVectors().getFirst();
+            IntVector intVector = (IntVector) root.getFieldVectors().get(1);
+
+            // Get values for bucket 0 (since this is a single-bucket aggregation)
+            sums = context.bigArrays().grow(sums, 1);
+            compensations = context.bigArrays().grow(compensations, 1);
+
+            CompensatedSum kahanSummation = new CompensatedSum(sums.get(0), compensations.get(0));
+            int result_count = 0;
+            for (int i = 0; i < root.getRowCount(); i++) {
+                try {
+                    int rowId = (int) (rowIdVector.get(i));
+                    if(bitset.get(rowId)) {
+                        result_count++;
+                        kahanSummation.add(intVector.get(i));
+                    }
+                } catch (IllegalStateException e) {
+                    System.out.println("Value is null for : " + i);
+                } catch (IndexOutOfBoundsException e) {
+                    logger.info("Index is out bound :{} , bitset len: {}", i, bitset.size());
+                }
+            }
+
+            // Store final results
+            sums.set(0, kahanSummation.value());
+            compensations.set(0, kahanSummation.delta());
+
+            return result_count;
+        }
+        return 0;
+    }
+
+    public void collect(int value) throws IOException {
+        // Get values for bucket 0 (since this is a single-bucket aggregation)
+        sums = context.bigArrays().grow(sums, 1);
+        compensations = context.bigArrays().grow(compensations, 1);
+
+        CompensatedSum kahanSummation = new CompensatedSum(sums.get(0), compensations.get(0));
+        kahanSummation.add(value);
+
+        // Store final results
+        sums.set(0, kahanSummation.value());
+        compensations.set(0, kahanSummation.delta());
+    }
+
+    public void collect(IntVector intVector, int idx) throws IOException {
+//IntVector intVector = ((IntVector) root.getVector(0));
+
+        // Get values for bucket 0 (since this is a single-bucket aggregation)
+        sums = context.bigArrays().grow(sums, 1);
+        compensations = context.bigArrays().grow(compensations, 1);
+
+        CompensatedSum kahanSummation = new CompensatedSum(sums.get(0), compensations.get(0));
+
+        // for (int i = 0; i < root.getRowCount(); i++) {
+        try {
+            kahanSummation.add(intVector.get(idx));
+        } catch (IllegalStateException e) {
+            System.out.println("Value is null for : " + idx);
+        }
+        // }
+
+        // Store final results
+        sums.set(0, kahanSummation.value());
+        compensations.set(0, kahanSummation.delta());
     }
 
     public void collect(VectorSchemaRoot root, int doc) throws IOException {

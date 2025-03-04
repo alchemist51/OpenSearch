@@ -26,15 +26,6 @@ public class CompositeIndexSettings {
     public static final Setting<Boolean> STAR_TREE_INDEX_ENABLED_SETTING = Setting.boolSetting(
         "indices.composite_index.star_tree.enabled",
         false,
-        value -> {
-            if (FeatureFlags.isEnabled(FeatureFlags.STAR_TREE_INDEX_SETTING) == false && value == true) {
-                throw new IllegalArgumentException(
-                    "star tree index is under an experimental feature and can be activated only by enabling "
-                        + FeatureFlags.STAR_TREE_INDEX_SETTING.getKey()
-                        + " feature flag in the JVM options"
-                );
-            }
-        },
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
