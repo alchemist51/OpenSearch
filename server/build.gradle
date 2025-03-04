@@ -159,7 +159,7 @@ dependencies {
 }
 
 // Add JNI support
-def datafusionRoot = '/Users/abandeji/Public/workplace/datafusion-java'
+def datafusionRoot = '/home/ec2-user/workplace/datafusion-java'
 def jniPath = "$datafusionRoot/datafusion-jni/target/release"
 
 tasks.named('compileJava') {
