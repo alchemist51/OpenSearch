@@ -92,8 +92,12 @@ import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
+import org.opensearch.index.mapper.DateFieldMapper;
+import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.NumberFieldMapper;
+import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.lucene.util.CombinedBitSet;
 import org.opensearch.search.DocValueFormat;
@@ -362,8 +366,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
             // Create scan options
             ScanOptions options = new ScanOptions(/*batchSize=*/32768, /*columns=*/Optional.of(getRequiredColumns()) // List of columns you
-                                                                                                                     // need
-            // /*filter=*/createFilter() // Your search criteria
+                // need
+                // /*filter=*/createFilter() // Your search criteria
             );
 
             // Create scanner
@@ -456,6 +460,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     "/Users/gbh/Documents/1728892707_zstd_32mb_rg_v2.parquet",
                     "target_status_code",
                     404,
+                    0,
                     allocator);
             RecordBatchStream stream = result.join();
             VectorSchemaRoot root = stream.getVectorSchemaRoot();
@@ -528,24 +533,25 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 //            System.getProperty("arrow.enable_unsafe_memory_access"));
 //        logger.info("arrow.enable_null_check_for_get: {}",
 //            System.getProperty("arrow.enable_null_check_for_get"));
-//        ArrowQueryContext arrowCtx = getArrowQueryContext();
-//        if (arrowCtx != null) {
-//            if (collector instanceof MultiCollector) {
-//                for (Collector c : ((MultiCollector) collector).getCollectors()) {
-//                    if (c instanceof ArrowBatchCollector) {
-//                        if(arrowCtx.isUsingParquetExec()) {
-//                            searchWithParquetExec(arrowCtx, c);
-//                        }
+        String filePath = Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.getAttribute("parquet_file");
+        ArrowQueryContext arrowCtx = getArrowQueryContext();
+        if (arrowCtx != null) {
+            if (collector instanceof MultiCollector) {
+                for (Collector c : ((MultiCollector) collector).getCollectors()) {
+                    if (c instanceof ArrowBatchCollector) {
+                        if (arrowCtx.isOnlyUsingParquetExec()) {
+                            searchWithParquetExec(arrowCtx, c, filePath);
+                        }
 //                        else if (arrowCtx.isUsingSubstrait()) {
 //                            searchWithSubstrait(arrowCtx, c);
 //                        } else {
 //                            searchWithArrow(arrowCtx, c);
 //                        }
-//                    }
-//                }
-//            }
-//            return;
-//        }
+                    }
+                }
+            }
+            return;
+        }
 
         // Check if at all we need to call this leaf for collecting results.
         if (canMatch(ctx) == false) {
@@ -571,7 +577,6 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             return;
         }
 
-        String filePath = Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.getAttribute("parquet_file");
         logger.info("searching for {}", filePath);
         // catch early terminated exception and rethrow?
         Bits liveDocs = ctx.reader().getLiveDocs();
@@ -581,10 +586,10 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         // Add logic for parquet context:
         Scorer scorer = weight.scorer(ctx);
         boolean arrowSearch = false;
-        if(scorer != null) {
+        if (scorer != null) {
             ArrowQueryContext arrowQueryContext = getArrowQueryContext();
-            if(arrowQueryContext != null) {
-                if(arrowQueryContext.isUsingParquetExec()) {
+            if (arrowQueryContext != null) {
+                if (arrowQueryContext.isUsingParquetExec()) {
                     if (collector instanceof MultiCollector) {
                         for (Collector c : ((MultiCollector) collector).getCollectors()) {
                             if (c instanceof ArrowBatchCollector) {
@@ -616,7 +621,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     return;
                 }
             }
-        } else if(liveDocsBitSet!= null && !arrowSearch) {
+        } else if (liveDocsBitSet != null && !arrowSearch) {
             // if the role query result set is sparse then we should use the SparseFixedBitSet for advancing:
             //Scorer scorer = weight.scorer(ctx);
             if (scorer != null) {
@@ -627,7 +632,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                         leafCollector,
                         minDocId,
                         maxDocId,
-                        this.cancellable.isEnabled() ? cancellable::checkCancelled : () -> {}
+                        this.cancellable.isEnabled() ? cancellable::checkCancelled : () -> {
+                        }
                     );
                 } catch (CollectionTerminatedException e) {
                     // collection was terminated prematurely
@@ -664,46 +670,46 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             RecordBatchStream stream = result.join();
             long total_count = 0;
             try {
-               VectorSchemaRoot root = stream.getVectorSchemaRoot();
+                VectorSchemaRoot root = stream.getVectorSchemaRoot();
                 boolean load_batch = true;
                 int doc = iterator.nextDoc();
                 BigIntVector rowIdVector;
-                while(doc != Integer.MAX_VALUE) {
-                     if(load_batch && !stream.loadNextBatch().get()) {
-                         break;
-                     }
+                while (doc != Integer.MAX_VALUE) {
+                    if (load_batch && !stream.loadNextBatch().get()) {
+                        break;
+                    }
 
-                     rowIdVector = (BigIntVector) root.getFieldVectors().getFirst();
-                     if(doc > rowIdVector.get(root.getRowCount() - 1)) {
-                         load_batch = true;
-                         continue;
-                     }
+                    rowIdVector = (BigIntVector) root.getFieldVectors().getFirst();
+                    if (doc > rowIdVector.get(root.getRowCount() - 1)) {
+                        load_batch = true;
+                        continue;
+                    }
 
-                     if(doc < rowIdVector.get(0)) {
-                         doc = iterator.nextDoc();
-                         load_batch = false;
-                         continue;
-                     }
+                    if (doc < rowIdVector.get(0)) {
+                        doc = iterator.nextDoc();
+                        load_batch = false;
+                        continue;
+                    }
 
                     int rowCount = root.getRowCount();
-                     IntVector intVector = (IntVector) root.getVector(1);
+                    IntVector intVector = (IntVector) root.getVector(1);
                     for (int i = 0; i < rowCount; i++) {
                         try {
                             long rowId = (rowIdVector.get(i));
-                            if(rowId == doc) {
+                            if (rowId == doc) {
                                 collector.collect(intVector, i);
                                 doc = iterator.nextDoc();
-                                if(doc == Integer.MAX_VALUE) {
+                                if (doc == Integer.MAX_VALUE) {
                                     // end of iterator;
                                     break;
                                 }
                             } else if (rowId > doc) {
-                                doc = iterator.advance((int)rowId);
-                                if(doc == Integer.MAX_VALUE) break;
-                                if(doc == rowId) {
+                                doc = iterator.advance((int) rowId);
+                                if (doc == Integer.MAX_VALUE) break;
+                                if (doc == rowId) {
                                     collector.collect(intVector, i);
                                     doc = iterator.nextDoc();
-                                    if(doc == Integer.MAX_VALUE) break;
+                                    if (doc == Integer.MAX_VALUE) break;
                                 }
                             }
                         } catch (IllegalStateException e) {
@@ -713,11 +719,11 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                         }
                     }
 
-                    if(!load_batch) {
+                    if (!load_batch) {
                         continue;
                     }
                     load_batch = true;
-                 }
+                }
 
             } finally {
                 logger.info("Total matches are: {}", total_count);
@@ -731,7 +737,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     }
 
 
-    private void searchWithParquetExec(ArrowQueryContext arrowCtx, Collector collector) throws IOException {
+    private void searchWithParquetExec(ArrowQueryContext arrowCtx, Collector collector, String filePath) throws IOException {
         try {
             ParquetExecQueryContext parquetCtx = arrowCtx.getParquetExecContext();
             ParquetExec exec = parquetCtx.getParquetExec();
@@ -745,23 +751,77 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 //            );
 
             // Execute query using ParquetExec
-            CompletableFuture<RecordBatchStream> result = exec.execute(
-                "/Users/gbh/Documents/1728892707_zstd_32mb_rg_v2.parquet",
-                getTargetField(arrowCtx.getBaseQueryBuilder()),
-                (Integer) NumberFieldMapper.NumberType.INTEGER.parse(getTargetValue(arrowCtx.getBaseQueryBuilder()), true),
-                parquetCtx.getAllocator());
 
+            CompletableFuture<RecordBatchStream> result = null;
+
+            if (arrowCtx.getBaseQueryBuilder() instanceof TermQueryBuilder) {
+                result = exec.execute(
+                    filePath,
+                    getTargetField(arrowCtx.getBaseQueryBuilder()),
+                    (Integer) NumberFieldMapper.NumberType.INTEGER.parse(getTargetValue(arrowCtx.getBaseQueryBuilder()), true),
+                    arrowCtx.getSize(),
+                    parquetCtx.getAllocator());
+            } else if (arrowCtx.getBaseQueryBuilder() instanceof RangeQueryBuilder) {
+                MappedFieldType mappedFieldType = searchContext.mapperService().fieldType(getTargetField(arrowCtx.getBaseQueryBuilder()));
+                DateFieldMapper.DateFieldType dateFieldType = (DateFieldMapper.DateFieldType) mappedFieldType;
+                RangeQueryBuilder rangeQueryBuilder = (RangeQueryBuilder) arrowCtx.getBaseQueryBuilder();
+                long parsedLow = dateFieldType.parse(rangeQueryBuilder.from().toString());
+                long parsedHigh = dateFieldType.parse(rangeQueryBuilder.to().toString());
+                result = exec.execute(
+                    filePath,
+                    getTargetField(rangeQueryBuilder),
+                    parsedLow,
+                    parsedHigh,
+                    arrowCtx.getSize(),
+                    parquetCtx.getAllocator()
+                );
+            } else if (arrowCtx.getBaseQueryBuilder() instanceof BoolQueryBuilder) {
+                BoolQueryBuilder boolQueryBuilder = (BoolQueryBuilder) arrowCtx.getBaseQueryBuilder();
+                QueryBuilder must1 = boolQueryBuilder.must().get(0);
+                QueryBuilder must2 = boolQueryBuilder.must().get(1);
+                RangeQueryBuilder rangeQueryBuilder = (RangeQueryBuilder) must1;
+                TermQueryBuilder termQueryBuilder = (TermQueryBuilder) must2;
+                MappedFieldType mappedFieldType = searchContext.mapperService().fieldType(getTargetField(rangeQueryBuilder));
+                DateFieldMapper.DateFieldType dateFieldType = (DateFieldMapper.DateFieldType) mappedFieldType;
+                long parsedLow = dateFieldType.parse(rangeQueryBuilder.from().toString());
+                long parsedHigh = dateFieldType.parse(rangeQueryBuilder.to().toString());
+                result = exec.execute(
+                    filePath,
+                    getTargetField(rangeQueryBuilder),
+                    parsedLow,
+                    parsedHigh,
+                    getTargetField(termQueryBuilder),
+                    (Integer) NumberFieldMapper.NumberType.INTEGER.parse(getTargetValue(must2), true),
+                    arrowCtx.getSize(),
+                    parquetCtx.getAllocator()
+                );
+            }
             // Process results
             RecordBatchStream stream = result.join();
             try {
                 VectorSchemaRoot root = stream.getVectorSchemaRoot();
                 while (stream.loadNextBatch().get()) {
-                    if (collector instanceof ArrowBatchCollector) {
-                        if(root.getRowCount() == 0) continue;
-                        ((ArrowBatchCollector) collector).collectBatch(root);
-//                         for(int i=0; i<root.getRowCount();i++) {
-//                         ((ArrowBatchCollector) collector).collect(root, i);
-//                         }
+                    if (arrowCtx.getSize() > 0) {
+
+                        for (int row = 0; row < root.getRowCount(); row++) {
+
+                            StringBuilder rowData = new StringBuilder();
+                            for (int field = 0; field < root.getFieldVectors().size(); field++) {
+                                if (field > 0) rowData.append(", ");
+                                Object o = root.getFieldVectors().get(field).getObject(row);
+                                rowData.append(o);
+                            }
+                            System.out.println("Row : " + rowData);
+                            //System.out.println("Row " + matchCount + ": " + rowData);
+                            //System.out.println("Row " + matchCount);
+
+                        }
+                    } else if (collector instanceof ArrowBatchCollector) {
+                        if (root.getRowCount() == 0) continue;
+
+                        for (int i = 0; i < root.getRowCount(); i++) {
+                            ((ArrowBatchCollector) collector).collect(root, i);
+                        }
                     }
                 }
             } finally {
@@ -776,6 +836,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     private String getTargetField(QueryBuilder query) {
         if (query instanceof TermQueryBuilder) {
             return ((TermQueryBuilder) query).fieldName();
+        } else if (query instanceof RangeQueryBuilder) {
+            return ((RangeQueryBuilder) query).fieldName();
         }
         throw new IllegalArgumentException("Unsupported query type for ParquetExec");
     }
@@ -828,9 +890,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 while (reader.loadNextBatch()) {
                     try (VectorSchemaRoot root = reader.getVectorSchemaRoot()) {
                         if (collector instanceof ArrowBatchCollector) {
-                             for(int i=0; i<root.getRowCount();i++) {
-                             ((ArrowBatchCollector) collector).collect(root, i);
-                             }
+                            for (int i = 0; i < root.getRowCount(); i++) {
+                                ((ArrowBatchCollector) collector).collect(root, i);
+                            }
 //                            if(root.getRowCount() == 0) continue;
 //                            ((ArrowBatchCollector) collector).collectBatch(root);
                         }
@@ -888,7 +950,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             Dataset dataset = factory.finish();
 
             // Create scan options with Substrait expressions
-            ScanOptions options = new ScanOptions.Builder(32768).columns(Optional.of(new String[] { "target_status_code" })) // TODO
+            ScanOptions options = new ScanOptions.Builder(32768).columns(Optional.of(new String[]{"target_status_code"})) // TODO
                 .substraitFilter(/*arrowCtx.getSubstraitFilter()*/null)
                 .substraitProjection(/*arrowCtx.getSubstraitProjection()*/null)
                 .build();
@@ -1049,10 +1111,10 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         } else if (liveDocs instanceof CombinedBitSet
             // if the underlying role bitset is sparse
             && ((CombinedBitSet) liveDocs).getFirst() instanceof SparseFixedBitSet) {
-                return (BitSet) liveDocs;
-            } else {
-                return null;
-            }
+            return (BitSet) liveDocs;
+        } else {
+            return null;
+        }
 
     }
 
@@ -1117,6 +1179,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
     /**
      * Compute the leaf slices that will be used by concurrent segment search to spread work across threads
+     *
      * @param leaves all the segments
      * @return leafSlice group to be executed by different threads
      */

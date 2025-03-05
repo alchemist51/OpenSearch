@@ -530,7 +530,7 @@ public class ShardSearchRequest extends TransportRequest implements IndicesReque
             FieldSortBuilder primarySort = FieldSortBuilder.getPrimaryFieldSortOrNull(newSource);
             if (shardContext != null
                 && primarySort != null
-                && primarySort.isBottomSortShardDisjoint(shardContext, request.getBottomSortValues())) {
+                && primarySort.isBottomSortShardDisjoint(shardContext, request.getBottomSortValues()) && false) {
                 assert newSource != null : "source should contain a primary sort field";
                 newSource = newSource.shallowCopy();
                 int trackTotalHitsUpTo = SearchRequest.resolveTrackTotalHitsUpTo(request.scroll, request.source);
@@ -543,13 +543,14 @@ public class ShardSearchRequest extends TransportRequest implements IndicesReque
                 request.setBottomSortValues(null);
             }
 
-            if (newSource == request.source() && newAliasFilter == request.getAliasFilter()) {
-                return this;
-            } else {
-                request.source(newSource);
-                request.setAliasFilter(newAliasFilter);
-                return new RequestRewritable(request);
-            }
+            return this;
+//            if (newSource == request.source() && newAliasFilter == request.getAliasFilter()) {
+//                return this;
+//            } else {
+//                request.source(newSource);
+//                request.setAliasFilter(newAliasFilter);
+//                return new RequestRewritable(request);
+//            }
         }
     }
 

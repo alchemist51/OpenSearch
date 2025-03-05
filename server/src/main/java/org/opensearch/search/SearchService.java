@@ -1555,10 +1555,12 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
             String parquetPath2 = "file://"
                 + "/Users/abandeji/Public/work-dump/experiments/data/nodes/0/indices/TaQYEzAFTP6VM2CVszs02Q/0/index"
                 + "/compact_zstd_v2.parquet";
+            source.size();
             ArrowQueryContext arrowContext = new ArrowQueryContext(
                 context,
                 source.query(),
-                parquetPath2
+                parquetPath2,
+                    source.size()
             // getParquetPath(context)
 
             );

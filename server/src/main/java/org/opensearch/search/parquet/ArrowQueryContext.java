@@ -13,6 +13,7 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.parquet.substrait.SubstraitFilterProvider;
@@ -33,14 +34,16 @@ public class ArrowQueryContext {
     private ExtendedExpression substraitProjection;
     private boolean useSubstrait;
     private boolean useParquetExec;
+    private boolean useOnlyParquetExec;
     private boolean useFilterExec;
     private final ParquetExecQueryContext parquetExecContext;
+    int size;
 
-    public ArrowQueryContext(SearchContext context, QueryBuilder baseQueryBuilder, String parquetPath) {
+    public ArrowQueryContext(SearchContext context, QueryBuilder baseQueryBuilder, String parquetPath, int size) {
         this.baseQueryBuilder = baseQueryBuilder;
         this.parquetPath = parquetPath;
         this.parquetExecContext = new ParquetExecQueryContext(context, parquetPath);
-
+        this.size = size;
         initializeFilters(context);
     }
 
@@ -51,6 +54,10 @@ public class ArrowQueryContext {
             return;
         }
 
+        if(canOnlyUseParquetExec(baseQueryBuilder)) {
+            this.useOnlyParquetExec = true;
+            return;
+        }
         if (canUseParquetExec(baseQueryBuilder)) {
             this.useParquetExec = true;
             return;
@@ -66,6 +73,15 @@ public class ArrowQueryContext {
         }
     }
 
+    public int getSize() {
+        return size;
+    }
+
+    private boolean canOnlyUseParquetExec(QueryBuilder query) {
+        // Add logic to determine if query can use ParquetExec
+        return query instanceof TermQueryBuilder || query instanceof BoolQueryBuilder || query instanceof RangeQueryBuilder;
+    }
+
     private boolean canUseParquetExec(QueryBuilder query) {
         // Add logic to determine if query can use ParquetExec
         return query instanceof TermQueryBuilder || query instanceof BoolQueryBuilder || query instanceof MatchQueryBuilder;
@@ -77,6 +93,11 @@ public class ArrowQueryContext {
 
     public boolean isUsingParquetExec() {
         return useParquetExec;
+        //return false;
+    }
+
+    public boolean isOnlyUsingParquetExec() {
+        return useOnlyParquetExec;
         //return false;
     }
 
