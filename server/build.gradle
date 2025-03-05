@@ -162,17 +162,13 @@ dependencies {
 //def datafusionRoot = '/home/ec2-user/workplace/datafusion-java'
 //def jniPath = "$datafusionRoot/datafusion-jni/target/release"
 
-def datafusionRoot = '/Users/gbh/Documents/collab/datafusion-java'
+def datafusionRoot = '/Users/abandeji/Public/workplace/datafusion-java'
 def jniPath = "$datafusionRoot/datafusion-java/build/jni_libs/dev"
+
 
 tasks.named('compileJava') {
   doFirst {
     // Ensure JNI libraries are built
-    exec {
-      workingDir = file("$datafusionRoot/datafusion-jni")
-      executable = "${System.getProperty('user.home')}/.cargo/bin/cargo"
-      args = ['build', '--release']
-    }
   }
 }
 

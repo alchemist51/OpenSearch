@@ -81,6 +81,7 @@ import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TermStatistics;
 import org.apache.lucene.search.TopFieldDocs;
+import org.apache.lucene.search.TopScoreDocCollector;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.search.similarities.Similarity;
@@ -535,23 +536,23 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 //            System.getProperty("arrow.enable_null_check_for_get"));
         String filePath = Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.getAttribute("parquet_file");
         ArrowQueryContext arrowCtx = getArrowQueryContext();
-        if (arrowCtx != null) {
-            if (collector instanceof MultiCollector) {
-                for (Collector c : ((MultiCollector) collector).getCollectors()) {
-                    if (c instanceof ArrowBatchCollector) {
-                        if (arrowCtx.isOnlyUsingParquetExec()) {
-                            searchWithParquetExec(arrowCtx, c, filePath);
-                        }
-//                        else if (arrowCtx.isUsingSubstrait()) {
-//                            searchWithSubstrait(arrowCtx, c);
-//                        } else {
-//                            searchWithArrow(arrowCtx, c);
+//        if (arrowCtx != null) {
+//            if (collector instanceof MultiCollector) {
+//                for (Collector c : ((MultiCollector) collector).getCollectors()) {
+//                    if (c instanceof ArrowBatchCollector) {
+//                        if (arrowCtx.isOnlyUsingParquetExec()) {
+//                            searchWithParquetExec(arrowCtx, c, filePath);
 //                        }
-                    }
-                }
-            }
-            return;
-        }
+////                        else if (arrowCtx.isUsingSubstrait()) {
+////                            searchWithSubstrait(arrowCtx, c);
+////                        } else {
+////                            searchWithArrow(arrowCtx, c);
+////                        }
+//                    }
+//                }
+//            }
+//            return;
+//        }
 
         // Check if at all we need to call this leaf for collecting results.
         if (canMatch(ctx) == false) {
@@ -592,18 +593,17 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 if (arrowQueryContext.isUsingParquetExec()) {
                     if (collector instanceof MultiCollector) {
                         for (Collector c : ((MultiCollector) collector).getCollectors()) {
-                            if (c instanceof ArrowBatchCollector) {
-                                arrowSearch = true;
+                            if (c instanceof TopScoreDocCollector) {
                                 leafFroggingWithParquetExec(
                                     filePath,
                                     arrowQueryContext,
-                                    (ArrowBatchCollector) c,
                                     scorer,
                                     minDocId,
                                     maxDocId);
                             }
                         }
                     }
+                    return;
                 }
             }
         }
@@ -654,7 +654,6 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     private void leafFroggingWithParquetExec(
         String filePath,
         ArrowQueryContext arrowQueryContext,
-        ArrowBatchCollector collector,
         Scorer scorer,
         int minDocId,
         int maxDocId
@@ -669,12 +668,17 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 filePath, parquetCtx.getAllocator());
             RecordBatchStream stream = result.join();
             long total_count = 0;
+            long size = arrowQueryContext.getSize();
+            boolean result_gathered = false;
             try {
                 VectorSchemaRoot root = stream.getVectorSchemaRoot();
                 boolean load_batch = true;
                 int doc = iterator.nextDoc();
                 BigIntVector rowIdVector;
                 while (doc != Integer.MAX_VALUE) {
+                    if(result_gathered) {
+                        break;
+                    }
                     if (load_batch && !stream.loadNextBatch().get()) {
                         break;
                     }
@@ -692,12 +696,24 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     }
 
                     int rowCount = root.getRowCount();
-                    IntVector intVector = (IntVector) root.getVector(1);
                     for (int i = 0; i < rowCount; i++) {
                         try {
                             long rowId = (rowIdVector.get(i));
                             if (rowId == doc) {
-                                collector.collect(intVector, i);
+                                StringBuilder rowData = new StringBuilder();
+                                for (int field = 0; field < root.getFieldVectors().size(); field++) {
+                                    if (field > 0) rowData.append(", ");
+                                    Object o = root.getFieldVectors().get(field).getObject(i);
+                                    rowData.append(o);
+                                }
+                                System.out.println("Row : " + rowData);
+
+                                total_count++;
+                                if(total_count == size) {
+                                    result_gathered = true;
+                                    break;
+                                }
+
                                 doc = iterator.nextDoc();
                                 if (doc == Integer.MAX_VALUE) {
                                     // end of iterator;
@@ -707,7 +723,20 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                 doc = iterator.advance((int) rowId);
                                 if (doc == Integer.MAX_VALUE) break;
                                 if (doc == rowId) {
-                                    collector.collect(intVector, i);
+                                    StringBuilder rowData = new StringBuilder();
+                                    for (int field = 0; field < root.getFieldVectors().size(); field++) {
+                                        if (field > 0) rowData.append(", ");
+                                        Object o = root.getFieldVectors().get(field).getObject(i);
+                                        rowData.append(o);
+                                    }
+                                    System.out.println("Row : " + rowData);
+
+                                    total_count++;
+                                    if(total_count == size) {
+                                        result_gathered = true;
+                                        break;
+                                    }
+
                                     doc = iterator.nextDoc();
                                     if (doc == Integer.MAX_VALUE) break;
                                 }

@@ -25,7 +25,7 @@ import org.opensearch.core.common.unit.ByteSizeValue;
 public class CompositeIndexSettings {
     public static final Setting<Boolean> STAR_TREE_INDEX_ENABLED_SETTING = Setting.boolSetting(
         "indices.composite_index.star_tree.enabled",
-        false,
+        true,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );

@@ -54,10 +54,10 @@ public class ArrowQueryContext {
             return;
         }
 
-        if(canOnlyUseParquetExec(baseQueryBuilder)) {
-            this.useOnlyParquetExec = true;
-            return;
-        }
+//        if(canOnlyUseParquetExec(baseQueryBuilder)) {
+//            this.useOnlyParquetExec = true;
+//            return;
+//        }
         if (canUseParquetExec(baseQueryBuilder)) {
             this.useParquetExec = true;
             return;
