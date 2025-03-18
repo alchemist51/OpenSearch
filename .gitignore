@@ -21,6 +21,8 @@ server/bin/*
 server/build-eclipse-default/*
 test/framework/build-eclipse-default/*
 
+libs/datafusion/jni/target/*
+
 # eclipse files
 .project
 .classpath
