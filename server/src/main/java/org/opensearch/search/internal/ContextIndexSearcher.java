@@ -32,6 +32,7 @@
 
 package org.opensearch.search.internal;
 
+import org.apache.arrow.datafusion.CustomIteratorInterface;
 import org.apache.arrow.datafusion.DataFrame;
 import org.apache.arrow.datafusion.ParquetExec;
 import org.apache.arrow.datafusion.RecordBatchStream;
@@ -585,12 +586,22 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                         for (Collector c : ((MultiCollector) collector).getCollectors()) {
                             if (c instanceof ArrowBatchCollector) {
                                 arrowSearch = true;
-                                leafFroggingWithParquetExec(
-                                    arrowQueryContext,
-                                    (ArrowBatchCollector) c,
-                                    scorer,
-                                    minDocId,
-                                    maxDocId);
+//                                leafFroggingWithParquetExec(
+//                                    arrowQueryContext,
+//                                    (ArrowBatchCollector) c,
+//                                    scorer,
+//                                    minDocId,
+//                                    maxDocId);
+
+                                try {
+                                    dataFusionLeapFroggingWithParquetExec(
+                                        arrowQueryContext,
+                                        (ArrowBatchCollector) c,
+                                        scorer
+                                    );
+                                } catch (Exception e) {
+                                    throw new RuntimeException(e);
+                                }
                             }
                         }
                     }
@@ -639,6 +650,60 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         leafCollector.finish();
     }
 
+    private void dataFusionLeapFroggingWithParquetExec(
+        ArrowQueryContext arrowQueryContext,
+        ArrowBatchCollector collector,
+        Scorer scorer
+    ) throws Exception {
+        ParquetExecQueryContext parquetCtx = arrowQueryContext.getParquetExecContext();
+        ParquetExec exec = parquetCtx.getParquetExec();
+
+        DocIdSetIterator iterator = scorer.iterator();
+
+        CustomIteratorInterface javaIterator = new CustomIteratorInterface() {
+            @Override
+            public boolean hasNext() {
+                return iterator.docID() != DocIdSetIterator.NO_MORE_DOCS;
+            }
+
+            @Override
+            public int next() throws IOException {
+                int val = iterator.nextDoc();
+                if (val == DocIdSetIterator.NO_MORE_DOCS) {
+                    return -1;
+                }
+
+                return val;
+            }
+        };
+
+        CompletableFuture<RecordBatchStream> result = exec.execute(
+            "/Users/abandeji/Downloads/output_with_rownum.parquet",
+            javaIterator,
+            "target_status_code",
+            200,
+            parquetCtx.getAllocator());
+
+        // Process results
+        RecordBatchStream stream = result.join();
+        try {
+            VectorSchemaRoot root = stream.getVectorSchemaRoot();
+            while (stream.loadNextBatch().get()) {
+                if (collector instanceof ArrowBatchCollector) {
+                    if(root.getRowCount() == 0) continue;
+                    ((ArrowBatchCollector) collector).collectBatch(root);
+
+                }
+            }
+        } catch (ExecutionException e) {
+            throw new RuntimeException(e);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        } finally {
+            stream.close();
+        }
+
+    }
 
     private void leafFroggingWithParquetExec(
         ArrowQueryContext arrowQueryContext,
