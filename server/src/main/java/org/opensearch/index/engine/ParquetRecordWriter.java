@@ -39,6 +39,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -70,7 +71,7 @@ public class ParquetRecordWriter {
         "  required float target_processing_time;\n" +
         "  required int32 target_status_code;\n" +
         "  required int64 timestamp;\n" +
-        "  required int64 ___row_id;\n" +
+        "  required int32 ___row_id;\n" +
         "  required binary _id;\n" +
         "}";
 
@@ -86,10 +87,13 @@ public class ParquetRecordWriter {
 
     public ParquetRecordWriter(String dataPath, EngineConfig config) {
         try {
-            Path path = Files.createDirectory(PathUtils.get(dataPath));
+            Path path = PathUtils.get(dataPath);
+            if (!Files.exists(path)) {
+                Files.createDirectories(path);
+            }
             latestFlushPoint.addAll(Files.list(path).map(p -> p.getFileName().toString()).collect(Collectors.toList()));
             if (!latestFlushPoint.isEmpty()) {
-                counter = new AtomicLong(latestFlushPoint.stream().mapToLong(s -> Long.parseLong(s.split(".")[0].split("-")[1])).max().getAsLong());
+                counter = new AtomicLong(latestFlushPoint.stream().mapToLong(s -> Long.parseLong(s.split("\\.")[0].split("-")[1])).max().getAsLong());
             } else {
                 counter = new AtomicLong();
             }
@@ -111,7 +115,6 @@ public class ParquetRecordWriter {
                 .build(), fileName, config));
         };
     }
-
     public void write(Group document, Engine.Index index) throws IOException {
         try {
             lock.readLock().lock();
@@ -120,7 +123,7 @@ public class ParquetRecordWriter {
                 tuple = writerSupplier.get();
             }
             ParquetWriter<Group> writer = tuple.v2().writer;
-            long rowId = tuple.v2().rowIdGenerator.getAndIncrement();
+            int rowId = tuple.v2().rowIdGenerator.getAndIncrement();
             writer.write(parquetRow(document, rowId));
             index.docs().get(0).add(new NumericDocValuesField(ROW_ID_FIELD, rowId));
             tuple.v2().indexWriter.addDocument(index.docs().get(0));
@@ -158,7 +161,7 @@ public class ParquetRecordWriter {
         return writers.stream().map(Tuple::v2).map(WriterWrapper::getIndexWriter).collect(Collectors.toList());
     }
 
-    private Group parquetRow(Group doc, long rowId) {
+    private Group parquetRow(Group doc, int rowId) {
         doc.add(ROW_ID_FIELD, rowId);
         return doc;
     }
@@ -167,7 +170,7 @@ public class ParquetRecordWriter {
 
     static class WriterWrapper {
         final ParquetWriter<Group> writer;
-        final AtomicLong rowIdGenerator = new AtomicLong();
+        final AtomicInteger rowIdGenerator = new AtomicInteger();
         final IndexWriter indexWriter;
         final Directory directory;
         public WriterWrapper(ParquetWriter<Group> writer, String fileName, EngineConfig config) throws IOException {
@@ -178,7 +181,7 @@ public class ParquetRecordWriter {
                 .setOpenMode(IndexWriterConfig.OpenMode.CREATE)
                 .setMergeScheduler(new OpenSearchConcurrentMergeScheduler(config.getShardId(), config.getIndexSettings()))
                 .setCodec(new TempIndexCodec(config.getCodec(), fileName))
-                .setIndexSort(new Sort(new SortField(ROW_ID_FIELD, SortField.Type.LONG))));
+                .setIndexSort(new Sort(new SortField(ROW_ID_FIELD, SortField.Type.INT))));
         }
 
         public IndexWriter getIndexWriter() {

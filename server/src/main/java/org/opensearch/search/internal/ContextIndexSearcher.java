@@ -32,8 +32,12 @@
 
 package org.opensearch.search.internal;
 
+import org.apache.arrow.c.ArrowArray;
+import org.apache.arrow.c.ArrowSchema;
+import org.apache.arrow.c.CDataDictionaryProvider;
+import org.apache.arrow.c.Data;
+import org.apache.arrow.datafusion.ArraySchema;
 import org.apache.arrow.datafusion.CustomIteratorInterface;
-import org.apache.arrow.datafusion.DataFrame;
 import org.apache.arrow.datafusion.ParquetExec;
 import org.apache.arrow.datafusion.RecordBatchStream;
 import org.apache.arrow.datafusion.SessionContext;
@@ -59,7 +63,6 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BulkScorer;
 import org.apache.lucene.search.CollectionStatistics;
@@ -82,7 +85,6 @@ import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TermStatistics;
 import org.apache.lucene.search.TopFieldDocs;
-import org.apache.lucene.search.TopScoreDocCollector;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.search.similarities.Similarity;
@@ -122,9 +124,6 @@ import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.search.sort.MinAndMax;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -579,7 +578,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             return;
         }
 
-        logger.info("searching for {}", filePath);
+        //logger.info("searching for {}", filePath);
         // catch early terminated exception and rethrow?
         Bits liveDocs = ctx.reader().getLiveDocs();
         BitSet liveDocsBitSet = getSparseBitSetOrNull(liveDocs);
@@ -595,7 +594,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     if (collector instanceof MultiCollector) {
                         for (Collector c : ((MultiCollector) collector).getCollectors()) {
                             if (c instanceof ArrowBatchCollector) {
-                                arrowSearch = true;
+//                                arrowSearch = true;
 //                                leafFroggingWithParquetExec(
 //                                    arrowQueryContext,
 //                                    (ArrowBatchCollector) c,
@@ -607,7 +606,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                     dataFusionLeapFroggingWithParquetExec(
                                         arrowQueryContext,
                                         (ArrowBatchCollector) c,
-                                        scorer
+                                        scorer,
+                                        filePath
                                     );
                                 } catch (Exception e) {
                                     throw new RuntimeException(e);
@@ -665,7 +665,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     private void dataFusionLeapFroggingWithParquetExec(
         ArrowQueryContext arrowQueryContext,
         ArrowBatchCollector collector,
-        Scorer scorer
+        Scorer scorer,
+        String filePath
     ) throws Exception {
         ParquetExecQueryContext parquetCtx = arrowQueryContext.getParquetExecContext();
         ParquetExec exec = parquetCtx.getParquetExec();
@@ -673,24 +674,38 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         DocIdSetIterator iterator = scorer.iterator();
 
         CustomIteratorInterface javaIterator = new CustomIteratorInterface() {
+            IntVector vector;
+            int batch_size = 1024;
             @Override
             public boolean hasNext() {
                 return iterator.docID() != DocIdSetIterator.NO_MORE_DOCS;
             }
 
             @Override
-            public int next() throws IOException {
-                int val = iterator.nextDoc();
-                if (val == DocIdSetIterator.NO_MORE_DOCS) {
-                    return -1;
+            public ArraySchema next() throws IOException {
+                RootAllocator allocator = (RootAllocator) parquetCtx.getAllocator();
+                if(vector == null) {
+                    vector = new IntVector("example", allocator);
                 }
 
-                return val;
+                vector.allocateNew(batch_size);
+                int val = iterator.nextDoc();
+                int i=0;
+                for(; i< batch_size && val != DocIdSetIterator.NO_MORE_DOCS;i++) {
+                    vector.setSafe(i, val);
+                    val = iterator.nextDoc();
+                }
+                vector.setValueCount(i);
+
+                ArrowArray arrowArray = ArrowArray.allocateNew(allocator);
+                ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
+                Data.exportVector(allocator, vector, new CDataDictionaryProvider(), arrowArray, arrowSchema);
+                return new ArraySchema(arrowArray.memoryAddress(), arrowSchema.memoryAddress());
             }
         };
 
         CompletableFuture<RecordBatchStream> result = exec.execute(
-            "/Users/abandeji/Downloads/output_with_rownum.parquet",
+            filePath,
             javaIterator,
             "target_status_code",
             200,
