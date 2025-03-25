@@ -727,7 +727,7 @@ final class BootstrapChecks {
             } catch (final SecurityException e) {
                 return false;
             }
-            return true;
+            return false;
         }
 
     }

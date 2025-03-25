@@ -9,12 +9,14 @@
 package org.opensearch.search.parquet;
 
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
+import org.opensearch.search.SearchService;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.parquet.substrait.SubstraitFilterProvider;
 
@@ -37,14 +39,36 @@ public class ArrowQueryContext {
     private boolean useOnlyParquetExec;
     private boolean useFilterExec;
     private final ParquetExecQueryContext parquetExecContext;
+    private final int fieldVal;
+    private final String fieldName;
+    private final boolean isLeapFrogginEnabled;
     int size;
 
-    public ArrowQueryContext(SearchContext context, QueryBuilder baseQueryBuilder, String parquetPath, int size) {
+    public ArrowQueryContext(
+        SearchContext context,
+        QueryBuilder baseQueryBuilder,
+        String parquetPath, int size,
+        ClusterService clusterService) {
         this.baseQueryBuilder = baseQueryBuilder;
         this.parquetPath = parquetPath;
         this.parquetExecContext = new ParquetExecQueryContext(context, parquetPath);
         this.size = size;
+        this.fieldVal = clusterService.getClusterSettings().get(SearchService.parquetFieldValueSetting);
+        this.fieldName = clusterService.getClusterSettings().get(SearchService.parquetFieldNameSetting);
+        this.isLeapFrogginEnabled = clusterService.getClusterSettings().get(SearchService.LeapFrogSettingEnabled);
         initializeFilters(context);
+    }
+
+    public boolean getIsLeapFrogginEnabled() {
+        return isLeapFrogginEnabled;
+    }
+
+    public int getFieldVal() {
+        return fieldVal;
+    }
+
+    public String getFieldName() {
+        return fieldName;
     }
 
     private void initializeFilters(SearchContext context) {

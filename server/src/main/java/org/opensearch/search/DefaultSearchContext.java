@@ -129,7 +129,7 @@ import static org.opensearch.search.SearchService.MAX_AGGREGATION_REWRITE_FILTER
  *
  * @opensearch.internal
  */
-final class DefaultSearchContext extends SearchContext {
+public final class DefaultSearchContext extends SearchContext {
 
     private static final Logger logger = LogManager.getLogger(DefaultSearchContext.class);
 
@@ -660,6 +660,10 @@ final class DefaultSearchContext extends SearchContext {
     public SearchContext trackScores(boolean trackScores) {
         this.trackScores = trackScores;
         return this;
+    }
+
+    public boolean isLeapFroggingEnabled() {
+        return this.clusterService.getClusterSettings().get(SearchService.LeapFrogSettingEnabled);
     }
 
     @Override

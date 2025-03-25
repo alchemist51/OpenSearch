@@ -96,6 +96,7 @@ import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
+import org.opensearch.common.settings.Setting;
 import org.opensearch.index.mapper.DateFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.NumberFieldMapper;
@@ -104,6 +105,7 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.lucene.util.CombinedBitSet;
+import org.opensearch.search.DefaultSearchContext;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.approximate.ApproximateScoreQuery;
@@ -145,6 +147,7 @@ import org.roaringbitmap.RoaringBitmap;
  */
 @PublicApi(since = "1.0.0")
 public class ContextIndexSearcher extends IndexSearcher implements Releasable {
+
 
     private static final Logger logger = LogManager.getLogger(ContextIndexSearcher.class);
     /**
@@ -594,24 +597,28 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     if (collector instanceof MultiCollector) {
                         for (Collector c : ((MultiCollector) collector).getCollectors()) {
                             if (c instanceof ArrowBatchCollector) {
-//                                arrowSearch = true;
-//                                leafFroggingWithParquetExec(
-//                                    arrowQueryContext,
-//                                    (ArrowBatchCollector) c,
-//                                    scorer,
-//                                    minDocId,
-//                                    maxDocId);
-
-                                try {
-                                    dataFusionLeapFroggingWithParquetExec(
+                                arrowSearch = true;
+                                if(arrowCtx.getIsLeapFrogginEnabled()) {
+                                    leafFroggingWithParquetExec(
+                                        filePath,
                                         arrowQueryContext,
                                         (ArrowBatchCollector) c,
                                         scorer,
-                                        filePath
-                                    );
-                                } catch (Exception e) {
-                                    throw new RuntimeException(e);
+                                        minDocId,
+                                        maxDocId);
+                                } else {
+                                    try {
+                                        dataFusionLeapFroggingWithParquetExec(
+                                            arrowQueryContext,
+                                            (ArrowBatchCollector) c,
+                                            scorer,
+                                            filePath
+                                        );
+                                    } catch (Exception e) {
+                                        throw new RuntimeException(e);
+                                    }
                                 }
+
                             }
                         }
                     }
@@ -707,8 +714,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         CompletableFuture<RecordBatchStream> result = exec.execute(
             filePath,
             javaIterator,
-            "target_status_code",
-            200,
+            Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
+            arrowQueryContext.getFieldVal(),
             parquetCtx.getAllocator());
 
         // Process results
@@ -718,7 +725,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             while (stream.loadNextBatch().get()) {
                 if (collector instanceof ArrowBatchCollector) {
                     if(root.getRowCount() == 0) continue;
-                    ((ArrowBatchCollector) collector).collectBatch(root);
+                    (collector).collectBatch(root);
 
                 }
             }
@@ -733,93 +740,67 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     }
 
     private void leafFroggingWithParquetExec(
-        String filePath,
+        String filepath,
         ArrowQueryContext arrowQueryContext,
+        ArrowBatchCollector collector,
         Scorer scorer,
         int minDocId,
         int maxDocId
     ) {
-
         try {
             ParquetExecQueryContext parquetCtx = arrowQueryContext.getParquetExecContext();
             ParquetExec exec = parquetCtx.getParquetExec();
 
             DocIdSetIterator iterator = scorer.iterator();
             CompletableFuture<RecordBatchStream> result = exec.execute(
-                filePath, parquetCtx.getAllocator());
+                filepath,
+                Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
+                arrowQueryContext.getFieldVal(),
+                parquetCtx.getAllocator());
+
             RecordBatchStream stream = result.join();
             long total_count = 0;
-            long size = arrowQueryContext.getSize();
-            boolean result_gathered = false;
             try {
                 VectorSchemaRoot root = stream.getVectorSchemaRoot();
                 boolean load_batch = true;
                 int doc = iterator.nextDoc();
                 BigIntVector rowIdVector;
-                while (doc != Integer.MAX_VALUE) {
-                    if(result_gathered) {
-                        break;
-                    }
-                    if (load_batch && !stream.loadNextBatch().get()) {
+                while(doc != Integer.MAX_VALUE) {
+                    if(load_batch && !stream.loadNextBatch().get()) {
                         break;
                     }
 
                     rowIdVector = (BigIntVector) root.getFieldVectors().getFirst();
-                    if (doc > rowIdVector.get(root.getRowCount() - 1)) {
+                    if(doc > rowIdVector.get(root.getRowCount() - 1)) {
                         load_batch = true;
                         continue;
                     }
 
-                    if (doc < rowIdVector.get(0)) {
+                    if(doc < rowIdVector.get(0)) {
                         doc = iterator.nextDoc();
                         load_batch = false;
                         continue;
                     }
 
                     int rowCount = root.getRowCount();
+                    IntVector intVector = (IntVector) root.getVector(1);
                     for (int i = 0; i < rowCount; i++) {
                         try {
                             long rowId = (rowIdVector.get(i));
-                            if (rowId == doc) {
-                                StringBuilder rowData = new StringBuilder();
-                                for (int field = 0; field < root.getFieldVectors().size(); field++) {
-                                    if (field > 0) rowData.append(", ");
-                                    Object o = root.getFieldVectors().get(field).getObject(i);
-                                    rowData.append(o);
-                                }
-                                System.out.println("Row : " + rowData);
-
-                                total_count++;
-                                if(total_count == size) {
-                                    result_gathered = true;
-                                    break;
-                                }
-
+                            if(rowId == doc) {
+                                collector.collect(intVector, i);
                                 doc = iterator.nextDoc();
-                                if (doc == Integer.MAX_VALUE) {
+                                if(doc == Integer.MAX_VALUE) {
                                     // end of iterator;
                                     break;
                                 }
                             } else if (rowId > doc) {
-                                doc = iterator.advance((int) rowId);
-                                if (doc == Integer.MAX_VALUE) break;
-                                if (doc == rowId) {
-                                    StringBuilder rowData = new StringBuilder();
-                                    for (int field = 0; field < root.getFieldVectors().size(); field++) {
-                                        if (field > 0) rowData.append(", ");
-                                        Object o = root.getFieldVectors().get(field).getObject(i);
-                                        rowData.append(o);
-                                    }
-                                    System.out.println("Row : " + rowData);
-
-                                    total_count++;
-                                    if(total_count == size) {
-                                        result_gathered = true;
-                                        break;
-                                    }
-
+                                doc = iterator.advance((int)rowId);
+                                if(doc == Integer.MAX_VALUE) break;
+                                if(doc == rowId) {
+                                    collector.collect(intVector, i);
                                     doc = iterator.nextDoc();
-                                    if (doc == Integer.MAX_VALUE) break;
+                                    if(doc == Integer.MAX_VALUE) break;
                                 }
                             }
                         } catch (IllegalStateException e) {
@@ -829,14 +810,14 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                         }
                     }
 
-                    if (!load_batch) {
+                    if(!load_batch) {
                         continue;
                     }
                     load_batch = true;
                 }
 
             } finally {
-                logger.info("Total matches are: {}", total_count);
+                //logger.info("Total matches are: {}", total_count);
                 stream.close();
             }
         } catch (Exception e) {
@@ -845,7 +826,6 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         }
 
     }
-
 
     private void searchWithParquetExec(ArrowQueryContext arrowCtx, Collector collector, String filePath) throws IOException {
         try {

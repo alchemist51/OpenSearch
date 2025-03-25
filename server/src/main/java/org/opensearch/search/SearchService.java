@@ -165,6 +165,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
 
 import static org.opensearch.common.unit.TimeValue.timeValueHours;
@@ -213,6 +214,30 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         Property.NodeScope,
         Property.Dynamic
     );
+
+    public static final Setting<Boolean> LeapFrogSettingEnabled = Setting.boolSetting(
+        "cluster.engine.parquet.leapfrog.enabled",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<Integer> parquetFieldValueSetting = Setting.intSetting(
+        "cluster.engine.parquet.field.value",
+        200,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<String> parquetFieldNameSetting = new Setting<>(
+        "cluster.engine.parquet.field.name",
+        "target_status_code",
+        Function.identity(),
+        Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+
 
     /**
      * Enables low-level, frequent search cancellation checks. Enabling low-level checks will make long running searches to react
@@ -404,6 +429,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
     private final String sessionId = UUIDs.randomBase64UUID();
     private final Executor indexSearcherExecutor;
     private final TaskResourceTrackingService taskResourceTrackingService;
+    private boolean leapFrogSettingEnabled;
 
     public SearchService(
         ClusterService clusterService,
@@ -435,6 +461,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         );
         this.indexSearcherExecutor = indexSearcherExecutor;
         this.taskResourceTrackingService = taskResourceTrackingService;
+        this.leapFrogSettingEnabled = LeapFrogSettingEnabled.get(settings);
         TimeValue keepAliveInterval = KEEPALIVE_INTERVAL_SETTING.get(settings);
         setKeepAlives(DEFAULT_KEEPALIVE_SETTING.get(settings), MAX_KEEPALIVE_SETTING.get(settings));
         setPitKeepAlives(DEFAULT_KEEPALIVE_SETTING.get(settings), MAX_PIT_KEEPALIVE_SETTING.get(settings));
@@ -448,6 +475,9 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(DEFAULT_KEEPALIVE_SETTING, MAX_KEEPALIVE_SETTING, this::setKeepAlives, this::validateKeepAlives);
+
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(LeapFrogSettingEnabled, this::setLeapFrogSettingEnabled);
 
         this.keepAliveReaper = threadPool.scheduleWithFixedDelay(new Reaper(), keepAliveInterval, Names.SAME);
 
@@ -540,6 +570,10 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
     private void setMaxOpenScrollContext(int maxOpenScrollContext) {
         this.maxOpenScrollContext = maxOpenScrollContext;
+    }
+
+    private void setLeapFrogSettingEnabled(boolean leapFrogSettingEnabled) {
+        this.leapFrogSettingEnabled = leapFrogSettingEnabled;
     }
 
     private void setAllowDerivedField(boolean allowDerivedField) {
@@ -1560,7 +1594,8 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
                 context,
                 source.query(),
                 parquetPath2,
-                    source.size()
+                    source.size(),
+                this.clusterService
             // getParquetPath(context)
 
             );
