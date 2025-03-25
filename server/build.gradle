@@ -127,7 +127,7 @@ dependencies {
   api "org.slf4j:slf4j-api:${versions.slf4j}"
   implementation 'com.fasterxml.woodstox:woodstox-core:7.1.0'
   // https://mvnrepository.com/artifact/org.apache.commons/commons-lang3
-  implementation 'org.apache.commons:commons-lang3:3.0'
+  implementation 'org.apache.commons:commons-lang3:3.17.0'
   implementation 'commons-collections:commons-collections:3.2.2'
   // https://mvnrepository.com/artifact/org.apache.commons/commons-configuration2
   implementation 'org.apache.commons:commons-configuration2:2.11.0'
