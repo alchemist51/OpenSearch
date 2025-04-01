@@ -1117,6 +1117,11 @@ public final class DefaultSearchContext extends SearchContext {
     }
 
     @Override
+    public boolean shouldUseIntraSegmentSearch() {
+        return clusterService.getClusterSettings().get(SearchService.ENABLE_INTRA_SEGMENT_SEARCH_SETTING);
+    }
+
+    @Override
     public int maxAggRewriteFilters() {
         return maxAggRewriteFilters;
     }

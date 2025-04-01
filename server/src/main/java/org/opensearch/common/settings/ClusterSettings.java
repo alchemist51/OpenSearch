@@ -771,6 +771,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING, // deprecated
                 SearchService.CONCURRENT_SEGMENT_SEARCH_TARGET_MAX_SLICE_COUNT_SETTING,
                 SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_MODE,
+                SearchService.ENABLE_INTRA_SEGMENT_SEARCH_SETTING,
                 SearchService.LeapFrogSettingEnabled,
                 SearchService.parquetFieldValueSetting,
                 SearchService.parquetFieldNameSetting,
