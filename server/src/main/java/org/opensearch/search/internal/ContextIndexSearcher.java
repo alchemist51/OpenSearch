@@ -612,7 +612,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                             arrowQueryContext,
                                             (ArrowBatchCollector) c,
                                             scorer,
-                                            filePath
+                                            filePath,
+                                            minDocId,
+                                            maxDocId
                                         );
                                     } catch (Exception e) {
                                         throw new RuntimeException(e);
@@ -673,7 +675,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         ArrowQueryContext arrowQueryContext,
         ArrowBatchCollector collector,
         Scorer scorer,
-        String filePath
+        String filePath,
+        int minDocId,
+        int maxDocId
     ) throws Exception {
         ParquetExecQueryContext parquetCtx = arrowQueryContext.getParquetExecContext();
         ParquetExec exec = parquetCtx.getParquetExec();
@@ -716,6 +720,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             javaIterator,
             Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
             arrowQueryContext.getFieldVal(),
+            minDocId,
+            maxDocId,
             parquetCtx.getAllocator());
 
         // Process results
@@ -1348,7 +1354,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     LeafSlice[] slicesInternal(List<LeafReaderContext> leaves, int targetMaxSlice) {
         LeafSlice[] leafSlices;
         if(shouldUseIntraSegmentSearch()) {
-            leafSlices = IndexSearcher.slices(leaves, 1, 1, true);
+            leafSlices = IndexSearcher.slices(leaves, 1048576, 1, true);
             logger.info("Using IntraSegment search for [{}]", targetMaxSlice);
         } else if (targetMaxSlice == 0) {
             // use the default lucene slice calculation
