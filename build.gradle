@@ -720,8 +720,7 @@ subprojects {
 
 reporting {
   reports {
-    testAggregateTestReport(AggregateTestReport) {
-      testSuiteName = "test"
+    testAggregateTestReport(AggregateTestReport) {testSuiteName = "test"
     }
   }
 }

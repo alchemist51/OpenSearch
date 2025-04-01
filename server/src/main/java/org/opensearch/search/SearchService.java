@@ -178,6 +178,7 @@ import static org.opensearch.search.internal.SearchContext.TRACK_TOTAL_HITS_DISA
 public class SearchService extends AbstractLifecycleComponent implements IndexEventListener {
     private static final Logger logger = LogManager.getLogger(SearchService.class);
 
+    public static final String ENABLE_INTRA_SEGMENT_SEARCH = "search.enable_intra_segment_search";
     // we can have 5 minutes here, since we make sure to clean with search requests and when shard/index closes
     public static final Setting<TimeValue> DEFAULT_KEEPALIVE_SETTING = Setting.positiveTimeSetting(
         "search.default_keep_alive",
@@ -212,6 +213,12 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         Property.Dynamic
     );
 
+    public static final Setting<Boolean> ENABLE_INTRA_SEGMENT_SEARCH_SETTING = Setting.boolSetting(
+        ENABLE_INTRA_SEGMENT_SEARCH,
+        false,
+        Property.NodeScope,
+        Property.Dynamic
+    );
     /**
      * Enables low-level, frequent search cancellation checks. Enabling low-level checks will make long running searches to react
      * to the cancellation request faster. It will produce more cancellation checks but benchmarking has shown these did not

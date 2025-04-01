@@ -605,7 +605,10 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     // package-private for testing
     LeafSlice[] slicesInternal(List<LeafReaderContext> leaves, int targetMaxSlice) {
         LeafSlice[] leafSlices;
-        if (targetMaxSlice == 0) {
+        if(shouldUseIntraSegmentSearch()) {
+            leafSlices = IndexSearcher.slices(leaves, 1, 1, true);
+            logger.info("Using IntraSegment search for [{}]", targetMaxSlice);
+        } else if (targetMaxSlice == 0) {
             // use the default lucene slice calculation
             leafSlices = super.slices(leaves);
             logger.debug("Slice count using lucene default [{}]", leafSlices.length);
@@ -615,5 +618,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             logger.debug("Slice count using max target slice supplier [{}]", leafSlices.length);
         }
         return leafSlices;
+    }
+
+    boolean shouldUseIntraSegmentSearch() {
+        return  searchContext.shouldUseIntraSegmentSearch();
     }
 }
