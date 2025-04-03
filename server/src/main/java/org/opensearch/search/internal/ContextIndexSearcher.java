@@ -599,6 +599,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                             if (c instanceof ArrowBatchCollector) {
                                 arrowSearch = true;
                                 if(arrowCtx.getIsLeapFrogginEnabled()) {
+                                    logger.info("Running java leap frogging logic from {} to {}", minDocId, maxDocId);
                                     leafFroggingWithParquetExec(
                                         filePath,
                                         arrowQueryContext,
@@ -608,6 +609,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                         maxDocId);
                                 } else {
                                     try {
+                                        logger.info("Running data-fusion dataframes from {} to {}", minDocId, maxDocId);
                                         dataFusionLeapFroggingWithParquetExec(
                                             arrowQueryContext,
                                             (ArrowBatchCollector) c,
@@ -1354,8 +1356,16 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     LeafSlice[] slicesInternal(List<LeafReaderContext> leaves, int targetMaxSlice) {
         LeafSlice[] leafSlices;
         if(shouldUseIntraSegmentSearch()) {
-            leafSlices = IndexSearcher.slices(leaves, 1048576, 1, true);
+            leafSlices = IntraSegmentSearchSupplier.getSlices(leaves, 3);
             logger.info("Using IntraSegment search for [{}]", targetMaxSlice);
+            for(int i=0; i<leafSlices.length; i++) {
+                logger.info("-----------");
+                logger.info("leaf slice partitions: [{}]", leafSlices[i].partitions.length);
+                for(int j=0; j<leafSlices[i].partitions.length; j++) {
+                    logger.info("Partition from [{}] to [{}]", leafSlices[i].partitions[j].minDocId, leafSlices[i].partitions[j].maxDocId);
+                }
+            }
+            logger.info("-----------");
         } else if (targetMaxSlice == 0) {
             // use the default lucene slice calculation
             leafSlices = super.slices(leaves);

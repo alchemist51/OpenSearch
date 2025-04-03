@@ -295,7 +295,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
     public static final Setting<Boolean> CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING = Setting.boolSetting(
         "search.concurrent_segment_search.enabled",
-        false,
+        true,
         Property.Dynamic,
         Property.NodeScope,
         Property.Deprecated
@@ -312,7 +312,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
     public static final Setting<String> CLUSTER_CONCURRENT_SEGMENT_SEARCH_MODE = Setting.simpleString(
         "search.concurrent_segment_search.mode",
-        CONCURRENT_SEGMENT_SEARCH_MODE_NONE,
+        CONCURRENT_SEGMENT_SEARCH_MODE_ALL,
         value -> {
             switch (value) {
                 case CONCURRENT_SEGMENT_SEARCH_MODE_ALL:
