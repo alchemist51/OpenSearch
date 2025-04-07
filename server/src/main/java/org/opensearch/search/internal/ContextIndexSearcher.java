@@ -129,8 +129,10 @@ import org.opensearch.search.sort.MinAndMax;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -162,6 +164,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     private QueryProfiler profiler;
     private MutableQueryTimeout cancellable;
     private SearchContext searchContext;
+    private Map<String, Integer> pathVsIdx;
 
     public ContextIndexSearcher(
         IndexReader reader,
@@ -200,6 +203,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         setQueryCachingPolicy(queryCachingPolicy);
         this.cancellable = cancellable;
         this.searchContext = searchContext;
+        this.pathVsIdx = new HashMap<>();
     }
 
     public void setProfiler(QueryProfiler profiler) {
@@ -687,6 +691,12 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         int maxDocId,
         Boolean isParallelismEnabled
     ) throws Exception {
+        if(this.pathVsIdx.containsKey(filePath)) {
+            pathVsIdx.put(filePath,  pathVsIdx.get(filePath) + 1);
+        } else {
+            pathVsIdx.put(filePath, 1);
+        }
+
         ParquetExecQueryContext parquetCtx = arrowQueryContext.getParquetExecContext();
         ParquetExec exec = parquetCtx.getParquetExec();
 
@@ -732,6 +742,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 arrowQueryContext.getFieldVal(),
                 minDocId,
                 maxDocId,
+                this.searchContext.getTargetMaxSliceCount(),
+                this.pathVsIdx.get(filePath),
                 parquetCtx.getAllocator());
         } else {
             result = exec.execute(
