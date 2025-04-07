@@ -29,6 +29,7 @@ import io.substrait.proto.ExtendedExpression;
 @ExperimentalApi
 public class ArrowQueryContext {
     private final QueryBuilder baseQueryBuilder;
+    private final Boolean isparallelismEnabled;
     private ArrowFilter baseArrowFilter;
     private final String parquetPath;
     private VectorSchemaRoot currentBatch; // Add this
@@ -56,11 +57,16 @@ public class ArrowQueryContext {
         this.fieldVal = clusterService.getClusterSettings().get(SearchService.parquetFieldValueSetting);
         this.fieldName = clusterService.getClusterSettings().get(SearchService.parquetFieldNameSetting);
         this.isLeapFrogginEnabled = clusterService.getClusterSettings().get(SearchService.LeapFrogSettingEnabled);
+        this.isparallelismEnabled = clusterService.getClusterSettings().get(SearchService.DataFusionParallelismEnabled);
         initializeFilters(context);
     }
 
     public boolean getIsLeapFrogginEnabled() {
         return isLeapFrogginEnabled;
+    }
+
+    public boolean getIsParallelismEnabled() {
+        return isparallelismEnabled;
     }
 
     public int getFieldVal() {

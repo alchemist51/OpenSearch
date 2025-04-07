@@ -97,6 +97,7 @@ import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
 import org.opensearch.common.settings.Setting;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.mapper.DateFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.NumberFieldMapper;
@@ -609,15 +610,19 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                         maxDocId);
                                 } else {
                                     try {
-                                        logger.info("Running data-fusion dataframes from {} to {}", minDocId, maxDocId);
+                                        //logger.info("Running data-fusion dataframes from {} to {} with parallelism {}", minDocId, maxDocId, arrowCtx.getIsParallelismEnabled());
+                                        long startTime = System.nanoTime();
                                         dataFusionLeapFroggingWithParquetExec(
                                             arrowQueryContext,
                                             (ArrowBatchCollector) c,
                                             scorer,
                                             filePath,
                                             minDocId,
-                                            maxDocId
+                                            maxDocId,
+                                            arrowCtx.getIsParallelismEnabled()
                                         );
+                                        long duration = TimeValue.nsecToMSec(System.nanoTime() - startTime);
+                                        logger.info("Range min: {} max: {} took {} ms for path {}", minDocId, maxDocId, duration, filePath);
                                     } catch (Exception e) {
                                         throw new RuntimeException(e);
                                     }
@@ -679,7 +684,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         Scorer scorer,
         String filePath,
         int minDocId,
-        int maxDocId
+        int maxDocId,
+        Boolean isParallelismEnabled
     ) throws Exception {
         ParquetExecQueryContext parquetCtx = arrowQueryContext.getParquetExecContext();
         ParquetExec exec = parquetCtx.getParquetExec();
@@ -717,14 +723,24 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             }
         };
 
-        CompletableFuture<RecordBatchStream> result = exec.execute(
-            filePath,
-            javaIterator,
-            Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
-            arrowQueryContext.getFieldVal(),
-            minDocId,
-            maxDocId,
-            parquetCtx.getAllocator());
+        CompletableFuture<RecordBatchStream> result;
+        if(isParallelismEnabled) {
+            result = exec.execute(
+                filePath,
+                javaIterator,
+                Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
+                arrowQueryContext.getFieldVal(),
+                minDocId,
+                maxDocId,
+                parquetCtx.getAllocator());
+        } else {
+            result = exec.execute(
+                filePath,
+                javaIterator,
+                Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
+                arrowQueryContext.getFieldVal(),
+                parquetCtx.getAllocator());
+        }
 
         // Process results
         RecordBatchStream stream = result.join();
@@ -1356,16 +1372,16 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     LeafSlice[] slicesInternal(List<LeafReaderContext> leaves, int targetMaxSlice) {
         LeafSlice[] leafSlices;
         if(shouldUseIntraSegmentSearch()) {
-            leafSlices = IntraSegmentSearchSupplier.getSlices(leaves, 3);
-            logger.info("Using IntraSegment search for [{}]", targetMaxSlice);
-            for(int i=0; i<leafSlices.length; i++) {
-                logger.info("-----------");
-                logger.info("leaf slice partitions: [{}]", leafSlices[i].partitions.length);
-                for(int j=0; j<leafSlices[i].partitions.length; j++) {
-                    logger.info("Partition from [{}] to [{}]", leafSlices[i].partitions[j].minDocId, leafSlices[i].partitions[j].maxDocId);
-                }
-            }
-            logger.info("-----------");
+            leafSlices = IntraSegmentSearchSupplier.getSlices(leaves, targetMaxSlice);
+            //logger.info("Using IntraSegment search for [{}]", targetMaxSlice);
+//            for(int i=0; i<leafSlices.length; i++) {
+//                logger.info("-----------");
+//                logger.info("leaf slice partitions: [{}]", leafSlices[i].partitions.length);
+//                for(int j=0; j<leafSlices[i].partitions.length; j++) {
+//                    logger.info("Partition from [{}] to [{}]", leafSlices[i].partitions[j].minDocId, leafSlices[i].partitions[j].maxDocId);
+//                }
+//            }
+            //logger.info("-----------");
         } else if (targetMaxSlice == 0) {
             // use the default lucene slice calculation
             leafSlices = super.slices(leaves);

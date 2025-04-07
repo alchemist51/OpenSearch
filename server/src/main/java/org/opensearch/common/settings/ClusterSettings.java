@@ -192,6 +192,7 @@ import java.util.function.Predicate;
 import static org.opensearch.gateway.remote.RemoteGlobalMetadataManager.GLOBAL_METADATA_UPLOAD_TIMEOUT_SETTING;
 import static org.opensearch.gateway.remote.RemoteIndexMetadataManager.INDEX_METADATA_UPLOAD_TIMEOUT_SETTING;
 import static org.opensearch.gateway.remote.RemoteManifestManager.METADATA_MANIFEST_UPLOAD_TIMEOUT_SETTING;
+import static org.opensearch.search.SearchService.DataFusionParallelismEnabled;
 
 /**
  * Encapsulates all valid cluster level settings.
@@ -775,6 +776,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 SearchService.LeapFrogSettingEnabled,
                 SearchService.parquetFieldValueSetting,
                 SearchService.parquetFieldNameSetting,
+                DataFusionParallelismEnabled,
 
                 RemoteStoreSettings.CLUSTER_REMOTE_INDEX_SEGMENT_METADATA_RETENTION_MAX_COUNT_SETTING,
                 RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING,
