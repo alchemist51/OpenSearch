@@ -31,12 +31,15 @@ public class IntraSegmentSearchSupplier {
             int minDocId = 0;
 
             for(int i = 0; i < numSlices - 1; ++i) {
-                groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, minDocId, maxDocId)));
+//                groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, minDocId, maxDocId)));
+                groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, 0, ctx.reader().maxDoc())));
                 minDocId = maxDocId;
                 maxDocId += numDocs;
             }
 
-            groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, minDocId, ctx.reader().maxDoc())));
+//            groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, minDocId, ctx.reader().maxDoc())));
+            groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, 0, ctx.reader().maxDoc())));
+
         }
 
 

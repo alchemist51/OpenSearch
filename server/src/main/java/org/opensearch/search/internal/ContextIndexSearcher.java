@@ -735,6 +735,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
         CompletableFuture<RecordBatchStream> result;
         if(isParallelismEnabled) {
+            logger.info("Path Idx is {} for path {}", pathVsIdx.get(filePath), filePath);
             result = exec.execute(
                 filePath,
                 javaIterator,

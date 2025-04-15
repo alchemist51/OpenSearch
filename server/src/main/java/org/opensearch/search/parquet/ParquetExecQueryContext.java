@@ -1,6 +1,8 @@
 package org.opensearch.search.parquet;
 
+import org.apache.arrow.datafusion.ExecutionOptions;
 import org.apache.arrow.datafusion.ParquetExec;
+import org.apache.arrow.datafusion.SessionConfig;
 import org.apache.arrow.datafusion.SessionContext;
 import org.apache.arrow.datafusion.SessionContexts;
 import org.apache.arrow.memory.BufferAllocator;
@@ -17,7 +19,10 @@ public class ParquetExecQueryContext implements AutoCloseable {
 
     public ParquetExecQueryContext(SearchContext context, String parquetPath) {
         try {
-            this.sessionContext = SessionContexts.create();
+            SessionConfig sessionConfig = new SessionConfig();
+            ExecutionOptions executionOptions = new ExecutionOptions(sessionConfig);
+            executionOptions.withTargetPartitions(1);
+            this.sessionContext = SessionContexts.withConfig(executionOptions.getConfig());
             this.parquetExec = new ParquetExec(sessionContext, sessionContext.getPointer());
             this.allocator = new RootAllocator();
             this.parquetPath = parquetPath;
