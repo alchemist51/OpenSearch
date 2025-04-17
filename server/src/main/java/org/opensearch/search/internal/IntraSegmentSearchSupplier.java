@@ -23,23 +23,29 @@ public class IntraSegmentSearchSupplier {
         sortedLeaves.sort(Collections.reverseOrder(Comparator.comparingInt((l) -> l.reader().maxDoc())));
 
         List<List<IndexSearcher.LeafReaderContextPartition>> groupedLeafPartitions = new ArrayList();
-
+        int i=0;
         for(LeafReaderContext ctx : sortedLeaves) {
-            int numSlices = numberOfSlices;
-            int numDocs = ctx.reader().maxDoc() / numSlices;
-            int maxDocId = numDocs;
-            int minDocId = 0;
-
-            for(int i = 0; i < numSlices - 1; ++i) {
-//                groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, minDocId, maxDocId)));
-                groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, 0, ctx.reader().maxDoc())));
-                minDocId = maxDocId;
-                maxDocId += numDocs;
+            // We have numberOfSlices, let's see, we will need rowGroups in the leaf.
+            int rowGroups = 0;
+            if(i==0) {
+                rowGroups = 9;
+            } else {
+                rowGroups = 6;
             }
 
-//            groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, minDocId, ctx.reader().maxDoc())));
-            groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, 0, ctx.reader().maxDoc())));
+            int avg_row_group_per_partition = rowGroups / numberOfSlices;
+            int start_doc = 0;
+            int end_doc = 0;
+            for(int j=0; j<numberOfSlices - 1; j++) {
+                start_doc = end_doc;
+                end_doc = start_doc + avg_row_group_per_partition * 1024 * 1024;
+                groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, start_doc, end_doc)));
+            }
 
+            start_doc = end_doc;
+            end_doc = ctx.reader().maxDoc();
+            groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, start_doc, end_doc)));
+            i++;
         }
 
 

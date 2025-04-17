@@ -70,6 +70,7 @@ import org.apache.lucene.search.CollectionTerminatedException;
 import org.apache.lucene.search.Collector;
 import org.apache.lucene.search.CollectorManager;
 import org.apache.lucene.search.ConjunctionUtils;
+import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
@@ -82,6 +83,7 @@ import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
+import org.apache.lucene.search.TaskExecutor;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TermStatistics;
 import org.apache.lucene.search.TopFieldDocs;
@@ -129,6 +131,7 @@ import org.opensearch.search.sort.MinAndMax;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -136,7 +139,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 
@@ -164,7 +169,10 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     private QueryProfiler profiler;
     private MutableQueryTimeout cancellable;
     private SearchContext searchContext;
-    private Map<String, Integer> pathVsIdx;
+    private ConcurrentHashMap<String, Integer> pathVsIdx;
+    private Executor executor;
+    // Used internally for load balancing threads executing for the query
+    private TaskExecutor taskExecutor;
 
     public ContextIndexSearcher(
         IndexReader reader,
@@ -175,7 +183,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         Executor executor,
         SearchContext searchContext
     ) throws IOException {
-        this(
+         this(
             reader,
             similarity,
             queryCache,
@@ -185,6 +193,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             executor,
             searchContext
         );
+        this.executor = executor;
+        this.taskExecutor = executor == null ? new TaskExecutor(Runnable::run) : new TaskExecutor(executor);
     }
 
     private ContextIndexSearcher(
@@ -203,7 +213,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         setQueryCachingPolicy(queryCachingPolicy);
         this.cancellable = cancellable;
         this.searchContext = searchContext;
-        this.pathVsIdx = new HashMap<>();
+        this.pathVsIdx = new ConcurrentHashMap<>();
+        this.executor = executor;
+        this.taskExecutor = executor == null ? new TaskExecutor(Runnable::run) : new TaskExecutor(executor);
     }
 
     public void setProfiler(QueryProfiler profiler) {
@@ -233,6 +245,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         // A cancellable can contain an indirect reference to the search context, which potentially retains a significant amount
         // of memory.
         this.cancellable.clear();
+        this.getArrowQueryContext().close();
     }
 
     public boolean hasCancellations() {
@@ -344,12 +357,46 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             // That can slow down ASC order queries on timestamp workload. So to avoid that slowdown, we will reverse leaf
             // reader order here.
             if (searchContext.shouldUseTimeSeriesDescSortOptimization()) {
+                int j = 1;
                 for (int i = partitions.length - 1; i >= 0; i--) {
-                    searchLeaf(partitions[i].ctx, partitions[i].minDocId, partitions[i].maxDocId, weight, collector);
+                    //searchLeaf(partitions[i].ctx, partitions[i].minDocId, partitions[i].maxDocId, weight, collector);
+                    searchLeaf(partitions[i].ctx, partitions[i].minDocId, partitions[i].maxDocId, j, weight, collector);
+                    j++;
                 }
             } else {
+                int i = 1;
                 for (LeafReaderContextPartition partition : partitions) {
-                    searchLeaf(partition.ctx, partition.minDocId, partition.maxDocId, weight, collector);
+                    //searchLeaf(partition.ctx, partition.minDocId, partition.maxDocId, weight, collector);
+                    searchLeaf(partition.ctx, partition.minDocId, partition.maxDocId, i, weight, collector);
+                    i++;
+                }
+            }
+            searchContext.bucketCollectorProcessor().processPostCollection(collector);
+        } catch (Throwable t) {
+            searchContext.indexShard().getSearchOperationListener().onFailedSliceExecution(searchContext);
+            throw t;
+        }
+        searchContext.indexShard().getSearchOperationListener().onSliceExecution(searchContext);
+    }
+
+    protected void search(LeafReaderContextPartition[] partitions, Weight weight, Collector collector, int sliceId) throws IOException {
+        searchContext.indexShard().getSearchOperationListener().onPreSliceExecution(searchContext);
+        try {
+            // Time series based workload by default traverses segments in desc order i.e. latest to the oldest order.
+            // This is actually beneficial for search queries to start search on latest segments first for time series workload.
+            // That can slow down ASC order queries on timestamp workload. So to avoid that slowdown, we will reverse leaf
+            // reader order here.
+            if (searchContext.shouldUseTimeSeriesDescSortOptimization()) {
+                int j = 1;
+                for (int i = partitions.length - 1; i >= 0; i--) {
+                    searchLeaf(partitions[i].ctx, partitions[i].minDocId, partitions[i].maxDocId, j, weight, collector);
+                    j++;
+                }
+            } else {
+                int i = 1;
+                for (LeafReaderContextPartition partition : partitions) {
+                    searchLeaf(partition.ctx, partition.minDocId, partition.maxDocId, sliceId, weight, collector);
+                    i++;
                 }
             }
             searchContext.bucketCollectorProcessor().processPostCollection(collector);
@@ -521,6 +568,67 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 });
     }
 
+    private Query rewrite(Query original, boolean needsScores) throws IOException {
+        if (needsScores) {
+            return rewrite(original);
+        } else {
+            // Take advantage of the few extra rewrite rules of ConstantScoreQuery.
+            return rewrite(new ConstantScoreQuery(original));
+        }
+    }
+
+    /**
+     * Lower-level search API. Search all leaves using the given {@link CollectorManager}. In contrast
+     * to {@link #search(Query, Collector)}, this method will use the searcher's {@link Executor} in
+     * order to parallelize execution of the collection on the configured {@link #getSlices()}.
+     *
+     * @see CollectorManager
+     * @lucene.experimental
+     */
+    @Override
+    public <C extends Collector, T> T search(Query query, CollectorManager<C, T> collectorManager) throws IOException {
+        final C firstCollector = collectorManager.newCollector();
+        query = rewrite(query, firstCollector.scoreMode().needsScores());
+        final Weight weight = createWeight(query, firstCollector.scoreMode(), 1);
+        return search(weight, collectorManager, firstCollector);
+    }
+
+    private <C extends Collector, T> T search(Weight weight, CollectorManager<C, T> collectorManager, C firstCollector) throws IOException {
+        final LeafSlice[] leafSlices = getSlices();
+        if (leafSlices.length == 0) {
+            // there are no segments, nothing to offload to the executor, but we do need to call reduce to
+            // create some kind of empty result
+            assert leafContexts.isEmpty();
+            return collectorManager.reduce(Collections.singletonList(firstCollector));
+        } else {
+            final List<C> collectors = new ArrayList<>(leafSlices.length);
+            collectors.add(firstCollector);
+            final ScoreMode scoreMode = firstCollector.scoreMode();
+            for (int i = 1; i < leafSlices.length; ++i) {
+                final C collector = collectorManager.newCollector();
+                collectors.add(collector);
+                if (scoreMode != collector.scoreMode()) {
+                    throw new IllegalStateException("CollectorManager does not always produce collectors with the same score mode");
+                }
+            }
+            final List<Callable<C>> listTasks = new ArrayList<>(leafSlices.length);
+            int partitionPerContext = leafSlices.length / leafContexts.size();
+            for (int i = 0; i < leafSlices.length; ++i) {
+                final LeafReaderContextPartition[] leaves = leafSlices[i].partitions;
+                final C collector = collectors.get(i);
+                int finalI = i % partitionPerContext;
+                //System.out.println("Partition no : " + i + " -- " + finalI);
+                listTasks.add(() -> {
+                    search(leaves, weight, collector, finalI);
+                    return collector;
+                });
+            }
+            List<C> results = taskExecutor.invokeAll(listTasks);
+            return collectorManager.reduce(results);
+        }
+    }
+
+
     /**
      * Lower-level search API.
      * <p>
@@ -529,38 +637,16 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
      */
     @Override
     protected void searchLeaf(LeafReaderContext ctx, int minDocId, int maxDocId, Weight weight, Collector collector) throws IOException {
+        searchLeaf(ctx, minDocId, maxDocId, 0, weight, collector);
+    }
 
+    protected void searchLeaf(LeafReaderContext ctx, int minDocId, int maxDocId, int partNo, Weight weight, Collector collector) throws IOException{
         // Check if we have an Arrow context and early terminate
         // TODO : only sum aggs is currently supported
         // TODO : only range and terms query is currently supportedw
-//        try {
-//            testParquetExec();
-//        } catch (Exception e) {
-//            throw new RuntimeException(e);
-//        }
-//        logger.info("arrow.enable_unsafe_memory_access: {}",
-//            System.getProperty("arrow.enable_unsafe_memory_access"));
-//        logger.info("arrow.enable_null_check_for_get: {}",
-//            System.getProperty("arrow.enable_null_check_for_get"));
+
         String filePath = Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.getAttribute("parquet_file");
         ArrowQueryContext arrowCtx = getArrowQueryContext();
-//        if (arrowCtx != null) {
-//            if (collector instanceof MultiCollector) {
-//                for (Collector c : ((MultiCollector) collector).getCollectors()) {
-//                    if (c instanceof ArrowBatchCollector) {
-//                        if (arrowCtx.isOnlyUsingParquetExec()) {
-//                            searchWithParquetExec(arrowCtx, c, filePath);
-//                        }
-////                        else if (arrowCtx.isUsingSubstrait()) {
-////                            searchWithSubstrait(arrowCtx, c);
-////                        } else {
-////                            searchWithArrow(arrowCtx, c);
-////                        }
-//                    }
-//                }
-//            }
-//            return;
-//        }
 
         // Check if at all we need to call this leaf for collecting results.
         if (canMatch(ctx) == false) {
@@ -604,7 +690,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                             if (c instanceof ArrowBatchCollector) {
                                 arrowSearch = true;
                                 if(arrowCtx.getIsLeapFrogginEnabled()) {
-                                    logger.info("Running java leap frogging logic from {} to {}", minDocId, maxDocId);
+                                    //logger.info("Running java leap frogging logic from {} to {}", minDocId, maxDocId);
                                     leafFroggingWithParquetExec(
                                         filePath,
                                         arrowQueryContext,
@@ -623,10 +709,11 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                             filePath,
                                             minDocId,
                                             maxDocId,
+                                            partNo,
                                             arrowCtx.getIsParallelismEnabled()
                                         );
                                         long duration = TimeValue.nsecToMSec(System.nanoTime() - startTime);
-                                        logger.info("Range min: {} max: {} took {} ms for path {}", minDocId, maxDocId, duration, filePath);
+                                        //logger.info("Range min: {} max: {} took {} ms for path {}", minDocId, maxDocId, duration, filePath);
                                     } catch (Exception e) {
                                         throw new RuntimeException(e);
                                     }
@@ -689,15 +776,11 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         String filePath,
         int minDocId,
         int maxDocId,
+        int partNo,
         Boolean isParallelismEnabled
     ) throws Exception {
-        if(this.pathVsIdx.containsKey(filePath)) {
-            pathVsIdx.put(filePath,  pathVsIdx.get(filePath) + 1);
-        } else {
-            pathVsIdx.put(filePath, 1);
-        }
+        ParquetExecQueryContext parquetCtx = new ParquetExecQueryContext(arrowQueryContext.getParquetExecContext());
 
-        ParquetExecQueryContext parquetCtx = arrowQueryContext.getParquetExecContext();
         ParquetExec exec = parquetCtx.getParquetExec();
 
         DocIdSetIterator iterator = scorer.iterator();
@@ -735,7 +818,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
         CompletableFuture<RecordBatchStream> result;
         if(isParallelismEnabled) {
-            logger.info("Path Idx is {} for path {}", pathVsIdx.get(filePath), filePath);
+            //logger.info("Path Idx is {} for path {}", partNo, filePath);
             result = exec.execute(
                 filePath,
                 javaIterator,
@@ -743,8 +826,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 arrowQueryContext.getFieldVal(),
                 minDocId,
                 maxDocId,
+                partNo,
                 this.searchContext.getTargetMaxSliceCount(),
-                this.pathVsIdx.get(filePath),
                 parquetCtx.getAllocator());
         } else {
             result = exec.execute(
@@ -763,7 +846,6 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 if (collector instanceof ArrowBatchCollector) {
                     if(root.getRowCount() == 0) continue;
                     (collector).collectBatch(root);
-
                 }
             }
         } catch (ExecutionException e) {

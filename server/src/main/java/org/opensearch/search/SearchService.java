@@ -223,6 +223,13 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         Setting.Property.Dynamic
     );
 
+    public static final Setting<Boolean> CacheEnabled = Setting.boolSetting(
+        "cluster.engine.parquet.cache.enabled",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     public static final Setting<Boolean> DataFusionParallelismEnabled = Setting.boolSetting(
         "cluster.engine.parquet.parallel.enabled",
         false,

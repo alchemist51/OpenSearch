@@ -52,7 +52,7 @@ public class ArrowQueryContext {
         ClusterService clusterService) {
         this.baseQueryBuilder = baseQueryBuilder;
         this.parquetPath = parquetPath;
-        this.parquetExecContext = new ParquetExecQueryContext(context, parquetPath);
+        this.parquetExecContext = new ParquetExecQueryContext(context, parquetPath, clusterService);
         this.size = size;
         this.fieldVal = clusterService.getClusterSettings().get(SearchService.parquetFieldValueSetting);
         this.fieldName = clusterService.getClusterSettings().get(SearchService.parquetFieldNameSetting);
@@ -277,5 +277,9 @@ public class ArrowQueryContext {
 
     public ParquetExecQueryContext getParquetExecContext() {
         return parquetExecContext;
+    }
+
+    public void close() {
+        parquetExecContext.close();
     }
 }
