@@ -713,6 +713,11 @@ public class TestSearchContext extends SearchContext {
             && sort.sort.getSort()[0].getReverse() == false;
     }
 
+    @Override
+    public boolean shouldUseIntraSegmentSearch() {
+        return false;
+    }
+
     /**
      * Clean the query results by consuming all of it
      */

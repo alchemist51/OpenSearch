@@ -77,6 +77,20 @@ public class ParsedDocument {
         List<Document> documents,
         BytesReference source,
         MediaType mediaType,
+        Mapping dynamicMappingsUpdate
+    ) {
+
+        this(version, seqID, id, routing, documents, source, mediaType, dynamicMappingsUpdate, null);
+    }
+
+    public ParsedDocument(
+        Field version,
+        SeqNoFieldMapper.SequenceIDFields seqID,
+        String id,
+        String routing,
+        List<Document> documents,
+        BytesReference source,
+        MediaType mediaType,
         Mapping dynamicMappingsUpdate,
         Group group
     ) {

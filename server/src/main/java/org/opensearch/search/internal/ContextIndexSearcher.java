@@ -688,36 +688,55 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     if (collector instanceof MultiCollector) {
                         for (Collector c : ((MultiCollector) collector).getCollectors()) {
                             if (c instanceof ArrowBatchCollector) {
-                                arrowSearch = true;
-                                if(arrowCtx.getIsLeapFrogginEnabled()) {
-                                    //logger.info("Running java leap frogging logic from {} to {}", minDocId, maxDocId);
-                                    leafFroggingWithParquetExec(
-                                        filePath,
+                                try {
+                                    //logger.info("Running data-fusion dataframes from {} to {} with parallelism {}", minDocId, maxDocId, arrowCtx.getIsParallelismEnabled());
+                                    long startTime = System.nanoTime();
+                                    dataFusionLeapFroggingWithParquetExec(
                                         arrowQueryContext,
                                         (ArrowBatchCollector) c,
                                         scorer,
+                                        filePath,
                                         minDocId,
-                                        maxDocId);
-                                } else {
-                                    try {
-                                        //logger.info("Running data-fusion dataframes from {} to {} with parallelism {}", minDocId, maxDocId, arrowCtx.getIsParallelismEnabled());
-                                        long startTime = System.nanoTime();
-                                        dataFusionLeapFroggingWithParquetExec(
-                                            arrowQueryContext,
-                                            (ArrowBatchCollector) c,
-                                            scorer,
-                                            filePath,
-                                            minDocId,
-                                            maxDocId,
-                                            partNo,
-                                            arrowCtx.getIsParallelismEnabled()
-                                        );
-                                        long duration = TimeValue.nsecToMSec(System.nanoTime() - startTime);
-                                        //logger.info("Range min: {} max: {} took {} ms for path {}", minDocId, maxDocId, duration, filePath);
-                                    } catch (Exception e) {
-                                        throw new RuntimeException(e);
-                                    }
+                                        maxDocId,
+                                        partNo,
+                                        arrowCtx.getIsParallelismEnabled()
+                                    );
+                                    long duration = TimeValue.nsecToMSec(System.nanoTime() - startTime);
+                                    //logger.info("Range min: {} max: {} took {} ms for path {}", minDocId, maxDocId, duration, filePath);
+                                } catch (Exception e) {
+                                    throw new RuntimeException(e);
                                 }
+
+//                                arrowSearch = true;
+//                                if(arrowCtx.getIsLeapFrogginEnabled()) {
+//                                    //logger.info("Running java leap frogging logic from {} to {}", minDocId, maxDocId);
+//                                    leafFroggingWithParquetExec(
+//                                        filePath,
+//                                        arrowQueryContext,
+//                                        (ArrowBatchCollector) c,
+//                                        scorer,
+//                                        minDocId,
+//                                        maxDocId);
+//                                } else {
+//                                    try {
+//                                        //logger.info("Running data-fusion dataframes from {} to {} with parallelism {}", minDocId, maxDocId, arrowCtx.getIsParallelismEnabled());
+//                                        long startTime = System.nanoTime();
+//                                        dataFusionLeapFroggingWithParquetExec(
+//                                            arrowQueryContext,
+//                                            (ArrowBatchCollector) c,
+//                                            scorer,
+//                                            filePath,
+//                                            minDocId,
+//                                            maxDocId,
+//                                            partNo,
+//                                            arrowCtx.getIsParallelismEnabled()
+//                                        );
+//                                        long duration = TimeValue.nsecToMSec(System.nanoTime() - startTime);
+//                                        //logger.info("Range min: {} max: {} took {} ms for path {}", minDocId, maxDocId, duration, filePath);
+//                                    } catch (Exception e) {
+//                                        throw new RuntimeException(e);
+//                                    }
+//                                }
 
                             }
                         }
@@ -817,8 +836,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         };
 
         CompletableFuture<RecordBatchStream> result;
-        if(isParallelismEnabled) {
-            //logger.info("Path Idx is {} for path {}", partNo, filePath);
+        if(isParallelismEnabled && arrowQueryContext.getIsLeapFrogginEnabled()) {
+            logger.info("Parallelism with leap frogging is enabled");
             result = exec.execute(
                 filePath,
                 javaIterator,
@@ -829,34 +848,128 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 partNo,
                 this.searchContext.getTargetMaxSliceCount(),
                 parquetCtx.getAllocator());
-        } else {
-            result = exec.execute(
-                filePath,
-                javaIterator,
-                Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
-                arrowQueryContext.getFieldVal(),
-                parquetCtx.getAllocator());
-        }
 
-        // Process results
-        RecordBatchStream stream = result.join();
-        try {
-            VectorSchemaRoot root = stream.getVectorSchemaRoot();
-            while (stream.loadNextBatch().get()) {
-                if (collector instanceof ArrowBatchCollector) {
-                    if(root.getRowCount() == 0) continue;
-                    (collector).collectBatch(root);
-                }
+            leafFroggingWithRecordBatchStream(collector, result, scorer);
+        } else {
+            if(isParallelismEnabled) {
+                //logger.info("Path Idx is {} for path {}", partNo, filePath);
+                result = exec.execute(
+                    filePath,
+                    javaIterator,
+                    Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
+                    arrowQueryContext.getFieldVal(),
+                    minDocId,
+                    maxDocId,
+                    partNo,
+                    this.searchContext.getTargetMaxSliceCount(),
+                    parquetCtx.getAllocator());
+
+
+            } else {
+                result = exec.execute(
+                    filePath,
+                    javaIterator,
+                    Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
+                    arrowQueryContext.getFieldVal(),
+                    parquetCtx.getAllocator());
             }
-        } catch (ExecutionException e) {
-            throw new RuntimeException(e);
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-        } finally {
-            stream.close();
+            // Process results
+            RecordBatchStream stream = result.join();
+            try {
+                VectorSchemaRoot root = stream.getVectorSchemaRoot();
+                while (stream.loadNextBatch().get()) {
+                    if (collector instanceof ArrowBatchCollector) {
+                        if(root.getRowCount() == 0) continue;
+                        (collector).collectBatch(root);
+                    }
+                }
+            } catch (ExecutionException e) {
+                throw new RuntimeException(e);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            } finally {
+                stream.close();
+            }
         }
 
     }
+
+    private void leafFroggingWithRecordBatchStream(
+        ArrowBatchCollector collector,
+        CompletableFuture<RecordBatchStream> result,
+        Scorer scorer
+    ) {
+        try {
+            DocIdSetIterator iterator = scorer.iterator();
+            RecordBatchStream stream = result.join();
+
+            try {
+                VectorSchemaRoot root = stream.getVectorSchemaRoot();
+                boolean load_batch = true;
+                int doc = iterator.nextDoc();
+                IntVector rowIdVector;
+                while(doc != Integer.MAX_VALUE) {
+                    if(load_batch && !stream.loadNextBatch().get()) {
+                        break;
+                    }
+
+                    rowIdVector = (IntVector) root.getFieldVectors().getFirst();
+                    if(doc > rowIdVector.get(root.getRowCount() - 1)) {
+                        load_batch = true;
+                        continue;
+                    }
+
+                    if(doc < rowIdVector.get(0)) {
+                        doc = iterator.advance((int)rowIdVector.get(0));
+                        load_batch = false;
+                        continue;
+                    }
+
+                    int rowCount = root.getRowCount();
+                    IntVector intVector = (IntVector) root.getVector(1);
+                    for (int i = 0; i < rowCount; i++) {
+                        try {
+                            long rowId = (rowIdVector.get(i));
+                            if(rowId == doc) {
+                                collector.collect(intVector, i);
+                                doc = iterator.nextDoc();
+                                if(doc == Integer.MAX_VALUE) {
+                                    // end of iterator;
+                                    break;
+                                }
+                            } else if (rowId > doc) {
+                                doc = iterator.advance((int)rowId);
+                                if(doc == Integer.MAX_VALUE) break;
+                                if(doc == rowId) {
+                                    collector.collect(intVector, i);
+                                    doc = iterator.nextDoc();
+                                    if(doc == Integer.MAX_VALUE) break;
+                                }
+                            }
+                        } catch (IllegalStateException e) {
+                            System.out.println("Value is null for : " + i);
+                        } catch (IndexOutOfBoundsException e) {
+                            logger.info("Index is out bound :{} , docID : {}", i, doc);
+                        }
+                    }
+
+                    if(!load_batch) {
+                        continue;
+                    }
+                    load_batch = true;
+                }
+
+            } finally {
+                //logger.info("Total matches are: {}", total_count);
+                stream.close();
+            }
+        } catch (Exception e) {
+            logger.error("Error processing data with ParquetExec: " + e.getMessage());
+            throw new RuntimeException(e);
+        }
+
+    }
+
 
     private void leafFroggingWithParquetExec(
         String filepath,
