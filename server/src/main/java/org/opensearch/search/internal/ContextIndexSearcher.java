@@ -245,7 +245,10 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         // A cancellable can contain an indirect reference to the search context, which potentially retains a significant amount
         // of memory.
         this.cancellable.clear();
-        this.getArrowQueryContext().close();
+        if(this.getArrowQueryContext() != null) {
+            this.getArrowQueryContext().close();
+        }
+
     }
 
     public boolean hasCancellations() {
@@ -688,55 +691,55 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     if (collector instanceof MultiCollector) {
                         for (Collector c : ((MultiCollector) collector).getCollectors()) {
                             if (c instanceof ArrowBatchCollector) {
-                                try {
-                                    //logger.info("Running data-fusion dataframes from {} to {} with parallelism {}", minDocId, maxDocId, arrowCtx.getIsParallelismEnabled());
-                                    long startTime = System.nanoTime();
-                                    dataFusionLeapFroggingWithParquetExec(
-                                        arrowQueryContext,
-                                        (ArrowBatchCollector) c,
-                                        scorer,
-                                        filePath,
-                                        minDocId,
-                                        maxDocId,
-                                        partNo,
-                                        arrowCtx.getIsParallelismEnabled()
-                                    );
-                                    long duration = TimeValue.nsecToMSec(System.nanoTime() - startTime);
-                                    //logger.info("Range min: {} max: {} took {} ms for path {}", minDocId, maxDocId, duration, filePath);
-                                } catch (Exception e) {
-                                    throw new RuntimeException(e);
-                                }
-
-//                                arrowSearch = true;
-//                                if(arrowCtx.getIsLeapFrogginEnabled()) {
-//                                    //logger.info("Running java leap frogging logic from {} to {}", minDocId, maxDocId);
-//                                    leafFroggingWithParquetExec(
-//                                        filePath,
+//                                try {
+//                                    //logger.info("Running data-fusion dataframes from {} to {} with parallelism {}", minDocId, maxDocId, arrowCtx.getIsParallelismEnabled());
+//                                    long startTime = System.nanoTime();
+//                                    dataFusionLeapFroggingWithParquetExec(
 //                                        arrowQueryContext,
 //                                        (ArrowBatchCollector) c,
 //                                        scorer,
+//                                        filePath,
 //                                        minDocId,
-//                                        maxDocId);
-//                                } else {
-//                                    try {
-//                                        //logger.info("Running data-fusion dataframes from {} to {} with parallelism {}", minDocId, maxDocId, arrowCtx.getIsParallelismEnabled());
-//                                        long startTime = System.nanoTime();
-//                                        dataFusionLeapFroggingWithParquetExec(
-//                                            arrowQueryContext,
-//                                            (ArrowBatchCollector) c,
-//                                            scorer,
-//                                            filePath,
-//                                            minDocId,
-//                                            maxDocId,
-//                                            partNo,
-//                                            arrowCtx.getIsParallelismEnabled()
-//                                        );
-//                                        long duration = TimeValue.nsecToMSec(System.nanoTime() - startTime);
-//                                        //logger.info("Range min: {} max: {} took {} ms for path {}", minDocId, maxDocId, duration, filePath);
-//                                    } catch (Exception e) {
-//                                        throw new RuntimeException(e);
-//                                    }
+//                                        maxDocId,
+//                                        partNo,
+//                                        arrowCtx.getIsParallelismEnabled()
+//                                    );
+//                                    long duration = TimeValue.nsecToMSec(System.nanoTime() - startTime);
+//                                    //logger.info("Range min: {} max: {} took {} ms for path {}", minDocId, maxDocId, duration, filePath);
+//                                } catch (Exception e) {
+//                                    throw new RuntimeException(e);
 //                                }
+
+                                arrowSearch = true;
+                                if(arrowCtx.getIsLeapFrogginEnabled()) {
+                                    //logger.info("Running java leap frogging logic from {} to {}", minDocId, maxDocId);
+                                    leafFroggingWithParquetExec(
+                                        filePath,
+                                        arrowQueryContext,
+                                        (ArrowBatchCollector) c,
+                                        scorer,
+                                        minDocId,
+                                        maxDocId);
+                                } else {
+                                    try {
+                                        //logger.info("Running data-fusion dataframes from {} to {} with parallelism {}", minDocId, maxDocId, arrowCtx.getIsParallelismEnabled());
+                                        long startTime = System.nanoTime();
+                                        dataFusionLeapFroggingWithParquetExec(
+                                            arrowQueryContext,
+                                            (ArrowBatchCollector) c,
+                                            scorer,
+                                            filePath,
+                                            minDocId,
+                                            maxDocId,
+                                            partNo,
+                                            arrowCtx.getIsParallelismEnabled()
+                                        );
+                                        long duration = TimeValue.nsecToMSec(System.nanoTime() - startTime);
+                                        //logger.info("Range min: {} max: {} took {} ms for path {}", minDocId, maxDocId, duration, filePath);
+                                    } catch (Exception e) {
+                                        throw new RuntimeException(e);
+                                    }
+                                }
 
                             }
                         }

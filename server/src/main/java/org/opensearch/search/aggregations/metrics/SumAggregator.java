@@ -194,8 +194,8 @@ public class SumAggregator extends NumericMetricsAggregator.SingleValue implemen
     }
 
     public void collectBatch(VectorSchemaRoot root) throws IOException {
-        if (root.getFieldVectors().getFirst() instanceof IntVector) {
-            IntVector intVector = (IntVector) root.getFieldVectors().getFirst();
+        if (root.getFieldVectors().getLast() instanceof IntVector) {
+            IntVector intVector = (IntVector) root.getFieldVectors().getLast();
 
             // Get values for bucket 0 (since this is a single-bucket aggregation)
             sums = context.bigArrays().grow(sums, 1);

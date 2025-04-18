@@ -28,7 +28,7 @@ public class IntraSegmentSearchSupplier {
             // We have numberOfSlices, let's see, we will need rowGroups in the leaf.
             int rowGroups = 0;
             if(i==0) {
-                rowGroups = 9;
+                rowGroups = 13;
             } else {
                 rowGroups = 6;
             }
@@ -39,8 +39,8 @@ public class IntraSegmentSearchSupplier {
             for(int j=0; j<numberOfSlices - 1; j++) {
                 start_doc = end_doc;
                 end_doc = start_doc + avg_row_group_per_partition * 1024 * 1024;
-                //groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, start_doc, end_doc)));
-                groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, 0, ctx.reader().maxDoc())));
+                groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, start_doc, end_doc)));
+//                groupedLeafPartitions.add(Collections.singletonList(IndexSearcher.LeafReaderContextPartition.createFromAndTo(ctx, 0, ctx.reader().maxDoc())));
             }
 
             start_doc = end_doc;
