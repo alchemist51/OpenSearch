@@ -28,9 +28,9 @@ public class IntraSegmentSearchSupplier {
             // We have numberOfSlices, let's see, we will need rowGroups in the leaf.
             int rowGroups = 0;
             if(i==0) {
-                rowGroups = 13;
+                rowGroups = 7;
             } else {
-                rowGroups = 6;
+                rowGroups = 7;
             }
 
             int avg_row_group_per_partition = rowGroups / numberOfSlices;

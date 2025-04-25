@@ -50,6 +50,7 @@ dependencies {
   runtimeOnly "io.netty:netty-common:${versions.netty}"
   runtimeOnly "io.netty:netty-transport:${versions.netty}"
   runtimeOnly "io.netty:netty-handler:${versions.netty}"
+  runtimeOnly "io.netty:netty-resolver:${versions.netty}"
 
   // Additional runtime dependencies
   runtimeOnly "org.apache.arrow:arrow-algorithm:${versions.arrow}"
