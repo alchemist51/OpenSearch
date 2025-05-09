@@ -216,6 +216,30 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         Property.Dynamic
     );
 
+    public static final String SEARCH_ENGINE_DUAL = "dual";
+    public static final String SEARCH_ENGINE_PARQUET = "parquet";
+    public static final String SEARCH_ENGINE_LUCENE = "lucene";
+
+    public static final Setting<String> CLUSTER_SEARCH_ENGINE_MODE = Setting.simpleString(
+        "search.engine.mode",
+        SEARCH_ENGINE_DUAL,
+        value -> {
+            switch (value) {
+                case SEARCH_ENGINE_DUAL:
+                case SEARCH_ENGINE_PARQUET:
+                case SEARCH_ENGINE_LUCENE:
+                    // valid setting
+                    break;
+                default:
+                    throw new IllegalArgumentException("Setting value must be one of [all, none, auto]");
+            }
+        },
+        Property.Dynamic,
+        Property.NodeScope
+    );
+
+
+
     public static final Setting<Boolean> LeapFrogSettingEnabled = Setting.boolSetting(
         "cluster.engine.parquet.leapfrog.enabled",
         false,

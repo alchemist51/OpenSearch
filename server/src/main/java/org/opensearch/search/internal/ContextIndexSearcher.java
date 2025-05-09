@@ -686,59 +686,77 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         boolean arrowSearch = false;
         if (scorer != null) {
             ArrowQueryContext arrowQueryContext = getArrowQueryContext();
-            if (arrowQueryContext != null) {
+            if (arrowQueryContext != null && !Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_LUCENE)) {
                 if (arrowQueryContext.isUsingParquetExec()) {
                     if (collector instanceof MultiCollector) {
                         for (Collector c : ((MultiCollector) collector).getCollectors()) {
                             if (c instanceof ArrowBatchCollector) {
-//                                try {
-//                                    //logger.info("Running data-fusion dataframes from {} to {} with parallelism {}", minDocId, maxDocId, arrowCtx.getIsParallelismEnabled());
-//                                    long startTime = System.nanoTime();
-//                                    dataFusionLeapFroggingWithParquetExec(
-//                                        arrowQueryContext,
-//                                        (ArrowBatchCollector) c,
-//                                        scorer,
-//                                        filePath,
-//                                        minDocId,
-//                                        maxDocId,
-//                                        partNo,
-//                                        arrowCtx.getIsParallelismEnabled()
-//                                    );
-//                                    long duration = TimeValue.nsecToMSec(System.nanoTime() - startTime);
-//                                    //logger.info("Range min: {} max: {} took {} ms for path {}", minDocId, maxDocId, duration, filePath);
-//                                } catch (Exception e) {
-//                                    throw new RuntimeException(e);
-//                                }
-
-                                arrowSearch = true;
-                                if(arrowCtx.getIsLeapFrogginEnabled()) {
-                                    //logger.info("Running java leap frogging logic from {} to {}", minDocId, maxDocId);
-                                    leafFroggingWithParquetExec(
-                                        filePath,
-                                        arrowQueryContext,
-                                        (ArrowBatchCollector) c,
-                                        scorer,
-                                        minDocId,
-                                        maxDocId);
-                                } else {
-                                    try {
-                                        //logger.info("Running data-fusion dataframes from {} to {} with parallelism {}", minDocId, maxDocId, arrowCtx.getIsParallelismEnabled());
-                                        long startTime = System.nanoTime();
-                                        dataFusionLeapFroggingWithParquetExec(
-                                            arrowQueryContext,
-                                            (ArrowBatchCollector) c,
-                                            scorer,
-                                            filePath,
-                                            minDocId,
-                                            maxDocId,
-                                            partNo,
-                                            arrowCtx.getIsParallelismEnabled()
-                                        );
-                                        long duration = TimeValue.nsecToMSec(System.nanoTime() - startTime);
-                                        //logger.info("Range min: {} max: {} took {} ms for path {}", minDocId, maxDocId, duration, filePath);
-                                    } catch (Exception e) {
-                                        throw new RuntimeException(e);
+                                boolean isParallelQuery = arrowCtx.getIsParallelismEnabled();
+                                // Run the Query accordingly
+                                try {
+                                    if(isParallelQuery) {
+                                        if(Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_DUAL)) {
+                                            dataFusionLeapFroggingWithParquetExec(
+                                                arrowQueryContext,
+                                                (ArrowBatchCollector) c,
+                                                scorer,
+                                                filePath,
+                                                minDocId,
+                                                maxDocId,
+                                                partNo,
+                                                arrowCtx.getIsParallelismEnabled()
+                                            );
+                                        } else if(Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_PARQUET)) {
+                                            // fill for pure parquet query
+                                            datafusionQuery(
+                                                arrowQueryContext,
+                                                (ArrowBatchCollector) c,
+                                                scorer,
+                                                filePath,
+                                                minDocId,
+                                                maxDocId,
+                                                partNo,
+                                                arrowCtx.getIsParallelismEnabled()
+                                            );
+                                        }
+                                    } else {
+                                        if(Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_DUAL)) {
+                                            if(arrowCtx.getIsLeapFrogginEnabled()) {
+                                                leafFroggingWithParquetExec(
+                                                    filePath,
+                                                    arrowQueryContext,
+                                                    (ArrowBatchCollector) c,
+                                                    scorer,
+                                                    minDocId,
+                                                    maxDocId);
+                                            } else {
+                                                dataFusionLeapFroggingWithParquetExec(
+                                                    arrowQueryContext,
+                                                    (ArrowBatchCollector) c,
+                                                    scorer,
+                                                    filePath,
+                                                    minDocId,
+                                                    maxDocId,
+                                                    partNo,
+                                                    arrowCtx.getIsParallelismEnabled()
+                                                );
+                                            }
+                                        } else if(Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_PARQUET)) {
+                                            // fill for pure parquet query
+                                            datafusionQuery(
+                                                arrowQueryContext,
+                                                (ArrowBatchCollector) c,
+                                                scorer,
+                                                filePath,
+                                                minDocId,
+                                                maxDocId,
+                                                partNo,
+                                                arrowCtx.getIsParallelismEnabled()
+                                            );
+                                        }
                                     }
+                                } catch (Exception e) {
+                                    throw new RuntimeException(e);
                                 }
 
                             }
@@ -790,6 +808,100 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         // CollectionTerminatedException and TimeExceededException, but no other exception.
         leafCollector.finish();
     }
+
+    private void datafusionQuery(
+        ArrowQueryContext arrowQueryContext,
+        ArrowBatchCollector collector,
+        Scorer scorer,
+        String filePath,
+        int minDocId,
+        int maxDocId,
+        int partNo,
+        Boolean isParallelismEnabled
+    ) throws Exception {
+        ParquetExecQueryContext parquetCtx1 = arrowQueryContext.getParquetExecContext();
+        // create a new context
+        ParquetExecQueryContext parquetCtx = new ParquetExecQueryContext(parquetCtx1);
+        ParquetExec exec = parquetCtx.getParquetExec();
+
+        DocIdSetIterator iterator = scorer.iterator();
+
+        CustomIteratorInterface javaIterator = new CustomIteratorInterface() {
+            IntVector vector;
+            int batch_size = 1024;
+
+            @Override
+            public boolean hasNext() {
+                return iterator.docID() != DocIdSetIterator.NO_MORE_DOCS;
+            }
+
+            @Override
+            public ArraySchema next() throws IOException {
+                RootAllocator allocator = (RootAllocator) parquetCtx.getAllocator();
+                if (vector == null) {
+                    vector = new IntVector("example", allocator);
+                }
+
+                vector.allocateNew(batch_size);
+                int val = iterator.nextDoc();
+                int i = 0;
+                for (; i < batch_size && val != DocIdSetIterator.NO_MORE_DOCS; i++) {
+                    vector.setSafe(i, val);
+                    val = iterator.nextDoc();
+                }
+                vector.setValueCount(i);
+
+                ArrowArray arrowArray = ArrowArray.allocateNew(allocator);
+                ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
+                Data.exportVector(allocator, vector, new CDataDictionaryProvider(), arrowArray, arrowSchema);
+                return new ArraySchema(arrowArray.memoryAddress(), arrowSchema.memoryAddress());
+            }
+        };
+
+        CompletableFuture<RecordBatchStream> result;
+        if (isParallelismEnabled) {
+            result = exec.executeParellelDatafusion(
+                filePath,
+                javaIterator,
+                Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
+                arrowQueryContext.getFieldVal(),
+                minDocId,
+                maxDocId,
+                partNo,
+                searchContext.getTargetMaxSliceCount(),
+                parquetCtx.getAllocator()
+            );
+        } else {
+            result = exec.executeDatafusion(
+                filePath,
+                javaIterator,
+                Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
+                arrowQueryContext.getFieldVal(),
+                parquetCtx.getAllocator()
+            );
+        }
+
+        // Process results
+        RecordBatchStream stream = result.join();
+        try {
+            VectorSchemaRoot root = stream.getVectorSchemaRoot();
+            while (stream.loadNextBatch().get()) {
+                if (collector instanceof ArrowBatchCollector) {
+                    if (root.getRowCount() == 0) continue;
+                    (collector).collectBatch(root);
+
+                }
+            }
+        } catch (ExecutionException e) {
+            throw new RuntimeException(e);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        } finally {
+            stream.close();
+        }
+
+    }
+
 
     private void dataFusionLeapFroggingWithParquetExec(
         ArrowQueryContext arrowQueryContext,
@@ -866,7 +978,6 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     partNo,
                     this.searchContext.getTargetMaxSliceCount(),
                     parquetCtx.getAllocator());
-
 
             } else {
                 result = exec.execute(

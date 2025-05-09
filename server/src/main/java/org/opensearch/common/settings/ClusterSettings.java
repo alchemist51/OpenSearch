@@ -777,6 +777,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 SearchService.CacheEnabled,
                 SearchService.parquetFieldValueSetting,
                 SearchService.parquetFieldNameSetting,
+                SearchService.CLUSTER_SEARCH_ENGINE_MODE,
                 DataFusionParallelismEnabled,
 
                 RemoteStoreSettings.CLUSTER_REMOTE_INDEX_SEGMENT_METADATA_RETENTION_MAX_COUNT_SETTING,

@@ -43,6 +43,7 @@ public class ArrowQueryContext {
     private final int fieldVal;
     private final String fieldName;
     private final boolean isLeapFrogginEnabled;
+    private String engineMode;
     int size;
 
     public ArrowQueryContext(
@@ -58,11 +59,16 @@ public class ArrowQueryContext {
         this.fieldName = clusterService.getClusterSettings().get(SearchService.parquetFieldNameSetting);
         this.isLeapFrogginEnabled = clusterService.getClusterSettings().get(SearchService.LeapFrogSettingEnabled);
         this.isparallelismEnabled = clusterService.getClusterSettings().get(SearchService.DataFusionParallelismEnabled);
+        this.engineMode = clusterService.getClusterSettings().get(SearchService.CLUSTER_SEARCH_ENGINE_MODE);
         initializeFilters(context);
     }
 
     public boolean getIsLeapFrogginEnabled() {
         return isLeapFrogginEnabled;
+    }
+
+    public String getEngineMode() {
+        return engineMode;
     }
 
     public boolean getIsParallelismEnabled() {
