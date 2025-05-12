@@ -648,7 +648,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         // TODO : only sum aggs is currently supported
         // TODO : only range and terms query is currently supportedw
 
+        PathTransformer pathTransformer = new PathTransformer();
         String filePath = Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.getAttribute("parquet_file");
+        filePath = pathTransformer.transformPath(filePath);
         ArrowQueryContext arrowCtx = getArrowQueryContext();
 
         // Check if at all we need to call this leaf for collecting results.
@@ -695,7 +697,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                 // Run the Query accordingly
                                 try {
                                     if(isParallelQuery) {
+                                        logger.info("ParallelQuery");
                                         if(Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_DUAL)) {
+                                            logger.info("Dual Engine query");
                                             dataFusionLeapFroggingWithParquetExec(
                                                 arrowQueryContext,
                                                 (ArrowBatchCollector) c,
@@ -708,6 +712,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                             );
                                         } else if(Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_PARQUET)) {
                                             // fill for pure parquet query
+                                            logger.info("Parquet Engine query");
                                             datafusionQuery(
                                                 arrowQueryContext,
                                                 (ArrowBatchCollector) c,
@@ -720,8 +725,11 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                             );
                                         }
                                     } else {
+                                        logger.info("SingleQuery");
                                         if(Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_DUAL)) {
+                                            logger.info("Dual Engine query");
                                             if(arrowCtx.getIsLeapFrogginEnabled()) {
+                                                logger.info("LeapFrogging query");
                                                 leafFroggingWithParquetExec(
                                                     filePath,
                                                     arrowQueryContext,
@@ -730,6 +738,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                                     minDocId,
                                                     maxDocId);
                                             } else {
+                                                logger.info("LeapFrogging disabled query");
                                                 dataFusionLeapFroggingWithParquetExec(
                                                     arrowQueryContext,
                                                     (ArrowBatchCollector) c,
@@ -743,6 +752,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                             }
                                         } else if(Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_PARQUET)) {
                                             // fill for pure parquet query
+                                            logger.info("Parquet Engine query");
                                             datafusionQuery(
                                                 arrowQueryContext,
                                                 (ArrowBatchCollector) c,
@@ -824,42 +834,11 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         ParquetExecQueryContext parquetCtx = new ParquetExecQueryContext(parquetCtx1);
         ParquetExec exec = parquetCtx.getParquetExec();
 
-        DocIdSetIterator iterator = scorer.iterator();
-
-        CustomIteratorInterface javaIterator = new CustomIteratorInterface() {
-            IntVector vector;
-            int batch_size = 1024;
-
-            @Override
-            public boolean hasNext() {
-                return iterator.docID() != DocIdSetIterator.NO_MORE_DOCS;
-            }
-
-            @Override
-            public ArraySchema next() throws IOException {
-                RootAllocator allocator = (RootAllocator) parquetCtx.getAllocator();
-                if (vector == null) {
-                    vector = new IntVector("example", allocator);
-                }
-
-                vector.allocateNew(batch_size);
-                int val = iterator.nextDoc();
-                int i = 0;
-                for (; i < batch_size && val != DocIdSetIterator.NO_MORE_DOCS; i++) {
-                    vector.setSafe(i, val);
-                    val = iterator.nextDoc();
-                }
-                vector.setValueCount(i);
-
-                ArrowArray arrowArray = ArrowArray.allocateNew(allocator);
-                ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
-                Data.exportVector(allocator, vector, new CDataDictionaryProvider(), arrowArray, arrowSchema);
-                return new ArraySchema(arrowArray.memoryAddress(), arrowSchema.memoryAddress());
-            }
-        };
+        CustomIteratorInterface javaIterator = null;
 
         CompletableFuture<RecordBatchStream> result;
         if (isParallelismEnabled) {
+            logger.info("Parallelism enabled");
             result = exec.executeParellelDatafusion(
                 filePath,
                 javaIterator,
@@ -872,6 +851,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 parquetCtx.getAllocator()
             );
         } else {
+            logger.info("Parallelism disabled");
             result = exec.executeDatafusion(
                 filePath,
                 javaIterator,
@@ -967,6 +947,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             leafFroggingWithRecordBatchStream(collector, result, scorer);
         } else {
             if(isParallelismEnabled) {
+                logger.info("Parallelism with table provider is enabled");
                 //logger.info("Path Idx is {} for path {}", partNo, filePath);
                 result = exec.execute(
                     filePath,
@@ -980,6 +961,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     parquetCtx.getAllocator());
 
             } else {
+                logger.info("Single thread with table provider is enabled");
                 result = exec.execute(
                     filePath,
                     javaIterator,
