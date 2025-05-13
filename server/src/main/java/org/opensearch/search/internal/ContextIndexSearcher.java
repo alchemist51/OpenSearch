@@ -933,7 +933,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         CompletableFuture<RecordBatchStream> result;
         if(isParallelismEnabled && arrowQueryContext.getIsLeapFrogginEnabled()) {
             logger.info("Parallelism with leap frogging is enabled");
-            result = exec.execute(
+            result = exec.executeLeapFrog(
                 filePath,
                 javaIterator,
                 Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
