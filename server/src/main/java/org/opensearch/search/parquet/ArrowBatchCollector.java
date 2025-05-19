@@ -8,6 +8,7 @@
 
 package org.opensearch.search.parquet;
 
+import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
@@ -35,5 +36,6 @@ public interface ArrowBatchCollector {
     void collect(int value) throws IOException;
 
     void collect(IntVector intVector, int idx) throws IOException;
+    void collect(BigIntVector intVector, int idx) throws IOException;
     int collectBatch(VectorSchemaRoot root, ParquetBitSet bitSet) throws IOException;
 }

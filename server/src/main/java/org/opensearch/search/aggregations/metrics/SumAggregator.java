@@ -134,7 +134,7 @@ public class SumAggregator extends NumericMetricsAggregator.SingleValue implemen
         }
         // Check if we're using Arrow
         ArrowQueryContext arrowCtx = context.getQueryShardContext().getArrowQueryContext();
-        if (arrowCtx != null) {
+        if (arrowCtx != null && arrowCtx.getEngineMode().equals("lucene") == false) {
             return getArrowLeafCollector(sub);
         }
         final BigArrays bigArrays = context.bigArrays();
@@ -265,6 +265,28 @@ public class SumAggregator extends NumericMetricsAggregator.SingleValue implemen
     }
 
     public void collect(IntVector intVector, int idx) throws IOException {
+//IntVector intVector = ((IntVector) root.getVector(0));
+
+        // Get values for bucket 0 (since this is a single-bucket aggregation)
+        sums = context.bigArrays().grow(sums, 1);
+        compensations = context.bigArrays().grow(compensations, 1);
+
+        CompensatedSum kahanSummation = new CompensatedSum(sums.get(0), compensations.get(0));
+
+        // for (int i = 0; i < root.getRowCount(); i++) {
+        try {
+            kahanSummation.add(intVector.get(idx));
+        } catch (IllegalStateException e) {
+            System.out.println("Value is null for : " + idx);
+        }
+        // }
+
+        // Store final results
+        sums.set(0, kahanSummation.value());
+        compensations.set(0, kahanSummation.delta());
+    }
+
+    public void collect(BigIntVector intVector, int idx) throws IOException {
 //IntVector intVector = ((IntVector) root.getVector(0));
 
         // Get values for bucket 0 (since this is a single-bucket aggregation)

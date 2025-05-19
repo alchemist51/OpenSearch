@@ -111,6 +111,7 @@ import org.opensearch.lucene.util.CombinedBitSet;
 import org.opensearch.search.DefaultSearchContext;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchService;
+import org.opensearch.search.aggregations.metrics.CompensatedSum;
 import org.opensearch.search.approximate.ApproximateScoreQuery;
 import org.opensearch.search.dfs.AggregatedDfs;
 import org.opensearch.search.parquet.ArrowBatchCollector;
@@ -245,9 +246,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         // A cancellable can contain an indirect reference to the search context, which potentially retains a significant amount
         // of memory.
         this.cancellable.clear();
-        if(this.getArrowQueryContext() != null) {
-            this.getArrowQueryContext().close();
-        }
+//        if(this.getArrowQueryContext() != null) {
+//            this.getArrowQueryContext().close();
+//        }
 
     }
 
@@ -869,13 +870,32 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             while (stream.loadNextBatch().get()) {
                 if (collector instanceof ArrowBatchCollector) {
                     if (root.getRowCount() == 0) continue;
-                    (collector).collectBatch(root);
-
+                    // (collector).collectBatch(root);
+                    if (root.getFieldVectors().getLast() instanceof IntVector intVector) {
+                        for (int i = 0; i < root.getRowCount(); i++) {
+                            try {
+                                collector.collect(intVector, i);
+                            } catch (IllegalStateException e) {
+                                System.out.println("Value is null for : " + i);
+                            }
+                        }
+                    } else  if (root.getFieldVectors().getLast() instanceof BigIntVector intVector) {
+                        for (int i = 0; i < root.getRowCount(); i++) {
+                            try {
+                                collector.collect(intVector, i);
+                            } catch (IllegalStateException e) {
+                                System.out.println("Value is null for : " + i);
+                            }
+                        }
+                    }
                 }
+                //System.out.println("loading next batch");
             }
         } catch (ExecutionException e) {
+            System.out.println("-================= execution");
             throw new RuntimeException(e);
         } catch (InterruptedException e) {
+            System.out.println("-================= interrupted");
             throw new RuntimeException(e);
         } finally {
             stream.close();

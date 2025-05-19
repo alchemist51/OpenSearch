@@ -851,6 +851,7 @@ public class InternalEngine extends Engine {
 
     private ParquetRecordWriter recordWriter;
 
+
     @Override
     public List<String> getFlushPoint() {
         return recordWriter.flushPoint();

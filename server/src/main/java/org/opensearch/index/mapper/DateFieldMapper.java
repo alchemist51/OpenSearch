@@ -770,7 +770,7 @@ public final class DateFieldMapper extends ParametrizedFieldMapper {
             timestamp = nullValue;
         } else {
             try {
-                timestamp = fieldType().parse(dateAsString);
+                timestamp = System.currentTimeMillis();//fieldType().parse(dateAsString);
             } catch (IllegalArgumentException | OpenSearchParseException | DateTimeException | ArithmeticException e) {
                 if (ignoreMalformed) {
                     context.addIgnoredField(mappedFieldType.name());
