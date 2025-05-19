@@ -42,6 +42,9 @@ public class ArrowQueryContext {
     private final ParquetExecQueryContext parquetExecContext;
     private final int fieldVal;
     private final String fieldName;
+    private final String range_fieldName;
+    private final long range_from;
+    private final long range_to;
     private final boolean isLeapFrogginEnabled;
     private String engineMode;
     int size;
@@ -57,10 +60,25 @@ public class ArrowQueryContext {
         this.size = size;
         this.fieldVal = clusterService.getClusterSettings().get(SearchService.parquetFieldValueSetting);
         this.fieldName = clusterService.getClusterSettings().get(SearchService.parquetFieldNameSetting);
+        this.range_fieldName = clusterService.getClusterSettings().get(SearchService.parquetRangeQueryFieldSetting);
+        this.range_from = clusterService.getClusterSettings().get(SearchService.parquetRangeQueryFromSetting);
+        this.range_to = clusterService.getClusterSettings().get(SearchService.parquetRangeQueryToSetting);
         this.isLeapFrogginEnabled = clusterService.getClusterSettings().get(SearchService.LeapFrogSettingEnabled);
         this.isparallelismEnabled = clusterService.getClusterSettings().get(SearchService.DataFusionParallelismEnabled);
         this.engineMode = clusterService.getClusterSettings().get(SearchService.CLUSTER_SEARCH_ENGINE_MODE);
         initializeFilters(context);
+    }
+
+    public String getRange_fieldName() {
+        return range_fieldName;
+    }
+
+    public long getRange_from() {
+        return range_from;
+    }
+
+    public long getRange_to() {
+        return range_to;
     }
 
     public boolean getIsLeapFrogginEnabled() {

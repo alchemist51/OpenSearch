@@ -830,6 +830,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         int partNo,
         Boolean isParallelismEnabled
     ) throws Exception {
+
         ParquetExecQueryContext parquetCtx1 = arrowQueryContext.getParquetExecContext();
         // create a new context
         ParquetExecQueryContext parquetCtx = new ParquetExecQueryContext(parquetCtx1);
@@ -849,15 +850,22 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 maxDocId,
                 partNo,
                 searchContext.getTargetMaxSliceCount(),
+                arrowQueryContext.getRange_fieldName(),
+                arrowQueryContext.getRange_from(),
+                arrowQueryContext.getRange_to(),
                 parquetCtx.getAllocator()
             );
         } else {
             logger.info("Parallelism disabled");
+            // Add Range query
             result = exec.executeDatafusion(
                 filePath,
                 javaIterator,
                 Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
                 arrowQueryContext.getFieldVal(),
+                arrowQueryContext.getRange_fieldName(),
+                arrowQueryContext.getRange_from(),
+                arrowQueryContext.getRange_to(),
                 parquetCtx.getAllocator()
             );
         }
@@ -869,8 +877,25 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             while (stream.loadNextBatch().get()) {
                 if (collector instanceof ArrowBatchCollector) {
                     if (root.getRowCount() == 0) continue;
-                    (collector).collectBatch(root);
-
+                    if (root.getFieldVectors().getLast() instanceof IntVector) {
+                        IntVector intVector = (IntVector) root.getFieldVectors().getLast();
+                        for (int i = 0; i < root.getRowCount(); i++) {
+                            try {
+                                collector.collect(intVector, i);
+                            } catch (IllegalStateException e) {
+                                System.out.println("Value is null for : " + i);
+                            }
+                        }
+                    } else  if (root.getFieldVectors().getLast() instanceof BigIntVector) {
+                        BigIntVector intVector = (BigIntVector) root.getFieldVectors().getLast();
+                        for (int i = 0; i < root.getRowCount(); i++) {
+                            try {
+                                collector.collect(intVector, i);
+                            } catch (IllegalStateException e) {
+                                System.out.println("Value is null for : " + i);
+                            }
+                        }
+                    }
                 }
             }
         } catch (ExecutionException e) {

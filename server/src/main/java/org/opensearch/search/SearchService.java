@@ -276,6 +276,28 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         Setting.Property.Dynamic
     );
 
+    public static final Setting<String> parquetRangeQueryFieldSetting = new Setting<>(
+        "cluster.engine.parquet.range_field.name",
+        "timestamp",
+        Function.identity(),
+        Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<Long> parquetRangeQueryFromSetting = Setting.longSetting(
+        "cluster.engine.parquet.range_field.from",
+        1747469620862L,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+
+    public static final Setting<Long> parquetRangeQueryToSetting = Setting.longSetting(
+        "cluster.engine.parquet.range_field.to",
+        1747469653634L,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
 
 
     public static final Setting<Boolean> ENABLE_INTRA_SEGMENT_SEARCH_SETTING = Setting.boolSetting(
