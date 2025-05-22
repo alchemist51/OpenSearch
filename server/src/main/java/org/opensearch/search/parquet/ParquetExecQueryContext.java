@@ -64,6 +64,10 @@ public class ParquetExecQueryContext implements AutoCloseable {
         return parquetPath;
     }
 
+    public SessionContext getSessionContext() {
+        return sessionContext;
+    }
+
     @Override
     public void close() {
         try {

@@ -683,11 +683,18 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         Bits liveDocs = ctx.reader().getLiveDocs();
         BitSet liveDocsBitSet = getSparseBitSetOrNull(liveDocs);
 
-
+        boolean isparquet = false;
+        if (arrowCtx != null && Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_PARQUET)) {
+            isparquet = true;
+        }
+        Scorer scorer = null;
+        if(isparquet == false) {
+            scorer = weight.scorer(ctx);
+        }
         // Add logic for parquet context:
-        Scorer scorer = weight.scorer(ctx);
+
         boolean arrowSearch = false;
-        if (scorer != null) {
+        if (scorer != null || isparquet) {
             ArrowQueryContext arrowQueryContext = getArrowQueryContext();
             if (arrowQueryContext != null && !Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_LUCENE)) {
                 if (arrowQueryContext.isUsingParquetExec()) {
@@ -927,7 +934,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
         CustomIteratorInterface javaIterator = new CustomIteratorInterface() {
             IntVector vector;
-            int batch_size = 1024;
+            int batch_size = 8192;
             @Override
             public boolean hasNext() {
                 return iterator.docID() != DocIdSetIterator.NO_MORE_DOCS;
@@ -935,6 +942,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
             @Override
             public ArraySchema next() throws IOException {
+                System.out.println("Calling next on lucene");
                 RootAllocator allocator = (RootAllocator) parquetCtx.getAllocator();
                 if(vector == null) {
                     vector = new IntVector("example", allocator);
@@ -948,7 +956,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     val = iterator.nextDoc();
                 }
                 vector.setValueCount(i);
-
+                System.out.println("value of doc : " + i);
                 ArrowArray arrowArray = ArrowArray.allocateNew(allocator);
                 ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
                 Data.exportVector(allocator, vector, new CDataDictionaryProvider(), arrowArray, arrowSchema);
@@ -999,8 +1007,10 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             RecordBatchStream stream = result.join();
             try {
                 VectorSchemaRoot root = stream.getVectorSchemaRoot();
+
                 while (stream.loadNextBatch().get()) {
                     if (collector instanceof ArrowBatchCollector) {
+                        System.out.println("row count : " + root.getRowCount());
                         if(root.getRowCount() == 0) continue;
                         (collector).collectBatch(root);
                     }
@@ -1106,6 +1116,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             ParquetExec exec = parquetCtx.getParquetExec();
 
             DocIdSetIterator iterator = scorer.iterator();
+
             CompletableFuture<RecordBatchStream> result = exec.execute(
                 filepath,
                 Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
@@ -1118,13 +1129,13 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 VectorSchemaRoot root = stream.getVectorSchemaRoot();
                 boolean load_batch = true;
                 int doc = iterator.nextDoc();
-                BigIntVector rowIdVector;
+                IntVector rowIdVector;
                 while(doc != Integer.MAX_VALUE) {
                     if(load_batch && !stream.loadNextBatch().get()) {
                         break;
                     }
 
-                    rowIdVector = (BigIntVector) root.getFieldVectors().getFirst();
+                    rowIdVector = (IntVector) root.getFieldVectors().getFirst();
                     if(doc > rowIdVector.get(root.getRowCount() - 1)) {
                         load_batch = true;
                         continue;

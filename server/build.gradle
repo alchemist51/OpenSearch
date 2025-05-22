@@ -160,6 +160,7 @@ dependencies {
 
 // Add JNI support
 def datafusionRoot = '/home/ec2-user/workplace/datafusion-java'
+//def datafusionRoot = '/Users/gbh/Documents/dev/ws-opensearch-datafusion/src/OSDataFusionPOC'
 def jniPath = "$datafusionRoot/datafusion-jni/target/release"
 
 //def datafusionRoot = '/Users/abandeji/Public/workplace/datafusion-java'
