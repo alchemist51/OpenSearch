@@ -651,7 +651,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         PathTransformer pathTransformer = new PathTransformer();
         String filePath = Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.getAttribute("parquet_file");
         // Use it when running locally!
-        // filePath = pathTransformer.transformPath(filePath);
+        filePath = pathTransformer.transformPath(filePath);
         ArrowQueryContext arrowCtx = getArrowQueryContext();
 
         // Check if at all we need to call this leaf for collecting results.

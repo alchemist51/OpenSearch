@@ -17,7 +17,7 @@ public class PathTransformer {
     public PathTransformer() {
         pathMappings = new HashMap<>();
         pathMappings.put(
-            "/home/ec2-user/workplace/OpenSearch/build/distribution/local/opensearch-3.0.0-SNAPSHOT",
+            "/home/ec2-user/opensearch-3.0.0-SNAPSHOT",
             "/Users/abandeji/Public/workplace/OpenSearch/build/distribution/local/opensearch-3.0.0-SNAPSHOT"
         );
     }
