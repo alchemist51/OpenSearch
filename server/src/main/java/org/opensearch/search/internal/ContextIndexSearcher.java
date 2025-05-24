@@ -510,34 +510,6 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         return searchContext.getQueryShardContext().getArrowQueryContext();
     }
 
-    public static void testParquetExec() throws Exception {
-        try (SessionContext context = SessionContexts.create();
-             BufferAllocator allocator = new RootAllocator()) {
-            ParquetExec exec = new ParquetExec(context, context.getPointer());
-            CompletableFuture<RecordBatchStream> result =
-                exec.execute(
-                    "/Users/gbh/Documents/1728892707_zstd_32mb_rg_v2.parquet",
-                    "target_status_code",
-                    404,
-                    0,
-                    allocator);
-            RecordBatchStream stream = result.join();
-            VectorSchemaRoot root = stream.getVectorSchemaRoot();
-            while (stream.loadNextBatch().get()) {
-                List<FieldVector> vectors = root.getFieldVectors();
-                for (FieldVector vector : vectors) {
-                    logger.info(
-                        "Field - {}, {}, {}, {}",
-                        vector.getField().getName(),
-                        vector.getField().getType(),
-                        vector.getValueCount(),
-                        vector);
-                }
-            }
-            stream.close();
-        }
-    }
-
     private static void consumeReader(ArrowReader reader) {
         try {
             VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -651,7 +623,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         PathTransformer pathTransformer = new PathTransformer();
         String filePath = Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.getAttribute("parquet_file");
         // Use it when running locally!
-        filePath = pathTransformer.transformPath(filePath);
+        // filePath = pathTransformer.transformPath(filePath);
         ArrowQueryContext arrowCtx = getArrowQueryContext();
 
         // Check if at all we need to call this leaf for collecting results.
@@ -692,7 +664,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             scorer = weight.scorer(ctx);
         }
         // Add logic for parquet context:
-
+        //logger.info("Starting query!");
         boolean arrowSearch = false;
         if (scorer != null || isparquet) {
             ArrowQueryContext arrowQueryContext = getArrowQueryContext();
@@ -705,9 +677,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                 // Run the Query accordingly
                                 try {
                                     if(isParallelQuery) {
-                                        logger.info("ParallelQuery");
+                                        //logger.info("ParallelQuery");
                                         if(Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_DUAL)) {
-                                            logger.info("Dual Engine query");
+                                            //logger.info("Dual Engine query");
                                             dataFusionLeapFroggingWithParquetExec(
                                                 arrowQueryContext,
                                                 (ArrowBatchCollector) c,
@@ -733,11 +705,11 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                             );
                                         }
                                     } else {
-                                        logger.info("SingleQuery");
+                                        //logger.info("SingleQuery");
                                         if(Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_DUAL)) {
-                                            logger.info("Dual Engine query");
+                                            //logger.info("Dual Engine query");
                                             if(arrowCtx.getIsLeapFrogginEnabled()) {
-                                                logger.info("LeapFrogging query");
+                                                //logger.info("LeapFrogging query");
                                                 leafFroggingWithParquetExec(
                                                     filePath,
                                                     arrowQueryContext,
@@ -746,17 +718,17 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                                     minDocId,
                                                     maxDocId);
                                             } else {
-                                                logger.info("LeapFrogging disabled query");
-                                                dataFusionLeapFroggingWithParquetExec(
-                                                    arrowQueryContext,
-                                                    (ArrowBatchCollector) c,
-                                                    scorer,
-                                                    filePath,
-                                                    minDocId,
-                                                    maxDocId,
-                                                    partNo,
-                                                    arrowCtx.getIsParallelismEnabled()
-                                                );
+                                                logger.info("LeapFrogging disabled query, fix query!");
+//                                                dataFusionLeapFroggingWithParquetExec(
+//                                                    arrowQueryContext,
+//                                                    (ArrowBatchCollector) c,
+//                                                    scorer,
+//                                                    filePath,
+//                                                    minDocId,
+//                                                    maxDocId,
+//                                                    partNo,
+//                                                    arrowCtx.getIsParallelismEnabled()
+//                                                );
                                             }
                                         } else if(Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_PARQUET)) {
                                             // fill for pure parquet query
@@ -850,11 +822,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             logger.info("Parallelism enabled");
             result = exec.executeParellelDatafusion(
                 filePath,
-                javaIterator,
                 Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
                 arrowQueryContext.getFieldVal(),
-                minDocId,
-                maxDocId,
                 partNo,
                 searchContext.getTargetMaxSliceCount(),
                 arrowQueryContext.getRange_fieldName(),
@@ -964,16 +933,16 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             }
         };
 
-        CompletableFuture<RecordBatchStream> result;
+        CompletableFuture<RecordBatchStream> result = null;
         if(isParallelismEnabled && arrowQueryContext.getIsLeapFrogginEnabled()) {
-            logger.info("Parallelism with leap frogging is enabled");
+            //logger.info("Parallelism with leap frogging is enabled");
             result = exec.executeLeapFrog(
                 filePath,
-                javaIterator,
                 Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
                 arrowQueryContext.getFieldVal(),
-                minDocId,
-                maxDocId,
+                arrowQueryContext.getRange_fieldName(),
+                arrowQueryContext.getRange_from(),
+                arrowQueryContext.getRange_to(),
                 partNo,
                 this.searchContext.getTargetMaxSliceCount(),
                 parquetCtx.getAllocator());
@@ -981,27 +950,27 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             leafFroggingWithRecordBatchStream(collector, result, scorer);
         } else {
             if(isParallelismEnabled) {
-                logger.info("Parallelism with table provider is enabled");
+                logger.info("Parallelism with table provider is enabled, please fix query!");
                 //logger.info("Path Idx is {} for path {}", partNo, filePath);
-                result = exec.execute(
-                    filePath,
-                    javaIterator,
-                    Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
-                    arrowQueryContext.getFieldVal(),
-                    minDocId,
-                    maxDocId,
-                    partNo,
-                    this.searchContext.getTargetMaxSliceCount(),
-                    parquetCtx.getAllocator());
+//                result = exec.execute(
+//                    filePath,
+//                    javaIterator,
+//                    Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
+//                    arrowQueryContext.getFieldVal(),
+//                    minDocId,
+//                    maxDocId,
+//                    partNo,
+//                    this.searchContext.getTargetMaxSliceCount(),
+//                    parquetCtx.getAllocator());
 
             } else {
-                logger.info("Single thread with table provider is enabled");
-                result = exec.execute(
-                    filePath,
-                    javaIterator,
-                    Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
-                    arrowQueryContext.getFieldVal(),
-                    parquetCtx.getAllocator());
+                logger.info("Single thread with table provider is enabled, please fix query!");
+//                result = exec.execute(
+//                    filePath,
+//                    javaIterator,
+//                    Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
+//                    arrowQueryContext.getFieldVal(),
+//                    parquetCtx.getAllocator());
             }
             // Process results
             RecordBatchStream stream = result.join();
@@ -1121,6 +1090,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 filepath,
                 Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
                 arrowQueryContext.getFieldVal(),
+                arrowQueryContext.getRange_fieldName(),
+                arrowQueryContext.getRange_from(),
+                arrowQueryContext.getRange_to(),
                 parquetCtx.getAllocator());
 
             RecordBatchStream stream = result.join();
@@ -1132,6 +1104,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 IntVector rowIdVector;
                 while(doc != Integer.MAX_VALUE) {
                     if(load_batch && !stream.loadNextBatch().get()) {
+                        //logger.info("row name : {}",root.getFieldVectors().getFirst().getName());
+                        //logger.info("target-status-code name : {}",root.getFieldVectors().get(1).getName());
                         break;
                     }
 
@@ -1190,102 +1164,6 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             throw new RuntimeException(e);
         }
 
-    }
-
-    private void searchWithParquetExec(ArrowQueryContext arrowCtx, Collector collector, String filePath) throws IOException {
-        try {
-            ParquetExecQueryContext parquetCtx = arrowCtx.getParquetExecContext();
-            ParquetExec exec = parquetCtx.getParquetExec();
-
-            // Execute query using ParquetExec
-//            CompletableFuture<RecordBatchStream> result = exec.execute(
-//                parquetCtx.getParquetPath(),
-//                getTargetField(arrowCtx.getBaseQueryBuilder()),
-//                Integer.parseInt((String)getTargetValue(arrowCtx.getBaseQueryBuilder())),
-//                parquetCtx.getAllocator()
-//            );
-
-            // Execute query using ParquetExec
-
-            CompletableFuture<RecordBatchStream> result = null;
-
-            if (arrowCtx.getBaseQueryBuilder() instanceof TermQueryBuilder) {
-                result = exec.execute(
-                    filePath,
-                    getTargetField(arrowCtx.getBaseQueryBuilder()),
-                    (Integer) NumberFieldMapper.NumberType.INTEGER.parse(getTargetValue(arrowCtx.getBaseQueryBuilder()), true),
-                    arrowCtx.getSize(),
-                    parquetCtx.getAllocator());
-            } else if (arrowCtx.getBaseQueryBuilder() instanceof RangeQueryBuilder) {
-                MappedFieldType mappedFieldType = searchContext.mapperService().fieldType(getTargetField(arrowCtx.getBaseQueryBuilder()));
-                DateFieldMapper.DateFieldType dateFieldType = (DateFieldMapper.DateFieldType) mappedFieldType;
-                RangeQueryBuilder rangeQueryBuilder = (RangeQueryBuilder) arrowCtx.getBaseQueryBuilder();
-                long parsedLow = dateFieldType.parse(rangeQueryBuilder.from().toString());
-                long parsedHigh = dateFieldType.parse(rangeQueryBuilder.to().toString());
-                result = exec.execute(
-                    filePath,
-                    getTargetField(rangeQueryBuilder),
-                    parsedLow,
-                    parsedHigh,
-                    arrowCtx.getSize(),
-                    parquetCtx.getAllocator()
-                );
-            } else if (arrowCtx.getBaseQueryBuilder() instanceof BoolQueryBuilder) {
-                BoolQueryBuilder boolQueryBuilder = (BoolQueryBuilder) arrowCtx.getBaseQueryBuilder();
-                QueryBuilder must1 = boolQueryBuilder.must().get(0);
-                QueryBuilder must2 = boolQueryBuilder.must().get(1);
-                RangeQueryBuilder rangeQueryBuilder = (RangeQueryBuilder) must1;
-                TermQueryBuilder termQueryBuilder = (TermQueryBuilder) must2;
-                MappedFieldType mappedFieldType = searchContext.mapperService().fieldType(getTargetField(rangeQueryBuilder));
-                DateFieldMapper.DateFieldType dateFieldType = (DateFieldMapper.DateFieldType) mappedFieldType;
-                long parsedLow = dateFieldType.parse(rangeQueryBuilder.from().toString());
-                long parsedHigh = dateFieldType.parse(rangeQueryBuilder.to().toString());
-                result = exec.execute(
-                    filePath,
-                    getTargetField(rangeQueryBuilder),
-                    parsedLow,
-                    parsedHigh,
-                    getTargetField(termQueryBuilder),
-                    (Integer) NumberFieldMapper.NumberType.INTEGER.parse(getTargetValue(must2), true),
-                    arrowCtx.getSize(),
-                    parquetCtx.getAllocator()
-                );
-            }
-            // Process results
-            RecordBatchStream stream = result.join();
-            try {
-                VectorSchemaRoot root = stream.getVectorSchemaRoot();
-                while (stream.loadNextBatch().get()) {
-                    if (arrowCtx.getSize() > 0) {
-
-                        for (int row = 0; row < root.getRowCount(); row++) {
-
-                            StringBuilder rowData = new StringBuilder();
-                            for (int field = 0; field < root.getFieldVectors().size(); field++) {
-                                if (field > 0) rowData.append(", ");
-                                Object o = root.getFieldVectors().get(field).getObject(row);
-                                rowData.append(o);
-                            }
-                            System.out.println("Row : " + rowData);
-                            //System.out.println("Row " + matchCount + ": " + rowData);
-                            //System.out.println("Row " + matchCount);
-
-                        }
-                    } else if (collector instanceof ArrowBatchCollector) {
-                        if (root.getRowCount() == 0) continue;
-
-                        for (int i = 0; i < root.getRowCount(); i++) {
-                            ((ArrowBatchCollector) collector).collect(root, i);
-                        }
-                    }
-                }
-            } finally {
-                stream.close();
-            }
-        } catch (Exception e) {
-            logger.error("Error processing data with ParquetExec: " + e.getMessage(), e);
-            throw new IOException("Failed to process data with ParquetExec", e);
-        }
     }
 
     private String getTargetField(QueryBuilder query) {
