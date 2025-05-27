@@ -623,7 +623,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         PathTransformer pathTransformer = new PathTransformer();
         String filePath = Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.getAttribute("parquet_file");
         // Use it when running locally!
-        // filePath = pathTransformer.transformPath(filePath);
+        //filePath = pathTransformer.transformPath(filePath);
         ArrowQueryContext arrowCtx = getArrowQueryContext();
 
         // Check if at all we need to call this leaf for collecting results.
@@ -1084,8 +1084,6 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             ParquetExecQueryContext parquetCtx = arrowQueryContext.getParquetExecContext();
             ParquetExec exec = parquetCtx.getParquetExec();
 
-            DocIdSetIterator iterator = scorer.iterator();
-
             CompletableFuture<RecordBatchStream> result = exec.execute(
                 filepath,
                 Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
@@ -1095,70 +1093,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 arrowQueryContext.getRange_to(),
                 parquetCtx.getAllocator());
 
-            RecordBatchStream stream = result.join();
-            long total_count = 0;
-            try {
-                VectorSchemaRoot root = stream.getVectorSchemaRoot();
-                boolean load_batch = true;
-                int doc = iterator.nextDoc();
-                IntVector rowIdVector;
-                while(doc != Integer.MAX_VALUE) {
-                    if(load_batch && !stream.loadNextBatch().get()) {
-                        //logger.info("row name : {}",root.getFieldVectors().getFirst().getName());
-                        //logger.info("target-status-code name : {}",root.getFieldVectors().get(1).getName());
-                        break;
-                    }
+            leafFroggingWithRecordBatchStream(collector, result, scorer);
 
-                    rowIdVector = (IntVector) root.getFieldVectors().getFirst();
-                    if(doc > rowIdVector.get(root.getRowCount() - 1)) {
-                        load_batch = true;
-                        continue;
-                    }
-
-                    if(doc < rowIdVector.get(0)) {
-                        doc = iterator.nextDoc();
-                        load_batch = false;
-                        continue;
-                    }
-
-                    int rowCount = root.getRowCount();
-                    IntVector intVector = (IntVector) root.getVector(1);
-                    for (int i = 0; i < rowCount; i++) {
-                        try {
-                            long rowId = (rowIdVector.get(i));
-                            if(rowId == doc) {
-                                collector.collect(intVector, i);
-                                doc = iterator.nextDoc();
-                                if(doc == Integer.MAX_VALUE) {
-                                    // end of iterator;
-                                    break;
-                                }
-                            } else if (rowId > doc) {
-                                doc = iterator.advance((int)rowId);
-                                if(doc == Integer.MAX_VALUE) break;
-                                if(doc == rowId) {
-                                    collector.collect(intVector, i);
-                                    doc = iterator.nextDoc();
-                                    if(doc == Integer.MAX_VALUE) break;
-                                }
-                            }
-                        } catch (IllegalStateException e) {
-                            System.out.println("Value is null for : " + i);
-                        } catch (IndexOutOfBoundsException e) {
-                            logger.info("Index is out bound :{} , docID : {}", i, doc);
-                        }
-                    }
-
-                    if(!load_batch) {
-                        continue;
-                    }
-                    load_batch = true;
-                }
-
-            } finally {
-                //logger.info("Total matches are: {}", total_count);
-                stream.close();
-            }
         } catch (Exception e) {
             logger.error("Error processing data with ParquetExec: " + e.getMessage());
             throw new RuntimeException(e);
