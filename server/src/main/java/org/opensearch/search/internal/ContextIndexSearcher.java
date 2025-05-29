@@ -692,7 +692,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                             );
                                         } else if(Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_PARQUET)) {
                                             // fill for pure parquet query
-                                            logger.info("Parquet Engine query");
+                                            //logger.info("Parquet Engine query");
                                             datafusionQuery(
                                                 arrowQueryContext,
                                                 (ArrowBatchCollector) c,
@@ -732,7 +732,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                                             }
                                         } else if(Objects.equals(arrowCtx.getEngineMode(), SearchService.SEARCH_ENGINE_PARQUET)) {
                                             // fill for pure parquet query
-                                            logger.info("Parquet Engine query");
+                                            //logger.info("Parquet Engine query");
                                             datafusionQuery(
                                                 arrowQueryContext,
                                                 (ArrowBatchCollector) c,
@@ -819,7 +819,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
         CompletableFuture<RecordBatchStream> result;
         if (isParallelismEnabled) {
-            logger.info("Parallelism enabled");
+            //logger.info("Parallelism enabled");
             result = exec.executeParellelDatafusion(
                 filePath,
                 Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
@@ -832,7 +832,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 parquetCtx.getAllocator()
             );
         } else {
-            logger.info("Parallelism disabled");
+            //logger.info("Parallelism disabled");
             // Add Range query
             result = exec.executeDatafusion(
                 filePath,
