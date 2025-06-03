@@ -90,6 +90,9 @@ import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.search.similarities.Similarity;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.Bits;
@@ -615,13 +618,41 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         searchLeaf(ctx, minDocId, maxDocId, 0, weight, collector);
     }
 
+    String createParquetFilePath(String segmentName, String dirName) {
+        // Extract the number from segment name (e.g., "_0" -> 0)
+        int segmentNumber = Integer.parseInt(segmentName.substring(1));
+
+        // Calculate new generation number (segment number + 1)
+        int generationNumber = segmentNumber + 1;
+
+        // Get the parent directory by removing "index" from the path
+        String parentDir = dirName.substring(0, dirName.lastIndexOf("/index"));
+
+        // Construct the final parquet file path
+        String parquetFilePath = parentDir + "/parquet/generation-" + generationNumber + ".parquet";
+
+        return parquetFilePath;
+    }
+
     protected void searchLeaf(LeafReaderContext ctx, int minDocId, int maxDocId, int partNo, Weight weight, Collector collector) throws IOException{
         // Check if we have an Arrow context and early terminate
         // TODO : only sum aggs is currently supported
         // TODO : only range and terms query is currently supportedw
 
-        PathTransformer pathTransformer = new PathTransformer();
-        String filePath = Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.getAttribute("parquet_file");
+        // _0
+        String name =  Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.name;
+
+        Directory dir = Lucene.segmentReader(ctx.reader()).directory();
+        while(dir instanceof FilterDirectory) {
+            dir = ((FilterDirectory) dir).getDelegate();
+        }
+        // /Users/gbh/Documents/os/data/nodes/0/indices/wHGNZN36SqiQ452QgYYcCg/0/index
+        String dirName = ((FSDirectory) dir).getDirectory().toString();
+
+        String filePath = createParquetFilePath(name, dirName);
+
+        //PathTransformer pathTransformer = new PathTransformer();
+        //String filePath = Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.getAttribute("parquet_file");
         // Use it when running locally!
         //filePath = pathTransformer.transformPath(filePath);
         ArrowQueryContext arrowCtx = getArrowQueryContext();
