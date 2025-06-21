@@ -60,6 +60,7 @@ public class ParquetExecQueryContext implements AutoCloseable {
             } else {
                 this.sessionContext = SessionContexts.withConfig(executionOptions.getConfig());
             }
+
             this.parquetExec = new ParquetExec(sessionContext, sessionContext.getPointer());
             this.allocator = new RootAllocator();
             this.parquetPath = parquetPath;
@@ -116,7 +117,9 @@ public class ParquetExecQueryContext implements AutoCloseable {
     public void close() {
         try {
             if (allocator != null) allocator.close();
-            //if (sessionContext != null) sessionContext.close();
+            if(this.cacheEnabled == false) {
+                if (sessionContext != null) sessionContext.close();
+            }
         } catch (Exception e) {
             System.out.println("Exception in parquet exec query context" + e);
         }

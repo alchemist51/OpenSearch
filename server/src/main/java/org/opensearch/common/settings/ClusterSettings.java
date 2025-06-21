@@ -775,6 +775,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 SearchService.ENABLE_INTRA_SEGMENT_SEARCH_SETTING,
                 SearchService.LeapFrogSettingEnabled,
                 SearchService.CacheEnabled,
+                SearchService.DataEngine,
                 SearchService.parquetFieldValueSetting,
                 SearchService.parquetFieldNameSetting,
                 SearchService.CLUSTER_SEARCH_ENGINE_MODE,

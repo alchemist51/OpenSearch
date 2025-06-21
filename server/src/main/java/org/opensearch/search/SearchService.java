@@ -32,6 +32,7 @@
 
 package org.opensearch.search;
 
+import org.apache.arrow.datafusion.ExecutionEngine;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.search.FieldDoc;
@@ -88,6 +89,7 @@ import org.opensearch.index.query.QueryCoordinatorContext;
 import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.Rewriteable;
+import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.SearchOperationListener;
@@ -252,6 +254,22 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         false,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
+    );
+
+    public static final Setting<ExecutionEngine> DataEngine = new Setting<>(
+        "cluster.data.engine",
+        ExecutionEngine.PARQUET.toString(),
+        ExecutionEngine::fromString,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<RemoteStoreEnums.PathType> SEARCHABLE_SNAPSHOT_SHARD_PATH_TYPE = new Setting<>(
+        "index.searchable_snapshot.shard_path_type",
+        RemoteStoreEnums.PathType.FIXED.toString(),
+        RemoteStoreEnums.PathType::parseString,
+        Property.IndexScope,
+        Property.InternalIndex
     );
 
     public static final Setting<Boolean> DataFusionParallelismEnabled = Setting.boolSetting(
@@ -497,6 +515,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
     private final Executor indexSearcherExecutor;
     private final TaskResourceTrackingService taskResourceTrackingService;
     private boolean leapFrogSettingEnabled;
+    private ExecutionEngine dataEngine;
 
     public SearchService(
         ClusterService clusterService,
@@ -529,6 +548,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         this.indexSearcherExecutor = indexSearcherExecutor;
         this.taskResourceTrackingService = taskResourceTrackingService;
         this.leapFrogSettingEnabled = LeapFrogSettingEnabled.get(settings);
+        this.dataEngine = DataEngine.get(settings);
         TimeValue keepAliveInterval = KEEPALIVE_INTERVAL_SETTING.get(settings);
         setKeepAlives(DEFAULT_KEEPALIVE_SETTING.get(settings), MAX_KEEPALIVE_SETTING.get(settings));
         setPitKeepAlives(DEFAULT_KEEPALIVE_SETTING.get(settings), MAX_PIT_KEEPALIVE_SETTING.get(settings));
@@ -545,6 +565,9 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(LeapFrogSettingEnabled, this::setLeapFrogSettingEnabled);
+
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(DataEngine, this::setDataEngine);
 
         this.keepAliveReaper = threadPool.scheduleWithFixedDelay(new Reaper(), keepAliveInterval, Names.SAME);
 
@@ -641,6 +664,10 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
     private void setLeapFrogSettingEnabled(boolean leapFrogSettingEnabled) {
         this.leapFrogSettingEnabled = leapFrogSettingEnabled;
+    }
+
+    private void setDataEngine(ExecutionEngine engine) {
+        this.dataEngine = dataEngine;
     }
 
     private void setAllowDerivedField(boolean allowDerivedField) {

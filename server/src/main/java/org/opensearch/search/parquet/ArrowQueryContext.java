@@ -8,6 +8,7 @@
 
 package org.opensearch.search.parquet;
 
+import org.apache.arrow.datafusion.ExecutionEngine;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.annotation.ExperimentalApi;
@@ -39,7 +40,7 @@ public class ArrowQueryContext {
     private boolean useParquetExec;
     private boolean useOnlyParquetExec;
     private boolean useFilterExec;
-    private final ParquetExecQueryContext parquetExecContext;
+    private final DataExecQueryContext dataExecContext;
     private final int fieldVal;
     private final String fieldName;
     private final String range_fieldName;
@@ -47,6 +48,7 @@ public class ArrowQueryContext {
     private final long range_to;
     private final boolean isLeapFrogginEnabled;
     private String engineMode;
+    private ExecutionEngine executionEngine;
     int size;
 
     public ArrowQueryContext(
@@ -56,7 +58,7 @@ public class ArrowQueryContext {
         ClusterService clusterService) {
         this.baseQueryBuilder = baseQueryBuilder;
         this.parquetPath = parquetPath;
-        this.parquetExecContext = new ParquetExecQueryContext(context, parquetPath, clusterService);
+        this.dataExecContext = new DataExecQueryContext(context, parquetPath, clusterService);
         this.size = size;
         this.fieldVal = clusterService.getClusterSettings().get(SearchService.parquetFieldValueSetting);
         this.fieldName = clusterService.getClusterSettings().get(SearchService.parquetFieldNameSetting);
@@ -66,6 +68,7 @@ public class ArrowQueryContext {
         this.isLeapFrogginEnabled = clusterService.getClusterSettings().get(SearchService.LeapFrogSettingEnabled);
         this.isparallelismEnabled = clusterService.getClusterSettings().get(SearchService.DataFusionParallelismEnabled);
         this.engineMode = clusterService.getClusterSettings().get(SearchService.CLUSTER_SEARCH_ENGINE_MODE);
+        this.executionEngine = clusterService.getClusterSettings().get(SearchService.DataEngine);
         initializeFilters(context);
     }
 
@@ -87,6 +90,10 @@ public class ArrowQueryContext {
 
     public String getEngineMode() {
         return engineMode;
+    }
+
+    public ExecutionEngine getExecutionEngine() {
+        return executionEngine;
     }
 
     public boolean getIsParallelismEnabled() {
@@ -299,11 +306,11 @@ public class ArrowQueryContext {
         return parquetPath;
     }
 
-    public ParquetExecQueryContext getParquetExecContext() {
-        return parquetExecContext;
+    public DataExecQueryContext getDataExecContext() {
+        return dataExecContext;
     }
 
     public void close() {
-        parquetExecContext.close();
+        dataExecContext.close();
     }
 }

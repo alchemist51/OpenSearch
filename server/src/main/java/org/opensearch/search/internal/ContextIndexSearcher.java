@@ -38,10 +38,10 @@ import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.datafusion.ArraySchema;
 import org.apache.arrow.datafusion.CustomIteratorInterface;
-import org.apache.arrow.datafusion.ParquetExec;
+import org.apache.arrow.datafusion.DataExec;
+import org.apache.arrow.datafusion.ExecutionEngine;
 import org.apache.arrow.datafusion.RecordBatchStream;
 import org.apache.arrow.datafusion.SessionContext;
-import org.apache.arrow.datafusion.SessionContexts;
 import org.apache.arrow.dataset.file.FileFormat;
 import org.apache.arrow.dataset.file.FileSystemDatasetFactory;
 import org.apache.arrow.dataset.jni.NativeMemoryPool;
@@ -52,7 +52,6 @@ import org.apache.arrow.dataset.source.DatasetFactory;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
-import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.ValueVector;
 import org.apache.arrow.vector.VarCharVector;
@@ -101,17 +100,10 @@ import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
-import org.opensearch.common.settings.Setting;
-import org.opensearch.common.unit.TimeValue;
-import org.opensearch.index.mapper.DateFieldMapper;
-import org.opensearch.index.mapper.MappedFieldType;
-import org.opensearch.index.mapper.NumberFieldMapper;
-import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.lucene.util.CombinedBitSet;
-import org.opensearch.search.DefaultSearchContext;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.approximate.ApproximateScoreQuery;
@@ -119,7 +111,7 @@ import org.opensearch.search.dfs.AggregatedDfs;
 import org.opensearch.search.parquet.ArrowBatchCollector;
 import org.opensearch.search.parquet.ArrowFilter;
 import org.opensearch.search.parquet.ArrowQueryContext;
-import org.opensearch.search.parquet.ParquetExecQueryContext;
+import org.opensearch.search.parquet.DataExecQueryContext;
 import org.opensearch.search.parquet.substrait.SubstraitFilterProvider;
 import org.opensearch.search.profile.ContextualProfileBreakdown;
 import org.opensearch.search.profile.Timer;
@@ -135,10 +127,8 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -618,7 +608,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         searchLeaf(ctx, minDocId, maxDocId, 0, weight, collector);
     }
 
-    String createParquetFilePath(String segmentName, String dirName) {
+    // Modified method to determine file path and engine type
+    private String createDataFilePath(String segmentName, String dirName, ExecutionEngine engine) {
         // Extract the number from segment name (e.g., "_0" -> 0)
         int segmentNumber = Integer.parseInt(segmentName.substring(1));
 
@@ -628,10 +619,11 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         // Get the parent directory by removing "index" from the path
         String parentDir = dirName.substring(0, dirName.lastIndexOf("/index"));
 
-        // Construct the final parquet file path
-        String parquetFilePath = parentDir + "/parquet/generation-" + generationNumber + ".parquet";
+        // Construct the file path based on engine type
+        String fileExtension = engine == ExecutionEngine.VORTEX ? ".vortex" : ".parquet";
+        String engineDir = engine == ExecutionEngine.VORTEX ? "vortex" : "parquet";
 
-        return parquetFilePath;
+        return parentDir + "/" + engineDir + "/generation-" + generationNumber + fileExtension;
     }
 
     protected void searchLeaf(LeafReaderContext ctx, int minDocId, int maxDocId, int partNo, Weight weight, Collector collector) throws IOException{
@@ -649,7 +641,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         // /Users/gbh/Documents/os/data/nodes/0/indices/wHGNZN36SqiQ452QgYYcCg/0/index
         String dirName = ((FSDirectory) dir).getDirectory().toString();
 
-        String filePath = createParquetFilePath(name, dirName);
+        String filePath = createDataFilePath(name, dirName, getArrowQueryContext().getExecutionEngine());
 
         //PathTransformer pathTransformer = new PathTransformer();
         //String filePath = Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.getAttribute("parquet_file");
@@ -841,17 +833,17 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         Boolean isParallelismEnabled
     ) throws Exception {
 
-        ParquetExecQueryContext parquetCtx1 = arrowQueryContext.getParquetExecContext();
+        DataExecQueryContext parquetCtx1 = arrowQueryContext.getDataExecContext();
         // create a new context
-        ParquetExecQueryContext parquetCtx = new ParquetExecQueryContext(parquetCtx1);
-        ParquetExec exec = parquetCtx.getParquetExec();
+        DataExecQueryContext parquetCtx = new DataExecQueryContext(parquetCtx1);
+        DataExec exec = parquetCtx.getDataExec();
 
         CustomIteratorInterface javaIterator = null;
 
         CompletableFuture<RecordBatchStream> result;
         if (isParallelismEnabled) {
             //logger.info("Parallelism enabled");
-            result = exec.executeParellelDatafusion(
+            result = exec.executeParallelDatafusion(
                 filePath,
                 Objects.equals(arrowQueryContext.getFieldName(), "") ? "target_status_code" : arrowQueryContext.getFieldName(),
                 arrowQueryContext.getFieldVal(),
@@ -926,9 +918,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         int partNo,
         Boolean isParallelismEnabled
     ) throws Exception {
-        ParquetExecQueryContext parquetCtx = new ParquetExecQueryContext(arrowQueryContext.getParquetExecContext());
+        DataExecQueryContext parquetCtx = new DataExecQueryContext(arrowQueryContext.getDataExecContext());
 
-        ParquetExec exec = parquetCtx.getParquetExec();
+        DataExec exec = parquetCtx.getDataExec();
 
         DocIdSetIterator iterator = scorer.iterator();
 
@@ -1046,6 +1038,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     }
 
                     rowIdVector = (IntVector) root.getFieldVectors().getFirst();
+                    System.out.println("rowIds : " + rowIdVector);
                     if(doc > rowIdVector.get(root.getRowCount() - 1)) {
                         load_batch = true;
                         continue;
@@ -1112,8 +1105,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         int maxDocId
     ) {
         try {
-            ParquetExecQueryContext parquetCtx = arrowQueryContext.getParquetExecContext();
-            ParquetExec exec = parquetCtx.getParquetExec();
+            DataExecQueryContext parquetCtx = arrowQueryContext.getDataExecContext();
+            DataExec exec = parquetCtx.getDataExec();
 
             CompletableFuture<RecordBatchStream> result = exec.execute(
                 filepath,

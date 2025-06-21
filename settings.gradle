@@ -25,8 +25,8 @@ rootProject.name = "OpenSearch"
 
 include 'doc-tools'
 includeBuild("doc-tools/missing-doclet")
-includeBuild('/home/ec2-user/workplace/datafusion-java') {
-//includeBuild('/Users/gbh/Documents/dev/ws-opensearch-datafusion/src/OSDataFusionPOC') {
+//includeBuild('/home/ec2-user/workplace/datafusion-java') {
+includeBuild('/Users/gbh/Documents/dev/ws-opensearch-datafusion/src/OSDataFusionPOC') {
 //includeBuild('/Users/abandeji/Public/workplace/datafusion-java'){
   dependencySubstitution {
     substitute(module('io.github.datafusion-contrib:datafusion-java'))

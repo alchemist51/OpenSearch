@@ -93,7 +93,7 @@ public class ParquetRecordWriter {
             }
             latestFlushPoint.addAll(Files.list(path).map(p -> p.getFileName().toString()).collect(Collectors.toList()));
             if (!latestFlushPoint.isEmpty()) {
-                counter = new AtomicLong(latestFlushPoint.stream().mapToLong(s -> Long.parseLong(s.split("\\.")[0].split("-")[1])).max().getAsLong());
+                counter = new AtomicLong(latestFlushPoint.stream().filter(s->s.contains("parquet")).mapToLong(s -> Long.parseLong(s.split("\\.")[0].split("-")[1])).max().getAsLong());
             } else {
                 counter = new AtomicLong();
             }
