@@ -632,6 +632,10 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         // TODO : only range and terms query is currently supportedw
 
         // _0
+
+        ArrowQueryContext arrowCtx = getArrowQueryContext();
+
+
         String name =  Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.name;
 
         Directory dir = Lucene.segmentReader(ctx.reader()).directory();
@@ -640,14 +644,16 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         }
         // /Users/gbh/Documents/os/data/nodes/0/indices/wHGNZN36SqiQ452QgYYcCg/0/index
         String dirName = ((FSDirectory) dir).getDirectory().toString();
-
-        String filePath = createDataFilePath(name, dirName, getArrowQueryContext().getExecutionEngine());
+        String filePath = null;
+        if (arrowCtx != null) {
+            filePath = createDataFilePath(name, dirName, getArrowQueryContext().getExecutionEngine());
+        }
 
         //PathTransformer pathTransformer = new PathTransformer();
         //String filePath = Lucene.segmentReader(ctx.reader()).getSegmentInfo().info.getAttribute("parquet_file");
         // Use it when running locally!
         //filePath = pathTransformer.transformPath(filePath);
-        ArrowQueryContext arrowCtx = getArrowQueryContext();
+
 
         // Check if at all we need to call this leaf for collecting results.
         if (canMatch(ctx) == false) {
@@ -1038,7 +1044,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     }
 
                     rowIdVector = (IntVector) root.getFieldVectors().getFirst();
-                    System.out.println("rowIds : " + rowIdVector);
+                    //System.out.println("rowIds : " + rowIdVector);
                     if(doc > rowIdVector.get(root.getRowCount() - 1)) {
                         load_batch = true;
                         continue;

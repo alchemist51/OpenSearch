@@ -29,6 +29,7 @@ public class DataExecQueryContext implements AutoCloseable {
     private static final Object LOCK = new Object();
 
     private static SessionContext createSessionContext(Boolean cacheEnabled) {
+        System.out.println("Creating session context");
         SessionConfig sessionConfig = new SessionConfig();
         ExecutionOptions executionOptions = new ExecutionOptions(sessionConfig);
         executionOptions.withTargetPartitions(1);

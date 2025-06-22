@@ -251,7 +251,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
     public static final Setting<Boolean> CacheEnabled = Setting.boolSetting(
         "cluster.engine.parquet.cache.enabled",
-        false,
+        true,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
