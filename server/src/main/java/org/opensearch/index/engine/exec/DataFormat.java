@@ -8,10 +8,12 @@
 
 package org.opensearch.index.engine.exec;
 
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.engine.exec.text.TextDF;
 
+@ExperimentalApi
 public interface DataFormat {
     Setting<Settings> dataFormatSettings();
 

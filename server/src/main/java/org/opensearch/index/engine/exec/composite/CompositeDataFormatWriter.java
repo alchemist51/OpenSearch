@@ -8,6 +8,7 @@
 
 package org.opensearch.index.engine.exec.composite;
 
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.engine.exec.DocumentInput;
 import org.opensearch.index.engine.exec.FileMetadata;
 import org.opensearch.index.engine.exec.FlushIn;
@@ -72,6 +73,7 @@ public class CompositeDataFormatWriter implements Writer<CompositeDataFormatWrit
         return new CompositeDocumentInput(writers.stream().map(Writer::newDocumentInput).collect(Collectors.toList()), this, postWrite);
     }
 
+    @ExperimentalApi
     public static class CompositeDocumentInput implements DocumentInput<List<? extends DocumentInput<?>>> {
         List<? extends DocumentInput<?>> inputs;
         CompositeDataFormatWriter writer;

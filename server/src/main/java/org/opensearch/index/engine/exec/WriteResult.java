@@ -8,5 +8,8 @@
 
 package org.opensearch.index.engine.exec;
 
+import org.opensearch.common.annotation.ExperimentalApi;
+
+@ExperimentalApi
 public record WriteResult(boolean success, Exception e, long version, long term, long seqNo) {
 }

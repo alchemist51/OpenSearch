@@ -8,4 +8,7 @@
 
 package org.opensearch.index.engine.exec;
 
+import org.opensearch.common.annotation.ExperimentalApi;
+
+@ExperimentalApi
 public record FileMetadata(DataFormat df, String fileName) { }
