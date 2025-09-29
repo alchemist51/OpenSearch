@@ -68,6 +68,8 @@ public class DatafusionContext extends SearchContext {
     private final SearchShardTask task;
     private final DatafusionEngine readEngine;
     private final DatafusionSearcher engineSearcher;
+    private final IndexShard indexShard;
+    private final QuerySearchResult queryResult;
     private DatafusionQuery datafusionQuery;
 
     /**
@@ -80,13 +82,16 @@ public class DatafusionContext extends SearchContext {
     public DatafusionContext(
         ReaderContext readerContext,
         ShardSearchRequest request,
+        SearchShardTarget searchShardTarget,
         SearchShardTask task,
         DatafusionEngine engine) {
         this.readerContext = readerContext;
+        this.indexShard = readerContext.indexShard();
         this.request = request;
         this.task = task;
         this.readEngine = engine;
         this.engineSearcher = engine.acquireSearcher("search");//null;//TODO readerContext.contextEngineSearcher();
+        this.queryResult = new QuerySearchResult(readerContext.id(), searchShardTarget, request);
     }
 
     /**
@@ -175,7 +180,7 @@ public class DatafusionContext extends SearchContext {
 
     @Override
     public ShardSearchRequest request() {
-        return null;
+        return request;
     }
 
     @Override
@@ -346,7 +351,7 @@ public class DatafusionContext extends SearchContext {
 
     @Override
     public IndexShard indexShard() {
-        return null;
+        return this.indexShard;
     }
 
     @Override
@@ -671,7 +676,7 @@ public class DatafusionContext extends SearchContext {
 
     @Override
     public QuerySearchResult queryResult() {
-        return null;
+        return this.queryResult;
     }
 
     @Override

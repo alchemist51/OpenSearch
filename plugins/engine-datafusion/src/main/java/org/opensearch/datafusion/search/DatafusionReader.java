@@ -45,14 +45,13 @@ public class DatafusionReader implements Closeable {
     public DatafusionReader(String directoryPath, Collection<FileMetadata> files) {
         this.directoryPath = directoryPath;
         this.files = files;
-        String[] fileNames = Objects.isNull(files) ? new String[]{} : files.stream().map(FileMetadata::fileName).toArray(String[]::new);
+        String[] fileNames = Objects.isNull(files) ? new String[]{"hits_data.parquet"} : files.stream().map(FileMetadata::fileName).toArray(String[]::new);
         this.cachePtr = DataFusionQueryJNI.createDatafusionReader(directoryPath, fileNames);
         incRef();
     }
 
     /**
      * Gets the cache pointer.
-     * 
      * @return the cache pointer
      */
     public long getCachePtr() {
@@ -68,7 +67,6 @@ public class DatafusionReader implements Closeable {
 
     /**
      * Decrements the reference count.
-     * 
      * @throws IOException if an I/O error occurs
      */
     public void decRef() throws IOException {
