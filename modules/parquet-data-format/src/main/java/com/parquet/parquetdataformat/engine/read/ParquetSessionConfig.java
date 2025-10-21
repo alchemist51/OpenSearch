@@ -16,23 +16,13 @@ import org.opensearch.vectorized.execution.search.spi.SessionConfigRegistry;
 
 public class ParquetSessionConfig implements SessionConfig {
 
-    public static final Setting<Integer> PARQUET_BATCH_SIZE = Setting.intSetting(
-        "parquet.batch_size",
-        1024,
-        Setting.Property.Dynamic,
-        Setting.Property.NodeScope,
-        Setting.Property.Deprecated
-    );
-
     SessionConfigRegistry sessionConfigRegistry;
     Integer parquetBatchSize;
 
-    ParquetSessionConfig(ClusterService clusterService) {
+    ParquetSessionConfig() {
         super();
-        sessionConfigRegistry = new SessionConfigRegistry();
+        //sessionConfigRegistry = new SessionConfigRegistry();
 
-        parquetBatchSize = PARQUET_BATCH_SIZE.get(clusterService.getSettings());
-        clusterService.getClusterSettings().addSettingsUpdateConsumer(PARQUET_BATCH_SIZE, this::setBatchSize);
     }
 
     @Override
@@ -49,13 +39,10 @@ public class ParquetSessionConfig implements SessionConfig {
 
     @Override
     public Integer getBatchSize() {
-        return parquetBatchSize;
-//        return getParquetSessionConfigValue(nativeSessionConfigPtr, "batch_size");
+        return indexSettings.getAsBoolean(
+            IndexSettings.INDEX_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(),
+            clusterSettings.getOrNull(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING)
+        );
     }
-
-    public void registerListener(ConfigUpdateListener listener) {
-        sessionConfigRegistry.registerListener(listener);
-    }
-
 
 }

@@ -19,8 +19,8 @@ public class ParquetConfig {
     ParquetSessionConfig parquetSessionConfig;
     ParquetNativeConfiguration parquetNativeConfiguration;
 
-    ParquetConfig(ClusterService clusterService) {
-        parquetSessionConfig = new ParquetSessionConfig(clusterService);
+    ParquetConfig() {
+        parquetSessionConfig = new ParquetSessionConfig();
         parquetNativeConfiguration = new ParquetNativeConfiguration();
     }
 

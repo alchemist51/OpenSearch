@@ -10,6 +10,7 @@ package org.opensearch.datafusion;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.common.util.concurrent.ConcurrentCollections;
 import org.opensearch.common.util.concurrent.ConcurrentMapLong;
@@ -32,12 +33,14 @@ public class DataFusionService extends AbstractLifecycleComponent {
 
     private final DataSourceRegistry dataSourceRegistry;
     private final GlobalRuntimeEnv globalRuntimeEnv;
+    private final ClusterService clusterStateService;
 
     /**
      * Creates a new DataFusion service instance.
      */
-    public DataFusionService(Map<DataFormat, DataSourceCodec> dataSourceCodecs) {
+    public DataFusionService(Map<DataFormat, DataSourceCodec> dataSourceCodecs, ClusterService clusterService) {
         this.dataSourceRegistry = new DataSourceRegistry(dataSourceCodecs);
+        this.clusterStateService = clusterService;
 
         // to verify jni
         String version = DataFusionQueryJNI.getVersionInfo();

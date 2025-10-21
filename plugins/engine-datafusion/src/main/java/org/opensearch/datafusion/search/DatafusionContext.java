@@ -14,6 +14,7 @@ import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.Query;
 import org.opensearch.action.search.SearchShardTask;
 import org.opensearch.action.search.SearchType;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.index.IndexService;
@@ -74,6 +75,7 @@ public class DatafusionContext extends SearchContext {
     private final QuerySearchResult queryResult;
     private final FetchSearchResult fetchResult;
     private final IndexService indexService;
+    private final ClusterService clusterService;
     private final QueryShardContext queryShardContext;
     private DatafusionQuery datafusionQuery;
     private Map<String, Object[]> dfResults;
@@ -94,6 +96,7 @@ public class DatafusionContext extends SearchContext {
         SearchShardTarget searchShardTarget,
         SearchShardTask task,
         DatafusionEngine engine,
+        ClusterService clusterService,
         BigArrays bigArrays) {
         this.readerContext = readerContext;
         this.indexShard = readerContext.indexShard();
@@ -113,6 +116,7 @@ public class DatafusionContext extends SearchContext {
             false // specific to lucene
         );
         this.bigArrays = bigArrays;
+        this.clusterService = clusterService;
     }
 
     /**

@@ -1289,7 +1289,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
             request.getClusterAlias(),
             OriginalIndices.NONE
         );
-        SearchContext context = searchExecEngine.createContext(readerContext, request, shardTarget, task, bigArrays);
+        SearchContext context = searchExecEngine.createContext(readerContext, request, shardTarget, task, clusterService, bigArrays);
         try {
             if (request.scroll() != null) {
                 context.scrollContext().scroll = request.scroll();

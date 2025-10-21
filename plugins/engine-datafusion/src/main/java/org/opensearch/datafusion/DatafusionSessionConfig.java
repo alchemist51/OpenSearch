@@ -12,21 +12,21 @@ import org.opensearch.vectorized.execution.search.spi.SessionConfig;
 
 public class DatafusionSessionConfig implements SessionConfig {
 
-    private static native void updateNativeConfig(String key, Boolean value);
+    private final long ptr;
 
-
-    public void updateConfig(String key, Boolean value) {
-        updateNativeConfig(key, value);
+    public DatafusionSessionConfig() {
+        this.ptr = createDefaultNativeSessionConfigPtr();
     }
+
 
     @Override
     public Integer getBatchSize() {
-        return 0;
+        return getParquetSessionConfigValue(ptr, "batch_size");
     }
 
     @Override
     public void setBatchSize(int batchSize) {
-
+        updateParquetSessionConfig(ptr, "batch_size", batchSize);
     }
 
     @Override
@@ -38,6 +38,6 @@ public class DatafusionSessionConfig implements SessionConfig {
     }
 
     native static long createDefaultNativeSessionConfigPtr();
-    native static void updateParquetSessionConfig(long ptr, String key, String value);
+    native static void updateParquetSessionConfig(long ptr, String key, int value);
     native static int getParquetSessionConfigValue(long ptr, String key);
 }

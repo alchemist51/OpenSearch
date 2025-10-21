@@ -39,8 +39,8 @@ public class ParquetDataSourceCodec implements DataSourceCodec {
     private final ConcurrentHashMap<Long, Long> sessionContexts = new ConcurrentHashMap<>();
     private ParquetConfig parquetConfig;
 
-    ParquetDataSourceCodec(ClusterService clusterService) {
-        parquetConfig = new ParquetConfig(clusterService);
+    public ParquetDataSourceCodec() {
+        parquetConfig = new ParquetConfig();
     }
 
     // JNI library loading

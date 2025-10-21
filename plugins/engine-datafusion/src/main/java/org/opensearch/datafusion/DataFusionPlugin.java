@@ -103,11 +103,8 @@ public class DataFusionPlugin extends Plugin implements ActionPlugin, SearchEngi
         if (!isDataFusionEnabled) {
             return Collections.emptyList();
         }
-        dataFusionService = new DataFusionService(dataSourceCodecs);
+        dataFusionService = new DataFusionService(dataSourceCodecs, clusterService);
 
-        for(DataFormat format : this.getSupportedFormats()) {
-            dataSourceCodecs.get(format);
-        }
         // return Collections.emptyList();
         return Collections.singletonList(dataFusionService);
     }

@@ -15,6 +15,7 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.search.SearchShardTask;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.lease.Releasables;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.datafusion.search.DatafusionContext;
@@ -66,15 +67,15 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
 
         // Add All the settings into the DatafusionConfig
         datafusionConfig = dataSourceCodec.updateEngineConfig(datafusionConfig);
-        dataSourceCodec.attachListener(new ConfigUpdateListener() {
-            @Override
-            public void onSessionConfigUpdate(SessionConfig sessionConfig) {
+//        dataSourceCodec.attachListener(new ConfigUpdateListener() {
+//            @Override
+//            public void onSessionConfigUpdate(SessionConfig sessionConfig) {
+//
+//            }
+//
+//        });
 
-            }
-
-        });
-
-        this.datafusionReaderManager = new DatafusionReaderManager(shardPath.getDataPath().toString(), formatCatalogSnapshot, dataFormat.getName());
+        this.datafusionReaderManager = new DatafusionReaderManager(shardPath.getDataPath().toString(), formatCatalogSnapshot, dataSourceCodec.getDataFormat().getName());
         this.datafusionService = dataFusionService;
     }
 
@@ -89,9 +90,15 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
     }
 
     @Override
-    public DatafusionContext createContext(ReaderContext readerContext, ShardSearchRequest request, SearchShardTarget searchShardTarget, SearchShardTask task, BigArrays bigArrays) throws IOException {
-        DatafusionContext datafusionContext = new DatafusionContext(readerContext, request, searchShardTarget, task, this, bigArrays);
+    public DatafusionContext createContext(ReaderContext readerContext, ShardSearchRequest request, SearchShardTarget searchShardTarget, SearchShardTask task, ClusterService clusterService, BigArrays bigArrays) throws IOException {
+
+        // Let's add logic in DatafusionContext to collate the EngineConfig to be used in the Search request
+        // Resolve the Config here
+        EngineConfig engineConfig = dataSourceCodec.updateEngineConfig(datafusionConfig);
+
+        DatafusionContext datafusionContext = new DatafusionContext(readerContext, request, searchShardTarget, task, this, clusterService, bigArrays);
         // Parse source
+        // Ideally the DatafusionQuery should have it
         datafusionContext.datafusionQuery(new DatafusionQuery(request.source().queryPlanIR(), new ArrayList<>()));
         return datafusionContext;
     }

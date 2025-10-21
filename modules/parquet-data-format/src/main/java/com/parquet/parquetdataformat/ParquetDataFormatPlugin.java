@@ -11,6 +11,8 @@ import com.parquet.parquetdataformat.engine.ParquetDataFormat;
 import com.parquet.parquetdataformat.fields.ParquetFieldUtil;
 import com.parquet.parquetdataformat.engine.read.ParquetDataSourceCodec;
 import com.parquet.parquetdataformat.writer.ParquetWriter;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.index.IndexModule;
 import org.opensearch.index.engine.DataFormatPlugin;
 import org.opensearch.index.engine.exec.DataFormat;
 import org.opensearch.index.engine.exec.IndexingExecutionEngine;
@@ -58,6 +60,12 @@ import java.util.Optional;
  */
 public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin, DataSourcePlugin {
 
+    Settings settings;
+
+    ParquetDataFormatPlugin(Settings settings) {
+        this.settings = settings;
+    }
+
     @Override
     @SuppressWarnings("unchecked")
     public <T extends DataFormat> IndexingExecutionEngine<T> indexingEngine(MapperService mapperService, ShardPath shardPath) {
@@ -81,6 +89,11 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
         codecs.put(parquetDataSourceCodec.getDataFormat(), new ParquetDataSourceCodec());
         return Optional.of(codecs);
         // return Optional.empty();
+    }
+
+    @Override
+    public void onIndexModule(IndexModule indexModule) {
+
     }
 
     // for testing locally only

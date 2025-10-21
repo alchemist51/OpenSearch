@@ -8,6 +8,8 @@
 package com.parquet.parquetdataformat;
 
 import com.parquet.parquetdataformat.bridge.RustBridge;
+import org.opensearch.common.settings.Setting;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -18,9 +20,10 @@ public class ParquetDataFormatTests extends OpenSearchTestCase {
         // Test only basic functionality without Arrow operations
         try {
             // Create plugin but don't call complex operations
-            ParquetDataFormatPlugin plugin = new ParquetDataFormatPlugin();
+            Settings setting = null;
+            ParquetDataFormatPlugin plugin = new ParquetDataFormatPlugin(setting);
             plugin.indexDataToParquetEngine();
-            
+
         } catch (UnsatisfiedLinkError e) {
             fail("Native library not loaded properly: " + e.getMessage());
         } catch (Exception e) {
