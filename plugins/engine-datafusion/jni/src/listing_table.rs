@@ -53,13 +53,13 @@ use datafusion::execution::{
 use datafusion_expr::{
     dml::InsertOp, Expr, SortExpr, TableProviderFilterPushDown, TableType,
 };
-use datafusion::physical_expr::schema_rewriter::PhysicalExprAdapterFactory;
 use datafusion::physical_expr_common::sort_expr::LexOrdering;
 use datafusion::physical_plan::{empty::EmptyExec, ExecutionPlan, Statistics};
 use futures::{future, stream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use object_store::ObjectStore;
 use std::{any::Any, collections::HashMap, str::FromStr, sync::Arc};
+use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
 use regex::Regex;
 
 /// Indicates the source of the schema for a [`ListingTable`]
@@ -1172,6 +1172,13 @@ impl TableProvider for ListingTable {
     }
 
 
+    fn get_table_definition(&self) -> Option<&str> {
+        self.definition.as_deref()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.column_defaults.get(column)
+    }
 
     async fn scan(
         &self,
@@ -1302,10 +1309,6 @@ impl TableProvider for ListingTable {
             .collect()
     }
 
-    fn get_table_definition(&self) -> Option<&str> {
-        self.definition.as_deref()
-    }
-
     async fn insert_into(
         &self,
         state: &dyn Session,
@@ -1362,10 +1365,6 @@ impl TableProvider for ListingTable {
             .format
             .create_writer_physical_plan(input, state, config, order_requirements)
             .await
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.column_defaults.get(column)
     }
 }
 

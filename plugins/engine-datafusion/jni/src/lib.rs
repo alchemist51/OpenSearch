@@ -36,8 +36,12 @@ use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
 use datafusion_substrait::substrait::proto::Plan;
 use futures::TryStreamExt;
 use jni::objects::{JObjectArray, JString};
+use liquid_cache_local::LiquidCacheLocalBuilder;
+use liquid_cache_local::storage::cache::squeeze_policies::TranscodeSqueezeEvict;
+use liquid_cache_local::storage::cache_policies::LiquidPolicy;
 use object_store::ObjectMeta;
 use prost::Message;
+use tempfile::env::temp_dir;
 use tokio::runtime::Runtime;
 use crate::listing_table::{ListingOptions, ListingTable, ListingTableConfig};
 use crate::row_id_optimizer::FilterRowIdOptimizer;
@@ -232,7 +236,8 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_execute
         // .with_physical_optimizer_rule(Arc::new(FilterRowIdOptimizer)) // TODO: enable only for query phase
         .build();
 
-    let ctx = SessionContext::new_with_state(state);
+
+    let mut ctx = SessionContext::new_with_state(state);
 
     // Create default parquet options
     let file_format = ParquetFormat::new();
@@ -253,6 +258,14 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_execute
 
         // Create a new TableProvider
         let provider = Arc::new(ListingTable::try_new(config).unwrap());
+
+        (ctx, _ ) = LiquidCacheLocalBuilder::new()
+            .with_max_cache_bytes(1024 * 1024 * 1024) // 1GB
+            .with_cache_dir(temp_dir())
+            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict::default()))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .build(SessionConfig::default()).unwrap();
+
         let shard_id = table_path.prefix().filename().expect("error in fetching Path");
         ctx.register_table("index-7", provider)
             .expect("Failed to attach the Table");

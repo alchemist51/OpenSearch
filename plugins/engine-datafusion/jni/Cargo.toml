@@ -11,22 +11,21 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # DataFusion dependencies
-datafusion = "49.0.0"
-datafusion-expr = "49.0.0"
-datafusion-datasource = "49.0.0"
-arrow-json = "55.2"
-arrow = { version = "55.2", features = ["ffi", "ipc_compression"] }
-#arrow = "55.2.0"
-arrow-array = "55.2.0"
-arrow-schema = "55.2.0"
-arrow-buffer = "55.2.0"
-
+datafusion = "=50.1.0"
+datafusion-expr = "=50.1.0"
+datafusion-datasource = "=50.1.0"
+liquid-cache-local =  { path = "/Users/abandeji/Public/workplace/liquid-cache/src/local" }
+arrow-json = "56.0.0"
+arrow = { version = "56.0.0", features = ["ffi", "ipc_compression"] }
+arrow-array = "56.0.0"
+arrow-schema = "56.0.0"
+arrow-buffer = "56.0.0"
 # JNI dependencies
 jni = "0.21"
 
 # Substrait support
-datafusion-substrait = "49.0.0"
-prost = "0.13"
+datafusion-substrait = "=50.1.0"
+prost = "0.13.1"
 
 
 # Async runtime
@@ -45,17 +44,17 @@ thiserror = "1.0"
 # Logging
 log = "0.4"
 # Parquet support
-parquet = "53.0.0"
+parquet = "56.0.0"
 
 # Object store for file access
-object_store = "=0.12.3"
+object_store = "0.12.3"
 url = "2.0"
 
 # Substrait support
-substrait = "0.47"
+substrait = "0.58"
 
 # Temporary directory support
-tempfile = "3.0"
+tempfile = "3.23.0"
 chrono = "0.4.41"
 
 async-trait = "0.1.89"

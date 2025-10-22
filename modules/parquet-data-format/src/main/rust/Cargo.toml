@@ -10,13 +10,13 @@ crate-type = ["cdylib"]
 [dependencies]
 
 # DataFusion dependencies
-datafusion = "49.0.0"
-datafusion-substrait = "49.0.0"
-arrow = { version = "54.0.0", features = ["ffi"] }
+datafusion = "50.1.0"
+datafusion-substrait = "50.1.0"
+arrow = { version = "56.0.0", features = ["ffi"] }
 
-arrow-array = "54.0.0"
-arrow-schema = "54.0.0"
-arrow-buffer = "54.0.0"
+arrow-array = "56.0.0"
+arrow-schema = "56.0.0"
+arrow-buffer = "56.0.0"
 
 # JNI dependencies
 jni = "0.21"
@@ -38,15 +38,15 @@ thiserror = "1.0"
 log = "0.4"
 
 # Parquet support
-parquet = "54.0.0"
+parquet = "56.0.0"
 
 # Object store for file access
 object_store = "0.11"
 url = "2.0"
 
 # Substrait support
-substrait = "0.47"
-prost = "0.13"
+substrait = "0.58"
+prost = "0.13.1"
 
 # Temporary directory support
 tempfile = "3.0"
