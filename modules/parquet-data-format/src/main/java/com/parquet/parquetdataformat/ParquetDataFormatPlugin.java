@@ -72,6 +72,7 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
         return (IndexingExecutionEngine<T>) new ParquetExecutionEngine(() -> ParquetFieldUtil.getSchema(mapperService), shardPath);
     }
 
+
     private Class<? extends DataFormat> getDataFormatType() {
         return ParquetDataFormat.class;
     }

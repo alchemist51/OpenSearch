@@ -15,9 +15,12 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.search.SearchShardTask;
+import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.lease.Releasables;
 import org.opensearch.common.util.BigArrays;
+import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.datafusion.search.DatafusionContext;
 import org.opensearch.datafusion.search.DatafusionQuery;
 import org.opensearch.datafusion.search.DatafusionQueryPhaseExecutor;
@@ -25,6 +28,8 @@ import org.opensearch.datafusion.search.DatafusionReader;
 import org.opensearch.datafusion.search.DatafusionReaderManager;
 import org.opensearch.datafusion.search.DatafusionSearcher;
 import org.opensearch.datafusion.search.DatafusionSearcherSupplier;
+import org.opensearch.env.Environment;
+import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.engine.CatalogSnapshotAwareRefreshListener;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineException;
@@ -32,24 +37,32 @@ import org.opensearch.index.engine.EngineSearcherSupplier;
 import org.opensearch.index.engine.SearchExecEngine;
 import org.opensearch.index.engine.exec.FileMetadata;
 import org.opensearch.index.shard.ShardPath;
+import org.opensearch.repositories.RepositoriesService;
+import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.SearchResultsCollector;
 import org.opensearch.search.internal.ReaderContext;
 import org.opensearch.search.internal.ShardSearchRequest;
 import org.opensearch.search.query.QueryPhaseExecutor;
 import org.opensearch.search.query.GenericQueryPhaseSearcher;
+import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.client.Client;
+import org.opensearch.vectorized.execution.search.DataFormat;
 import org.opensearch.vectorized.execution.search.spi.ConfigUpdateListener;
 import org.opensearch.vectorized.execution.search.spi.DataSourceCodec;
 import org.opensearch.vectorized.execution.search.spi.EngineConfig;
 import org.opensearch.vectorized.execution.search.spi.SessionConfig;
+import org.opensearch.watcher.ResourceWatcherService;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 public class DatafusionEngine extends SearchExecEngine<DatafusionContext, DatafusionSearcher,
     DatafusionReaderManager, DatafusionQuery> {
@@ -82,6 +95,30 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
     @Override
     public GenericQueryPhaseSearcher<DatafusionContext, DatafusionSearcher, DatafusionQuery> getQueryPhaseSearcher() {
         return new DatafusionQueryPhaseSearcher();
+    }
+
+    @Override
+    public Collection<Object> createComponents(
+        Client client,
+        ClusterService clusterService,
+        ThreadPool threadPool,
+        ResourceWatcherService resourceWatcherService,
+        ScriptService scriptService,
+        NamedXContentRegistry xContentRegistry,
+        Environment environment,
+        NodeEnvironment nodeEnvironment,
+        NamedWriteableRegistry namedWriteableRegistry,
+        IndexNameExpressionResolver indexNameExpressionResolver,
+        Supplier<RepositoriesService> repositoriesServiceSupplier,
+        Map<DataFormat, DataSourceCodec> dataSourceCodecs
+    ) {
+        if (!isDataFusionEnabled) {
+            return Collections.emptyList();
+        }
+        dataFusionService = new DataFusionService(dataSourceCodecs, clusterService);
+
+        // return Collections.emptyList();
+        return Collections.singletonList(dataFusionService);
     }
 
     @Override
