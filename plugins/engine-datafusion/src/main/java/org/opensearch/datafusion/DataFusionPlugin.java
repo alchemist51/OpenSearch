@@ -126,6 +126,11 @@ public class DataFusionPlugin extends Plugin implements ActionPlugin, SearchEngi
     public SearchExecEngine<DatafusionContext, DatafusionSearcher,
             DatafusionReaderManager, DatafusionQuery>
         createEngine(DataFormat dataFormat,Collection<FileMetadata> formatCatalogSnapshot, ShardPath shardPath) throws IOException {
+        try {
+            DataFusionQueryJNI.startMemoryMonitor("/home/ec2-user/benchsetup/stats/samples.txt", 5000);
+        } catch (UnsatisfiedLinkError e) {
+            // Memory monitor not available, continue without it
+        }
         return new DatafusionEngine(dataFormat, formatCatalogSnapshot, dataFusionService, shardPath);
     }
 

@@ -20,6 +20,7 @@ arrow = { version = "55.2", features = ["ffi", "ipc_compression"] }
 arrow-array = "55.2.0"
 arrow-schema = "55.2.0"
 arrow-buffer = "55.2.0"
+tikv-jemalloc-ctl = { version = "0.5.4", features = ["use_std", "disable_initial_exec_tls"] }
 
 # JNI dependencies
 jni = "0.21"
