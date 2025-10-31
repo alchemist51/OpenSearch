@@ -91,7 +91,7 @@ public class CoreDataFieldPlugin implements ParquetFieldPlugin {
      * @param fieldMap the map to populate with temporal field mappings
      */
     private static void registerTemporalFields(final Map<String, ParquetField> fieldMap) {
-        fieldMap.put(DateFieldMapper.CONTENT_TYPE, new DateParquetField());
+        fieldMap.put(DateFieldMapper.CONTENT_TYPE, new LongParquetField());
         fieldMap.put(DateFieldMapper.DATE_NANOS_CONTENT_TYPE, new DateNanosParquetField());
     }
 
