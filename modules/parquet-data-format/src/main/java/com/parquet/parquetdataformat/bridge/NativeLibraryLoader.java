@@ -45,6 +45,7 @@ public final class NativeLibraryLoader {
         if (loaded) return;
         try {
             System.loadLibrary(libraryName);
+            logger.info("Loaded native library from system path: {}", libraryName);
             loaded = true;
             return;
         } catch (UnsatisfiedLinkError ignored) {
@@ -54,18 +55,19 @@ public final class NativeLibraryLoader {
         //Look-up with default path
         try {
             loadFromResources(DEFAULT_PATH, libraryName);
+            logger.info("Loaded native library from default path: {}", DEFAULT_PATH);
             return;
         }  catch (UnsatisfiedLinkError | IOException ignored) {
-            logger.warn("Failed to load library '" + libraryName + "' from default path");
+            logger.warn("Failed to load library '" + libraryName + "' from default path" + DEFAULT_PATH);
         }
 
         // Try platform-specific directory
         try {
             String platformDir = PlatformHelper.getPlatformDirectory();
             String currentDir = Optional.of(System.getProperty("user.dir")).orElse("/");
-            String path = Paths.get(currentDir, "native", platformDir,
-                PlatformHelper.getPlatformLibraryName(libraryName)).toString();
+            String path = Paths.get(currentDir, "native", platformDir).toString();
             loadFromResources(path, libraryName);
+            logger.info("Loaded native library from platform-specific directory: {}, {}", path, libraryName);
         } catch (UnsatisfiedLinkError | IOException e) {
             throw new NativeLoaderException(
                 "Failed to load library '" + libraryName + "' from all attempted locations", e);
@@ -73,9 +75,17 @@ public final class NativeLibraryLoader {
     }
 
     private static void loadFromResources(String providedPath, String libraryName) throws IOException {
+        String libName = System.mapLibraryName(libraryName);
+        String resourcePath = Paths.get("/", providedPath, libName).toString();
+        System.out.println("Older Resource path is: " + resourcePath);
+
         String platformDir = PlatformHelper.getPlatformDirectory();
-        String libName = PlatformHelper.getPlatformLibraryName(libraryName);
-        String resourcePath = Paths.get("/", providedPath, platformDir, libName).toString();
+        libName = PlatformHelper.getPlatformLibraryName(libraryName);
+        System.out.println("Loading native library from " + providedPath);
+        System.out.println("Platform directory is: " + platformDir);
+        System.out.println("Library name is: " + libName);
+        resourcePath = Paths.get("/", providedPath, platformDir, libName).toString();
+        System.out.println("Resource path is: " + resourcePath);
         try (InputStream is = NativeLibraryLoader.class.getResourceAsStream(resourcePath)) {
             if (is == null) {
                 throw new IOException("Native library not found: " + resourcePath);
@@ -90,6 +100,7 @@ public final class NativeLibraryLoader {
                 } catch (IOException ignored) {}
             }));
             System.load(tempFile.toAbsolutePath().toString());
+            logger.info("Loaded native library from resource: {}", resourcePath);
             loaded = true;
         } catch (IOException e) {
             throw e;

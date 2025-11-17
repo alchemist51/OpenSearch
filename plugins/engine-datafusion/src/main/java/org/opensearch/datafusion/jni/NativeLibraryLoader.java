@@ -45,6 +45,7 @@ public final class NativeLibraryLoader {
         if (loaded) return;
         try {
             System.loadLibrary(libraryName);
+            logger.info("Loaded native library from system path: {}", libraryName);
             loaded = true;
             return;
         } catch (UnsatisfiedLinkError ignored) {
@@ -54,6 +55,7 @@ public final class NativeLibraryLoader {
         //Look-up with default path
         try {
             loadFromResources(DEFAULT_PATH, libraryName);
+            logger.info("Loaded native library from default path: {}", libraryName);
             return;
         }  catch (UnsatisfiedLinkError ignored) {
             logger.warn("Failed to load library '" + libraryName + "' from default path");
@@ -66,6 +68,7 @@ public final class NativeLibraryLoader {
             String path = Paths.get(currentDir, "native", platformDir,
                 PlatformHelper.getPlatformLibraryName(libraryName)).toString();
             loadFromResources(path, libraryName);
+            logger.info("Loaded native library from path: {}", path);
         } catch (UnsatisfiedLinkError e) {
             throw new UnsatisfiedLinkError(
                 "Failed to load library '" + libraryName + "' from all attempted locations");
