@@ -39,7 +39,7 @@ public class CatalogSnapshot extends AbstractRefCounted implements Writeable {
     public static final String LAST_COMPOSITE_WRITER_GEN_KEY = "_last_composite_writer_gen_";
     private final long id;
     private long lastWriterGeneration;
-    private final Map<String, Collection<WriterFileSet>> dfGroupedSearchableFiles;
+    private Map<String, Collection<WriterFileSet>> dfGroupedSearchableFiles;
     private Supplier<IndexFileDeleter> indexFileDeleterSupplier;
     private Map<Long, CatalogSnapshot> catalogSnapshotMap;
 
@@ -82,7 +82,7 @@ public class CatalogSnapshot extends AbstractRefCounted implements Writeable {
         }
     }
 
-    public CatalogSnapshot remapPaths(Path newShardDataPath) {
+    public void remapPaths(Path newShardDataPath) {
         Map<String, Collection<WriterFileSet>> remappedFiles = new HashMap<>();
         for (Map.Entry<String, Collection<WriterFileSet>> entry : dfGroupedSearchableFiles.entrySet()) {
             String dataFormat = entry.getKey();
@@ -94,7 +94,7 @@ public class CatalogSnapshot extends AbstractRefCounted implements Writeable {
             }
             remappedFiles.put(dataFormat, remappedFileSets);
         }
-        return new CatalogSnapshot(this.id, remappedFiles);
+        this.dfGroupedSearchableFiles = remappedFiles;
     }
 
     @Override
