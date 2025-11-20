@@ -98,7 +98,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_createGlo
         // Take ownership of the CustomCacheManager
         let custom_cache_manager = unsafe { *Box::from_raw(cache_manager_ptr as *mut CustomCacheManager) };
         let cache_manager_config = custom_cache_manager.build_cache_manager_config();
-        
+
         let runtime_env = RuntimeEnvBuilder::new().with_cache_manager(cache_manager_config)
             .with_memory_pool(memory_pool.clone())
             .build().unwrap();
@@ -380,7 +380,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeQu
         .build()
         .unwrap();
 
-    
+
     // TODO: get config from CSV DataFormat
     let mut config = SessionConfig::new();
     config.options_mut().execution.parquet.pushdown_filters = false;
@@ -465,10 +465,10 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeQu
             .await
             .expect("Failed to execute logical plan");
         let physical_plan = dataframe.clone().create_physical_plan().await.unwrap();
-        println!(
-            "Physical Plan:\n{}",
-            datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
-        );
+        // println!(
+        //     "Physical Plan:\n{}",
+        //     datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
+        // );
 
         let stream = match dataframe.execute_stream().await {
             Ok(stream) => stream,
@@ -482,10 +482,10 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeQu
         let stream_ptr = Box::into_raw(Box::new(stream)) as jlong;
 
         let duration1 = overall.elapsed();
-        println!(
-            "Rust: Overall query setup time in milliseconds: {}",
-            duration1.as_millis()
-        );
+        // println!(
+        //     "Rust: Overall query setup time in milliseconds: {}",
+        //     duration1.as_millis()
+        // );
 
         // set_projections(env, projections, callback);
         stream_ptr
