@@ -186,6 +186,7 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
         this.totalShards = totalShards;
         this.successfulShards = successfulShards;
         this.skippedShards = skippedShards;
+        System.out.println("Took : " + tookInMillis);
         this.tookInMillis = tookInMillis;
         this.phaseTook = phaseTook;
         this.shardFailures = shardFailures;

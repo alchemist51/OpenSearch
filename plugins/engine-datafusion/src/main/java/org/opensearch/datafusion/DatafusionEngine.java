@@ -58,6 +58,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 
 import static java.util.Collections.emptyMap;
@@ -71,6 +72,69 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
     private DatafusionReaderManager datafusionReaderManager;
     private DataFusionService datafusionService;
     private CacheManager cacheManager;
+
+    // Helper class to track timing across async operations in a thread-safe manner
+    private static class AsyncTimingContext {
+        private final AtomicLong phaseStartTime;
+        private final AtomicLong searchStartTime;
+        private final AtomicLong searchEndTime;
+        private final AtomicLong collectionStartTime;
+        private final AtomicLong collectionEndTime;
+        private final AtomicLong batchCounter;
+
+        public AsyncTimingContext() {
+            this.phaseStartTime = new AtomicLong(System.nanoTime());
+            this.searchStartTime = new AtomicLong(0);
+            this.searchEndTime = new AtomicLong(0);
+            this.collectionStartTime = new AtomicLong(0);
+            this.collectionEndTime = new AtomicLong(0);
+            this.batchCounter = new AtomicLong(0);
+        }
+
+        public void markSearchStart() {
+            searchStartTime.set(System.nanoTime());
+        }
+
+        public void markSearchEnd() {
+            searchEndTime.set(System.nanoTime());
+        }
+
+        public void markCollectionStart() {
+            collectionStartTime.set(System.nanoTime());
+        }
+
+        public void markCollectionEnd() {
+            collectionEndTime.set(System.nanoTime());
+        }
+
+        public long incrementBatch() {
+            return batchCounter.incrementAndGet();
+        }
+
+        public long getPhaseStartTime() {
+            return phaseStartTime.get();
+        }
+
+        public double getSearchDurationMs() {
+            long start = searchStartTime.get();
+            long end = searchEndTime.get();
+            return (start > 0 && end > 0) ? (end - start) / 1_000_000.0 : 0;
+        }
+
+        public double getCollectionDurationMs() {
+            long start = collectionStartTime.get();
+            long end = collectionEndTime.get();
+            return (start > 0 && end > 0) ? (end - start) / 1_000_000.0 : 0;
+        }
+
+        public double getTotalDurationMs() {
+            return (System.nanoTime() - phaseStartTime.get()) / 1_000_000.0;
+        }
+
+        public long getBatchCount() {
+            return batchCounter.get();
+        }
+    }
 
     public DatafusionEngine(DataFormat dataFormat, Collection<FileMetadata> formatCatalogSnapshot, DataFusionService dataFusionService, ShardPath shardPath) throws IOException {
         this.dataFormat = dataFormat;
@@ -110,7 +174,7 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
                 @Override
                 protected DatafusionSearcher acquireSearcherInternal(String source) {
                     return new DatafusionSearcher(source, reader,
-                         () -> {});
+                        () -> {});
 
                 }
 
@@ -181,19 +245,29 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
 
     @Override
     public Map<String, Object[]> executeQueryPhase(DatafusionContext context) {
+        long startTime = System.nanoTime();
+        logger.info("[QueryPhase] Starting query phase for shard: {}", context.indexShard().shardId());
+
         Map<String, Object[]> finalRes = new HashMap<>();
         List<Long> rowIdResult = new ArrayList<>();
         RootAllocator allocator = null;
         RecordBatchStream stream = null;
 
+        long searchStartTime = 0;
+        long searchEndTime = 0;
+        long collectionStartTime = 0;
+        long collectionEndTime = 0;
+
         try {
             DatafusionSearcher datafusionSearcher = context.getEngineSearcher();
+
+            searchStartTime = System.nanoTime();
             long streamPointer = datafusionSearcher.search(context.getDatafusionQuery(), datafusionService.getRuntimePointer());
+            searchEndTime = System.nanoTime();
+            logger.info("[QueryPhase] Search execution took: {} ms", (searchEndTime - searchStartTime) / 1_000_000.0);
+
             allocator = new RootAllocator(Long.MAX_VALUE);
             stream = new RecordBatchStream(streamPointer, datafusionService.getRuntimePointer() , allocator);
-
-            // We can have some collectors passed like this which can collect the results and convert to InternalAggregation
-            // Is the possible? need to check
 
             SearchResultsCollector<RecordBatchStream> collector = new SearchResultsCollector<RecordBatchStream>() {
                 @Override
@@ -220,24 +294,16 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
                 }
             };
 
+            collectionStartTime = System.nanoTime();
+            int batchCount = 0;
             while (stream.loadNextBatch().join()) {
+                long batchStartTime = System.nanoTime();
                 collector.collect(stream);
+                batchCount++;
+                logger.debug("[QueryPhase] Batch {} collection took: {} ms", batchCount, (System.nanoTime() - batchStartTime) / 1_000_000.0);
             }
-
-//            logger.info("Final Results:");
-//            for (Map.Entry<String, Object[]> entry : finalRes.entrySet()) {
-//                logger.info("{}: {}", entry.getKey(), java.util.Arrays.toString(entry.getValue()));
-//            }
-
-
-//            logger.info("Memory Pool Allocation Post Query ShardID:{}", context.getQueryShardContext().getShardId());
-//            printMemoryPoolAllocation(datafusionService.getRuntimePointer());
-
-
-//            logger.info("Final Results:");
-//            for (Map.Entry<String, Object[]> entry : finalRes.entrySet()) {
-//                logger.info("{}: {}", entry.getKey(), java.util.Arrays.toString(entry.getValue()));
-//            }
+            collectionEndTime = System.nanoTime();
+            logger.info("[QueryPhase] Total batches processed: {}, Collection took: {} ms", batchCount, (collectionEndTime - collectionStartTime) / 1_000_000.0);
 
         } catch (Exception exception) {
             logger.error("Failed to execute Substrait query plan", exception);
@@ -253,6 +319,15 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
+
+            long endTime = System.nanoTime();
+            long totalTime = endTime - startTime;
+            logger.info("[QueryPhase] Query phase completed for shard: {} | Total time: {} ms | Search: {} ms | Collection: {} ms | Result size: {}",
+                context.indexShard().shardId(),
+                totalTime / 1_000_000.0,
+                searchEndTime > 0 ? (searchEndTime - searchStartTime) / 1_000_000.0 : 0,
+                collectionEndTime > 0 ? (collectionEndTime - collectionStartTime) / 1_000_000.0 : 0,
+                rowIdResult.size());
         }
 
         context.queryResult().topDocs(new TopDocsAndMaxScore(new TopDocs(new TotalHits(rowIdResult.size(), TotalHits.Relation.EQUAL_TO), rowIdResult.stream().map(d-> new ScoreDoc(d.intValue(), Float.NaN, context.indexShard().shardId().getId())).toList().toArray(ScoreDoc[]::new)) , Float.NaN), new DocValueFormat[0]);
@@ -261,16 +336,30 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
 
     @Override
     public void executeQueryPhaseAsync(DatafusionContext context, Executor executor, ActionListener<Map<String, Object[]>> listener) {
+        final AsyncTimingContext timingContext = new AsyncTimingContext();
+        //logger.info("[QueryPhaseAsync] Starting async query phase for shard: {}", context.indexShard().shardId());
+
         try {
             DatafusionSearcher datafusionSearcher = context.getEngineSearcher();
+            timingContext.markSearchStart();
+
             datafusionSearcher.searchAsync(context.getDatafusionQuery(), datafusionService.getRuntimePointer()).whenCompleteAsync((streamPointer, error)-> {
-                Map<String, Object[]> finalRes = new HashMap<>();
-                List<Long> rowIdResult = new ArrayList<>();
+                timingContext.markSearchEnd();
+                //logger.info("[QueryPhaseAsync] Async search execution took: {} ms", timingContext.getSearchDurationMs());
+
                 if(streamPointer == null) {
-                    throw new RuntimeException(error);
+                    logger.error("[QueryPhaseAsync] Query phase failed for shard: {} | Total time: {} ms",
+                        context.indexShard().shardId(), timingContext.getTotalDurationMs());
+                    listener.onFailure(new RuntimeException("Search returned null stream pointer", error));
+                    return;
                 }
+
+                final Map<String, Object[]> finalRes = new HashMap<>();
+                final List<Long> rowIdResult = new ArrayList<>();
+
                 RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
                 RecordBatchStream stream = new RecordBatchStream(streamPointer, datafusionService.getRuntimePointer() , allocator);
+
                 SearchResultsCollector<RecordBatchStream> collector = new SearchResultsCollector<RecordBatchStream>() {
                     @Override
                     public void collect(RecordBatchStream value) {
@@ -295,26 +384,39 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
                         }
                     }
                 };
-                loadNextBatch(stream, executor, collector, finalRes, allocator, listener, context, rowIdResult);
-            });
 
-//            logger.info("Memory Pool Allocation Post Query ShardID:{}", context.getQueryShardContext().getShardId());
-//            printMemoryPoolAllocation(datafusionService.getRuntimePointer());
+                timingContext.markCollectionStart();
 
-
-//            logger.info("Final Results:");
-//            for (Map.Entry<String, Object[]> entry : finalRes.entrySet()) {
-//                logger.info("{}: {}", entry.getKey(), java.util.Arrays.toString(entry.getValue()));
-//            }
+                loadNextBatchAsync(stream, executor, collector, finalRes, allocator,
+                    ActionListener.wrap(
+                        response -> {
+                            timingContext.markCollectionEnd();
+                            logger.info("[QueryPhaseAsync] Query phase completed for shard: {} | Total time: {} ms | Search: {} ms | Collection: {} ms | Batches: {} | Result size: {}",
+                                context.indexShard().shardId(),
+                                timingContext.getTotalDurationMs(),
+                                timingContext.getSearchDurationMs(),
+                                timingContext.getCollectionDurationMs(),
+                                timingContext.getBatchCount(),
+                                rowIdResult.size());
+                            listener.onResponse(response);
+                        },
+                        failure -> {
+                            logger.error("[QueryPhaseAsync] Query phase failed for shard: {} | Total time: {} ms",
+                                context.indexShard().shardId(), timingContext.getTotalDurationMs());
+                            listener.onFailure(failure);
+                        }
+                    ),
+                    context, rowIdResult, timingContext);
+            }, executor);
 
         } catch (Exception exception) {
-            logger.error("Failed to execute Substrait query plan", exception);
-            throw new RuntimeException(exception);
+            logger.error("[QueryPhaseAsync] Failed to execute Substrait query plan | Time: {} ms",
+                timingContext.getTotalDurationMs(), exception);
+            listener.onFailure(exception);
         }
-        //return finalRes;
     }
 
-    private void loadNextBatch(
+    private void loadNextBatchAsync(
         RecordBatchStream stream,
         Executor executor,
         SearchResultsCollector<RecordBatchStream> collector,
@@ -322,29 +424,50 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
         RootAllocator allocator,
         ActionListener<Map<String, Object[]>> listener,
         DatafusionContext context,
-        List<Long> rowIdResult
+        List<Long> rowIdResult,
+        AsyncTimingContext timingContext
     ) {
+        final long batchStartTime = System.nanoTime();
+
         stream.loadNextBatch().whenCompleteAsync((hasMore, error) -> {
+            final long batchLoadEndTime = System.nanoTime();
+            final double batchLoadTimeMs = (batchLoadEndTime - batchStartTime) / 1_000_000.0;
+
             if (error != null) {
+                logger.error("[LoadNextBatch] Error loading batch {} after {} ms",
+                    timingContext.getBatchCount(), batchLoadTimeMs, error);
                 cleanup(stream, allocator);
                 listener.onFailure(new RuntimeException("Error loading batch", error));
                 return;
             }
+
             if (hasMore) {
                 try {
+                    final long collectStartTime = System.nanoTime();
                     collector.collect(stream);
-                    // Recursively load next batch - TODO : anyway to Change this to iteration ?
-                    loadNextBatch(stream, executor, collector, finalRes, allocator, listener, context, rowIdResult);
+                    final long collectEndTime = System.nanoTime();
+                    final double collectTimeMs = (collectEndTime - collectStartTime) / 1_000_000.0;
+                    final long currentBatch = timingContext.incrementBatch();
+
+                    logger.debug("[LoadNextBatch] Batch {} completed | Load: {} ms | Collect: {} ms | Total: {} ms",
+                        currentBatch,
+                        batchLoadTimeMs,
+                        collectTimeMs,
+                        (collectEndTime - batchStartTime) / 1_000_000.0);
+
+                    // Recursively load next batch
+                    loadNextBatchAsync(stream, executor, collector, finalRes, allocator, listener, context, rowIdResult, timingContext);
                 } catch (Exception e) {
+                    logger.error("[LoadNextBatch] Error collecting batch {} after {} ms",
+                        timingContext.getBatchCount(), (System.nanoTime() - batchStartTime) / 1_000_000.0, e);
                     cleanup(stream, allocator);
                     listener.onFailure(e);
                 }
             } else {
+//                logger.info("[LoadNextBatch] All batches loaded | Total batches: {} | Final batch load time: {} ms",
+//                    timingContext.getBatchCount(), batchLoadTimeMs);
                 cleanup(stream, allocator);
-//                logger.info("Final Results:");
-//                for (Map.Entry<String, Object[]> entry : finalRes.entrySet()) {
-//                    logger.info("{}: {}", entry.getKey(), java.util.Arrays.toString(entry.getValue()));
-//                }
+
                 context.queryResult().topDocs(new TopDocsAndMaxScore(new TopDocs(new TotalHits(rowIdResult.size(),
                     TotalHits.Relation.EQUAL_TO), rowIdResult.stream().map(d-> new ScoreDoc(d.intValue(),
                     Float.NaN, context.indexShard().shardId().getId())).toList().toArray(ScoreDoc[]::new)) , Float.NaN), new DocValueFormat[0]);
@@ -352,12 +475,15 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
             }
         }, executor);
     }
+
     private void cleanup(RecordBatchStream stream, RootAllocator allocator) {
+        long cleanupStartTime = System.nanoTime();
         try {
             if (stream != null) stream.close();
             if (allocator != null) allocator.close();
+            logger.debug("[Cleanup] Cleanup completed in {} ms", (System.nanoTime() - cleanupStartTime) / 1_000_000.0);
         } catch (Exception e) {
-            logger.error("Cleanup error", e);
+            logger.error("[Cleanup] Cleanup error after {} ms", (System.nanoTime() - cleanupStartTime) / 1_000_000.0, e);
         }
     }
 
@@ -369,22 +495,35 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
      */
     @Override
     public void executeFetchPhase(DatafusionContext context) throws IOException {
+        long startTime = System.nanoTime();
+//        logger.info("[FetchPhase] Starting fetch phase for shard: {} | Docs to load: {}",
+//            context.indexShard().shardId(), context.docIdsToLoad().length);
 
         List<Long> rowIds = Arrays.stream(context.docIdsToLoad()).mapToObj(Long::valueOf).toList();
         if (rowIds.isEmpty()) {
             // no individual hits to process, so we shortcut
             context.fetchResult()
                 .hits(new SearchHits(new SearchHit[0], context.queryResult().getTotalHits(), context.queryResult().getMaxScore()));
+//            logger.info("[FetchPhase] No docs to fetch for shard: {} | Time: {} ms",
+//                context.indexShard().shardId(), (System.nanoTime() - startTime) / 1_000_000.0);
             return;
         }
 
+        long preprocessStartTime = System.nanoTime();
         // preprocess
         context.getDatafusionQuery().setFetchPhaseContext(rowIds);
         List<String> projections = new ArrayList<>(List.of(context.request().source().fetchSource().includes()));
         projections.add(CompositeDataFormatWriter.ROW_ID);
         context.getDatafusionQuery().setProjections(projections);
+        long preprocessEndTime = System.nanoTime();
+       // logger.debug("[FetchPhase] Preprocessing took: {} ms", (preprocessEndTime - preprocessStartTime) / 1_000_000.0);
+
+        long searchStartTime = System.nanoTime();
         DatafusionSearcher datafusionSearcher = context.getEngineSearcher();
         long streamPointer = datafusionSearcher.search(context.getDatafusionQuery(), datafusionService.getRuntimePointer());
+        long searchEndTime = System.nanoTime();
+        //logger.info("[FetchPhase] Search execution took: {} ms", (searchEndTime - searchStartTime) / 1_000_000.0);
+
         RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
         RecordBatchStream stream = new RecordBatchStream(streamPointer, datafusionService.getRuntimePointer() , allocator);
 
@@ -395,14 +534,23 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
 
         MapperService mapperService = context.mapperService();
         MappingLookup mappingLookup = mapperService.documentMapper().mappers();
+
+        long collectionStartTime = System.nanoTime();
         SearchResultsCollector<RecordBatchStream> collector = recordBatchStream -> {
             List<BytesReference> byteRefs = new ArrayList<>();
             SearchHit[] hits = new SearchHit[rowIds.size()];
             int totalHits = 0;
+            int batchCount = 0;
+
             while (recordBatchStream.loadNextBatch().join()) {
+                long batchStartTime = System.nanoTime();
+                batchCount++;
+
                 VectorSchemaRoot vectorSchemaRoot = recordBatchStream.getVectorSchemaRoot();
                 List<FieldVector> fieldVectorList = vectorSchemaRoot.getFieldVectors();
-                for (int i = 0; i < vectorSchemaRoot.getRowCount(); i++) {
+                int rowCount = vectorSchemaRoot.getRowCount();
+
+                for (int i = 0; i < rowCount; i++) {
                     XContentBuilder builder = XContentFactory.jsonBuilder().startObject();
                     String _id = "_id";
                     Long row_id = null;
@@ -419,7 +567,7 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
                             Object value = valueVectors.getObject(i);
                             if(valueVectors instanceof ViewVarCharVector) {
                                 BytesRef bytesRef = new BytesRef(((ViewVarCharVector) valueVectors).get(i));
-                                derivedFieldGenerator.generate(builder, List.of(bytesRef)); // TODO: // Currently keyword field mapper do not have derived field converter from byte[] to BytesRef
+                                derivedFieldGenerator.generate(builder, List.of(bytesRef));
                             } else {
                                 derivedFieldGenerator.generate(builder, List.of(value));
                             }
@@ -429,7 +577,7 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
                             }
                         }
                     } catch (Exception e) {
-                        logger.error("Failed to derive source for doc id [{i}]: {}", i, e);
+                        logger.error("[FetchPhase] Failed to derive source for doc id [{}]", i, e);
                         throw new OpenSearchException("Failed to derive source for doc id [" + i + "]", e);
                     } finally {
                         builder.endObject();
@@ -440,29 +588,52 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
                     byteRefs.add(document);
                     SearchHit hit = new SearchHit(Math.toIntExact(rowIds.get(i)), _id, emptyMap(), emptyMap());
                     hit.sourceRef(document);
-                    FetchSubPhase.HitContext hitContext = new FetchSubPhase.HitContext(hit, null, Math.toIntExact(rowIds.get(i)), new SourceLookup()); //TODO: make source lookup one per thread
+                    FetchSubPhase.HitContext hitContext = new FetchSubPhase.HitContext(hit, null, Math.toIntExact(rowIds.get(i)), new SourceLookup());
                     hitContext.sourceLookup().setSource(document);
                     int index = rowIdToIndex.get(row_id);
                     hits[index] = hit;
                     totalHits++;
                 }
+
+                long batchEndTime = System.nanoTime();
+//                logger.debug("[FetchPhase] Batch {} processed | Rows: {} | Time: {} ms",
+//                    batchCount, rowCount, (batchEndTime - batchStartTime) / 1_000_000.0);
             }
+
+            long collectionEndTime = System.nanoTime();
+//            logger.info("[FetchPhase] Collection completed | Total batches: {} | Total hits: {} | Time: {} ms",
+//                batchCount, totalHits, (collectionEndTime - collectionStartTime) / 1_000_000.0);
+
             context.fetchResult().hits(new SearchHits(hits, new TotalHits(totalHits, TotalHits.Relation.EQUAL_TO), context.queryResult().getMaxScore()));
         };
 
         try {
             collector.collect(stream);
         } catch (IOException exception) {
-            logger.error("Failed to perform fetch phase", exception);
+            logger.error("[FetchPhase] Failed to perform fetch phase after {} ms",
+                (System.nanoTime() - startTime) / 1_000_000.0, exception);
             throw new RuntimeException(exception);
         } finally {
+            long cleanupStartTime = System.nanoTime();
             try {
                 stream.close();
                 allocator.close();
+                logger.debug("[FetchPhase] Cleanup completed in {} ms", (System.nanoTime() - cleanupStartTime) / 1_000_000.0);
             } catch (Exception e) {
-                logger.error("Failed to close stream", e);
+                logger.error("[FetchPhase] Failed to close stream after {} ms",
+                    (System.nanoTime() - cleanupStartTime) / 1_000_000.0, e);
                 throw new RuntimeException(e);
             }
+
+            long endTime = System.nanoTime();
+            long totalTime = endTime - startTime;
+            logger.info("[FetchPhase] Fetch phase completed for shard: {} | Total time: {} ms | Preprocess: {} ms | Search: {} ms | Collection: {} ms | Hits: {}",
+                context.indexShard().shardId(),
+                totalTime / 1_000_000.0,
+                (preprocessEndTime - preprocessStartTime) / 1_000_000.0,
+                (searchEndTime - searchStartTime) / 1_000_000.0,
+                (System.nanoTime() - collectionStartTime) / 1_000_000.0,
+                rowIds.size());
         }
     }
 }
