@@ -322,12 +322,12 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
 
             long endTime = System.nanoTime();
             long totalTime = endTime - startTime;
-            logger.info("[QueryPhase] Query phase completed for shard: {} | Total time: {} ms | Search: {} ms | Collection: {} ms | Result size: {}",
-                context.indexShard().shardId(),
-                totalTime / 1_000_000.0,
-                searchEndTime > 0 ? (searchEndTime - searchStartTime) / 1_000_000.0 : 0,
-                collectionEndTime > 0 ? (collectionEndTime - collectionStartTime) / 1_000_000.0 : 0,
-                rowIdResult.size());
+//            logger.info("[QueryPhase] Query phase completed for shard: {} | Total time: {} ms | Search: {} ms | Collection: {} ms | Result size: {}",
+//                context.indexShard().shardId(),
+//                totalTime / 1_000_000.0,
+//                searchEndTime > 0 ? (searchEndTime - searchStartTime) / 1_000_000.0 : 0,
+//                collectionEndTime > 0 ? (collectionEndTime - collectionStartTime) / 1_000_000.0 : 0,
+//                rowIdResult.size());
         }
 
         context.queryResult().topDocs(new TopDocsAndMaxScore(new TopDocs(new TotalHits(rowIdResult.size(), TotalHits.Relation.EQUAL_TO), rowIdResult.stream().map(d-> new ScoreDoc(d.intValue(), Float.NaN, context.indexShard().shardId().getId())).toList().toArray(ScoreDoc[]::new)) , Float.NaN), new DocValueFormat[0]);
@@ -391,13 +391,13 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
                     ActionListener.wrap(
                         response -> {
                             timingContext.markCollectionEnd();
-                            logger.info("[QueryPhaseAsync] Query phase completed for shard: {} | Total time: {} ms | Search: {} ms | Collection: {} ms | Batches: {} | Result size: {}",
-                                context.indexShard().shardId(),
-                                timingContext.getTotalDurationMs(),
-                                timingContext.getSearchDurationMs(),
-                                timingContext.getCollectionDurationMs(),
-                                timingContext.getBatchCount(),
-                                rowIdResult.size());
+//                            logger.info("[QueryPhaseAsync] Query phase completed for shard: {} | Total time: {} ms | Search: {} ms | Collection: {} ms | Batches: {} | Result size: {}",
+//                                context.indexShard().shardId(),
+//                                timingContext.getTotalDurationMs(),
+//                                timingContext.getSearchDurationMs(),
+//                                timingContext.getCollectionDurationMs(),
+//                                timingContext.getBatchCount(),
+//                                rowIdResult.size());
                             listener.onResponse(response);
                         },
                         failure -> {
