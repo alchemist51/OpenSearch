@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 use std::collections::{BTreeSet, HashMap};
+use std::time::Instant;
 use jni::sys::jlong;
 use datafusion::{
     common::DataFusionError,
@@ -35,6 +36,7 @@ use datafusion_substrait::substrait::proto::{Plan, extensions::simple_extension_
 use object_store::ObjectMeta;
 use prost::Message;
 use arrow_schema::DataType;
+use datafusion::physical_plan::execute_stream;
 use log::error;
 
 use crate::listing_table::{ListingOptions, ListingTable, ListingTableConfig};
@@ -53,6 +55,10 @@ pub async fn execute_query_with_cross_rt_stream(
     runtime: &DataFusionRuntime,
     cpu_executor: DedicatedExecutor,
 ) -> Result<jlong, DataFusionError> {
+    let start_total = Instant::now();
+    println!("[TIMER] Starting execute_query_with_cross_rt_stream");
+
+    let start = Instant::now();
     let object_meta: Arc<Vec<ObjectMeta>> = Arc::new(
         files_meta
             .iter()
@@ -62,14 +68,20 @@ pub async fn execute_query_with_cross_rt_stream(
 
     let list_file_cache = Arc::new(DefaultListFilesCache::default());
     list_file_cache.put(table_path.prefix(), object_meta);
-
     let runtimeEnv = &runtime.runtime_env;
+    let file_metadata_cache = runtime.runtime_env.cache_manager.get_file_metadata_cache();
+
+    println!("[TIMER] Object meta preparation: {:?}", start.elapsed());
+
+
+    let start = Instant::now();
 
     let runtime_env = match RuntimeEnvBuilder::from_runtime_env(runtimeEnv)
         .with_cache_manager(
             CacheManagerConfig::default()
                 .with_list_files_cache(Some(list_file_cache.clone()))
-                .with_file_metadata_cache(Some(runtimeEnv.cache_manager.get_file_metadata_cache()))
+                .with_metadata_cache_limit(file_metadata_cache.cache_limit())
+                .with_file_metadata_cache(Some(file_metadata_cache))
                 .with_files_statistics_cache(runtimeEnv.cache_manager.get_file_statistic_cache()),
         )
         .with_metadata_cache_limit(250 * 1024 * 1024) // 250 MB
@@ -80,20 +92,24 @@ pub async fn execute_query_with_cross_rt_stream(
             return Err(e);
         }
     };
+    println!("[TIMER] Runtime env build: {:?}", start.elapsed());
 
+    let start = Instant::now();
     let mut config = SessionConfig::new();
     config.options_mut().execution.parquet.pushdown_filters = false;
     config.options_mut().execution.target_partitions = 1;
     config.options_mut().execution.batch_size = 1024;
 
     let state = datafusion::execution::SessionStateBuilder::new()
-        .with_config(config)
+        .with_config(config.clone())
         .with_runtime_env(Arc::from(runtime_env))
         .with_default_features()
         //.with_physical_optimizer_rule(Arc::new(ProjectRowIdOptimizer)) // TODO : uncomment this after fix
-        .with_physical_optimizer_rule(Arc::new(PartialAggregationOptimizer))
+        // .with_physical_optimizer_rule(Arc::new(PartialAggregationOptimizer))
         .build();
+    println!("[TIMER] Session config and state: {:?}", start.elapsed());
 
+    let start = Instant::now();
     let ctx = SessionContext::new_with_state(state);
 
     // Register table
@@ -101,8 +117,11 @@ pub async fn execute_query_with_cross_rt_stream(
     let listing_options = ListingOptions::new(Arc::new(file_format))
         .with_file_extension(".parquet")
         .with_files_metadata(files_meta)
-        .with_table_partition_cols(vec![("row_base".to_string(), DataType::Int64)]);
+        .with_session_config_options(&config);
+        // .with_table_partition_cols(vec![("row_base".to_string(), DataType::Int64)]);
+    println!("[TIMER] Listing options creation: {:?}", start.elapsed());
 
+    let start = Instant::now();
     let resolved_schema = match listing_options
         .infer_schema(&ctx.state(), &table_path)
         .await {
@@ -112,7 +131,9 @@ pub async fn execute_query_with_cross_rt_stream(
             return Err(e);
         }
     };
+    println!("[TIMER] Schema inference: {:?}", start.elapsed());
 
+    let start = Instant::now();
     let table_config = ListingTableConfig::new(table_path.clone())
         .with_listing_options(listing_options)
         .with_schema(resolved_schema);
@@ -129,8 +150,10 @@ pub async fn execute_query_with_cross_rt_stream(
         error!("Failed to register table: {}", e);
         return Err(e);
     }
+    println!("[TIMER] Table registration: {:?}", start.elapsed());
 
     // Decode substrait
+    let start = Instant::now();
     let substrait_plan = match Plan::decode(plan_bytes_vec.as_slice()) {
         Ok(plan) => plan,
         Err(e) => {
@@ -138,7 +161,9 @@ pub async fn execute_query_with_cross_rt_stream(
             return Err(DataFusionError::Execution(format!("Failed to decode Substrait: {}", e)));
         }
     };
+    println!("[TIMER] Substrait decode: {:?}", start.elapsed());
 
+    let start = Instant::now();
     let mut modified_plan = substrait_plan.clone();
     for ext in modified_plan.extensions.iter_mut() {
         if let Some(mapping_type) = &mut ext.mapping_type {
@@ -149,7 +174,9 @@ pub async fn execute_query_with_cross_rt_stream(
             }
         }
     }
+    println!("[TIMER] Plan modification: {:?}", start.elapsed());
 
+    let start = Instant::now();
     let logical_plan = match from_substrait_plan(&ctx.state(), &modified_plan).await {
         Ok(plan) => plan,
         Err(e) => {
@@ -157,7 +184,9 @@ pub async fn execute_query_with_cross_rt_stream(
             return Err(e);
         }
     };
+    println!("[TIMER] Substrait to logical plan: {:?}", start.elapsed());
 
+    let start = Instant::now();
     let dataframe = match ctx.execute_logical_plan(logical_plan).await {
         Ok(df) => df,
         Err(e) => {
@@ -165,29 +194,71 @@ pub async fn execute_query_with_cross_rt_stream(
             return Err(e);
         }
     };
+    println!("[TIMER] Logical plan execution: {:?}", start.elapsed());
+    // let start = Instant::now();
 
-    let df_stream = match dataframe.execute_stream().await {
+    let clone_df = dataframe.clone();
+    // clone_df.explain(false, true).expect("Printing").show().await.expect("TODO: panic message");
+    //
+    // println!("[TIMER] Clone DF time taken: {:?}", start.elapsed());
+
+    let start = Instant::now();
+    let task_ctx = Arc::new(dataframe.task_ctx());
+    println!("[TIMER] Task context creation: {:?}", start.elapsed());
+    let start = Instant::now();
+
+    let plan = dataframe.create_physical_plan().await?;
+    println!("[TIMER] Physical PLan creation time: {:?}", start.elapsed());
+
+    let start = Instant::now();
+    let df_stream = match execute_stream(plan, task_ctx) {
         Ok(stream) => stream,
         Err(e) => {
             error!("Failed to create execution stream: {}", e);
             return Err(e);
         }
     };
+    println!("[TIMER] Execute stream time taken: {:?}", start.elapsed());
+    // let df_stream = match dataframe.execute_stream().await {
+    //     Ok(stream) => stream,
+    //     Err(e) => {
+    //         error!("Failed to create execution stream: {}", e);
+    //         return Err(e);
+    //     }
+    // };
+    let start = Instant::now();
+    let result = get_cross_rt_stream(cpu_executor, df_stream);
+    println!("[TIMER] GET_CROSS_RT_STREAM: {:?}", start.elapsed());
 
-    Ok(get_cross_rt_stream(cpu_executor, df_stream))
+    println!("[TIMER] Total time in executor: {:?}", start_total.elapsed());
+
+    let start = Instant::now();
+    clone_df.explain(false, true).expect("Printing").show().await.expect("TODO: panic message");
+    println!("[TIMER] Clone DF time taken: {:?}", start.elapsed());
+
+    // let cache = runtime.runtime_env.cache_manager.get_file_statistic_cache();
+    // let cache_len = cache.iter().len();
+    // println!("[CACHE] File statistic cache size: {}", cache_len);
+    // for (idx, _entry) in cache.iter().enumerate() {
+    //     println!("[CACHE] Entry index: {}", idx);
+    // }
+    Ok(result)
 }
 
 pub fn get_cross_rt_stream(cpu_executor: DedicatedExecutor, df_stream: SendableRecordBatchStream) -> jlong {
+    let start_total = Instant::now();
     let cross_rt_stream = CrossRtStream::new_with_df_error_stream(
         df_stream,
         cpu_executor,
     );
+    println!("[TIMER] Total cross_rt_stream: {:?}", start_total.elapsed());
 
+    let start_total = Instant::now();
     let wrapped_stream = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
         cross_rt_stream.schema(),
         cross_rt_stream,
     );
-
+    println!("[TIMER] Total wrapped_stream: {:?}", start_total.elapsed());
     Box::into_raw(Box::new(wrapped_stream)) as jlong
 }
 
