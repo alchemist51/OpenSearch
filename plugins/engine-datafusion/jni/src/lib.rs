@@ -29,6 +29,7 @@ use datafusion::{
     DATAFUSION_VERSION,
 };
 use std::default::Default;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 mod util;
@@ -52,6 +53,7 @@ use datafusion::execution::memory_pool::{GreedyMemoryPool, TrackConsumersPool};
 use object_store::ObjectMeta;
 use tokio::runtime::Runtime;
 use std::result;
+use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 
@@ -228,6 +230,10 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_createGlo
         monitor.clone(),
     ));
 
+    let mut builder = DiskManagerBuilder::default()
+        .with_max_temp_directory_size(100 * 1024 * 1024 * 1024);
+    let builder = builder.with_mode(DiskManagerMode::Directories(vec![PathBuf::from("/home/ec2-user/spill_dir")]));
+
     if cache_manager_ptr != 0 {
         // Take ownership of the CustomCacheManager
         let custom_cache_manager = unsafe { *Box::from_raw(cache_manager_ptr as *mut CustomCacheManager) };
@@ -235,6 +241,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_createGlo
 
         let runtime_env = RuntimeEnvBuilder::new().with_cache_manager(cache_manager_config)
             .with_memory_pool(memory_pool.clone())
+            .with_disk_manager_builder(builder)
             .build().unwrap();
 
         let runtime = DataFusionRuntime {
@@ -247,6 +254,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_createGlo
     } else {
         let runtime_env = RuntimeEnvBuilder::new()
             .with_memory_pool(memory_pool)
+            .with_disk_manager_builder(builder)
             .build().unwrap();
 
         let runtime = DataFusionRuntime {
