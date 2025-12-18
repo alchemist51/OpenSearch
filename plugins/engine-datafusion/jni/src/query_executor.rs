@@ -142,6 +142,7 @@ pub async fn execute_query_with_cross_rt_stream(
     config.options_mut().execution.parquet.pushdown_filters = false;
     config.options_mut().execution.target_partitions = 1;
     config.options_mut().execution.batch_size = 1024;
+    config.options_mut().execution.parquet.pushdown_filters = true;
 
     let state = datafusion::execution::SessionStateBuilder::new()
         .with_config(config.clone())
