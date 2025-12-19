@@ -20,10 +20,9 @@ pub struct AllocationMonitoringMemoryPool {
 
 impl AllocationMonitoringMemoryPool {
     /// Create a new pool that can allocate up to `pool_size` bytes
-    pub fn new(pool_size: usize) -> Self {
-        println!("Created new GreedyMemoryPool(pool_size={pool_size})");
+    pub fn new(monitor: Arc<AllocationMonitor>) -> Self {
         Self {
-            monitor: Arc::new(AllocationMonitor::try_new(pool_size).unwrap())
+            monitor
         }
     }
 }

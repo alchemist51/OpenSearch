@@ -5,9 +5,10 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-
+use std::fmt::format;
 use snafu::{ResultExt, Snafu};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use datafusion::error::DataFusionError;
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -59,7 +60,7 @@ impl std::fmt::Debug for AllocationMonitor {
 impl AllocationMonitor {
     /// Create a new allocation monitor that will return an error if the
     /// amount of memory allocated exceeds `max`.
-    pub fn try_new(max: usize) -> Result<Self, AllocationMonitorError> {
+    pub fn try_new(max: usize) -> Result<Self, DataFusionError> {
         let monitor = Self {
             max,
             allocated: AtomicUsize::new(0),
@@ -70,34 +71,33 @@ impl AllocationMonitor {
     }
 
     /// Update the stats for the heap monitor
-    fn try_refresh(&self) -> Result<(), AllocationMonitorError> {
-        let reserved = self.reserved.load(Ordering::Acquire);
-        self.allocated.store(
-            jemalloc_stats::refresh_allocated().context(JemallocSnafu)?,
-            Ordering::SeqCst,
-        );
-        self.reserved.fetch_sub(reserved, Ordering::Release);
+    fn try_refresh(&self) -> Result<(), DataFusionError> {
+        let allocated = jemalloc_stats::refresh_allocated()
+            .map_err(|e| DataFusionError::ResourcesExhausted(format!("Failed to get jemalloc stats: {}", e)))?;
+        self.allocated.store(allocated, Ordering::SeqCst);
+        self.reserved.store(0, Ordering::Release);
         Ok(())
     }
 
     /// Reserve `sz` bytes of memory. This will return an error if the
     /// amount of memory allocated will exceed the maximum if the
     /// allocation were to be allowed.
-    pub fn try_reserve(&self, sz: usize) -> Result<(), AllocationMonitorError> {
-        let reserved = self.reserved.fetch_add(sz, Ordering::AcqRel) + sz;
-        if self.allocated.load(Ordering::Acquire) + MEMORY_RESERVATION_RECHECK_FACTOR * reserved
-            > self.max
-        {
+    pub fn try_reserve(&self, sz: usize) -> Result<(), DataFusionError> {
+        let reserved = self.reserved.fetch_add(sz, Ordering::AcqRel);
+        let allocated = self.allocated.load(Ordering::Acquire);
+        
+        if allocated + MEMORY_RESERVATION_RECHECK_FACTOR * (reserved + sz) > self.max {
             println!("Refreshing stats sz: {}, reserved: {}, max: {}", sz, reserved + sz, self.max);
-            // We have used more than a quarter of the memory that was considered
-            // free last time we checkes the stats. Refresh the stats and check again.
             self.try_refresh()?;
+            
             let allocated = self.allocated.load(Ordering::Acquire);
-            let reserved = self.reserved.fetch_add(sz, Ordering::Acquire);
-
+            let reserved = self.reserved.load(Ordering::Acquire);
+            
             println!("New Allocated stats: {}, sz: {}, reserved: {}, max: {}", allocated, sz, reserved, self.max);
             if allocated + sz + reserved > self.max {
-                return Err(AllocationMonitorError::HeapExhausted);
+                return Err(DataFusionError::ResourcesExhausted(
+                    format!("Needed: {}, Available: {}", sz, self.max.saturating_sub(allocated + reserved))
+                ));
             }
         }
 

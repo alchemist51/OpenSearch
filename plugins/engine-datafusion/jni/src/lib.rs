@@ -285,13 +285,8 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_createGlo
         .expect("AllocationMonitor creation error failing");
     let monitor = Arc::new(monitor);
 
-    let memory_pool = runtime_env_builder
-        .memory_pool
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(UnboundedMemoryPool::default()));
     runtime_env_builder = runtime_env_builder.with_memory_pool(Arc::new(
-        AllocationMonitoringMemoryPool::new(memory_pool, monitor.clone()),
+        AllocationMonitoringMemoryPool::new(monitor.clone()),
     ));
 
     let runtime = DataFusionRuntime {
