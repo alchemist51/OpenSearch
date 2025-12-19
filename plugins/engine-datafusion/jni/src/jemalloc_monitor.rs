@@ -42,8 +42,8 @@ const MEMORY_RESERVATION_RECHECK_FACTOR: usize = 4;
 /// is having the whole process be OOM killed.
 pub struct AllocationMonitor {
     max: usize,
-    allocated: AtomicUsize,
-    reserved: AtomicUsize,
+    pub(crate) allocated: AtomicUsize,
+    pub(crate) reserved: AtomicUsize,
 }
 
 impl std::fmt::Debug for AllocationMonitor {
@@ -111,6 +111,14 @@ impl AllocationMonitor {
     /// next call to try_reserve will update the memory statistics.
     pub fn reserve(&self, sz: usize) {
         self.reserved.fetch_add(sz, Ordering::AcqRel);
+    }
+
+    pub fn limit(&self) -> usize {
+        self.max
+    }
+
+    pub fn current_used(&self) -> usize {
+        self.allocated.load(Ordering::Relaxed) + self.reserved.load(Ordering::Relaxed)
     }
 }
 
