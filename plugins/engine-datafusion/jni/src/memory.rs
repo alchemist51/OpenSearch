@@ -1,185 +1,74 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
 use std::result;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use std::sync::Arc;
 use datafusion::common::DataFusionError;
-use snafu::{ResultExt, Snafu};
+use crate::jemalloc_monitor::{AllocationMonitor, AllocationMonitorError};
 
 pub type Result<T, E = DataFusionError> = result::Result<T, E>;
 
-#[derive(Debug, Snafu)]
-pub enum AllocationMonitorError {
-    #[snafu(display("Error getting jemalloc stats: {}", source))]
-    Jemalloc { source: tikv_jemalloc_ctl::Error },
-
-    #[snafu(display("Heap exhausted"))]
-    HeapExhausted,
-}
-
-const MEMORY_RESERVATION_RECHECK_FACTOR: usize = 4;
-
-pub struct AllocationMonitor {
-    max: usize,
-    allocated: AtomicUsize,
-    reserved: AtomicUsize,
-}
-
-impl std::fmt::Debug for AllocationMonitor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AllocationMonitor")
-            .field("max", &self.max)
-            .field("allocated", &self.allocated)
-            .field("reserved", &self.reserved)
-            .finish_non_exhaustive()
-    }
-}
-// Allocation (Monitor --> )
-// TrackingMonitor(BaseMonitor --> Does not change
-impl AllocationMonitor {
-    /// Create a new allocation monitor that will return an error if the
-    /// amount of memory allocated exceeds `max`.
-    pub fn try_new(max: usize) -> Result<Self, AllocationMonitorError> {
-        let monitor = Self {
-            max,
-            allocated: AtomicUsize::new(0),
-            reserved: AtomicUsize::new(0),
-        };
-        monitor.try_refresh()?;
-        Ok(monitor)
-    }
-
-    /// Update the stats for the heap monitor
-    fn try_refresh(&self) -> Result<(), AllocationMonitorError> {
-        self.allocated.store(
-            jemalloc_stats::refresh_allocated().context(JemallocSnafu)?,
-            Ordering::SeqCst,
-        );
-        self.reserved.store(0, Ordering::Release);
-        Ok(())
-    }
-
-    /// Reserve `sz` bytes of memory. This will return an error if the
-    /// amount of memory allocated will exceed the maximum if the
-    /// allocation were to be allowed.
-    pub fn try_reserve(&self, sz: usize) -> Result<()> {
-        let reserved = self.reserved.fetch_add(sz, Ordering::AcqRel);
-        let allocated = self.allocated.load(Ordering::Acquire);
-
-        if allocated + MEMORY_RESERVATION_RECHECK_FACTOR * (reserved + sz) > self.max {
-            log_info!("Refreshing stats. sz: {}, reserved: {}, max: {}", sz, reserved + sz, self.max);
-
-            self.try_refresh().map_err(|_| {
-                DataFusionError::ResourcesExhausted("Failed to allocate additional memory".to_string())
-            })?;
-
-            let allocated = self.allocated.load(Ordering::Acquire);
-            let reserved = self.reserved.load(Ordering::Acquire);
-
-            log_info!("New Allocated stats: {}, sz: {}, reserved: {}, max: {}", allocated, sz, reserved, self.max);
-
-            if allocated + sz + reserved > self.max {
-                log_info!("Heap exhausted. Allocated: {}, sz: {}, reserved: {}, max: {}", allocated, sz, reserved, self.max);
-                return Err(DataFusionError::ResourcesExhausted(format!(
-                    "Failed to allocate additional {} bytes with {} bytes already allocated - {} bytes remain available for the total pool",
-                    sz, allocated + reserved, self.max.saturating_sub(allocated + reserved)
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Unconditionally reserve sz bytes of memory. This marks the
-    /// additional memory as being reserved, but cannot fail. This is
-    /// used to tell the monitor about memory that is being reserved
-    /// outside of it's control. It will make it more likely that the
-    /// next call to try_reserve will update the memory statistics.
-    pub fn reserve(&self, sz: usize) {
-        self.reserved.fetch_add(sz, Ordering::AcqRel);
-    }
-}
-
-mod jemalloc_stats {
-    use std::sync::LazyLock;
-    use tikv_jemalloc_ctl::{
-        Result, epoch, epoch_mib,
-        stats::{allocated, allocated_mib},
-    };
-
-    static EPOCH_MIB: LazyLock<Result<epoch_mib>> = LazyLock::new(epoch::mib);
-    static ALLOCATED_MIB: LazyLock<Result<allocated_mib>> = LazyLock::new(allocated::mib);
-
-    pub(super) fn refresh_allocated() -> Result<usize> {
-        (*EPOCH_MIB)?.write(0)?;
-        (*ALLOCATED_MIB)?.read()
-    }
-}
 
 #[derive(Debug)]
-pub struct GreedyMemoryPool {
-    pool_size: usize,
-    used: AtomicUsize,
-    monitor: Arc<AllocationMonitor>
+pub struct AllocationMonitoringMemoryPool {
+    inner: Arc<dyn MemoryPool>,
+    monitor: Arc<AllocationMonitor>,
 }
 
-impl GreedyMemoryPool {
-    /// Create a new pool that can allocate up to `pool_size` bytes
-    pub fn new(pool_size: usize) -> Self {
-        log_debug!("Created new GreedyMemoryPool(pool_size={pool_size})");
-        Self {
-            pool_size,
-            used: AtomicUsize::new(0),
-            monitor: Arc::new(AllocationMonitor::try_new(pool_size).unwrap())
-        }
+impl AllocationMonitoringMemoryPool {
+    pub fn new(inner: Arc<dyn MemoryPool>, monitor: Arc<AllocationMonitor>) -> Self {
+        Self { inner, monitor }
     }
 }
 
-impl MemoryPool for GreedyMemoryPool {
-    fn grow(&self, _reservation: &MemoryReservation, additional: usize) {
+impl MemoryPool for AllocationMonitoringMemoryPool {
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
         self.monitor.reserve(additional);
-        self.used.fetch_add(additional, Ordering::Relaxed);
+        self.inner.grow(reservation, additional);
     }
 
-    fn shrink(&self, _reservation: &MemoryReservation, shrink: usize) {
-        self.used.fetch_sub(shrink, Ordering::Relaxed);
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        // Shrinking doesn't update the monitor. This means that the
+        // monitor will always see the memory reservation is increasing
+        // causing the statistics to be polled from jemalloc
+        // occasionally, keeping the statistics more accurate.
+        self.inner.shrink(reservation, shrink);
     }
 
-    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> Result<()> {
         self.monitor.try_reserve(additional).map_err(|e| match e {
-            _ => {
-                insufficient_capacity_err(reservation, additional, self.pool_size)
+            AllocationMonitorError::Jemalloc { source } => {
+                DataFusionError::External(Box::new(source))
+            }
+            AllocationMonitorError::HeapExhausted => {
+                DataFusionError::ResourcesExhausted(e.to_string())
             }
         })?;
-
-        let allocated = self.monitor.allocated.load(Ordering::Acquire);
-        let reserved = self.monitor.reserved.load(Ordering::Acquire);
-        log_info!("allocated:{:?}, reserved: {:?}", allocated, reserved);
-
-
-        self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                let used = allocated + reserved;
-                let new_used = used + additional;
-                (new_used <= self.pool_size).then_some(new_used)
-            })
-            .map_err(|used| {
-                insufficient_capacity_err(
-                    reservation,
-                    additional,
-                    self.pool_size.saturating_sub(used),
-                )
-            })?;
-        Ok(())
+        self.inner.try_grow(reservation, additional)
     }
 
     fn reserved(&self) -> usize {
-        self.used.load(Ordering::Relaxed)
+        self.inner.reserved()
     }
 
-    fn memory_limit(&self) -> MemoryLimit {
-        MemoryLimit::Finite(self.pool_size)
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.inner.register(consumer)
+    }
+
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.inner.unregister(consumer)
     }
 }
+
 
 #[inline(always)]
 fn insufficient_capacity_err(
@@ -192,8 +81,6 @@ fn insufficient_capacity_err(
         additional, reservation.consumer().name(), reservation.size(), available
     ))
 }
-
-
 
 
 macro_rules! make_error {

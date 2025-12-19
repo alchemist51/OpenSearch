@@ -59,6 +59,7 @@ use object_store::ObjectMeta;
 use tokio::runtime::Runtime;
 use std::result;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::memory_pool::UnboundedMemoryPool;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::sqlparser::keywords::Keyword::ALLOCATE;
 use futures::TryStreamExt;
@@ -71,11 +72,13 @@ use log::{error, warn};
 use once_cell::sync::Lazy;
 use tokio_metrics::TaskMonitor;
 use crate::cross_rt_stream::CrossRtStream;
-use crate::memory::{AllocationMonitor, GreedyMemoryPool, Monitor, MonitoredMemoryPool};
+use crate::jemalloc_monitor::AllocationMonitor;
+use crate::memory::{AllocationMonitoringMemoryPool};
 use crate::runtime_manager::RuntimeManager;
 
 mod statistics_cache;
 mod eviction_policy;
+mod jemalloc_monitor;
 
 struct DataFusionRuntime {
     runtime_env: RuntimeEnv,
@@ -282,9 +285,14 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_createGlo
         .expect("AllocationMonitor creation error failing");
     let monitor = Arc::new(monitor);
 
-    let memory_pool = Arc::new(GreedyMemoryPool::new(memory_pool_limit as usize));
-
-    runtime_env_builder = runtime_env_builder.with_memory_pool(memory_pool);
+    let memory_pool = runtime_env_builder
+        .memory_pool
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(UnboundedMemoryPool::default()));
+    runtime_env_builder = runtime_env_builder.with_memory_pool(Arc::new(
+        AllocationMonitoringMemoryPool::new(memory_pool, monitor.clone()),
+    ));
 
     let runtime = DataFusionRuntime {
         runtime_env: runtime_env_builder.build().unwrap(),
