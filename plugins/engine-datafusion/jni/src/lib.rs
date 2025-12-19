@@ -71,7 +71,7 @@ use log::{error, warn};
 use once_cell::sync::Lazy;
 use tokio_metrics::TaskMonitor;
 use crate::cross_rt_stream::CrossRtStream;
-use crate::memory::{AllocationMonitor, AllocationMonitoringMemoryPool, GreedyMemoryPool, Monitor, MonitoredMemoryPool};
+use crate::memory::{AllocationMonitor, GreedyMemoryPool, Monitor, MonitoredMemoryPool};
 use crate::runtime_manager::RuntimeManager;
 
 mod statistics_cache;
@@ -284,10 +284,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_createGlo
 
     let memory_pool = Arc::new(GreedyMemoryPool::new(memory_pool_limit as usize));
 
-    runtime_env_builder = runtime_env_builder.with_memory_pool(Arc::new(
-        AllocationMonitoringMemoryPool::new(memory_pool, monitor.clone()),
-    ));
-
+    runtime_env_builder = runtime_env_builder.with_memory_pool(memory_pool);
 
     let runtime = DataFusionRuntime {
         runtime_env: runtime_env_builder.build().unwrap(),
