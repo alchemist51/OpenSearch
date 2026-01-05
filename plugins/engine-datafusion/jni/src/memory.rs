@@ -13,6 +13,8 @@ use datafusion::common::DataFusionError;
 
 pub type Result<T, E = DataFusionError> = result::Result<T, E>;
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// Wrapper around MonitoredMemoryPool providing access to memory monitoring capabilities.
 #[derive(Debug)]
