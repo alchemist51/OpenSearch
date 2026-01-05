@@ -78,6 +78,9 @@ tokio-stream = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 
+tikv-jemalloc-ctl = { version = "0.5.4", features = ["use_std", "disable_initial_exec_tls"] }
+tikv-jemallocator = "0.5.4"
+
 [build-dependencies]
 cbindgen = "0.27"
 
