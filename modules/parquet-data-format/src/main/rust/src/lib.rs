@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 pub mod logger;
 pub mod parquet_merge;
 pub mod rate_limited_writer;
+pub mod reader_heap;
 
 pub use parquet_merge::*;
 

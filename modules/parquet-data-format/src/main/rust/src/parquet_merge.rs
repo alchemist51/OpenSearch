@@ -6,18 +6,19 @@ use std::error::Error;
 use std::any::Any;
 use std::sync::Arc;
 use std::panic::AssertUnwindSafe;
-use std::collections::BinaryHeap;
 use std::cmp::Ordering;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use arrow::array::{Int64Array, ArrayRef, TimestampMillisecondArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use arrow_array::Datum;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use crate::rate_limited_writer::RateLimitedWriter;
 
 use crate::{log_info, log_error};
+use crate::reader_heap::ParquetReaderHeap;
 
 // Constants
 const READER_BATCH_SIZE: usize = 1024;
@@ -292,8 +293,8 @@ fn process_files_sorted(
 
     log_info!("Processing merge with sorting.");
 
-    // Create file states for all files
-    let mut file_states = Vec::new();
+    let mut readers = Vec::with_capacity(input_files.len());
+
     for path in input_files {
         let file = File::open(path)
             .map_err(|e| ParquetMergeError::InvalidFile(format!("{}: {}", path, e)))?;
@@ -302,122 +303,67 @@ fn process_files_sorted(
             .with_batch_size(READER_BATCH_SIZE)
             .build()
             .map_err(|e| ParquetMergeError::BatchProcessingError(format!("Failed to build reader: {}", e)))?;
-        
-        file_states.push(FileState {
-            reader,
-            current_batch: None,
-            batch_index: 0,
-        });
+
+        readers.push(reader);
     }
-
-    // Priority queue for sorted merging
-    let mut heap = BinaryHeap::new();
-
-    // Initialize heap with first record from each file
-    for (file_index, file_state) in file_states.iter_mut().enumerate() {
-        if let Some(batch_result) = file_state.reader.next() {
-            let batch = batch_result
-                .map_err(|e| ParquetMergeError::BatchProcessingError(format!("Failed to read batch: {}", e)))?;
-
-            if batch.num_rows() > 0 {
-                let mut sort_value = get_sort_value_from_batch(&batch, 0, schema, sort_column_name)?;
-                if reverse_sort {
-                    sort_value = -sort_value;
-                }
-                
-                file_state.current_batch = Some(batch);
-                heap.push(PriorityItem {
-                    sort_value,
-                    file_index,
-                    row_index: 0,
-                    batch_index: 0,
-                });
-            }
+    let priority_fn = |batch: &RecordBatch, row: usize| -> Result<i64, Box<dyn Error>> {
+        let val = get_sort_value_from_batch(batch, row, schema, sort_column_name);
+        if reverse_sort {
+            Ok(-val?)
+        } else {
+            Ok(val?)
         }
-    }
+    };
 
-    let mut output_records = Vec::new();
+    let mut heap = ParquetReaderHeap::new(readers, priority_fn)?;
+    let mut collected_records: Vec<RecordBatch> = Vec::with_capacity(WRITER_BATCH_SIZE);
+    let mut collected_records_count: usize = 0;
+    while let Some((item, batch)) = heap.pop_with_batch() {
+        let start_row = item.row_index;
+        let mut end_row = start_row + 1;
 
-    // Process records in sorted order
-    while let Some(item) = heap.pop() {
-        // Get current batch from file state
-        let current_batch = file_states[item.file_index].current_batch.as_ref()
-            .ok_or("Current batch not available")?;
-
-        // Extract current record
-        let record = extract_record_from_batch(current_batch, item.row_index, schema)?;
-        output_records.push(record);
-
-        // Write batch when it reaches the target size
-        if output_records.len() >= WRITER_BATCH_SIZE {
-            let output_batch = create_batch_from_records(&output_records, schema)?;
-            let new_batch = update_row_ids(&output_batch, current_row_id, schema)?;
-
-            writer.write(&new_batch)
-                .map_err(|e| ParquetMergeError::BatchProcessingError(format!("Failed to write batch: {}", e)))?;
-
-            current_row_id += new_batch.num_rows() as i64;
-            stats.total_rows += output_records.len();
-            stats.total_batches += 1;
-            output_records.clear();
-        }
-
-        // Get next record from the same file
-        let next_row_index = item.row_index + 1;
-        let file_state = &mut file_states[item.file_index];
-        
-        if let Some(ref current_batch) = file_state.current_batch {
-            if next_row_index < current_batch.num_rows() {
-                // Next record is in the same batch
-                let mut sort_value = get_sort_value_from_batch(current_batch, next_row_index, schema, sort_column_name)?;
-                if reverse_sort {
-                    sort_value = -sort_value;
-                }
-                heap.push(PriorityItem {
-                    sort_value,
-                    file_index: item.file_index,
-                    row_index: next_row_index,
-                    batch_index: item.batch_index,
-                });
+        // Collect contiguous rows from same batch
+        while let Some((_, next_item)) = heap.peek() {
+            if next_item.reader_index == item.reader_index &&
+                next_item.row_index == end_row &&
+                next_item.batch_id == item.batch_id {
+                heap.pop();
+                end_row += 1;
             } else {
-                // Need to read next batch from this file
-                if let Some(batch_result) = file_state.reader.next() {
-                    let batch = batch_result
-                        .map_err(|e| ParquetMergeError::BatchProcessingError(format!("Failed to read batch: {}", e)))?;
-                    if batch.num_rows() > 0 {
-                        let mut sort_value = get_sort_value_from_batch(&batch, 0, schema, sort_column_name)?;
-                        if reverse_sort {
-                            sort_value = -sort_value;
-                        }
-                        
-                        file_state.current_batch = Some(batch);
-                        file_state.batch_index += 1;
-                        
-                        heap.push(PriorityItem {
-                            sort_value,
-                            file_index: item.file_index,
-                            row_index: 0,
-                            batch_index: file_state.batch_index,
-                        });
-                    } else {
-                        // No more data in this file
-                        file_state.current_batch = None;
-                    }
-                } else {
-                    // No more batches in this file
-                    file_state.current_batch = None;
-                }
+                break;
+            }
+        }
+
+        if start_row < batch.num_rows() && end_row <= batch.num_rows() {
+            let slice = batch.slice(start_row, end_row - start_row);
+            collected_records_count += slice.num_rows();
+            collected_records.push(slice);
+
+            // Write when batch is full
+            if collected_records_count >= WRITER_BATCH_SIZE {
+                let output_batch = create_batch_from_records(&collected_records, schema)?;
+                let new_batch = update_row_ids(&output_batch, current_row_id, schema)?;
+                writer.write(&new_batch)
+                    .map_err(|e| ParquetMergeError::BatchProcessingError(format!("Failed to write batch: {}", e)))?;
+
+                current_row_id += new_batch.num_rows() as i64;
+                stats.total_rows += collected_records_count;
+                stats.total_batches += 1;
+
+                collected_records.clear();
+                collected_records_count = 0;
             }
         }
     }
+
+    log_info!("batch write complete for sort flow");
 
     // Write remaining records
-    if !output_records.is_empty() {
-        let output_batch = create_batch_from_records(&output_records, schema)?;
+    if !collected_records.is_empty() {
+        let output_batch = create_batch_from_records(&collected_records, schema)?;
         let new_batch = update_row_ids(&output_batch, current_row_id, schema)?;
-        writer.write(&new_batch)
-            .map_err(|e| ParquetMergeError::BatchProcessingError(format!("Failed to write batch: {}", e)))?;
-        stats.total_rows += output_records.len();
+        writer.write(&new_batch)?;
+        stats.total_rows += collected_records_count;
         stats.total_batches += 1;
     }
 
@@ -448,39 +394,36 @@ fn get_sort_value_from_batch(batch: &RecordBatch, row_index: usize, schema: &Sch
     return Ok(0);
     // TODO
     // Confirm the behaviour when sort field is not present, today will consider it as 0.
-//     Err("Sort column not found".into())
+    //     Err("Sort column not found".into())
 }
 
 // Helper function to extract a single record from batch
-fn extract_record_from_batch(batch: &RecordBatch, row_index: usize, _schema: &SchemaRef) -> Result<Vec<ArrayRef>, Box<dyn Error>> {
-    let mut record = Vec::new();
-    for column in batch.columns() {
-        let slice = column.slice(row_index, 1);
-        record.push(slice);
-    }
-    Ok(record)
+fn extract_record_from_batch(batch: &RecordBatch, row_index: usize, count_schema: &SchemaRef) -> Result<RecordBatch, Box<dyn Error>> {
+    Ok(batch.slice(row_index, 1))
 }
 
 // Helper function to create batch from collected records
-fn create_batch_from_records(records: &[Vec<ArrayRef>], schema: &SchemaRef) -> Result<RecordBatch, Box<dyn Error>> {
+fn create_batch_from_records(records: &Vec<RecordBatch>, schema: &SchemaRef) -> Result<RecordBatch, Box<dyn Error>> {
     if records.is_empty() {
         return Err("No records to create batch".into());
     }
 
-    let mut columns = Vec::new();
-    for col_index in 0..schema.fields().len() {
-        let mut arrays = Vec::new();
-        for record in records {
-            arrays.push(record[col_index].clone());
-        }
-        let array_refs: Vec<&dyn arrow::array::Array> = arrays.iter().map(|a| a.as_ref()).collect();
-        let concatenated = arrow::compute::concat(&array_refs)
-            .map_err(|e| format!("Failed to concatenate arrays: {}", e))?;
-        columns.push(concatenated);
-    }
+    // let mut columns = Vec::with_capacity(records.len());
+    // for col_index in 0..schema.fields().len() {
+    //     let mut arrays = Vec::new();
+    //     for record in records {
+    //         arrays.push(record[col_index].clone());
+    //     }
+    //     let array_refs: Vec<&dyn arrow::array::Array> = arrays.iter().map(|a| a.as_ref()).collect();
+    //     let concatenated = arrow::compute::concat(&array_refs)
+    //         .map_err(|e| format!("Failed to concatenate arrays: {}", e))?;
+    //     columns.push(concatenated);
+    // }
+    //
+    // RecordBatch::try_new(schema.clone(), columns)
+    //     .map_err(|e| ParquetMergeError::BatchProcessingError(format!("Failed to create batch: {}", e)).into())
 
-    RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| ParquetMergeError::BatchProcessingError(format!("Failed to create batch: {}", e)).into())
+    arrow::compute::concat_batches(schema, records).map_err(Into::into)
 }
 
 // Row ID update logic
