@@ -6,21 +6,61 @@ use std::error::Error;
 use std::any::Any;
 use std::sync::Arc;
 use std::panic::AssertUnwindSafe;
+use std::cmp::Ordering;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use arrow::array::{Int64Array, ArrayRef};
+use arrow::array::{Int64Array, ArrayRef, TimestampMillisecondArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use arrow_array::Datum;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use crate::rate_limited_writer::RateLimitedWriter;
 
 use crate::{log_info, log_error};
+use crate::reader_heap::ParquetReaderHeap;
 
 // Constants
-const READER_BATCH_SIZE: usize = 8192;
+const READER_BATCH_SIZE: usize = 1024;
 const WRITER_BATCH_SIZE: usize = 8192;
 const ROW_ID_COLUMN_NAME: &str = "___row_id";
+
+
+// Priority queue item for sorted merging
+#[derive(Debug)]
+struct PriorityItem {
+    sort_value: i64,
+    file_index: usize,
+    row_index: usize,
+    batch_index: usize,
+}
+
+// File state to track current batch per file
+struct FileState {
+    reader: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
+    current_batch: Option<RecordBatch>,
+    batch_index: usize,
+}
+
+impl Eq for PriorityItem {}
+
+impl PartialEq for PriorityItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.sort_value == other.sort_value
+    }
+}
+
+impl Ord for PriorityItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.sort_value.cmp(&self.sort_value) // Min-heap for ascending order
+    }
+}
+
+impl PartialOrd for PriorityItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 // Custom error types
 #[derive(Debug)]
@@ -60,6 +100,8 @@ pub extern "system" fn Java_com_parquet_parquetdataformat_bridge_RustBridge_merg
     _class: JClass,
     input_files: JObject,
     output_file: JString,
+    sort_column: JString,
+    reverse_sort: jint,
 ) -> jint {
     let result = catch_unwind(|| {
         let input_files_vec = convert_java_list_to_vec(&mut env, input_files)
@@ -70,9 +112,19 @@ pub extern "system" fn Java_com_parquet_parquetdataformat_bridge_RustBridge_merg
             .map_err(|e| format!("Failed to get output file string: {}", e))?
             .into();
 
-        log_info!("Starting merge of {} files to {}", input_files_vec.len(), output_path);
+        let sort_column_name: Option<String> = if sort_column.is_null() {
+            None
+        } else {
+            Some(env
+                .get_string(&sort_column)
+                .map_err(|e| format!("Failed to get sort column string: {}", e))?
+                .into())
+        };
+        let is_reverse_sort = reverse_sort != 0;
 
-        process_parquet_files(&input_files_vec, &output_path)?;
+        log_info!("Starting merge of {} files to {} sorted by {:?} (reverse: {})", input_files_vec.len(), output_path, sort_column_name, is_reverse_sort);
+
+        process_parquet_files(&input_files_vec, &output_path, sort_column_name.as_deref(), is_reverse_sort)?;
 
         log_info!("Merge completed successfully");
         Ok(())
@@ -96,7 +148,7 @@ pub extern "system" fn Java_com_parquet_parquetdataformat_bridge_RustBridge_merg
 }
 
 // Main processing function
-pub fn process_parquet_files(input_files: &[String], output_path: &str) -> Result<(), Box<dyn Error>> {
+pub fn process_parquet_files(input_files: &[String], output_path: &str, sort_column_name: Option<&str>, reverse_sort: bool) -> Result<(), Box<dyn Error>> {
     // Validate input
     validate_input(input_files)?;
 
@@ -107,8 +159,12 @@ pub fn process_parquet_files(input_files: &[String], output_path: &str) -> Resul
     // Create writer
     let mut writer = create_writer(output_path, schema.clone())?;
 
-    // Process files
-    let stats = process_files(input_files, &schema, &mut writer)?;
+    // Process files with or without sorting
+    let stats = if let Some(sort_col) = sort_column_name {
+        process_files_sorted(input_files, &schema, &mut writer, sort_col, reverse_sort)?
+    } else {
+        process_files(input_files, &schema, &mut writer)?
+    };
 
     // Close writer
     writer.close()
@@ -177,7 +233,7 @@ fn process_files(
         total_rows: 0,
         total_batches: 0,
     };
-
+    log_info!("Processing merge without sorting.");
     for path in input_files {
         log_info!("Processing file: {}", path);
 
@@ -217,6 +273,157 @@ fn process_files(
     }
 
     Ok(stats)
+}
+
+
+// File processing with sorted merging
+fn process_files_sorted(
+    input_files: &[String],
+    schema: &SchemaRef,
+    writer: &mut ArrowWriter<RateLimitedWriter<File>>,
+    sort_column_name: &str,
+    reverse_sort: bool,
+) -> Result<ProcessingStats, Box<dyn Error>> {
+    let mut current_row_id: i64 = 0;
+    let mut stats = ProcessingStats {
+        files_processed: input_files.len(),
+        total_rows: 0,
+        total_batches: 0,
+    };
+
+    log_info!("Processing merge with sorting.");
+
+    let mut readers = Vec::with_capacity(input_files.len());
+
+    for path in input_files {
+        let file = File::open(path)
+            .map_err(|e| ParquetMergeError::InvalidFile(format!("{}: {}", path, e)))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| ParquetMergeError::BatchProcessingError(format!("Failed to create reader: {}", e)))?
+            .with_batch_size(READER_BATCH_SIZE)
+            .build()
+            .map_err(|e| ParquetMergeError::BatchProcessingError(format!("Failed to build reader: {}", e)))?;
+
+        readers.push(reader);
+    }
+    let priority_fn = |batch: &RecordBatch, row: usize| -> Result<i64, Box<dyn Error>> {
+        let val = get_sort_value_from_batch(batch, row, schema, sort_column_name);
+        if reverse_sort {
+            Ok(-val?)
+        } else {
+            Ok(val?)
+        }
+    };
+
+    let mut heap = ParquetReaderHeap::new(readers, priority_fn)?;
+    let mut collected_records: Vec<RecordBatch> = Vec::with_capacity(WRITER_BATCH_SIZE);
+    let mut collected_records_count: usize = 0;
+    while let Some((item, batch)) = heap.pop_with_batch() {
+        let start_row = item.row_index;
+        let mut end_row = start_row + 1;
+
+        // Collect contiguous rows from same batch
+        while let Some((_, next_item)) = heap.peek() {
+            if next_item.reader_index == item.reader_index &&
+                next_item.row_index == end_row &&
+                next_item.batch_id == item.batch_id {
+                heap.pop();
+                end_row += 1;
+            } else {
+                break;
+            }
+        }
+
+        if start_row < batch.num_rows() && end_row <= batch.num_rows() {
+            let slice = batch.slice(start_row, end_row - start_row);
+            collected_records_count += slice.num_rows();
+            collected_records.push(slice);
+
+            // Write when batch is full
+            if collected_records_count >= WRITER_BATCH_SIZE {
+                let output_batch = create_batch_from_records(&collected_records, schema)?;
+                let new_batch = update_row_ids(&output_batch, current_row_id, schema)?;
+                writer.write(&new_batch)
+                    .map_err(|e| ParquetMergeError::BatchProcessingError(format!("Failed to write batch: {}", e)))?;
+
+                current_row_id += new_batch.num_rows() as i64;
+                stats.total_rows += collected_records_count;
+                stats.total_batches += 1;
+
+                collected_records.clear();
+                collected_records_count = 0;
+            }
+        }
+    }
+
+    log_info!("batch write complete for sort flow");
+
+    // Write remaining records
+    if !collected_records.is_empty() {
+        let output_batch = create_batch_from_records(&collected_records, schema)?;
+        let new_batch = update_row_ids(&output_batch, current_row_id, schema)?;
+        writer.write(&new_batch)?;
+        stats.total_rows += collected_records_count;
+        stats.total_batches += 1;
+    }
+
+    Ok(stats)
+}
+
+// Helper function to get sort value from a batch at specific index
+fn get_sort_value_from_batch(batch: &RecordBatch, row_index: usize, schema: &SchemaRef, sort_column_name: &str) -> Result<i64, Box<dyn Error>> {
+    for (i, field) in schema.fields().iter().enumerate() {
+        if field.name() == sort_column_name {
+            let column = batch.column(i);
+
+            // Try TimestampMillisecondArray for timestamp fields
+            if let Some(timestamp_array) = column.as_any().downcast_ref::<TimestampMillisecondArray>() {
+                return Ok(timestamp_array.value(row_index));
+            }
+
+            // Try Int64Array
+            if let Some(int64_array) = column.as_any().downcast_ref::<Int64Array>() {
+                return Ok(int64_array.value(row_index));
+            }
+
+            // TODO
+            // For now only date/long fields are supported for sort
+            return Err(format!("Sort column '{}' is not Int64Array or TimestampMillisecondArray", sort_column_name).into());
+        }
+    }
+    return Ok(0);
+    // TODO
+    // Confirm the behaviour when sort field is not present, today will consider it as 0.
+    //     Err("Sort column not found".into())
+}
+
+// Helper function to extract a single record from batch
+fn extract_record_from_batch(batch: &RecordBatch, row_index: usize, count_schema: &SchemaRef) -> Result<RecordBatch, Box<dyn Error>> {
+    Ok(batch.slice(row_index, 1))
+}
+
+// Helper function to create batch from collected records
+fn create_batch_from_records(records: &Vec<RecordBatch>, schema: &SchemaRef) -> Result<RecordBatch, Box<dyn Error>> {
+    if records.is_empty() {
+        return Err("No records to create batch".into());
+    }
+
+    // let mut columns = Vec::with_capacity(records.len());
+    // for col_index in 0..schema.fields().len() {
+    //     let mut arrays = Vec::new();
+    //     for record in records {
+    //         arrays.push(record[col_index].clone());
+    //     }
+    //     let array_refs: Vec<&dyn arrow::array::Array> = arrays.iter().map(|a| a.as_ref()).collect();
+    //     let concatenated = arrow::compute::concat(&array_refs)
+    //         .map_err(|e| format!("Failed to concatenate arrays: {}", e))?;
+    //     columns.push(concatenated);
+    // }
+    //
+    // RecordBatch::try_new(schema.clone(), columns)
+    //     .map_err(|e| ParquetMergeError::BatchProcessingError(format!("Failed to create batch: {}", e)).into())
+
+    arrow::compute::concat_batches(schema, records).map_err(Into::into)
 }
 
 // Row ID update logic
