@@ -249,7 +249,7 @@ impl NativeParquetWriter {
         let schema = batches[0].schema();
         let combined_batch = arrow::compute::concat_batches(&schema, &batches)?;
 
-        let timestamp_col_idx = schema.fields().iter().position(|f| f.name() == "EventDate")
+        let timestamp_col_idx = schema.fields().iter().position(|f| f.name() == "CounterID")
             .ok_or("timestamp column not found")?;
 
         let timestamp_array = combined_batch.column(timestamp_col_idx);
@@ -285,7 +285,7 @@ impl NativeParquetWriter {
             let batch = batch_result?;
             let schema = batch.schema();
 
-            let timestamp_col_idx = schema.fields().iter().position(|f| f.name() == "EventDate")
+            let timestamp_col_idx = schema.fields().iter().position(|f| f.name() == "CounterID")
                 .ok_or("timestamp column not found")?;
 
             let timestamp_array = batch.column(timestamp_col_idx);
@@ -358,7 +358,7 @@ impl NativeParquetWriter {
         let schema = all_batches[0].schema();
         let combined = arrow::compute::concat_batches(&schema, &all_batches)?;
 
-        let timestamp_col_idx = schema.fields().iter().position(|f| f.name() == "EventDate")
+        let timestamp_col_idx = schema.fields().iter().position(|f| f.name() == "CounterID")
             .ok_or("timestamp column not found")?;
 
         let timestamp_array = combined.column(timestamp_col_idx);
