@@ -20,7 +20,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use parquet::format::FileMetaData as FormatFileMetaData;
 use parquet::file::metadata::FileMetaData as FileFileMetaData;
-use parquet::file::reader::{FileReader, SerializedFileReader};
 
 pub mod logger;
 pub mod parquet_merge;
