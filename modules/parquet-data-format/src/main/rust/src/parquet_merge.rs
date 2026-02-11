@@ -388,7 +388,7 @@ fn get_sort_value_from_batch(batch: &RecordBatch, row_index: usize, schema: &Sch
 
             // Try Int64Array
             if let Some(int32_array) = column.as_any().downcast_ref::<Int32Array>() {
-                return Ok(int32_array.value(row_index));
+                return Ok(int32_array.value(row_index) as i64);
             }
 
             // TODO
