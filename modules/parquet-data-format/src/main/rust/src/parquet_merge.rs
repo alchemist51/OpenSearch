@@ -12,7 +12,7 @@ use parquet::file::properties::WriterProperties;
 use arrow::array::{Int64Array, ArrayRef, TimestampMillisecondArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use arrow_array::Datum;
+use arrow_array::{Datum, Int32Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use crate::rate_limited_writer::RateLimitedWriter;
@@ -386,9 +386,14 @@ fn get_sort_value_from_batch(batch: &RecordBatch, row_index: usize, schema: &Sch
                 return Ok(int64_array.value(row_index));
             }
 
+            // Try Int64Array
+            if let Some(int32_array) = column.as_any().downcast_ref::<Int32Array>() {
+                return Ok(int32_array.value(row_index));
+            }
+
             // TODO
             // For now only date/long fields are supported for sort
-            return Err(format!("Sort column '{}' is not Int64Array or TimestampMillisecondArray", sort_column_name).into());
+            return Err(format!("Sort column '{}' is not Int64Array, Int32Array or TimestampMillisecondArray", sort_column_name).into());
         }
     }
     return Ok(0);
