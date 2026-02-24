@@ -16,7 +16,6 @@ import org.apache.lucene.search.Query;
 import org.opensearch.action.search.SearchShardTask;
 import org.opensearch.action.search.SearchType;
 import org.opensearch.cluster.service.ClusterService;
-import org.opensearch.common.SetOnce;
 import org.opensearch.common.lease.Releasables;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
@@ -35,6 +34,7 @@ import org.opensearch.index.similarity.SimilarityService;
 import org.opensearch.search.SearchExtBuilder;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.SearchShardTarget;
+import org.opensearch.search.VectorisedQueryResult;
 import org.opensearch.search.aggregations.BucketCollectorProcessor;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.SearchContextAggregations;
@@ -62,7 +62,6 @@ import org.opensearch.search.query.ReduceableSearchResult;
 import org.opensearch.search.rescore.RescoreContext;
 import org.opensearch.search.sort.SortAndFormats;
 import org.opensearch.search.suggest.SuggestionSearchContext;
-import org.opensearch.vectorized.execution.search.spi.QueryResult;
 import org.opensearch.vectorized.execution.search.spi.RecordBatchStream;
 
 import java.time.LocalDateTime;
@@ -71,10 +70,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
-import static org.opensearch.search.SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_MODE;
 import static org.opensearch.search.SearchService.CLUSTER_SEARCH_QUERY_PLAN_EXPLAIN_SETTING;
-import static org.opensearch.search.SearchService.CONCURRENT_SEGMENT_SEARCH_MODE_ALL;
-import static org.opensearch.search.SearchService.CONCURRENT_SEGMENT_SEARCH_MODE_AUTO;
 import static org.opensearch.search.SearchService.NATIVE_CLUSTER_CONCURRENT_SEGMENT_SEARCH_MODE;
 import static org.opensearch.search.SearchService.NATIVE_CONCURRENT_SEGMENT_SEARCH_MODE_ALL;
 import static org.opensearch.search.SearchService.NATIVE_CONCURRENT_SEGMENT_SEARCH_MODE_NONE;
@@ -95,7 +91,7 @@ public class DatafusionContext extends SearchContext {
     private final QueryShardContext queryShardContext;
     private final String nativeConcurrentSearchMode;
     private DatafusionQuery datafusionQuery;
-    private QueryResult dfResults;
+    private VectorisedQueryResult dfResults;
     private SearchContextAggregations aggregations;
     private final BigArrays bigArrays;
     private final Map<Class<?>, CollectorManager<? extends Collector, ReduceableSearchResult>> queryCollectorManagers = new HashMap<>();
@@ -851,11 +847,11 @@ public class DatafusionContext extends SearchContext {
         return new ContextEngineSearcher<>(this.engineSearcher, this);
     }
 
-    public void setDFResults(QueryResult dfResults) {
+    public void setDFResults(VectorisedQueryResult dfResults) {
         this.dfResults = dfResults;
     }
 
-    public QueryResult getDFResults() {
+    public VectorisedQueryResult getDFResults() {
         return dfResults;
     }
 

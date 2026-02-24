@@ -11,15 +11,13 @@ package org.opensearch.search.query;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.collect.Tuple;
+import org.opensearch.search.VectorisedQueryResult;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.ShardResultConvertor;
-import org.opensearch.search.aggregations.metrics.CardinalityAggregator;
-import org.opensearch.search.aggregations.metrics.InternalCardinality;
 import org.opensearch.search.aggregations.metrics.InternalValueCount;
 import org.opensearch.search.aggregations.metrics.ValueCountAggregator;
-import org.opensearch.vectorized.execution.search.spi.QueryResult;
 import org.opensearch.search.internal.SearchContext;
 
 import java.io.IOException;
@@ -36,7 +34,7 @@ public class SearchEngineResultConversionUtils {
 
     public static void convertDFResultGeneric(SearchContext searchContext) {
         if (searchContext.aggregations() != null) {
-            QueryResult dfResult = searchContext.getDFResults();
+            VectorisedQueryResult dfResult = searchContext.getDFResults();
 
             try {
 

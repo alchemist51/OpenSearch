@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.vectorized.execution.search.spi;
+package org.opensearch.search;
 
 import java.util.List;
 import java.util.Map;
@@ -14,14 +14,14 @@ import java.util.Map;
 /**
  * Service Provider Interface for query execution results.
  * Implementations provide access to columnar query results from different execution engines.
- * 
+ *
  * @opensearch.experimental
  */
-public interface QueryResult {
+public interface VectorisedQueryResult {
 
     /**
      * Returns the columnar result data where each entry maps a column name to its list of values.
-     * 
+     *
      * @return Map of column names to their corresponding value lists
      */
     Map<String, List<Object>> getColumns();

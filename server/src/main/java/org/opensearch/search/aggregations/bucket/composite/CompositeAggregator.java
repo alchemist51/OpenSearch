@@ -61,7 +61,7 @@ import org.apache.lucene.util.RoaringDocIdSet;
 import org.opensearch.common.Rounding;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.lease.Releasables;
-import org.opensearch.vectorized.execution.search.spi.QueryResult;
+import org.opensearch.search.VectorisedQueryResult;
 import org.opensearch.index.IndexSortConfig;
 import org.opensearch.lucene.queries.SearchAfterSortedDocQuery;
 import org.opensearch.search.DocValueFormat;
@@ -80,9 +80,6 @@ import org.opensearch.search.aggregations.bucket.filterrewrite.CompositeAggregat
 import org.opensearch.search.aggregations.bucket.filterrewrite.FilterRewriteOptimizationContext;
 import org.opensearch.search.aggregations.bucket.missing.MissingOrder;
 import org.opensearch.search.aggregations.bucket.terms.LongKeyedBucketOrds;
-import org.opensearch.search.aggregations.bucket.terms.StringTerms;
-import org.opensearch.search.aggregations.metrics.InternalValueCount;
-import org.opensearch.search.aggregations.metrics.ValueCountAggregator;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.query.SearchEngineResultConversionUtils;
 import org.opensearch.search.searchafter.SearchAfterBuilder;
@@ -735,7 +732,7 @@ public final class CompositeAggregator extends BucketsAggregator implements Shar
     }
 
     @Override
-    public List<InternalAggregation> convert(QueryResult dfResult, SearchContext searchContext) {
+    public List<InternalAggregation> convert(VectorisedQueryResult dfResult, SearchContext searchContext) {
         Map<String, List<Object>> shardResult = dfResult.getColumns();
         if(shardResult.isEmpty()) {
             return Collections.singletonList(buildEmptyAggregation());

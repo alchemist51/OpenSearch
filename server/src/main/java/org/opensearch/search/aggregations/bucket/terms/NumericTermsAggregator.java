@@ -42,12 +42,11 @@ import org.opensearch.common.Numbers;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lease.Releasables;
 import org.opensearch.common.util.LongArray;
-import org.opensearch.vectorized.execution.search.spi.QueryResult;
+import org.opensearch.search.VectorisedQueryResult;
 import org.opensearch.index.codec.composite.CompositeIndexFieldInfo;
 import org.opensearch.index.compositeindex.datacube.startree.index.StarTreeValues;
 import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.SortedNumericStarTreeValuesIterator;
 import org.opensearch.index.fielddata.FieldData;
-import org.opensearch.index.fielddata.plain.SortedNumericIndexFieldData;
 import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.Aggregator;
@@ -525,7 +524,7 @@ public class NumericTermsAggregator extends TermsAggregator implements StarTreeP
         }
 
         @Override
-        public List<InternalAggregation> convert(QueryResult dfResult, SearchContext searchContext) {
+        public List<InternalAggregation> convert(VectorisedQueryResult dfResult, SearchContext searchContext) {
                 Map<String, List<Object>> shardResult = dfResult.getColumns();
                 int rowCount = shardResult.isEmpty() ? 0 : shardResult.get(name).size() ;
                 List<LongTerms.Bucket> buckets = new ArrayList<>(rowCount);
@@ -643,7 +642,7 @@ public class NumericTermsAggregator extends TermsAggregator implements StarTreeP
         }
 
         @Override
-        public List<InternalAggregation> convert(QueryResult dfResult, SearchContext searchContext) {
+        public List<InternalAggregation> convert(VectorisedQueryResult dfResult, SearchContext searchContext) {
             Map<String, List<Object>> shardResult = dfResult.getColumns();
             if(shardResult.isEmpty()) {
                 return Collections.singletonList(buildEmptyAggregation());
@@ -881,7 +880,7 @@ public class NumericTermsAggregator extends TermsAggregator implements StarTreeP
     }
 
     @Override
-    public List<InternalAggregation> convert(QueryResult dfResult, SearchContext searchContext) {
+    public List<InternalAggregation> convert(VectorisedQueryResult dfResult, SearchContext searchContext) {
         if(dfResult.getColumns().isEmpty()) {
             return Collections.singletonList(buildEmptyAggregation());
         }

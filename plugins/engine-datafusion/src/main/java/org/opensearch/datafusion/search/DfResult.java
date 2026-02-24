@@ -8,7 +8,7 @@
 
 package org.opensearch.datafusion.search;
 
-import org.opensearch.vectorized.execution.search.spi.QueryResult;
+import org.opensearch.search.VectorisedQueryResult;
 
 import java.util.List;
 import java.util.Map;
@@ -18,7 +18,7 @@ import java.util.Map;
  * Each entry maps a column name to its list of values.
  * Implements the QueryResult SPI to allow usage in core without creating a dependency.
  */
-public class DfResult implements QueryResult {
+public class DfResult implements VectorisedQueryResult {
 
     private final Map<String, List<Object>> columns;
 

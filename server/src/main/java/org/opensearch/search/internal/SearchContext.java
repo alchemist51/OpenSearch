@@ -58,6 +58,7 @@ import org.opensearch.search.SearchExtBuilder;
 import org.opensearch.search.SearchPhaseResult;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.SearchShardTarget;
+import org.opensearch.search.VectorisedQueryResult;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.BucketCollectorProcessor;
 import org.opensearch.search.aggregations.InternalAggregation;
@@ -79,14 +80,12 @@ import org.opensearch.search.profile.Profilers;
 import org.opensearch.search.query.QuerySearchResult;
 import org.opensearch.search.query.ReduceableSearchResult;
 import org.opensearch.search.rescore.RescoreContext;
-import org.opensearch.vectorized.execution.search.spi.QueryResult;
 import org.opensearch.search.slice.SliceBuilder;
 import org.opensearch.search.sort.SortAndFormats;
 import org.opensearch.search.streaming.FlushMode;
 import org.opensearch.search.suggest.SuggestionSearchContext;
 
 import java.util.Collection;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -608,9 +607,9 @@ public abstract class SearchContext implements Releasable {
     }
 
 
-    public void setDFResults(QueryResult dfResults) {}
+    public void setDFResults(VectorisedQueryResult dfResults) {}
 
-    public QueryResult getDFResults() {
+    public VectorisedQueryResult getDFResults() {
         return null;
     }
 

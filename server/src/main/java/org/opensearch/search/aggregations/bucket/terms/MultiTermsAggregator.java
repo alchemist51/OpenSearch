@@ -20,7 +20,7 @@ import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lease.Releasables;
-import org.opensearch.vectorized.execution.search.spi.QueryResult;
+import org.opensearch.search.VectorisedQueryResult;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -47,8 +47,6 @@ import org.opensearch.search.aggregations.StarTreePreComputeCollector;
 import org.opensearch.search.aggregations.bucket.BucketsAggregator;
 import org.opensearch.search.aggregations.bucket.DeferableBucketAggregator;
 import org.opensearch.search.aggregations.bucket.LocalBucketCountThresholds;
-import org.opensearch.search.aggregations.metrics.InternalValueCount;
-import org.opensearch.search.aggregations.metrics.ValueCountAggregator;
 import org.opensearch.search.aggregations.support.AggregationPath;
 import org.opensearch.search.aggregations.support.ValuesSource;
 import org.opensearch.search.internal.SearchContext;
@@ -710,7 +708,7 @@ public class MultiTermsAggregator extends DeferableBucketAggregator implements S
     }
 
     @Override
-    public List<InternalAggregation> convert(QueryResult dfResult, SearchContext searchContext) {
+    public List<InternalAggregation> convert(VectorisedQueryResult dfResult, SearchContext searchContext) {
         Map<String, List<Object>> shardResult = dfResult.getColumns();
         int rowCount = shardResult.isEmpty() ? 0 : shardResult.get(fields.getFirst()).size() ;
         List<InternalMultiTerms.Bucket> buckets = new ArrayList<>(rowCount);

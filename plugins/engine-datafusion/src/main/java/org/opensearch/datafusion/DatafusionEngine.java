@@ -62,6 +62,7 @@ import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.SearchShardTarget;
+import org.opensearch.search.VectorisedQueryResult;
 import org.opensearch.search.aggregations.SearchResultsCollector;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.fetch.FetchSubPhase;
@@ -71,7 +72,6 @@ import org.opensearch.search.internal.SearchContext;
 import org.opensearch.datafusion.search.DfResult;
 import org.opensearch.search.internal.ShardSearchRequest;
 import org.opensearch.search.lookup.SourceLookup;
-import org.opensearch.vectorized.execution.search.spi.QueryResult;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -289,7 +289,7 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
     }
 
     @Override
-    public void executeQueryPhaseAsync(DatafusionContext context, Executor executor, ActionListener<QueryResult> listener) {
+    public void executeQueryPhaseAsync(DatafusionContext context, Executor executor, ActionListener<VectorisedQueryResult> listener) {
         try {
             DatafusionSearcher datafusionSearcher = context.getEngineSearcher();
             context.getDatafusionQuery().setQueryPlanExplainEnabled(context.evaluateSearchQueryExplainMode());
@@ -355,7 +355,7 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
         SearchResultsCollector<RecordBatchStream> collector,
         Map<String, List<Object>> finalRes,
         RootAllocator allocator,
-        ActionListener<QueryResult> listener,
+        ActionListener<VectorisedQueryResult> listener,
         DatafusionContext context,
         List<Long> rowIdResult
     ) {

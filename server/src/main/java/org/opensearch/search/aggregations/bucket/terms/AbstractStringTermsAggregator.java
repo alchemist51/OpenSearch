@@ -35,7 +35,7 @@ package org.opensearch.search.aggregations.bucket.terms;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.collect.Tuple;
-import org.opensearch.vectorized.execution.search.spi.QueryResult;
+import org.opensearch.search.VectorisedQueryResult;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
@@ -45,16 +45,12 @@ import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.InternalOrder;
 import org.opensearch.search.aggregations.ShardResultConvertor;
 import org.opensearch.search.aggregations.bucket.terms.heuristic.SignificanceHeuristic;
-import org.opensearch.search.aggregations.metrics.InternalValueCount;
-import org.opensearch.search.aggregations.metrics.ValueCountAggregationBuilder;
-import org.opensearch.search.aggregations.metrics.ValueCountAggregator;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.query.SearchEngineResultConversionUtils;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -121,7 +117,7 @@ abstract class AbstractStringTermsAggregator extends TermsAggregator implements 
     }
 
     @Override
-    public List<InternalAggregation> convert(QueryResult dfResult, SearchContext searchContext) {
+    public List<InternalAggregation> convert(VectorisedQueryResult dfResult, SearchContext searchContext) {
         Map<String, List<Object>> shardResult = dfResult.getColumns();
         if(shardResult.isEmpty()) {
             return Collections.singletonList(buildEmptyTermsAggregation());

@@ -56,7 +56,6 @@ import org.opensearch.action.support.TransportActions;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.CheckedSupplier;
-import org.opensearch.common.SetOnce;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lease.Releasable;
@@ -143,7 +142,6 @@ import org.opensearch.search.profile.ProfileMetric;
 import org.opensearch.search.profile.ProfileShardResult;
 import org.opensearch.search.profile.Profilers;
 import org.opensearch.search.profile.SearchProfileShardResults;
-import org.opensearch.vectorized.execution.search.spi.QueryResult;
 import org.opensearch.search.query.*;
 import org.opensearch.search.rescore.RescorerBuilder;
 import org.opensearch.search.searchafter.SearchAfterBuilder;
@@ -1000,9 +998,9 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
             SearchExecEngine searchExecEngine = indexer instanceof CompositeEngine ? ((CompositeEngine) indexer).getPrimaryReadEngine() : null;
 
             // Execute native query async
-            searchExecEngine.executeQueryPhaseAsync(finalContext, executor, new ActionListener<QueryResult>() {
+            searchExecEngine.executeQueryPhaseAsync(finalContext, executor, new ActionListener<VectorisedQueryResult>() {
                 @Override
-                public void onResponse(QueryResult result) {
+                public void onResponse(VectorisedQueryResult result) {
                     try {
                         finalContext.setDFResults(result);
                         // Continue with rest of query phase
