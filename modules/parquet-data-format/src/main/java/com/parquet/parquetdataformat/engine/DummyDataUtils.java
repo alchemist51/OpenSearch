@@ -3,7 +3,6 @@ package com.parquet.parquetdataformat.engine;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
-import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.index.engine.exec.DocumentInput;
 import org.opensearch.index.mapper.MappedFieldType;

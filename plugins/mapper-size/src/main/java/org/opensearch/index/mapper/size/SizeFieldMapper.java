@@ -101,7 +101,7 @@ public class SizeFieldMapper extends MetadataFieldMapper {
         final int value = context.sourceToParse().source().length();
 
         if (isPluggableDataFormatFeatureEnabled(context)) {
-            context.compositeDocumentInput().addField(fieldType(), value);
+            context.compositeDocumentInput().addField(fieldType(), value, );
         } else {
             context.doc().addAll(NumberType.INTEGER.createFields(name(), value, true, true, false, true));
         }

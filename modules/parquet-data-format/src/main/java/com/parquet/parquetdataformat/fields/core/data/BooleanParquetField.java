@@ -8,6 +8,8 @@
 
 package com.parquet.parquetdataformat.fields.core.data;
 
+import org.opensearch.index.engine.exec.EngineRole;
+import org.opensearch.index.engine.exec.FieldCapability;
 import com.parquet.parquetdataformat.fields.ArrowFieldRegistry;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
@@ -15,6 +17,8 @@ import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.opensearch.index.mapper.MappedFieldType;
+
+import java.util.Set;
 
 /**
  * Parquet field implementation for handling boolean data types in OpenSearch documents.
@@ -41,7 +45,7 @@ import org.opensearch.index.mapper.MappedFieldType;
 public class BooleanParquetField extends ParquetField {
 
     @Override
-    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue) {
+    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, EngineRole engineRole, Set<FieldCapability> assignedCapabilities) {
         BitVector bitVector = (BitVector) managedVSR.getVector(mappedFieldType.name());
         int rowIndex = managedVSR.getRowCount();
         bitVector.setSafe(rowIndex, (Boolean) parseValue ? 1 : 0);
@@ -55,5 +59,10 @@ public class BooleanParquetField extends ParquetField {
     @Override
     public FieldType getFieldType() {
         return FieldType.nullable(getArrowType());
+    }
+
+    @Override
+    public EngineRole getFieldRole() {
+        return EngineRole.PRIMARY;
     }
 }

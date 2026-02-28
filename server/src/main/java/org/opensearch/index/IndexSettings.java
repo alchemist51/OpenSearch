@@ -863,6 +863,17 @@ public final class IndexSettings {
         Property.Final
     );
 
+    /**
+     * Declares which data format is primary for a composite index.
+     * Required when multiple DataSourcePlugins are registered.
+     * Empty default means "not set" — throws when multiple plugins are registered.
+     */
+    public static final Setting<String> INDEX_COMPOSITE_PRIMARY_DATA_FORMAT_SETTING = Setting.simpleString(
+        "index.composite.primary_data_format",
+        "",
+        Property.IndexScope
+    );
+
     private final Index index;
     private final Version version;
     private final Logger logger;

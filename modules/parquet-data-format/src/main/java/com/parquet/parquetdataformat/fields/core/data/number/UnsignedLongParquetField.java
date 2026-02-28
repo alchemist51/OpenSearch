@@ -8,12 +8,16 @@
 
 package com.parquet.parquetdataformat.fields.core.data.number;
 
+import org.opensearch.index.engine.exec.EngineRole;
+import org.opensearch.index.engine.exec.FieldCapability;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.opensearch.index.mapper.MappedFieldType;
+
+import java.util.Set;
 
 /**
  * Parquet field implementation for handling 64-bit unsigned long integer data types in OpenSearch documents.
@@ -41,7 +45,7 @@ import org.opensearch.index.mapper.MappedFieldType;
 public class UnsignedLongParquetField extends ParquetField {
 
     @Override
-    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue) {
+    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, EngineRole engineRole, Set<FieldCapability> assignedCapabilities) {
         UInt8Vector uInt8Vector = (UInt8Vector) managedVSR.getVector(mappedFieldType.name());
         int rowCount = managedVSR.getRowCount();
         long longValue = ((Number) parseValue).longValue();
@@ -56,5 +60,10 @@ public class UnsignedLongParquetField extends ParquetField {
     @Override
     public FieldType getFieldType() {
         return FieldType.nullable(getArrowType());
+    }
+
+    @Override
+    public EngineRole getFieldRole() {
+        return EngineRole.PRIMARY;
     }
 }

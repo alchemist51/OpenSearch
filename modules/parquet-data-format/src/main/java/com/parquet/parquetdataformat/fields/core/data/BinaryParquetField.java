@@ -8,12 +8,16 @@
 
 package com.parquet.parquetdataformat.fields.core.data;
 
+import org.opensearch.index.engine.exec.EngineRole;
+import org.opensearch.index.engine.exec.FieldCapability;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.opensearch.index.mapper.MappedFieldType;
+
+import java.util.Set;
 
 /**
  * Parquet field implementation for handling binary data types in OpenSearch documents.
@@ -40,7 +44,7 @@ import org.opensearch.index.mapper.MappedFieldType;
 public class BinaryParquetField extends ParquetField {
 
     @Override
-    protected void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue) {
+    protected void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, EngineRole engineRole, Set<FieldCapability> assignedCapabilities) {
         final VarBinaryVector varBinaryVector = (VarBinaryVector) managedVSR.getVector(mappedFieldType.name());
         int rowCount = managedVSR.getRowCount();
         varBinaryVector.set(rowCount, (byte[]) parseValue);
@@ -54,5 +58,10 @@ public class BinaryParquetField extends ParquetField {
     @Override
     public FieldType getFieldType() {
         return FieldType.nullable(getArrowType());
+    }
+
+    @Override
+    public EngineRole getFieldRole() {
+        return EngineRole.PRIMARY;
     }
 }

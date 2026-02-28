@@ -8,6 +8,8 @@
 
 package com.parquet.parquetdataformat.fields.core.data;
 
+import org.opensearch.index.engine.exec.EngineRole;
+import org.opensearch.index.engine.exec.FieldCapability;
 import com.parquet.parquetdataformat.fields.ArrowFieldRegistry;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
@@ -17,6 +19,7 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.opensearch.index.mapper.MappedFieldType;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Set;
 
 /**
  * Parquet field implementation for handling text data types in OpenSearch documents.
@@ -45,7 +48,7 @@ import java.nio.charset.StandardCharsets;
 public class TextParquetField extends ParquetField {
 
     @Override
-    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue) {
+    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, EngineRole engineRole, Set<FieldCapability> assignedCapabilities) {
         VarCharVector textVector = (VarCharVector) managedVSR.getVector(mappedFieldType.name());
         int rowIndex = managedVSR.getRowCount();
         textVector.setSafe(rowIndex, parseValue.toString().getBytes(StandardCharsets.UTF_8));
@@ -59,5 +62,10 @@ public class TextParquetField extends ParquetField {
     @Override
     public FieldType getFieldType() {
         return FieldType.nullable(getArrowType());
+    }
+
+    @Override
+    public EngineRole getFieldRole() {
+        return EngineRole.PRIMARY;
     }
 }

@@ -319,6 +319,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
 
             logger.debug("While initialising Composite Engine - lst commit generation : " + lastCommittedWriterGeneration.get());
             this.engine = new CompositeIndexingExecutionEngine(
+                engineConfig,
                 mapperService,
                 pluginsService,
                 shardPath,

@@ -12,7 +12,10 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.exec.DataFormat;
+import org.opensearch.index.engine.exec.FieldAssignments;
+import org.opensearch.index.engine.exec.FieldSupportRegistry;
 import org.opensearch.index.engine.exec.IndexingExecutionEngine;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.shard.ShardPath;
@@ -20,6 +23,7 @@ import org.opensearch.plugins.spi.vectorized.DataSourceCodec;
 import org.opensearch.index.store.FormatStoreDirectory;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -28,7 +32,7 @@ public interface DataSourcePlugin {
         return Optional.empty();
     }
 
-    <T extends DataFormat> IndexingExecutionEngine<T> indexingEngine(MapperService mapperService, ShardPath shardPath, IndexSettings indexSettings);
+    <T extends DataFormat> IndexingExecutionEngine<T> indexingEngine(EngineConfig engineConfig, MapperService mapperService, boolean isPrimary, ShardPath shardPath, IndexSettings indexSettings, FieldAssignments fieldAssignments);
 
     FormatStoreDirectory<?> createFormatStoreDirectory(
         IndexSettings indexSettings,
@@ -38,4 +42,19 @@ public interface DataSourcePlugin {
     BlobContainer createBlobContainer(BlobStore blobStore, BlobPath blobPath) throws IOException;
 
     DataFormat getDataFormat();
+
+    // This is used to resolve the conflicts in case of multi-datasource plugins
+    // In case we have single plugin, it should not consider this value and go with considering the only DataSource as primary
+    default boolean isPrimary() {
+        return false;
+    }
+
+    /**
+     * Registers the field type capabilities this plugin's data format supports.
+     * Plugins override this to declare which field types their format can handle
+     * and with what capabilities (STORE, INDEX, DOC_VALUES).
+     */
+    default void registerFieldSupport(FieldSupportRegistry registry) {
+        // Default no-op; plugins override to register their field type capabilities
+    }
 }

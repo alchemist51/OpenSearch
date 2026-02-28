@@ -4,12 +4,17 @@ import com.parquet.parquetdataformat.fields.ArrowFieldRegistry;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import org.apache.arrow.vector.BigIntVector;
 import org.opensearch.index.engine.exec.DocumentInput;
+import org.opensearch.index.engine.exec.EngineRole;
+import org.opensearch.index.engine.exec.FieldAssignments;
+import org.opensearch.index.engine.exec.FieldCapability;
 import org.opensearch.index.engine.exec.WriteResult;
 import org.opensearch.index.engine.exec.composite.CompositeDataFormatWriter;
 import org.opensearch.index.mapper.MappedFieldType;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 
 import java.io.IOException;
+import java.util.Objects;
+import java.util.Set;
 
 /**
  * Document input wrapper for Parquet-based document processing.
@@ -33,9 +38,13 @@ import java.io.IOException;
  */
 public class ParquetDocumentInput implements DocumentInput<ManagedVSR> {
     private final ManagedVSR managedVSR;
+    private final EngineRole engineRole;
+    private final FieldAssignments fieldAssignments;
 
-    public ParquetDocumentInput(ManagedVSR managedVSR) {
-        this.managedVSR = managedVSR;
+    public ParquetDocumentInput(ManagedVSR managedVSR, EngineRole engineRole, FieldAssignments fieldAssignments) {
+        this.managedVSR = Objects.requireNonNull(managedVSR, "managedVSR must not be null");
+        this.engineRole = Objects.requireNonNull(engineRole, "engineRole must not be null");
+        this.fieldAssignments = Objects.requireNonNull(fieldAssignments, "fieldAssignments must not be null");
     }
 
     @Override
@@ -48,15 +57,21 @@ public class ParquetDocumentInput implements DocumentInput<ManagedVSR> {
     @Override
     public void addField(MappedFieldType fieldType, Object value) {
         final String fieldTypeName = fieldType.typeName();
+
+        // Check if this format should handle this field type at all
+        if (!fieldAssignments.shouldHandle(fieldTypeName)) {
+            return;
+        }
+
         final ParquetField parquetField = ArrowFieldRegistry.getParquetField(fieldTypeName);
 
         if (parquetField == null) {
-            throw new IllegalArgumentException(
-                String.format("Unsupported field type: %s. Field type is not registered in ArrowFieldRegistry.", fieldTypeName)
-            );
+            // Field type not supported by Parquet format — skip silently
+            return;
         }
 
-        parquetField.createField(fieldType, managedVSR, value);
+        Set<FieldCapability> assignedCapabilities = fieldAssignments.getAssignedCapabilities(fieldTypeName);
+        parquetField.createField(fieldType, managedVSR, value, engineRole, assignedCapabilities);
     }
 
     @Override
@@ -69,6 +84,11 @@ public class ParquetDocumentInput implements DocumentInput<ManagedVSR> {
     @Override
     public ManagedVSR getFinalInput() {
         return managedVSR;
+    }
+
+    @Override
+    public EngineRole getEngineRole() {
+        return engineRole;
     }
 
     @Override

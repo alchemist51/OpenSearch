@@ -12,6 +12,7 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.mapper.MappedFieldType;
 
 import java.io.IOException;
+
 @ExperimentalApi
 public interface DocumentInput<T> extends AutoCloseable {
 
@@ -33,5 +34,18 @@ public interface DocumentInput<T> extends AutoCloseable {
 
     default void setPrimaryTerm(String fieldName, long seqNo) {
         // Default no-op implementations, override as needed
+    }
+
+    /**
+     * Returns the {@link EngineRole} for this document input, indicating whether the engine
+     * is primary, secondary, or all in a composite configuration.
+     * Defaults to {@link EngineRole#PRIMARY} for backward compatibility.
+     */
+    default EngineRole getEngineRole() {
+        return EngineRole.PRIMARY;
+    }
+
+    default DataFormat getDataFormat() {
+        return null;
     }
 }

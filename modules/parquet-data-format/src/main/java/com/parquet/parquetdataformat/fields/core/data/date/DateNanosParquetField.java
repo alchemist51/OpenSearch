@@ -8,6 +8,8 @@
 
 package com.parquet.parquetdataformat.fields.core.data.date;
 
+import org.opensearch.index.engine.exec.EngineRole;
+import org.opensearch.index.engine.exec.FieldCapability;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.TimeStampNanoVector;
@@ -15,6 +17,8 @@ import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.opensearch.index.mapper.MappedFieldType;
+
+import java.util.Set;
 
 /**
  * Parquet field implementation for handling date and timestamp data types in OpenSearch documents.
@@ -43,7 +47,7 @@ import org.opensearch.index.mapper.MappedFieldType;
 public class DateNanosParquetField extends ParquetField {
 
     @Override
-    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue) {
+    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, EngineRole engineRole, Set<FieldCapability> assignedCapabilities) {
         TimeStampNanoVector timeStampNanoVector = (TimeStampNanoVector) managedVSR.getVector(mappedFieldType.name());
         int rowIndex = managedVSR.getRowCount();
         timeStampNanoVector.setSafe(rowIndex, (long) parseValue);
@@ -57,5 +61,10 @@ public class DateNanosParquetField extends ParquetField {
     @Override
     public FieldType getFieldType() {
         return FieldType.nullable(getArrowType());
+    }
+
+    @Override
+    public EngineRole getFieldRole() {
+        return EngineRole.PRIMARY;
     }
 }

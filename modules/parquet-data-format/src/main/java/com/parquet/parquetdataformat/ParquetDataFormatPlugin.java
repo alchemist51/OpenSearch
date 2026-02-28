@@ -23,15 +23,19 @@ import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
+import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.exec.DataFormat;
+import org.opensearch.index.engine.exec.FieldAssignments;
+import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldSupportRegistry;
 import org.opensearch.index.engine.exec.IndexingExecutionEngine;
 import com.parquet.parquetdataformat.bridge.RustBridge;
 import com.parquet.parquetdataformat.engine.ParquetExecutionEngine;
+import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.FormatStoreDirectory;
 import org.opensearch.index.store.GenericStoreDirectory;
 import org.opensearch.plugins.DataSourcePlugin;
-import org.opensearch.index.mapper.MapperService;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.spi.vectorized.DataSourceCodec;
 import org.opensearch.repositories.RepositoriesService;
@@ -41,6 +45,7 @@ import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
 
 import java.io.IOException;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Collection;
 import java.util.Map;
@@ -82,8 +87,16 @@ public class ParquetDataFormatPlugin extends Plugin implements DataSourcePlugin 
 
     @Override
     @SuppressWarnings("unchecked")
-    public <T extends DataFormat> IndexingExecutionEngine<T> indexingEngine(MapperService mapperService, ShardPath shardPath, IndexSettings indexSettings) {
-        return (IndexingExecutionEngine<T>) new ParquetExecutionEngine(settings, () -> ArrowSchemaBuilder.getSchema(mapperService), shardPath, indexSettings);
+    public <T extends DataFormat> IndexingExecutionEngine<T> indexingEngine(EngineConfig engineConfig, MapperService mapperService, boolean isPrimary, ShardPath shardPath, IndexSettings indexSettings, FieldAssignments fieldAssignments) {
+        ParquetExecutionEngine engine = new ParquetExecutionEngine(
+            settings,
+            isPrimary,
+            () -> ArrowSchemaBuilder.getSchema(mapperService, isPrimary),
+            shardPath,
+            indexSettings,
+            fieldAssignments
+        );
+        return (IndexingExecutionEngine<T>) engine;
     }
 
     @Override
@@ -107,6 +120,12 @@ public class ParquetDataFormatPlugin extends Plugin implements DataSourcePlugin 
     @Override
     public DataFormat getDataFormat() {
         return new ParquetDataFormat();
+    }
+
+    // In case of Parquet with multi-datasource, it will act as source of truth
+    @Override
+    public boolean isPrimary() {
+        return true;
     }
 
     @Override
@@ -134,6 +153,21 @@ public class ParquetDataFormatPlugin extends Plugin implements DataSourcePlugin 
     public BlobContainer createBlobContainer(BlobStore blobStore, BlobPath baseBlobPath) throws IOException {
         BlobPath formatPath = baseBlobPath.add(getDataFormat().name().toLowerCase());
         return blobStore.blobContainer(formatPath);
+    }
+
+    @Override
+    public void registerFieldSupport(FieldSupportRegistry registry) {
+        DataFormat parquet = getDataFormat();
+        java.util.Set<FieldCapability> storeAndDocValues = EnumSet.of(FieldCapability.STORE, FieldCapability.DOC_VALUES);
+
+        // Parquet supports STORE and DOC_VALUES for numeric and keyword types but not INDEX (no inverted index)
+        String[] supportedTypes = {
+            "keyword", "long", "integer", "short", "byte", "double", "float", "half_float", "scaled_float",
+            "date", "date_nanos", "boolean", "ip", "binary", "unsigned_long"
+        };
+        for (String type : supportedTypes) {
+            registry.register(type, parquet, storeAndDocValues);
+        }
     }
 
     @Override

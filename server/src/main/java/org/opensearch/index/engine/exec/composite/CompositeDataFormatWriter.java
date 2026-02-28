@@ -8,6 +8,8 @@
 
 package org.opensearch.index.engine.exec.composite;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.util.SetOnce;
 import org.opensearch.index.engine.exec.DataFormat;
 import org.opensearch.index.engine.exec.DocumentInput;
@@ -35,6 +37,7 @@ import java.util.stream.Collectors;
 
 public class CompositeDataFormatWriter implements Writer<CompositeDataFormatWriter.CompositeDocumentInput>, Lock {
 
+    private static final Logger logger = LogManager.getLogger(CompositeDataFormatWriter.class);
     private final List<Map.Entry<DataFormat, Writer<? extends DocumentInput<?>>>> writers;
     private final Runnable postWrite;
     private final ReentrantLock lock;
@@ -85,7 +88,7 @@ public class CompositeDataFormatWriter implements Writer<CompositeDataFormatWrit
     }
 
     @Override
-    public void close() {
+    public void close() throws IOException {
         for (Map.Entry<DataFormat, Writer<? extends DocumentInput<?>>> writerPair : writers) {
             writerPair.getValue().close();
         }
@@ -180,6 +183,7 @@ public class CompositeDataFormatWriter implements Writer<CompositeDataFormatWrit
 
         @Override
         public void addField(MappedFieldType fieldType, Object value) {
+            // Each delegate's addField uses its own FieldAssignments to decide what to write
             for (DocumentInput<?> input : inputs) {
                 input.addField(fieldType, value);
             }
@@ -188,13 +192,17 @@ public class CompositeDataFormatWriter implements Writer<CompositeDataFormatWrit
         @Override
         public void setVersion(long version) {
             this.version = version;
-            addField(VersionFieldMapper.VersionFieldType.INSTANCE, version);
+            for (DocumentInput<?> input : inputs) {
+                input.addField(VersionFieldMapper.VersionFieldType.INSTANCE, version);
+            }
         }
 
         @Override
         public void setSeqNo(long seqNo) {
             this.seqNo = seqNo;
-            addField(SeqNoFieldMapper.SeqNoFieldType.INSTANCE, seqNo);
+            for (DocumentInput<?> input : inputs) {
+                input.addField(SeqNoFieldMapper.SeqNoFieldType.INSTANCE, seqNo);
+            }
         }
 
         @Override
