@@ -118,7 +118,7 @@ public final class ArrowSchemaBuilder {
      * @throws IllegalStateException if the mapper type is not supported in primary context
      */
     private static Field createArrowField(final Mapper mapper, boolean isPrimary) {
-        final ParquetField parquetField = ArrowFieldRegistry.getParquetFieldAfterMatchingRole(mapper.typeName(), isPrimary);
+        final ParquetField parquetField = ArrowFieldRegistry.getParquetField(mapper.typeName());
 
         if (parquetField == null) {
             if (isPrimary) {

@@ -12,9 +12,7 @@ import com.parquet.parquetdataformat.fields.core.data.number.LongParquetField;
 import com.parquet.parquetdataformat.plugins.fields.CoreDataFieldPlugin;
 import com.parquet.parquetdataformat.plugins.fields.MetadataFieldPlugin;
 import com.parquet.parquetdataformat.plugins.fields.ParquetFieldPlugin;
-import org.opensearch.index.engine.exec.EngineRole;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
-import org.opensearch.index.shard.IllegalIndexShardStateException;
 
 import java.util.Collections;
 import java.util.Map;
@@ -143,17 +141,11 @@ public final class ArrowFieldRegistry {
         return FIELD_REGISTRY.get(fieldType);
     }
 
-    public static ParquetField getParquetFieldAfterMatchingRole(String fieldType, boolean isPrimary) {
-        ParquetField field = FIELD_REGISTRY.get(fieldType);
-        if(field == null) return null;
-
-        // in case of primary, field should be either Primary marked or marked for All
-        if(isPrimary && field.getFieldRole() == EngineRole.SECONDARY) return null;
-
-        // in case of non-primary, field should either be Secondary marked or marked for All
-        if(!isPrimary && field.getFieldRole() == EngineRole.PRIMARY) return null;
-
-        return field;
+    /**
+     * Returns an unmodifiable view of all registered field mappings.
+     */
+    public static Map<String, ParquetField> getRegisteredFields() {
+        return Collections.unmodifiableMap(FIELD_REGISTRY);
     }
 
     public static class RegistryStats {

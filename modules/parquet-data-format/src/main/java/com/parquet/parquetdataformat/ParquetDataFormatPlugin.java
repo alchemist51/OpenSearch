@@ -26,7 +26,6 @@ import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.exec.DataFormat;
 import org.opensearch.index.engine.exec.FieldAssignments;
-import org.opensearch.index.engine.exec.FieldCapability;
 import org.opensearch.index.engine.exec.FieldSupportRegistry;
 import org.opensearch.index.engine.exec.IndexingExecutionEngine;
 import com.parquet.parquetdataformat.bridge.RustBridge;
@@ -45,7 +44,6 @@ import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
 
 import java.io.IOException;
-import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Collection;
 import java.util.Map;
@@ -158,15 +156,9 @@ public class ParquetDataFormatPlugin extends Plugin implements DataSourcePlugin 
     @Override
     public void registerFieldSupport(FieldSupportRegistry registry) {
         DataFormat parquet = getDataFormat();
-        java.util.Set<FieldCapability> storeAndDocValues = EnumSet.of(FieldCapability.STORE, FieldCapability.DOC_VALUES);
-
-        // Parquet supports STORE and DOC_VALUES for numeric and keyword types but not INDEX (no inverted index)
-        String[] supportedTypes = {
-            "keyword", "long", "integer", "short", "byte", "double", "float", "half_float", "scaled_float",
-            "date", "date_nanos", "boolean", "ip", "binary", "unsigned_long"
-        };
-        for (String type : supportedTypes) {
-            registry.register(type, parquet, storeAndDocValues);
+        for (Map.Entry<String, com.parquet.parquetdataformat.fields.ParquetField> entry :
+                com.parquet.parquetdataformat.fields.ArrowFieldRegistry.getRegisteredFields().entrySet()) {
+            registry.register(entry.getKey(), parquet, entry.getValue().getFieldCapabilities());
         }
     }
 

@@ -8,7 +8,6 @@
 
 package com.parquet.parquetdataformat.fields.core.data;
 
-import org.opensearch.index.engine.exec.EngineRole;
 import org.opensearch.index.engine.exec.FieldCapability;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
@@ -20,6 +19,7 @@ import org.apache.lucene.document.InetAddressPoint;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.index.mapper.MappedFieldType;
 
+import java.util.EnumSet;
 import java.util.Set;
 
 import java.net.InetAddress;
@@ -52,7 +52,7 @@ import java.net.InetAddress;
 public class IpParquetField extends ParquetField {
 
     @Override
-    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, EngineRole engineRole, Set<FieldCapability> assignedCapabilities) {
+    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, Set<FieldCapability> assignedCapabilities) {
         VarBinaryVector varBinaryVector = (VarBinaryVector) managedVSR.getVector(mappedFieldType.name());
         int rowIndex = managedVSR.getRowCount();
         final BytesRef bytesRef = new BytesRef(InetAddressPoint.encode((InetAddress) parseValue));
@@ -70,7 +70,7 @@ public class IpParquetField extends ParquetField {
     }
 
     @Override
-    public EngineRole getFieldRole() {
-        return EngineRole.PRIMARY;
+    public Set<FieldCapability> getFieldCapabilities() {
+        return EnumSet.of(FieldCapability.DOC_VALUES);
     }
 }

@@ -8,7 +8,6 @@
 
 package com.parquet.parquetdataformat.fields.core.data.number;
 
-import org.opensearch.index.engine.exec.EngineRole;
 import org.opensearch.index.engine.exec.FieldCapability;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
@@ -18,6 +17,7 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.opensearch.index.mapper.MappedFieldType;
 
+import java.util.EnumSet;
 import java.util.Set;
 
 /**
@@ -46,7 +46,7 @@ import java.util.Set;
 public class HalfFloatParquetField extends ParquetField {
 
     @Override
-    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, EngineRole engineRole, Set<FieldCapability> assignedCapabilities) {
+    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, Set<FieldCapability> assignedCapabilities) {
         Float2Vector float2Vector = (Float2Vector) managedVSR.getVector(mappedFieldType.name());
         int rowCount = managedVSR.getRowCount();
         float2Vector.setSafe(rowCount, (Short) parseValue);
@@ -63,7 +63,7 @@ public class HalfFloatParquetField extends ParquetField {
     }
 
     @Override
-    public EngineRole getFieldRole() {
-        return EngineRole.PRIMARY;
+    public Set<FieldCapability> getFieldCapabilities() {
+        return EnumSet.of(FieldCapability.DOC_VALUES);
     }
 }

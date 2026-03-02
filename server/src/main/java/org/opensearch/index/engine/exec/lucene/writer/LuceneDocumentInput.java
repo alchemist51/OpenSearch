@@ -59,7 +59,7 @@ public class LuceneDocumentInput implements DocumentInput<ParseContext.Document>
         }
 
         Set<FieldCapability> assignedCapabilities = fieldAssignments.getAssignedCapabilities(fieldTypeName);
-        luceneField.createField(fieldType, document, value, engineRole, assignedCapabilities);
+        luceneField.createField(fieldType, document, value, assignedCapabilities);
     }
 
     /**

@@ -9,7 +9,6 @@
 package org.opensearch.index.engine.exec.lucene.fields;
 
 import org.apache.lucene.document.Field;
-import org.opensearch.index.engine.exec.EngineRole;
 import org.opensearch.index.engine.exec.FieldCapability;
 import org.opensearch.index.mapper.FieldNamesFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
@@ -20,7 +19,7 @@ import java.util.Set;
 
 public abstract class LuceneField {
 
-    public abstract void createField(MappedFieldType mappedFieldType, Document document, Object parseValue, EngineRole engineRole, Set<FieldCapability> assignedCapabilities);
+    public abstract void createField(MappedFieldType mappedFieldType, Document document, Object parseValue, Set<FieldCapability> assignedCapabilities);
 
     protected final void createFieldNamesField(MappedFieldType mappedFieldType, Document document, ParseContext context) {
         assert !mappedFieldType.hasDocValues() : "_field_names should only be used when doc_values are turned off";
@@ -33,5 +32,9 @@ public abstract class LuceneField {
         }
     }
 
-    public abstract EngineRole getFieldRole();
+    /**
+     * Returns the set of capabilities this field supports.
+     * The engine uses this to populate the FieldSupportRegistry.
+     */
+    public abstract Set<FieldCapability> getFieldCapabilities();
 }

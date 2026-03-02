@@ -8,58 +8,46 @@
 
 package org.opensearch.index.engine.exec.lucene.fields.data;
 
-import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.util.BytesRef;
-import org.opensearch.index.engine.exec.EngineRole;
 import org.opensearch.index.engine.exec.FieldCapability;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
 import org.opensearch.index.mapper.KeywordFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParseContext;
 
+import java.util.EnumSet;
 import java.util.Set;
 
 public class KeywordLuceneField extends LuceneField {
 
     @Override
-    public void createField(MappedFieldType mappedFieldType, ParseContext.Document document, Object parseValue, EngineRole engineRole, Set<FieldCapability> assignedCapabilities) {
+    public void createField(MappedFieldType mappedFieldType, ParseContext.Document document, Object parseValue, Set<FieldCapability> assignedCapabilities) {
         String value = (String) parseValue;
-        KeywordFieldMapper.KeywordFieldType keywordFieldType = (KeywordFieldMapper.KeywordFieldType) mappedFieldType;
-
-        // Convert to utf8 only once before feeding postings/dv/stored fields
         final BytesRef binaryValue = new BytesRef(value);
 
-        FieldType fieldType = getFieldType(keywordFieldType);
+        boolean shouldIndex = assignedCapabilities.contains(FieldCapability.INDEX);
+        boolean shouldStore = assignedCapabilities.contains(FieldCapability.STORE);
 
-        if (fieldType.indexOptions() != IndexOptions.NONE || fieldType.stored()) {
-            Field field = new KeywordFieldMapper.KeywordField(mappedFieldType.name(), binaryValue, fieldType);
-            document.add(field);
-
-            if (keywordFieldType.hasDocValues() == false && fieldType.omitNorms()) {
-                createFieldNamesField(mappedFieldType, document, null);
-            }
+        if (shouldIndex || shouldStore) {
+            FieldType fieldType = new FieldType();
+            fieldType.setTokenized(false);
+            fieldType.setStored(shouldStore);
+            fieldType.setOmitNorms(true);
+            fieldType.setIndexOptions(shouldIndex ? IndexOptions.DOCS : IndexOptions.NONE);
+            fieldType.freeze();
+            document.add(new KeywordFieldMapper.KeywordField(mappedFieldType.name(), binaryValue, fieldType));
         }
 
-        if (keywordFieldType.hasDocValues()) {
+        if (assignedCapabilities.contains(FieldCapability.DOC_VALUES)) {
             document.add(new SortedSetDocValuesField(mappedFieldType.name(), binaryValue));
         }
     }
 
-    private FieldType getFieldType(KeywordFieldMapper.KeywordFieldType keywordFieldType) {
-        FieldType fieldType = new FieldType();
-        fieldType.setTokenized(false);
-        fieldType.setStored(keywordFieldType.isStored());
-        fieldType.setOmitNorms(true);
-        fieldType.setIndexOptions(keywordFieldType.isSearchable() ? IndexOptions.DOCS : IndexOptions.NONE);
-        fieldType.freeze();
-        return fieldType;
-    }
-
     @Override
-    public EngineRole getFieldRole() {
-        return EngineRole.ALL;
+    public Set<FieldCapability> getFieldCapabilities() {
+        return EnumSet.of(FieldCapability.STORE, FieldCapability.INDEX, FieldCapability.DOC_VALUES);
     }
 }

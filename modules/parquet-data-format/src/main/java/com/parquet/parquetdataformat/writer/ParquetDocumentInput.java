@@ -71,7 +71,7 @@ public class ParquetDocumentInput implements DocumentInput<ManagedVSR> {
         }
 
         Set<FieldCapability> assignedCapabilities = fieldAssignments.getAssignedCapabilities(fieldTypeName);
-        parquetField.createField(fieldType, managedVSR, value, engineRole, assignedCapabilities);
+        parquetField.createField(fieldType, managedVSR, value, assignedCapabilities);
     }
 
     @Override

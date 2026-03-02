@@ -8,7 +8,6 @@
 
 package com.parquet.parquetdataformat.fields.core.metadata;
 
-import org.opensearch.index.engine.exec.EngineRole;
 import org.opensearch.index.engine.exec.FieldCapability;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
@@ -46,7 +45,7 @@ import java.util.Set;
 public class IdParquetField extends ParquetField {
 
     @Override
-    protected void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, EngineRole engineRole, Set<FieldCapability> assignedCapabilities) {
+    protected void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, Set<FieldCapability> assignedCapabilities) {
         VarBinaryVector idVector = (VarBinaryVector) managedVSR.getVector(mappedFieldType.name());
         int rowIndex = managedVSR.getRowCount();
         BytesRef bytesRef = (BytesRef) parseValue;
@@ -64,7 +63,7 @@ public class IdParquetField extends ParquetField {
     }
 
     @Override
-    public EngineRole getFieldRole() {
-        return EngineRole.PRIMARY;
+    public Set<FieldCapability> getFieldCapabilities() {
+        return java.util.EnumSet.of(FieldCapability.DOC_VALUES);
     }
 }

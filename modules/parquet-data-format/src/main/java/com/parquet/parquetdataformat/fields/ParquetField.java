@@ -11,7 +11,6 @@ package com.parquet.parquetdataformat.fields;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
-import org.opensearch.index.engine.exec.EngineRole;
 import org.opensearch.index.engine.exec.FieldCapability;
 import org.opensearch.index.mapper.MappedFieldType;
 
@@ -52,7 +51,7 @@ public abstract class ParquetField {
      * @throws IllegalArgumentException if any parameter is invalid for this field type
      * @throws ClassCastException if parseValue cannot be cast to the expected type
      */
-    protected abstract void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, EngineRole engineRole, Set<FieldCapability> assignedCapabilities);
+    protected abstract void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, Set<FieldCapability> assignedCapabilities);
 
     /**
      * Creates and processes a field entry if the field type supports columnar storage.
@@ -69,14 +68,12 @@ public abstract class ParquetField {
      * @param mappedFieldType the OpenSearch field type metadata, must not be null
      * @param managedVSR the managed vector schema root, must not be null
      * @param parseValue the parsed field value to be processed, may be null
-     * @param engineRole the engine role for this format
      * @param assignedCapabilities the capabilities this format is responsible for on this field type
      * @throws IllegalArgumentException if mappedFieldType or managedVSR is null
      */
     public final void createField(final MappedFieldType mappedFieldType,
                                   final ManagedVSR managedVSR,
                                   final Object parseValue,
-                                  final EngineRole engineRole,
                                   final Set<FieldCapability> assignedCapabilities) {
         Objects.requireNonNull(mappedFieldType, "MappedFieldType cannot be null");
         Objects.requireNonNull(managedVSR, "ManagedVSR cannot be null");
@@ -85,7 +82,7 @@ public abstract class ParquetField {
             // TODO: support dynamic mapping update
             // for now ignore the field
             if (managedVSR.getVector(mappedFieldType.name()) != null) {
-                addToGroup(mappedFieldType, managedVSR, parseValue, engineRole, assignedCapabilities);
+                addToGroup(mappedFieldType, managedVSR, parseValue, assignedCapabilities);
             }
         }
     }
@@ -116,7 +113,11 @@ public abstract class ParquetField {
      */
     public abstract FieldType getFieldType();
 
-    public abstract EngineRole getFieldRole();
+    /**
+     * Returns the set of capabilities this field supports.
+     * The engine uses this to populate the FieldSupportRegistry.
+     */
+    public abstract Set<FieldCapability> getFieldCapabilities();
 
     /**
      * Provides a string representation of this ParquetField for debugging purposes.
