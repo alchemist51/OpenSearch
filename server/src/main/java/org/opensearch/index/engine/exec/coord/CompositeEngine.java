@@ -806,7 +806,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
 
             RefreshInput refreshInput = new RefreshInput();
             refreshInput.setExistingSegments(new ArrayList<>(catalogSnapshotReleasableRef.getRef().getSegments()));
-            RefreshResult refreshResult = engine.refresh(refreshInput);
+            RefreshResult refreshResult = engine.refresh(refreshInput); // It should refresh the primary engine, i.e parquet
             if (refreshResult != null) {
                 catalogSnapshotManager.applyRefreshResult(refreshResult);
                 refreshed = true;
@@ -1036,7 +1036,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                 boolean shouldPeriodicallyFlush = shouldPeriodicallyFlush();
                 if (force || shouldFlush() || shouldPeriodicallyFlush || getProcessedLocalCheckpoint() > Long.parseLong(
                     readLastCommittedData().get(SequenceNumbers.LOCAL_CHECKPOINT_KEY))) {
-
+                    refresh("flush in composite engine");
                     translogManager.ensureCanFlush();
 
                     try {

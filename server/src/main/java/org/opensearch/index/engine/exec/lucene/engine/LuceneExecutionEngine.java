@@ -111,7 +111,7 @@ public class LuceneExecutionEngine implements IndexingExecutionEngine<LuceneData
 
     @Override
     public DataFormat getDataFormat() {
-        return null;
+        return new LuceneDataFormat();
     }
 
     @Override

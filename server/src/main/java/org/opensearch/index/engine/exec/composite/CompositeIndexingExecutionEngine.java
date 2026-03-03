@@ -211,6 +211,7 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
 
     @Override
     public void loadWriterFiles(CatalogSnapshot catalogSnapshot) throws IOException {
+        // If this get's called will it not throw exception?
         for (IndexingExecutionEngine<?> delegate : delegates) {
             delegate.loadWriterFiles(catalogSnapshot);
         }
@@ -219,6 +220,7 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
     @Override
     public void deleteFiles(Map<String, Collection<String>> filesToDelete) throws IOException {
         for (IndexingExecutionEngine<?> delegate : delegates) {
+            // Why creating a map when we are always passing for that format here?
             Map<String, Collection<String>> formatSpecificFilesToDelete = new HashMap<>();
             formatSpecificFilesToDelete.put(delegate.getDataFormat().name(), filesToDelete.get(delegate.getDataFormat().name()));
             delegate.deleteFiles(formatSpecificFilesToDelete);
@@ -235,11 +237,11 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
     }
 
     @Override
-    public RefreshResult refresh(RefreshInput ignore) throws IOException {
+    public RefreshResult refresh(RefreshInput refreshInput) throws IOException {
         RefreshResult finalResult;
         try {
             List<CompositeDataFormatWriter> dataFormatWriters = dataFormatWriterPool.checkoutAll();
-            List<Segment> refreshedSegment = ignore.getExistingSegments();
+            List<Segment> refreshedSegment = refreshInput.getExistingSegments();
             List<Segment> newSegmentList = new ArrayList<>();
             // flush to disk
             for (CompositeDataFormatWriter dataFormatWriter : dataFormatWriters) {
