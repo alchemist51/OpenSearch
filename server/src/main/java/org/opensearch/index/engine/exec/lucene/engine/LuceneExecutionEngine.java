@@ -53,7 +53,6 @@ public class LuceneExecutionEngine implements IndexingExecutionEngine<LuceneData
     private final EngineConfig engineConfig;
     private static final Logger logger = LogManager.getLogger(LuceneExecutionEngine.class);
     private final boolean isPrimaryEngine;
-    private final FieldAssignments fieldAssignments;
 
     public LuceneExecutionEngine(EngineConfig engineConfig, MapperService mapperService, boolean isPrimaryEngine, ShardPath shardPath, IndexSettings indexSettings, FieldAssignments fieldAssignments) {
         this.engineConfig = engineConfig;
@@ -61,7 +60,6 @@ public class LuceneExecutionEngine implements IndexingExecutionEngine<LuceneData
         this.dataFormat = DataFormat.LUCENE;
         this.isPrimaryEngine = isPrimaryEngine;
         this.shardPath = shardPath;
-        this.fieldAssignments = fieldAssignments;
 
         // TODO: Add check for Lucene being the primary engine and MapperService has an unknown field, currently
         // in POC it's only a secondary engine so we don't need to have all fields in this.
@@ -77,7 +75,7 @@ public class LuceneExecutionEngine implements IndexingExecutionEngine<LuceneData
     public Writer<? extends DocumentInput<?>> createWriter(long writerGeneration) throws IOException {
         Path directoryPath = Files.createTempDirectory(Long.toString(System.nanoTime())); // TODO:: Is this the right name?
         EngineRole role = isPrimaryEngine ? EngineRole.PRIMARY : EngineRole.SECONDARY;
-        return new LuceneWriter(directoryPath, createWriter(directoryPath, writerGeneration), writerGeneration, role, fieldAssignments);
+        return new LuceneWriter(directoryPath, createWriter(directoryPath, writerGeneration), writerGeneration, role);
 
     }
 

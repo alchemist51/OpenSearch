@@ -9,7 +9,9 @@
 package org.opensearch.index.engine.exec.lucene.fields;
 
 import org.apache.lucene.document.Field;
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 import org.opensearch.index.mapper.FieldNamesFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParseContext;
@@ -17,9 +19,24 @@ import org.opensearch.index.mapper.ParseContext.Document;
 
 import java.util.Set;
 
+/**
+ * Base class for Lucene field implementations in the composite engine.
+ *
+ * <p>Each subclass handles a specific field type (keyword, long, text, etc.) and
+ * creates the appropriate Lucene index fields based on the capabilities described
+ * in the {@link FieldDescriptor}.
+ */
+@ExperimentalApi
 public abstract class LuceneField {
 
-    public abstract void createField(MappedFieldType mappedFieldType, Document document, Object parseValue, Set<FieldCapability> assignedCapabilities);
+    /**
+     * Creates Lucene index fields for the given value based on the descriptor's assigned capabilities.
+     *
+     * @param descriptor the per-field descriptor carrying field name, type name, and capability flags
+     * @param document   the Lucene document to add fields to
+     * @param parseValue the parsed field value to index
+     */
+    public abstract void createField(FieldDescriptor descriptor, Document document, Object parseValue);
 
     protected final void createFieldNamesField(MappedFieldType mappedFieldType, Document document, ParseContext context) {
         assert !mappedFieldType.hasDocValues() : "_field_names should only be used when doc_values are turned off";

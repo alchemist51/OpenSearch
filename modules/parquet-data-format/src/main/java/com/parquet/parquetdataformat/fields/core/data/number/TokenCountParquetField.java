@@ -9,12 +9,12 @@
 package com.parquet.parquetdataformat.fields.core.data.number;
 
 import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
-import org.opensearch.index.mapper.MappedFieldType;
 
 import java.util.EnumSet;
 import java.util.Set;
@@ -47,8 +47,8 @@ import java.util.Set;
 public class TokenCountParquetField extends ParquetField {
 
     @Override
-    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, Set<FieldCapability> assignedCapabilities) {
-        IntVector intVector = (IntVector) managedVSR.getVector(mappedFieldType.name());
+    protected void addToGroup(FieldDescriptor descriptor, ManagedVSR managedVSR, Object parseValue) {
+        IntVector intVector = (IntVector) managedVSR.getVector(descriptor.fieldName());
         int rowCount = managedVSR.getRowCount();
         intVector.setSafe(rowCount, (Integer) parseValue);
     }

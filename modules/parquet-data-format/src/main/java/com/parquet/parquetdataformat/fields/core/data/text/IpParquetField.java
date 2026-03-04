@@ -9,6 +9,7 @@
 package com.parquet.parquetdataformat.fields.core.data.text;
 
 import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.VarBinaryVector;
@@ -17,7 +18,6 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.lucene.document.InetAddressPoint;
 import org.apache.lucene.util.BytesRef;
-import org.opensearch.index.mapper.MappedFieldType;
 
 import java.util.EnumSet;
 import java.util.Set;
@@ -52,8 +52,8 @@ import java.net.InetAddress;
 public class IpParquetField extends ParquetField {
 
     @Override
-    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, Set<FieldCapability> assignedCapabilities) {
-        VarBinaryVector varBinaryVector = (VarBinaryVector) managedVSR.getVector(mappedFieldType.name());
+    protected void addToGroup(FieldDescriptor descriptor, ManagedVSR managedVSR, Object parseValue) {
+        VarBinaryVector varBinaryVector = (VarBinaryVector) managedVSR.getVector(descriptor.fieldName());
         int rowIndex = managedVSR.getRowCount();
         final BytesRef bytesRef = new BytesRef(InetAddressPoint.encode((InetAddress) parseValue));
         varBinaryVector.setSafe(rowIndex, bytesRef.bytes, bytesRef.offset, bytesRef.length);

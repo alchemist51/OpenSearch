@@ -9,13 +9,13 @@
 package com.parquet.parquetdataformat.fields.core.data;
 
 import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 import com.parquet.parquetdataformat.fields.ArrowFieldRegistry;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
-import org.opensearch.index.mapper.MappedFieldType;
 
 import java.util.EnumSet;
 import java.util.Set;
@@ -45,8 +45,8 @@ import java.util.Set;
 public class BooleanParquetField extends ParquetField {
 
     @Override
-    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, Set<FieldCapability> assignedCapabilities) {
-        BitVector bitVector = (BitVector) managedVSR.getVector(mappedFieldType.name());
+    protected void addToGroup(FieldDescriptor descriptor, ManagedVSR managedVSR, Object parseValue) {
+        BitVector bitVector = (BitVector) managedVSR.getVector(descriptor.fieldName());
         int rowIndex = managedVSR.getRowCount();
         bitVector.setSafe(rowIndex, (Boolean) parseValue ? 1 : 0);
     }

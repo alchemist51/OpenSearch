@@ -13,9 +13,8 @@ import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.util.NumericUtils;
 import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
-import org.opensearch.index.mapper.MappedFieldType;
-import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.index.mapper.ParseContext;
 
 import java.util.EnumSet;
@@ -24,17 +23,16 @@ import java.util.Set;
 public class FloatLuceneField extends LuceneField {
 
     @Override
-    public void createField(MappedFieldType mappedFieldType, ParseContext.Document document, Object parseValue, Set<FieldCapability> assignedCapabilities) {
-        final NumberFieldMapper.NumberFieldType fieldType = (NumberFieldMapper.NumberFieldType) mappedFieldType;
+    public void createField(FieldDescriptor descriptor, ParseContext.Document document, Object parseValue) {
         final Number value = (Number) parseValue;
-        if (assignedCapabilities.contains(FieldCapability.INDEX)) {
-            document.add(new FloatPoint(fieldType.name(), value.floatValue()));
+        if (descriptor.isSearchable()) {
+            document.add(new FloatPoint(descriptor.fieldName(), value.floatValue()));
         }
-        if (assignedCapabilities.contains(FieldCapability.DOC_VALUES)) {
-            document.add(new SortedNumericDocValuesField(fieldType.name(), NumericUtils.floatToSortableInt(value.floatValue())));
+        if (descriptor.hasDocValues()) {
+            document.add(new SortedNumericDocValuesField(descriptor.fieldName(), NumericUtils.floatToSortableInt(value.floatValue())));
         }
-        if (assignedCapabilities.contains(FieldCapability.STORE)) {
-            document.add(new StoredField(fieldType.name(), value.floatValue()));
+        if (descriptor.isStored()) {
+            document.add(new StoredField(descriptor.fieldName(), value.floatValue()));
         }
     }
 

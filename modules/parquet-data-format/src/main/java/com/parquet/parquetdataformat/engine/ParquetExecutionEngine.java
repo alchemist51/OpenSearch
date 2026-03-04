@@ -17,7 +17,6 @@ import org.opensearch.index.IndexSettings;
 import com.parquet.parquetdataformat.fields.ArrowFieldRegistry;
 import org.opensearch.index.engine.exec.DataFormat;
 import org.opensearch.index.engine.exec.EngineRole;
-import org.opensearch.index.engine.exec.FieldAssignments;
 import org.opensearch.index.engine.exec.IndexingExecutionEngine;
 import org.opensearch.index.engine.exec.Merger;
 import org.opensearch.index.engine.exec.RefreshInput;
@@ -79,15 +78,13 @@ public class ParquetExecutionEngine implements IndexingExecutionEngine<ParquetDa
     private final ArrowBufferPool arrowBufferPool;
     private final IndexSettings indexSettings;
     private final boolean isPrimaryEngine;
-    private final FieldAssignments fieldAssignments;
 
     public ParquetExecutionEngine(
         Settings settings,
         boolean isPrimaryEngine,
         Supplier<Schema> schema,
         ShardPath shardPath,
-        IndexSettings indexSettings,
-        FieldAssignments fieldAssignments
+        IndexSettings indexSettings
     ) {
         this.schema = schema;
         this.shardPath = shardPath;
@@ -95,7 +92,6 @@ public class ParquetExecutionEngine implements IndexingExecutionEngine<ParquetDa
         this.indexSettings = indexSettings;
         this.parquetMerger = new ParquetMergeExecutor(CompactionStrategy.RECORD_BATCH, indexSettings.getIndex().getName());
         this.isPrimaryEngine = isPrimaryEngine;
-        this.fieldAssignments = fieldAssignments;
         // Push current settings to Rust store once on construction, then keep in sync on updates
         pushSettingsToRust(indexSettings);
 
@@ -159,7 +155,7 @@ public class ParquetExecutionEngine implements IndexingExecutionEngine<ParquetDa
     public Writer<ParquetDocumentInput> createWriter(long writerGeneration) {
         String fileName = Path.of(shardPath.getDataPath().toString(), getDataFormat().name(), FILE_NAME_PREFIX + "_" + writerGeneration + FILE_NAME_EXT).toString();
         EngineRole role = isPrimaryEngine ? EngineRole.PRIMARY : EngineRole.SECONDARY;
-        return new ParquetWriter(fileName, schema.get(), writerGeneration, arrowBufferPool, indexSettings, role, fieldAssignments);
+        return new ParquetWriter(fileName, schema.get(), writerGeneration, arrowBufferPool, indexSettings, role);
     }
 
     @Override

@@ -9,7 +9,6 @@
 package org.opensearch.index.engine.exec;
 
 import org.opensearch.common.annotation.ExperimentalApi;
-import org.opensearch.index.mapper.MappedFieldType;
 
 import java.io.IOException;
 
@@ -18,7 +17,13 @@ public interface DocumentInput<T> extends AutoCloseable {
 
     void addRowIdField(String fieldName, long rowId);
 
-    void addField(MappedFieldType fieldType, Object value);
+    /**
+     * Adds a field value to this document input.
+     *
+     * @param descriptor the {@link FieldDescriptor} carrying the field's name, type, and assigned capabilities
+     * @param value      the field value to add
+     */
+    void addField(FieldDescriptor descriptor, Object value);
 
     T getFinalInput();
 

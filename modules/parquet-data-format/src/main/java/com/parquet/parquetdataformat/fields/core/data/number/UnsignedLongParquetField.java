@@ -9,12 +9,12 @@
 package com.parquet.parquetdataformat.fields.core.data.number;
 
 import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
-import org.opensearch.index.mapper.MappedFieldType;
 
 import java.util.EnumSet;
 import java.util.Set;
@@ -45,8 +45,8 @@ import java.util.Set;
 public class UnsignedLongParquetField extends ParquetField {
 
     @Override
-    public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, Set<FieldCapability> assignedCapabilities) {
-        UInt8Vector uInt8Vector = (UInt8Vector) managedVSR.getVector(mappedFieldType.name());
+    protected void addToGroup(FieldDescriptor descriptor, ManagedVSR managedVSR, Object parseValue) {
+        UInt8Vector uInt8Vector = (UInt8Vector) managedVSR.getVector(descriptor.fieldName());
         int rowCount = managedVSR.getRowCount();
         long longValue = ((Number) parseValue).longValue();
         uInt8Vector.setSafe(rowCount, longValue);

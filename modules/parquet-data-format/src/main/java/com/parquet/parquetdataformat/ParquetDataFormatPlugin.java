@@ -91,8 +91,7 @@ public class ParquetDataFormatPlugin extends Plugin implements DataSourcePlugin 
             isPrimary,
             () -> ArrowSchemaBuilder.getSchema(mapperService, isPrimary),
             shardPath,
-            indexSettings,
-            fieldAssignments
+            indexSettings
         );
         return (IndexingExecutionEngine<T>) engine;
     }

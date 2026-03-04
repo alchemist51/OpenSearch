@@ -12,8 +12,8 @@ import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
-import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParseContext;
 
 import java.util.EnumSet;
@@ -22,16 +22,16 @@ import java.util.Set;
 public class DateLuceneField extends LuceneField {
 
     @Override
-    public void createField(MappedFieldType mappedFieldType, ParseContext.Document document, Object parseValue, Set<FieldCapability> assignedCapabilities) {
+    public void createField(FieldDescriptor descriptor, ParseContext.Document document, Object parseValue) {
         final long timestamp = (long) parseValue;
-        if (assignedCapabilities.contains(FieldCapability.INDEX)) {
-            document.add(new LongPoint(mappedFieldType.name(), timestamp));
+        if (descriptor.isSearchable()) {
+            document.add(new LongPoint(descriptor.fieldName(), timestamp));
         }
-        if (assignedCapabilities.contains(FieldCapability.DOC_VALUES)) {
-            document.add(new SortedNumericDocValuesField(mappedFieldType.name(), timestamp));
+        if (descriptor.hasDocValues()) {
+            document.add(new SortedNumericDocValuesField(descriptor.fieldName(), timestamp));
         }
-        if (assignedCapabilities.contains(FieldCapability.STORE)) {
-            document.add(new StoredField(mappedFieldType.name(), timestamp));
+        if (descriptor.isStored()) {
+            document.add(new StoredField(descriptor.fieldName(), timestamp));
         }
     }
 

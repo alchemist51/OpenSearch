@@ -13,9 +13,9 @@ import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
 import org.opensearch.index.mapper.KeywordFieldMapper;
-import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParseContext;
 
 import org.apache.logging.log4j.LogManager;
@@ -29,15 +29,15 @@ public class KeywordLuceneField extends LuceneField {
     private static final Logger logger = LogManager.getLogger(KeywordLuceneField.class);
 
     @Override
-    public void createField(MappedFieldType mappedFieldType, ParseContext.Document document, Object parseValue, Set<FieldCapability> assignedCapabilities) {
+    public void createField(FieldDescriptor descriptor, ParseContext.Document document, Object parseValue) {
         String value = (String) parseValue;
         final BytesRef binaryValue = new BytesRef(value);
 
-        boolean shouldIndex = assignedCapabilities.contains(FieldCapability.INDEX);
-        boolean shouldStore = assignedCapabilities.contains(FieldCapability.STORE);
+        boolean shouldIndex = descriptor.isSearchable();
+        boolean shouldStore = descriptor.isStored();
 
         logger.info("[COMPOSITE_DEBUG] KeywordLuceneField.createField: field=[{}] value=[{}] capabilities={} shouldIndex={} shouldStore={} hasDocValues={}",
-            mappedFieldType.name(), value, assignedCapabilities, shouldIndex, shouldStore, assignedCapabilities.contains(FieldCapability.DOC_VALUES));
+            descriptor.fieldName(), value, descriptor.assignedCapabilities(), shouldIndex, shouldStore, descriptor.hasDocValues());
 
         if (shouldIndex || shouldStore) {
             FieldType fieldType = new FieldType();
@@ -46,13 +46,13 @@ public class KeywordLuceneField extends LuceneField {
             fieldType.setOmitNorms(true);
             fieldType.setIndexOptions(shouldIndex ? IndexOptions.DOCS : IndexOptions.NONE);
             fieldType.freeze();
-            document.add(new KeywordFieldMapper.KeywordField(mappedFieldType.name(), binaryValue, fieldType));
-            logger.debug("[COMPOSITE_DEBUG] KeywordLuceneField: added KeywordField for [{}] indexed={} stored={}", mappedFieldType.name(), shouldIndex, shouldStore);
+            document.add(new KeywordFieldMapper.KeywordField(descriptor.fieldName(), binaryValue, fieldType));
+            logger.debug("[COMPOSITE_DEBUG] KeywordLuceneField: added KeywordField for [{}] indexed={} stored={}", descriptor.fieldName(), shouldIndex, shouldStore);
         }
 
-        if (assignedCapabilities.contains(FieldCapability.DOC_VALUES)) {
-            document.add(new SortedSetDocValuesField(mappedFieldType.name(), binaryValue));
-            logger.debug("[COMPOSITE_DEBUG] KeywordLuceneField: added SortedSetDocValuesField for [{}]", mappedFieldType.name());
+        if (descriptor.hasDocValues()) {
+            document.add(new SortedSetDocValuesField(descriptor.fieldName(), binaryValue));
+            logger.debug("[COMPOSITE_DEBUG] KeywordLuceneField: added SortedSetDocValuesField for [{}]", descriptor.fieldName());
         }
     }
 

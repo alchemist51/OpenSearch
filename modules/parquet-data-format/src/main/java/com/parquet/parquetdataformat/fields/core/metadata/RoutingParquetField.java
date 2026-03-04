@@ -9,12 +9,12 @@
 package com.parquet.parquetdataformat.fields.core.metadata;
 
 import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
-import org.opensearch.index.mapper.MappedFieldType;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Set;
@@ -45,8 +45,8 @@ import java.util.Set;
 public class RoutingParquetField extends ParquetField {
 
     @Override
-    protected void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, Set<FieldCapability> assignedCapabilities) {
-        VarCharVector routingVector = (VarCharVector) managedVSR.getVector(mappedFieldType.name());
+    protected void addToGroup(FieldDescriptor descriptor, ManagedVSR managedVSR, Object parseValue) {
+        VarCharVector routingVector = (VarCharVector) managedVSR.getVector(descriptor.fieldName());
         int rowIndex = managedVSR.getRowCount();
         routingVector.setSafe(rowIndex, parseValue.toString().getBytes(StandardCharsets.UTF_8));
     }

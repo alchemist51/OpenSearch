@@ -12,31 +12,27 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.index.IndexWriter;
+import org.opensearch.index.engine.exec.DataFormat;
 import org.opensearch.index.engine.exec.DocumentInput;
 import org.opensearch.index.engine.exec.EngineRole;
-import org.opensearch.index.engine.exec.FieldAssignments;
-import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 import org.opensearch.index.engine.exec.WriteResult;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneFieldRegistry;
-import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParseContext;
 
 import java.io.IOException;
-import java.util.Set;
 
 public class LuceneDocumentInput implements DocumentInput<ParseContext.Document> {
     private static final Logger logger = LogManager.getLogger(LuceneDocumentInput.class);
     private final ParseContext.Document document;
     private final IndexWriter indexWriter;
     private final EngineRole engineRole;
-    private final FieldAssignments fieldAssignments;
 
-    public LuceneDocumentInput(ParseContext.Document document, IndexWriter indexWriter, EngineRole engineRole, FieldAssignments fieldAssignments) {
+    public LuceneDocumentInput(ParseContext.Document document, IndexWriter indexWriter, EngineRole engineRole) {
         this.document = document;
         this.indexWriter = indexWriter;
         this.engineRole = engineRole;
-        this.fieldAssignments = fieldAssignments;
     }
 
     @Override
@@ -46,26 +42,27 @@ public class LuceneDocumentInput implements DocumentInput<ParseContext.Document>
 
     @SuppressWarnings("unchecked")
     @Override
-    public void addField(MappedFieldType fieldType, Object value) {
-        final String fieldTypeName = fieldType.typeName();
-
-        // Check if this format should handle this field type at all
-        if (!fieldAssignments.shouldHandle(fieldTypeName)) {
-            logger.debug("[COMPOSITE_DEBUG] Lucene SKIP field=[{}] type=[{}] — not assigned to this format", fieldType.name(), fieldTypeName);
-            return;
-        }
-
-        final LuceneField luceneField = LuceneFieldRegistry.getLuceneField(fieldTypeName);
+    public void addField(FieldDescriptor descriptor, Object value) {
+        final LuceneField luceneField = LuceneFieldRegistry.getLuceneField(descriptor.typeName());
 
         if (luceneField == null) {
             // Field type not supported by Lucene format — skip silently
-            logger.debug("[COMPOSITE_DEBUG] Lucene SKIP field=[{}] type=[{}] — no LuceneField registered in LuceneFieldRegistry", fieldType.name(), fieldTypeName);
+            logger.debug(
+                "[COMPOSITE_DEBUG] Lucene SKIP field=[{}] type=[{}] — no LuceneField registered in LuceneFieldRegistry",
+                descriptor.fieldName(),
+                descriptor.typeName()
+            );
             return;
         }
 
-        Set<FieldCapability> assignedCapabilities = fieldAssignments.getAssignedCapabilities(fieldTypeName);
-        logger.debug("[COMPOSITE_DEBUG] Lucene ACCEPT field=[{}] type=[{}] value=[{}] capabilities={}", fieldType.name(), fieldTypeName, value, assignedCapabilities);
-        luceneField.createField(fieldType, document, value, assignedCapabilities);
+        logger.debug(
+            "[COMPOSITE_DEBUG] Lucene ACCEPT field=[{}] type=[{}] value=[{}] capabilities={}",
+            descriptor.fieldName(),
+            descriptor.typeName(),
+            value,
+            descriptor.assignedCapabilities()
+        );
+        luceneField.createField(descriptor, document, value);
     }
 
     /**
@@ -97,7 +94,13 @@ public class LuceneDocumentInput implements DocumentInput<ParseContext.Document>
     }
 
     @Override
+    public DataFormat getDataFormat() {
+        return DataFormat.LUCENE;
+    }
+
+    @Override
     public void close() throws Exception {
         // no-op, reuse writer
     }
+
 }

@@ -5,10 +5,13 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.index.engine.exec.DocumentInput;
+import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 import org.opensearch.index.mapper.MappedFieldType;
 import com.parquet.parquetdataformat.converter.FieldTypeConverter;
 
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.Random;
 
 @SuppressForbidden(reason = "Need random for creating temp files")
@@ -24,14 +27,22 @@ public class DummyDataUtils {
     }
 
     public static void populateDocumentInput(DocumentInput<?> documentInput) {
+        EnumSet<FieldCapability> allCapabilities = EnumSet.allOf(FieldCapability.class);
+
         MappedFieldType idField = FieldTypeConverter.convertToMappedFieldType(ID, new ArrowType.Int(32, true));
-        documentInput.addField(idField, generateRandomId());
+        documentInput.addField(new FieldDescriptor(idField.name(), idField.typeName(), allCapabilities), generateRandomId());
+
         MappedFieldType nameField = FieldTypeConverter.convertToMappedFieldType(NAME, new ArrowType.Utf8());
-        documentInput.addField(nameField, generateRandomName());
+        documentInput.addField(new FieldDescriptor(nameField.name(), nameField.typeName(), allCapabilities), generateRandomName());
+
         MappedFieldType designationField = FieldTypeConverter.convertToMappedFieldType(DESIGNATION, new ArrowType.Utf8());
-        documentInput.addField(designationField, generateRandomDesignation());
+        documentInput.addField(
+            new FieldDescriptor(designationField.name(), designationField.typeName(), allCapabilities),
+            generateRandomDesignation()
+        );
+
         MappedFieldType salaryField = FieldTypeConverter.convertToMappedFieldType(SALARY, new ArrowType.Int(32, true));
-        documentInput.addField(salaryField, random.nextInt(100000));
+        documentInput.addField(new FieldDescriptor(salaryField.name(), salaryField.typeName(), allCapabilities), random.nextInt(100000));
     }
 
     private static final String ID = "id";

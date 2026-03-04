@@ -53,6 +53,7 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
     private final List<IndexingExecutionEngine<?>> delegates = new ArrayList<>();
     private final FieldSupportRegistry fieldSupportRegistry;
     private final Map<DataFormat, EngineRole> roleMap;
+    private final Map<DataFormat, FieldAssignments> fieldAssignmentsMap;
 
     private static final Logger logger = LogManager.getLogger(CompositeIndexingExecutionEngine.class);
 
@@ -93,15 +94,10 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
             logger.info("[COMPOSITE_DEBUG] Composite field validation passed for all mapped fields");
         }
 
-        // Resolve field assignments: which format handles which capability for each field type
-        Map<DataFormat, FieldAssignments> fieldAssignmentsMap;
-        if (singlePlugin) {
-            fieldAssignmentsMap = Map.of(dataSourcePlugins.get(0).getDataFormat(), FieldAssignments.ACCEPT_ALL);
-            logger.info("[COMPOSITE_DEBUG] Single plugin mode — using ACCEPT_ALL field assignments for [{}]",
-                dataSourcePlugins.get(0).getDataFormat().name());
-        } else {
-            fieldAssignmentsMap = FieldAssignmentResolver.resolve(fieldSupportRegistry, roleMap, mapperService.fieldTypes());
-        }
+        // Resolve field assignments: which format handles which capability for each field
+        // Both single-plugin and multi-plugin modes go through per-field resolution
+        this.fieldAssignmentsMap = FieldAssignmentResolver.resolve(fieldSupportRegistry, roleMap, mapperService.fieldTypes());
+        logger.info("[COMPOSITE_DEBUG] Resolved per-field assignments for {} format(s)", fieldAssignmentsMap.size());
 
         // Determine primary format from role map
         DataFormat primaryDataFormat = roleMap.entrySet().stream()
@@ -114,9 +110,7 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
         for (DataSourcePlugin plugin : dataSourcePlugins) {
             dataFormats.add(plugin.getDataFormat());
             boolean isPrimary = roleMap.get(plugin.getDataFormat()) == EngineRole.PRIMARY;
-            FieldAssignments assignments = fieldAssignmentsMap.getOrDefault(
-                plugin.getDataFormat(), FieldAssignments.ACCEPT_ALL
-            );
+            FieldAssignments assignments = fieldAssignmentsMap.get(plugin.getDataFormat());
             IndexingExecutionEngine<?> indexingEngine = plugin.indexingEngine(
                 engineConfig, mapperService, isPrimary, shardPath, indexSettings, assignments
             );
@@ -180,6 +174,10 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
 
     public Map<DataFormat, EngineRole> getRoleMap() {
         return Collections.unmodifiableMap(roleMap);
+    }
+
+    public Map<DataFormat, FieldAssignments> getFieldAssignmentsMap() {
+        return Collections.unmodifiableMap(fieldAssignmentsMap);
     }
 
 

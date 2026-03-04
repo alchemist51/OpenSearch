@@ -19,9 +19,12 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Resolves which data format handles which capabilities for each field type.
+ * Resolves which data format handles which capabilities for each mapped field.
  * Uses primary-gets-priority strategy: if the primary format supports a capability
- * for a field type, it wins. Secondary formats only get capabilities the primary can't handle.
+ * for a field's type, it wins. Secondary formats only get capabilities the primary can't handle.
+ *
+ * <p>Resolution is keyed by field name (not type name), so two fields of the same type
+ * with different mapping attributes receive different capability sets.
  */
 @ExperimentalApi
 public final class FieldAssignmentResolver {
@@ -33,10 +36,10 @@ public final class FieldAssignmentResolver {
     /**
      * Resolves field assignments for all mapped fields.
      *
-     * @param registry       the field support registry with all format capabilities
+     * @param registry       the field support registry with type-level format capabilities
      * @param roleMap        format → engine role mapping
      * @param fieldTypes     all mapped field types from the mapper service
-     * @return per-format FieldAssignments
+     * @return per-format FieldAssignments keyed by field name
      */
     public static Map<DataFormat, FieldAssignments> resolve(
         FieldSupportRegistry registry,
@@ -52,10 +55,12 @@ public final class FieldAssignmentResolver {
             }
         }
 
-        // Build per-format assignment maps
-        Map<DataFormat, Map<String, Set<FieldCapability>>> perFormatMap = new HashMap<>();
+        // Accumulate capabilities per field name per format before creating FieldDescriptors
+        Map<DataFormat, Map<String, EnumSet<FieldCapability>>> perFormatCaps = new HashMap<>();
+        // Track typeName per fieldName for FieldDescriptor construction
+        Map<String, String> fieldNameToTypeName = new HashMap<>();
         for (DataFormat format : roleMap.keySet()) {
-            perFormatMap.put(format, new HashMap<>());
+            perFormatCaps.put(format, new HashMap<>());
         }
 
         for (MappedFieldType fieldType : fieldTypes) {
@@ -63,17 +68,30 @@ public final class FieldAssignmentResolver {
             if (fieldType.typeName().startsWith("_")) {
                 continue;
             }
+            String fieldName = fieldType.name();
             String typeName = fieldType.typeName();
-            resolveField(registry, roleMap, primaryFormat, perFormatMap, fieldType, typeName);
+            fieldNameToTypeName.put(fieldName, typeName);
+            resolveField(registry, roleMap, primaryFormat, perFormatCaps, fieldType, fieldName, typeName);
         }
 
-        // Wrap into FieldAssignments
+        // Convert accumulated capabilities into FieldDescriptor objects and wrap into FieldAssignments
         Map<DataFormat, FieldAssignments> result = new HashMap<>();
-        for (Map.Entry<DataFormat, Map<String, Set<FieldCapability>>> entry : perFormatMap.entrySet()) {
-            result.put(entry.getKey(), new FieldAssignments(entry.getValue()));
-            logger.info("[COMPOSITE_DEBUG] Field assignments for format [{}]:", entry.getKey().name());
-            for (Map.Entry<String, Set<FieldCapability>> fieldEntry : entry.getValue().entrySet()) {
-                logger.info("[COMPOSITE_DEBUG]   fieldType=[{}] -> capabilities={}", fieldEntry.getKey(), fieldEntry.getValue());
+        for (Map.Entry<DataFormat, Map<String, EnumSet<FieldCapability>>> formatEntry : perFormatCaps.entrySet()) {
+            DataFormat format = formatEntry.getKey();
+            Map<String, EnumSet<FieldCapability>> fieldCaps = formatEntry.getValue();
+            Map<String, FieldDescriptor> descriptors = new HashMap<>();
+            for (Map.Entry<String, EnumSet<FieldCapability>> fieldEntry : fieldCaps.entrySet()) {
+                String fieldName = fieldEntry.getKey();
+                EnumSet<FieldCapability> caps = fieldEntry.getValue();
+                if (!caps.isEmpty()) {
+                    String typeName = fieldNameToTypeName.get(fieldName);
+                    descriptors.put(fieldName, new FieldDescriptor(fieldName, typeName, caps));
+                }
+            }
+            result.put(format, new FieldAssignments(descriptors));
+            logger.info("[COMPOSITE_DEBUG] Field assignments for format [{}]:", format.name());
+            for (Map.Entry<String, FieldDescriptor> descEntry : descriptors.entrySet()) {
+                logger.info("[COMPOSITE_DEBUG]   field=[{}] -> {}", descEntry.getKey(), descEntry.getValue());
             }
         }
         return result;
@@ -83,11 +101,12 @@ public final class FieldAssignmentResolver {
         FieldSupportRegistry registry,
         Map<DataFormat, EngineRole> roleMap,
         DataFormat primaryFormat,
-        Map<DataFormat, Map<String, Set<FieldCapability>>> perFormatMap,
+        Map<DataFormat, Map<String, EnumSet<FieldCapability>>> perFormatCaps,
         MappedFieldType fieldType,
+        String fieldName,
         String typeName
     ) {
-        // Determine which capabilities are required by the mapping
+        // Determine which capabilities are required by this field's mapping attributes
         Set<FieldCapability> required = EnumSet.noneOf(FieldCapability.class);
         if (fieldType.isSearchable()) {
             required.add(FieldCapability.INDEX);
@@ -99,21 +118,30 @@ public final class FieldAssignmentResolver {
             required.add(FieldCapability.STORE);
         }
 
-        logger.info("[COMPOSITE_DEBUG] resolveField: field=[{}] type=[{}] required capabilities={} (isSearchable={}, hasDocValues={}, isStored={})",
-            fieldType.name(), typeName, required, fieldType.isSearchable(), fieldType.hasDocValues(), fieldType.isStored());
+        logger.info(
+            "[COMPOSITE_DEBUG] resolveField: field=[{}] type=[{}] required capabilities={} (isSearchable={}, hasDocValues={}, isStored={})",
+            fieldName,
+            typeName,
+            required,
+            fieldType.isSearchable(),
+            fieldType.hasDocValues(),
+            fieldType.isStored()
+        );
 
         // For each required capability, assign to primary if it supports it, else to secondary
         for (FieldCapability cap : required) {
             boolean primaryHasCap = primaryFormat != null && registry.hasCapability(typeName, primaryFormat, cap);
-            logger.info("[COMPOSITE_DEBUG]   capability [{}]: primary format [{}] hasCapability={}, registry capabilities for type={}",
-                cap, primaryFormat != null ? primaryFormat.name() : "null", primaryHasCap,
-                primaryFormat != null ? registry.getCapabilities(typeName, primaryFormat) : "N/A");
+            logger.info(
+                "[COMPOSITE_DEBUG]   capability [{}]: primary format [{}] hasCapability={}, registry capabilities for type={}",
+                cap,
+                primaryFormat != null ? primaryFormat.name() : "null",
+                primaryHasCap,
+                primaryFormat != null ? registry.getCapabilities(typeName, primaryFormat) : "N/A"
+            );
 
             if (primaryHasCap) {
                 // Primary handles this capability
-                perFormatMap.get(primaryFormat)
-                    .computeIfAbsent(typeName, k -> EnumSet.noneOf(FieldCapability.class))
-                    .add(cap);
+                perFormatCaps.get(primaryFormat).computeIfAbsent(fieldName, k -> EnumSet.noneOf(FieldCapability.class)).add(cap);
                 logger.info("[COMPOSITE_DEBUG]   -> assigned [{}] to PRIMARY format [{}]", cap, primaryFormat.name());
             } else {
                 // Find a secondary format that supports it
@@ -123,13 +151,18 @@ public final class FieldAssignmentResolver {
                     EngineRole role = entry.getValue();
                     boolean isSecondary = role != EngineRole.PRIMARY;
                     boolean secondaryHasCap = registry.hasCapability(typeName, secondaryFormat, cap);
-                    logger.info("[COMPOSITE_DEBUG]   checking secondary format [{}] role={} isSecondary={} hasCapability={} registryCapabilities={}",
-                        secondaryFormat.name(), role, isSecondary, secondaryHasCap,
-                        registry.getCapabilities(typeName, secondaryFormat));
+                    logger.info(
+                        "[COMPOSITE_DEBUG]   checking secondary format [{}] role={} isSecondary={} hasCapability={} registryCapabilities={}",
+                        secondaryFormat.name(),
+                        role,
+                        isSecondary,
+                        secondaryHasCap,
+                        registry.getCapabilities(typeName, secondaryFormat)
+                    );
 
                     if (isSecondary && secondaryHasCap) {
-                        perFormatMap.get(secondaryFormat)
-                            .computeIfAbsent(typeName, k -> EnumSet.noneOf(FieldCapability.class))
+                        perFormatCaps.get(secondaryFormat)
+                            .computeIfAbsent(fieldName, k -> EnumSet.noneOf(FieldCapability.class))
                             .add(cap);
                         logger.info("[COMPOSITE_DEBUG]   -> assigned [{}] to SECONDARY format [{}]", cap, secondaryFormat.name());
                         assignedToSecondary = true;
@@ -137,10 +170,15 @@ public final class FieldAssignmentResolver {
                     }
                 }
                 if (!assignedToSecondary) {
-                    logger.warn("[COMPOSITE_DEBUG]   -> capability [{}] for field=[{}] type=[{}] NOT assigned to any format!",
-                        cap, fieldType.name(), typeName);
+                    logger.warn(
+                        "[COMPOSITE_DEBUG]   -> capability [{}] for field=[{}] type=[{}] NOT assigned to any format!",
+                        cap,
+                        fieldName,
+                        typeName
+                    );
                 }
             }
         }
     }
 }
+

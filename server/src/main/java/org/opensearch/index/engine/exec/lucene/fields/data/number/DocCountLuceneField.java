@@ -11,8 +11,8 @@ package org.opensearch.index.engine.exec.lucene.fields.data.number;
 import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
-import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParseContext;
 
 import java.util.EnumSet;
@@ -21,13 +21,13 @@ import java.util.Set;
 public class DocCountLuceneField extends LuceneField {
 
     @Override
-    public void createField(MappedFieldType mappedFieldType, ParseContext.Document document, Object parseValue, Set<FieldCapability> assignedCapabilities) {
+    public void createField(FieldDescriptor descriptor, ParseContext.Document document, Object parseValue) {
         final Number value = (Number) parseValue;
-        if (assignedCapabilities.contains(FieldCapability.DOC_VALUES)) {
-            document.add(new SortedNumericDocValuesField(mappedFieldType.name(), value.longValue()));
+        if (descriptor.hasDocValues()) {
+            document.add(new SortedNumericDocValuesField(descriptor.fieldName(), value.longValue()));
         }
-        if (assignedCapabilities.contains(FieldCapability.STORE)) {
-            document.add(new StoredField(mappedFieldType.name(), value.longValue()));
+        if (descriptor.isStored()) {
+            document.add(new StoredField(descriptor.fieldName(), value.longValue()));
         }
     }
 

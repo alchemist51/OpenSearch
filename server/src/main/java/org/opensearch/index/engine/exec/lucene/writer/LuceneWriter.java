@@ -11,7 +11,6 @@ package org.opensearch.index.engine.exec.lucene.writer;
 import org.apache.lucene.index.IndexWriter;
 import org.opensearch.index.engine.exec.DataFormat;
 import org.opensearch.index.engine.exec.EngineRole;
-import org.opensearch.index.engine.exec.FieldAssignments;
 import org.opensearch.index.engine.exec.FileInfos;
 import org.opensearch.index.engine.exec.FlushIn;
 import org.opensearch.index.engine.exec.WriteResult;
@@ -28,14 +27,12 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
     private final long writerGeneration;
     private final Path directoryPath;
     private final EngineRole engineRole;
-    private final FieldAssignments fieldAssignments;
 
-    public LuceneWriter(Path directoryPath, IndexWriter writer, long writerGeneration, EngineRole engineRole, FieldAssignments fieldAssignments) {
+    public LuceneWriter(Path directoryPath, IndexWriter writer, long writerGeneration, EngineRole engineRole) {
         this.directoryPath = directoryPath;
         this.writer = writer;
         this.writerGeneration = writerGeneration;
         this.engineRole = engineRole;
-        this.fieldAssignments = fieldAssignments;
     }
 
     @Override
@@ -63,6 +60,6 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
 
     @Override
     public LuceneDocumentInput newDocumentInput() {
-        return new LuceneDocumentInput(new ParseContext.Document(), writer, engineRole, fieldAssignments);
+        return new LuceneDocumentInput(new ParseContext.Document(), writer, engineRole);
     }
 }

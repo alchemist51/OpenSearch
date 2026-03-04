@@ -5,18 +5,17 @@ import com.parquet.parquetdataformat.fields.ParquetField;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import com.parquet.parquetdataformat.engine.ParquetDataFormat;
+import org.opensearch.index.engine.exec.DataFormat;
 import org.opensearch.index.engine.exec.DocumentInput;
 import org.opensearch.index.engine.exec.EngineRole;
-import org.opensearch.index.engine.exec.FieldAssignments;
-import org.opensearch.index.engine.exec.FieldCapability;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 import org.opensearch.index.engine.exec.WriteResult;
 import org.opensearch.index.engine.exec.composite.CompositeDataFormatWriter;
-import org.opensearch.index.mapper.MappedFieldType;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 
 import java.io.IOException;
 import java.util.Objects;
-import java.util.Set;
 
 /**
  * Document input wrapper for Parquet-based document processing.
@@ -30,7 +29,7 @@ import java.util.Set;
  *
  * <p>Key responsibilities:
  * <ul>
- *   <li>Direct field vector population using OpenSearch's {@link MappedFieldType}</li>
+ *   <li>Direct field vector population using {@link FieldDescriptor}</li>
  *   <li>Document lifecycle management via ManagedVSR</li>
  *   <li>Integration with the Arrow-based Parquet writer pipeline</li>
  * </ul>
@@ -42,12 +41,10 @@ public class ParquetDocumentInput implements DocumentInput<ManagedVSR> {
     private static final Logger logger = LogManager.getLogger(ParquetDocumentInput.class);
     private final ManagedVSR managedVSR;
     private final EngineRole engineRole;
-    private final FieldAssignments fieldAssignments;
 
-    public ParquetDocumentInput(ManagedVSR managedVSR, EngineRole engineRole, FieldAssignments fieldAssignments) {
+    public ParquetDocumentInput(ManagedVSR managedVSR, EngineRole engineRole) {
         this.managedVSR = Objects.requireNonNull(managedVSR, "managedVSR must not be null");
         this.engineRole = Objects.requireNonNull(engineRole, "engineRole must not be null");
-        this.fieldAssignments = Objects.requireNonNull(fieldAssignments, "fieldAssignments must not be null");
     }
 
     @Override
@@ -58,26 +55,17 @@ public class ParquetDocumentInput implements DocumentInput<ManagedVSR> {
     }
 
     @Override
-    public void addField(MappedFieldType fieldType, Object value) {
-        final String fieldTypeName = fieldType.typeName();
-
-        // Check if this format should handle this field type at all
-        if (!fieldAssignments.shouldHandle(fieldTypeName)) {
-            logger.debug("[COMPOSITE_DEBUG] Parquet SKIP field=[{}] type=[{}] — not assigned to this format", fieldType.name(), fieldTypeName);
-            return;
-        }
-
-        final ParquetField parquetField = ArrowFieldRegistry.getParquetField(fieldTypeName);
+    public void addField(FieldDescriptor descriptor, Object value) {
+        final ParquetField parquetField = ArrowFieldRegistry.getParquetField(descriptor.typeName());
 
         if (parquetField == null) {
             // Field type not supported by Parquet format — skip silently
-            logger.debug("[COMPOSITE_DEBUG] Parquet SKIP field=[{}] type=[{}] — no ParquetField registered in ArrowFieldRegistry", fieldType.name(), fieldTypeName);
+            logger.debug("[COMPOSITE_DEBUG] Parquet SKIP field=[{}] type=[{}] — no ParquetField registered in ArrowFieldRegistry", descriptor.fieldName(), descriptor.typeName());
             return;
         }
 
-        Set<FieldCapability> assignedCapabilities = fieldAssignments.getAssignedCapabilities(fieldTypeName);
-        logger.debug("[COMPOSITE_DEBUG] Parquet ACCEPT field=[{}] type=[{}] value=[{}] capabilities={}", fieldType.name(), fieldTypeName, value, assignedCapabilities);
-        parquetField.createField(fieldType, managedVSR, value, assignedCapabilities);
+        logger.debug("[COMPOSITE_DEBUG] Parquet ACCEPT field=[{}] type=[{}] value=[{}] capabilities={}", descriptor.fieldName(), descriptor.typeName(), value, descriptor.assignedCapabilities());
+        parquetField.createField(descriptor, managedVSR, value);
     }
 
     @Override
@@ -109,6 +97,11 @@ public class ParquetDocumentInput implements DocumentInput<ManagedVSR> {
     }
 
     @Override
+    public DataFormat getDataFormat() {
+        return ParquetDataFormat.PARQUET_DATA_FORMAT;
+    }
+
+    @Override
     public void close() throws Exception {
         // NOTE: ParquetDocumentInput does NOT own the ManagedVSR lifecycle
         // The ManagedVSR is owned and managed by VSRManager/VSRPool
@@ -117,4 +110,5 @@ public class ParquetDocumentInput implements DocumentInput<ManagedVSR> {
 
         // No cleanup needed here - VSRManager handles the ManagedVSR lifecycle
     }
+
 }

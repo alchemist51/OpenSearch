@@ -12,7 +12,7 @@ import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.opensearch.index.engine.exec.FieldCapability;
-import org.opensearch.index.mapper.MappedFieldType;
+import org.opensearch.index.engine.exec.FieldDescriptor;
 
 import java.util.Objects;
 import java.util.Set;
@@ -45,13 +45,13 @@ public abstract class ParquetField {
      * <p>Implementations must handle null values appropriately and ensure type safety
      * when casting the parseValue to the expected type.</p>
      *
-     * @param mappedFieldType the OpenSearch field type metadata containing field configuration
+     * @param descriptor the per-field descriptor carrying field name, type name, and capability flags
      * @param managedVSR the managed vector schema root for columnar data storage
      * @param parseValue the parsed field value to be stored, may be null
      * @throws IllegalArgumentException if any parameter is invalid for this field type
      * @throws ClassCastException if parseValue cannot be cast to the expected type
      */
-    protected abstract void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, Set<FieldCapability> assignedCapabilities);
+    protected abstract void addToGroup(FieldDescriptor descriptor, ManagedVSR managedVSR, Object parseValue);
 
     /**
      * Creates and processes a field entry if the field type supports columnar storage.
@@ -61,29 +61,25 @@ public abstract class ParquetField {
      * <p>The method performs the following operations:
      * <ol>
      *   <li>Validates input parameters</li>
-     *   <li>Checks if the field supports columnar storage</li>
+     *   <li>Checks if the field vector exists in the managed VSR</li>
      *   <li>Delegates to {@link #addToGroup} for actual data processing</li>
      * </ol>
      *
-     * @param mappedFieldType the OpenSearch field type metadata, must not be null
+     * @param descriptor the per-field descriptor carrying field name, type name, and capability flags, must not be null
      * @param managedVSR the managed vector schema root, must not be null
      * @param parseValue the parsed field value to be processed, may be null
-     * @param assignedCapabilities the capabilities this format is responsible for on this field type
-     * @throws IllegalArgumentException if mappedFieldType or managedVSR is null
+     * @throws IllegalArgumentException if descriptor or managedVSR is null
      */
-    public final void createField(final MappedFieldType mappedFieldType,
+    public final void createField(final FieldDescriptor descriptor,
                                   final ManagedVSR managedVSR,
-                                  final Object parseValue,
-                                  final Set<FieldCapability> assignedCapabilities) {
-        Objects.requireNonNull(mappedFieldType, "MappedFieldType cannot be null");
+                                  final Object parseValue) {
+        Objects.requireNonNull(descriptor, "FieldDescriptor cannot be null");
         Objects.requireNonNull(managedVSR, "ManagedVSR cannot be null");
 
-        if (mappedFieldType.isColumnar()) {
-            // TODO: support dynamic mapping update
-            // for now ignore the field
-            if (managedVSR.getVector(mappedFieldType.name()) != null) {
-                addToGroup(mappedFieldType, managedVSR, parseValue, assignedCapabilities);
-            }
+        // TODO: support dynamic mapping update
+        // for now ignore the field
+        if (managedVSR.getVector(descriptor.fieldName()) != null) {
+            addToGroup(descriptor, managedVSR, parseValue);
         }
     }
 
