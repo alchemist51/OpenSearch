@@ -6,10 +6,11 @@
  * compatible open source license.
  */
 
-package org.opensearch.index.engine.exec.lucene.fields.data;
+package org.opensearch.index.engine.exec.lucene.fields.data.metadata;
 
-import org.apache.lucene.document.SortedNumericDocValuesField;
+import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.document.StoredField;
+import org.apache.lucene.util.BytesRef;
 import org.opensearch.index.engine.exec.FieldCapability;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
 import org.opensearch.index.mapper.MappedFieldType;
@@ -18,16 +19,16 @@ import org.opensearch.index.mapper.ParseContext;
 import java.util.EnumSet;
 import java.util.Set;
 
-public class SizeLuceneField extends LuceneField {
+public class RoutingLuceneField extends LuceneField {
 
     @Override
     public void createField(MappedFieldType mappedFieldType, ParseContext.Document document, Object parseValue, Set<FieldCapability> assignedCapabilities) {
-        final Number value = (Number) parseValue;
+        final String value = parseValue.toString();
         if (assignedCapabilities.contains(FieldCapability.DOC_VALUES)) {
-            document.add(new SortedNumericDocValuesField(mappedFieldType.name(), value.intValue()));
+            document.add(new SortedSetDocValuesField(mappedFieldType.name(), new BytesRef(value)));
         }
         if (assignedCapabilities.contains(FieldCapability.STORE)) {
-            document.add(new StoredField(mappedFieldType.name(), value.intValue()));
+            document.add(new StoredField(mappedFieldType.name(), value));
         }
     }
 

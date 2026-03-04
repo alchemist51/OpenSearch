@@ -608,6 +608,8 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                         index.documentInput.setSeqNo(index.seqNo());
                         index.documentInput.setPrimaryTerm(SeqNoFieldMapper.PRIMARY_TERM_NAME, index.primaryTerm());
                         index.documentInput.setVersion(1); // we are not supporting update in parquet
+                        logger.info("[COMPOSITE_DEBUG] Indexing doc id=[{}] seqNo=[{}] primaryTerm=[{}] — writing to engine",
+                            index.id(), index.seqNo(), index.primaryTerm());
                         WriteResult writeResult = index.documentInput.addToWriter();
                         indexResult =
                             new Engine.IndexResult(writeResult.version(), index.primaryTerm(), index.seqNo(), writeResult.success());
@@ -804,12 +806,25 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
         try (CompositeEngine.ReleasableRef<CatalogSnapshot> catalogSnapshotReleasableRef = catalogSnapshotManager.acquireSnapshot()) {
             refreshListeners.forEach(PRE_REFRESH_LISTENER_CONSUMER);
 
+            CatalogSnapshot preRefreshSnapshot = catalogSnapshotReleasableRef.getRef();
+            logger.info("[COMPOSITE_DEBUG] refresh(source=[{}]) starting. Pre-refresh CatalogSnapshot: id={}, version={}, segments={}",
+                source, preRefreshSnapshot.getId(), preRefreshSnapshot.getVersion(), preRefreshSnapshot.getSegments().size());
+            for (org.opensearch.index.engine.exec.coord.Segment seg : preRefreshSnapshot.getSegments()) {
+                logger.info("[COMPOSITE_DEBUG]   pre-refresh segment: gen={}, formats={}", seg.getGeneration(), seg.getDFGroupedSearchableFiles().keySet());
+            }
+
             RefreshInput refreshInput = new RefreshInput();
             refreshInput.setExistingSegments(new ArrayList<>(catalogSnapshotReleasableRef.getRef().getSegments()));
             RefreshResult refreshResult = engine.refresh(refreshInput); // It should refresh the primary engine, i.e parquet
             if (refreshResult != null) {
+                logger.info("[COMPOSITE_DEBUG] refresh produced {} segments", refreshResult.getRefreshedSegments().size());
+                for (org.opensearch.index.engine.exec.coord.Segment seg : refreshResult.getRefreshedSegments()) {
+                    logger.info("[COMPOSITE_DEBUG]   refreshed segment: gen={}, formats={}", seg.getGeneration(), seg.getDFGroupedSearchableFiles().keySet());
+                }
                 catalogSnapshotManager.applyRefreshResult(refreshResult);
                 refreshed = true;
+            } else {
+                logger.info("[COMPOSITE_DEBUG] refresh returned null (no new data to flush)");
             }
 
             invokeRefreshListeners(refreshed);

@@ -39,4 +39,16 @@ public class LuceneDataFormat implements DataFormat {
     public String toString() {
         return LUCENE_DATA_FORMAT;
     }
+
+    @Override
+    public boolean equals(Object obj) {
+        if (this == obj) return true;
+        if (!(obj instanceof DataFormat)) return false;
+        return name().equals(((DataFormat) obj).name());
+    }
+
+    @Override
+    public int hashCode() {
+        return name().hashCode();
+    }
 }

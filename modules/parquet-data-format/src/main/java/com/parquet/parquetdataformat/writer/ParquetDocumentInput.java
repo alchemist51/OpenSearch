@@ -3,6 +3,8 @@ package com.parquet.parquetdataformat.writer;
 import com.parquet.parquetdataformat.fields.ArrowFieldRegistry;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import org.apache.arrow.vector.BigIntVector;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.index.engine.exec.DocumentInput;
 import org.opensearch.index.engine.exec.EngineRole;
 import org.opensearch.index.engine.exec.FieldAssignments;
@@ -37,6 +39,7 @@ import java.util.Set;
  * intermediate ParquetDocument representation for improved performance and memory efficiency.
  */
 public class ParquetDocumentInput implements DocumentInput<ManagedVSR> {
+    private static final Logger logger = LogManager.getLogger(ParquetDocumentInput.class);
     private final ManagedVSR managedVSR;
     private final EngineRole engineRole;
     private final FieldAssignments fieldAssignments;
@@ -60,6 +63,7 @@ public class ParquetDocumentInput implements DocumentInput<ManagedVSR> {
 
         // Check if this format should handle this field type at all
         if (!fieldAssignments.shouldHandle(fieldTypeName)) {
+            logger.debug("[COMPOSITE_DEBUG] Parquet SKIP field=[{}] type=[{}] — not assigned to this format", fieldType.name(), fieldTypeName);
             return;
         }
 
@@ -67,10 +71,12 @@ public class ParquetDocumentInput implements DocumentInput<ManagedVSR> {
 
         if (parquetField == null) {
             // Field type not supported by Parquet format — skip silently
+            logger.debug("[COMPOSITE_DEBUG] Parquet SKIP field=[{}] type=[{}] — no ParquetField registered in ArrowFieldRegistry", fieldType.name(), fieldTypeName);
             return;
         }
 
         Set<FieldCapability> assignedCapabilities = fieldAssignments.getAssignedCapabilities(fieldTypeName);
+        logger.debug("[COMPOSITE_DEBUG] Parquet ACCEPT field=[{}] type=[{}] value=[{}] capabilities={}", fieldType.name(), fieldTypeName, value, assignedCapabilities);
         parquetField.createField(fieldType, managedVSR, value, assignedCapabilities);
     }
 

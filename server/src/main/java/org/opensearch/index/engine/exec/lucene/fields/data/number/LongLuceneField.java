@@ -6,11 +6,11 @@
  * compatible open source license.
  */
 
-package org.opensearch.index.engine.exec.lucene.fields.data;
+package org.opensearch.index.engine.exec.lucene.fields.data.number;
 
+import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.document.StoredField;
-import org.apache.lucene.sandbox.document.HalfFloatPoint;
 import org.opensearch.index.engine.exec.FieldCapability;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
 import org.opensearch.index.mapper.MappedFieldType;
@@ -20,20 +20,20 @@ import org.opensearch.index.mapper.ParseContext;
 import java.util.EnumSet;
 import java.util.Set;
 
-public class HalfFloatLuceneField extends LuceneField {
+public class LongLuceneField extends LuceneField {
 
     @Override
     public void createField(MappedFieldType mappedFieldType, ParseContext.Document document, Object parseValue, Set<FieldCapability> assignedCapabilities) {
         final NumberFieldMapper.NumberFieldType fieldType = (NumberFieldMapper.NumberFieldType) mappedFieldType;
         final Number value = (Number) parseValue;
         if (assignedCapabilities.contains(FieldCapability.INDEX)) {
-            document.add(new HalfFloatPoint(fieldType.name(), value.floatValue()));
+            document.add(new LongPoint(fieldType.name(), value.longValue()));
         }
         if (assignedCapabilities.contains(FieldCapability.DOC_VALUES)) {
-            document.add(new SortedNumericDocValuesField(fieldType.name(), HalfFloatPoint.halfFloatToSortableShort(value.floatValue())));
+            document.add(new SortedNumericDocValuesField(fieldType.name(), value.longValue()));
         }
         if (assignedCapabilities.contains(FieldCapability.STORE)) {
-            document.add(new StoredField(fieldType.name(), value.floatValue()));
+            document.add(new StoredField(fieldType.name(), value.longValue()));
         }
     }
 

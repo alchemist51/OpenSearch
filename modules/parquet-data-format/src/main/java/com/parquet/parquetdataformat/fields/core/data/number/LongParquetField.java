@@ -63,6 +63,6 @@ public class LongParquetField extends ParquetField {
 
     @Override
     public Set<FieldCapability> getFieldCapabilities() {
-        return EnumSet.of(FieldCapability.DOC_VALUES);
+        return EnumSet.of(FieldCapability.DOC_VALUES, FieldCapability.INDEX);
     }
 }

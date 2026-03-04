@@ -146,6 +146,8 @@ public class CatalogSnapshotManager {
     }
 
     private synchronized void advanceCatalogSnapshot(List<Segment> refreshedSegments) throws IOException {
+        logger.info("[COMPOSITE_DEBUG] advanceCatalogSnapshot: previous id={}, version={}, old segment count={}",
+            latestCatalogSnapshot.getId(), latestCatalogSnapshot.getVersion(), latestCatalogSnapshot.getSegments().size());
         compositeEngineCommitter.addLuceneIndexes(refreshedSegments);
         CompositeEngineCatalogSnapshot cecs = new CompositeEngineCatalogSnapshot(
             latestCatalogSnapshot.getId() + 1,
@@ -159,6 +161,11 @@ public class CatalogSnapshotManager {
             latestCatalogSnapshot.decRef();
         }
         latestCatalogSnapshot = cecs;
+        logger.info("[COMPOSITE_DEBUG] advanceCatalogSnapshot: new id={}, version={}, new segment count={}",
+            latestCatalogSnapshot.getId(), latestCatalogSnapshot.getVersion(), refreshedSegments.size());
+        for (Segment seg : refreshedSegments) {
+            logger.info("[COMPOSITE_DEBUG]   segment gen={}, formats={}", seg.getGeneration(), seg.getDFGroupedSearchableFiles().keySet());
+        }
     }
 
     private Segment getSegment(Map<DataFormat, WriterFileSet> writerFileSetMap) {

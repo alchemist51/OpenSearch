@@ -74,23 +74,31 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
         // Setting-based role resolution
         String primaryDataFormatName = indexSettings.getValue(IndexSettings.INDEX_COMPOSITE_PRIMARY_DATA_FORMAT_SETTING);
         this.roleMap = resolveRoles(primaryDataFormatName, dataSourcePlugins, singlePlugin);
+        logger.info("[COMPOSITE_DEBUG] Resolved engine roles: {}", roleMap.entrySet().stream()
+            .map(e -> e.getKey().name() + " -> " + e.getValue())
+            .collect(java.util.stream.Collectors.joining(", ")));
 
         // Build FieldSupportRegistry from plugin registrations
         this.fieldSupportRegistry = new FieldSupportRegistry();
         for (DataSourcePlugin plugin : dataSourcePlugins) {
             plugin.registerFieldSupport(fieldSupportRegistry);
         }
+        logger.info("[COMPOSITE_DEBUG] FieldSupportRegistry built. Registered formats: {}",
+            fieldSupportRegistry.allFormats().stream().map(DataFormat::name).collect(java.util.stream.Collectors.joining(", ")));
 
         // Validate field capabilities if composite (multiple plugins)
         if (!singlePlugin) {
             CompositeFieldValidator.validatePrimaryCoverage(fieldSupportRegistry, roleMap, mapperService.fieldTypes());
             CompositeFieldValidator.validateMappingPropertyCoverage(fieldSupportRegistry, mapperService.fieldTypes());
+            logger.info("[COMPOSITE_DEBUG] Composite field validation passed for all mapped fields");
         }
 
         // Resolve field assignments: which format handles which capability for each field type
         Map<DataFormat, FieldAssignments> fieldAssignmentsMap;
         if (singlePlugin) {
             fieldAssignmentsMap = Map.of(dataSourcePlugins.get(0).getDataFormat(), FieldAssignments.ACCEPT_ALL);
+            logger.info("[COMPOSITE_DEBUG] Single plugin mode — using ACCEPT_ALL field assignments for [{}]",
+                dataSourcePlugins.get(0).getDataFormat().name());
         } else {
             fieldAssignmentsMap = FieldAssignmentResolver.resolve(fieldSupportRegistry, roleMap, mapperService.fieldTypes());
         }
@@ -243,11 +251,15 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
             List<CompositeDataFormatWriter> dataFormatWriters = dataFormatWriterPool.checkoutAll();
             List<Segment> refreshedSegment = refreshInput.getExistingSegments();
             List<Segment> newSegmentList = new ArrayList<>();
+            logger.info("[COMPOSITE_DEBUG] CompositeIndexingExecutionEngine.refresh: flushing {} writers, existing segments={}",
+                dataFormatWriters.size(), refreshedSegment.size());
             // flush to disk
             for (CompositeDataFormatWriter dataFormatWriter : dataFormatWriters) {
                 Segment newSegment = new Segment(dataFormatWriter.getWriterGeneration());
                 FileInfos fileInfos = dataFormatWriter.flush(null);
                 fileInfos.getWriterFilesMap().forEach((key, value) -> {
+                    logger.info("[COMPOSITE_DEBUG]   writer gen={} flushed format=[{}] files={}",
+                        dataFormatWriter.getWriterGeneration(), key.name(), value.getFiles());
                     newSegment.addSearchableFiles(key.name(), value);
                 });
                 dataFormatWriter.close();
@@ -257,8 +269,10 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
             }
 
             if (newSegmentList.isEmpty()) {
+                logger.info("[COMPOSITE_DEBUG] No new segments produced from flush");
                 return null;
             } else {
+                logger.info("[COMPOSITE_DEBUG] Produced {} new segments from flush", newSegmentList.size());
                 refreshedSegment.addAll(newSegmentList);
             }
 

@@ -184,6 +184,8 @@ public class CompositeDataFormatWriter implements Writer<CompositeDataFormatWrit
         @Override
         public void addField(MappedFieldType fieldType, Object value) {
             // Each delegate's addField uses its own FieldAssignments to decide what to write
+            logger.debug("[COMPOSITE_DEBUG] addField: field=[{}] type=[{}] value=[{}] — delegating to {} format inputs",
+                fieldType.name(), fieldType.typeName(), value, inputs.size());
             for (DocumentInput<?> input : inputs) {
                 input.addField(fieldType, value);
             }

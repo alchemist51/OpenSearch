@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.index.engine.exec.lucene.fields.data;
+package org.opensearch.index.engine.exec.lucene.fields.data.text;
 
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;

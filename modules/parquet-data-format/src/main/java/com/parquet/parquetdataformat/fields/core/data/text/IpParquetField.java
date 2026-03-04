@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package com.parquet.parquetdataformat.fields.core.data;
+package com.parquet.parquetdataformat.fields.core.data.text;
 
 import org.opensearch.index.engine.exec.FieldCapability;
 import com.parquet.parquetdataformat.fields.ParquetField;

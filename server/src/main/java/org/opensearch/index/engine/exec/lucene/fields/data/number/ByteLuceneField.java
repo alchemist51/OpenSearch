@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.index.engine.exec.lucene.fields.data;
+package org.opensearch.index.engine.exec.lucene.fields.data.number;
 
 import org.apache.lucene.document.IntPoint;
 import org.apache.lucene.document.SortedNumericDocValuesField;

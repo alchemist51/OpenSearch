@@ -6,36 +6,34 @@
  * compatible open source license.
  */
 
-package org.opensearch.index.engine.exec.lucene.fields.data;
+package org.opensearch.index.engine.exec.lucene.fields.data.number;
 
-import org.apache.lucene.document.InetAddressPoint;
-import org.apache.lucene.document.SortedSetDocValuesField;
+import org.apache.lucene.document.IntPoint;
+import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.document.StoredField;
-import org.apache.lucene.util.BytesRef;
-import org.opensearch.common.network.InetAddresses;
 import org.opensearch.index.engine.exec.FieldCapability;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
 import org.opensearch.index.mapper.MappedFieldType;
+import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.index.mapper.ParseContext;
 
-import java.net.InetAddress;
 import java.util.EnumSet;
 import java.util.Set;
 
-public class IpLuceneField extends LuceneField {
+public class IntegerLuceneField extends LuceneField {
 
     @Override
     public void createField(MappedFieldType mappedFieldType, ParseContext.Document document, Object parseValue, Set<FieldCapability> assignedCapabilities) {
-        final InetAddress address = (InetAddress) parseValue;
-        final byte[] encoded = InetAddresses.forString(address.getHostAddress()).getAddress();
+        final NumberFieldMapper.NumberFieldType fieldType = (NumberFieldMapper.NumberFieldType) mappedFieldType;
+        final Number value = (Number) parseValue;
         if (assignedCapabilities.contains(FieldCapability.INDEX)) {
-            document.add(new InetAddressPoint(mappedFieldType.name(), InetAddresses.forString(address.getHostAddress())));
+            document.add(new IntPoint(fieldType.name(), value.intValue()));
         }
         if (assignedCapabilities.contains(FieldCapability.DOC_VALUES)) {
-            document.add(new SortedSetDocValuesField(mappedFieldType.name(), new BytesRef(encoded)));
+            document.add(new SortedNumericDocValuesField(fieldType.name(), value.intValue()));
         }
         if (assignedCapabilities.contains(FieldCapability.STORE)) {
-            document.add(new StoredField(mappedFieldType.name(), new BytesRef(encoded)));
+            document.add(new StoredField(fieldType.name(), value.intValue()));
         }
     }
 

@@ -866,11 +866,11 @@ public final class IndexSettings {
     /**
      * Declares which data format is primary for a composite index.
      * Required when multiple DataSourcePlugins are registered.
-     * Empty default means "not set" — throws when multiple plugins are registered.
+     * Defaults to "parquet".
      */
     public static final Setting<String> INDEX_COMPOSITE_PRIMARY_DATA_FORMAT_SETTING = Setting.simpleString(
         "index.composite.primary_data_format",
-        "",
+        "parquet",
         Property.IndexScope
     );
 

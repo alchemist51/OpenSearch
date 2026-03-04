@@ -6,35 +6,32 @@
  * compatible open source license.
  */
 
-package org.opensearch.index.engine.exec.lucene.fields.data;
+package org.opensearch.index.engine.exec.lucene.fields.data.date;
 
-import org.apache.lucene.document.FloatPoint;
+import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.document.StoredField;
-import org.apache.lucene.util.NumericUtils;
 import org.opensearch.index.engine.exec.FieldCapability;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
 import org.opensearch.index.mapper.MappedFieldType;
-import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.index.mapper.ParseContext;
 
 import java.util.EnumSet;
 import java.util.Set;
 
-public class FloatLuceneField extends LuceneField {
+public class DateNanosLuceneField extends LuceneField {
 
     @Override
     public void createField(MappedFieldType mappedFieldType, ParseContext.Document document, Object parseValue, Set<FieldCapability> assignedCapabilities) {
-        final NumberFieldMapper.NumberFieldType fieldType = (NumberFieldMapper.NumberFieldType) mappedFieldType;
-        final Number value = (Number) parseValue;
+        final long timestamp = (long) parseValue;
         if (assignedCapabilities.contains(FieldCapability.INDEX)) {
-            document.add(new FloatPoint(fieldType.name(), value.floatValue()));
+            document.add(new LongPoint(mappedFieldType.name(), timestamp));
         }
         if (assignedCapabilities.contains(FieldCapability.DOC_VALUES)) {
-            document.add(new SortedNumericDocValuesField(fieldType.name(), NumericUtils.floatToSortableInt(value.floatValue())));
+            document.add(new SortedNumericDocValuesField(mappedFieldType.name(), timestamp));
         }
         if (assignedCapabilities.contains(FieldCapability.STORE)) {
-            document.add(new StoredField(fieldType.name(), value.floatValue()));
+            document.add(new StoredField(mappedFieldType.name(), timestamp));
         }
     }
 

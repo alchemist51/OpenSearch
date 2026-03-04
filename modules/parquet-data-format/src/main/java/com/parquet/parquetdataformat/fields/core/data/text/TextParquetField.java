@@ -6,9 +6,10 @@
  * compatible open source license.
  */
 
-package com.parquet.parquetdataformat.fields.core.data;
+package com.parquet.parquetdataformat.fields.core.data.text;
 
 import org.opensearch.index.engine.exec.FieldCapability;
+import com.parquet.parquetdataformat.fields.ArrowFieldRegistry;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.VarCharVector;
@@ -21,30 +22,30 @@ import java.util.EnumSet;
 import java.util.Set;
 
 /**
- * Parquet field implementation for handling keyword data types in OpenSearch documents.
+ * Parquet field implementation for handling text data types in OpenSearch documents.
  *
- * <p>This class provides the conversion logic between OpenSearch keyword fields and Apache Arrow
- * UTF-8 string vectors for columnar storage in Parquet format. Keyword values are stored using
- * Apache Arrow's {@link VarCharVector}, which provides efficient variable-length string storage
- * with UTF-8 encoding.</p>
+ * <p>This class provides the conversion logic between OpenSearch text fields and Apache Arrow
+ * vectors for columnar storage in Parquet format. Text values are stored using Apache Arrow's
+ * {@link VarCharVector}, which provides efficient variable-length string storage with UTF-8 encoding.</p>
  *
- * <p>This field type corresponds to OpenSearch's {@code keyword} field mapping, which is
- * typically used for exact-match searches, aggregations, and sorting. Unlike text fields,
- * keyword fields are not analyzed and are stored as-is for precise matching.</p>
+ * <p>This field type corresponds to OpenSearch's {@code text} field mapping, which is
+ * typically used for full-text search operations. Text fields are usually analyzed during
+ * indexing, but this implementation stores the original text content for columnar access.</p>
  *
  * <p><strong>Usage Example:</strong></p>
  * <pre>{@code
- * KeywordParquetField keywordField = new KeywordParquetField();
- * ArrowType arrowType = keywordField.getArrowType(); // Returns ArrowType.Utf8
- * FieldType fieldType = keywordField.getFieldType(); // Returns non-nullable UTF-8 field type
+ * TextParquetField textField = new TextParquetField();
+ * ArrowType arrowType = textField.getArrowType(); // Returns ArrowType.Utf8
+ * FieldType fieldType = textField.getFieldType(); // Returns non-nullable integer field type
  * }</pre>
  *
  * @see ParquetField
+ * @see ArrowFieldRegistry
  * @see VarCharVector
- * @see ArrowType.Utf8
+ * @see ArrowType.Int
  * @since 1.0
  */
-public class KeywordParquetField extends ParquetField {
+public class TextParquetField extends ParquetField {
 
     @Override
     public void addToGroup(MappedFieldType mappedFieldType, ManagedVSR managedVSR, Object parseValue, Set<FieldCapability> assignedCapabilities) {

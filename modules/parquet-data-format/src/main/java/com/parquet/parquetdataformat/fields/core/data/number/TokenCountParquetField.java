@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package com.parquet.parquetdataformat.fields.core.data;
+package com.parquet.parquetdataformat.fields.core.data.number;
 
 import org.opensearch.index.engine.exec.FieldCapability;
 import com.parquet.parquetdataformat.fields.ParquetField;
@@ -65,6 +65,6 @@ public class TokenCountParquetField extends ParquetField {
 
     @Override
     public Set<FieldCapability> getFieldCapabilities() {
-        return EnumSet.of(FieldCapability.DOC_VALUES);
+        return EnumSet.of(FieldCapability.DOC_VALUES, FieldCapability.INDEX);
     }
 }
