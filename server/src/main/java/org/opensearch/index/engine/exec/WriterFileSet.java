@@ -34,6 +34,14 @@ public class WriterFileSet implements Serializable, Writeable {
         this.isRefreshed = false;
     }
 
+    public WriterFileSet(Path directory, long writerGeneration, long numRows, boolean isRefreshed) {
+        this.numRows = numRows;
+        this.files = new HashSet<>();
+        this.writerGeneration = writerGeneration;
+        this.directory = directory.toString();
+        this.isRefreshed = isRefreshed;
+    }
+
     public WriterFileSet withDirectoryAndFiles(String newDirectory, Set<String> files) {
         return WriterFileSet.builder()
             .directory(Path.of(newDirectory))
@@ -188,7 +196,7 @@ public class WriterFileSet implements Serializable, Writeable {
                 throw new IllegalStateException("writerGeneration must be set");
             }
 
-            WriterFileSet fileSet = new WriterFileSet(directory, writerGeneration, numRows);
+            WriterFileSet fileSet = new WriterFileSet(directory, writerGeneration, numRows, isRefreshed);
             fileSet.files.addAll(this.files);
             return fileSet;
         }

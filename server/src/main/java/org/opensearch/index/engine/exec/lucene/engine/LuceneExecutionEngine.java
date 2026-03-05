@@ -73,7 +73,11 @@ public class LuceneExecutionEngine implements IndexingExecutionEngine<LuceneData
 
     @Override
     public Writer<? extends DocumentInput<?>> createWriter(long writerGeneration) throws IOException {
-        Path directoryPath = Files.createTempDirectory(Long.toString(System.nanoTime())); // TODO:: Is this the right name?
+
+        Path tmpDirectoryPath = shardPath.getDataPath().resolve("tmp");
+        Files.createDirectories(tmpDirectoryPath);
+        Path directoryPath = Files.createTempDirectory(tmpDirectoryPath, Long.toString(writerGeneration)); // TODO:: Is this the right name?
+        //Path directoryPath = Files.createTempDirectory(Long.toString(System.nanoTime())); // TODO:: Is this the right name?
         EngineRole role = isPrimaryEngine ? EngineRole.PRIMARY : EngineRole.SECONDARY;
         return new LuceneWriter(directoryPath, createWriter(directoryPath, writerGeneration), writerGeneration, role);
 

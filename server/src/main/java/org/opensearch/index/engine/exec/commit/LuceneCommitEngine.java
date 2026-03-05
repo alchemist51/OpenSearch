@@ -79,7 +79,7 @@ public class LuceneCommitEngine implements Committer {
                 indexWriter.addIndexes(new NIOFSDirectory(Path.of(wfs.getDirectory())));
                 wfs.setRefreshed();
             } catch (IOException e) {
-                throw new RuntimeException("Not able to copy it to the main writer in commiter");
+                throw new RuntimeException("Not able to copy it to the main writer in commiter: {}", e);
             }
         }
 
