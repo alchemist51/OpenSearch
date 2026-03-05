@@ -17,6 +17,7 @@ import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentInfos;
+import org.apache.lucene.misc.store.HardlinkCopyDirectoryWrapper;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.opensearch.common.collect.MapBuilder;
 import org.opensearch.common.concurrent.GatedCloseable;
@@ -76,7 +77,7 @@ public class LuceneCommitEngine implements Committer {
             if(wfs == null || wfs.refresh()) continue;
 
             try {
-                indexWriter.addIndexes(new NIOFSDirectory(Path.of(wfs.getDirectory())));
+                indexWriter.addIndexes(new HardlinkCopyDirectoryWrapper(new NIOFSDirectory(Path.of(wfs.getDirectory()))));
                 wfs.setRefreshed();
             } catch (IOException e) {
                 throw new RuntimeException("Not able to copy it to the main writer in commiter: {}", e);
@@ -97,10 +98,13 @@ public class LuceneCommitEngine implements Committer {
                 if (segmentByGeneration.containsKey(writerGeneration)) {
                     WriterFileSet writerFileSet =
                         segmentByGeneration.get(writerGeneration).getDFGroupedSearchableFiles().get(DataFormat.LUCENE.name());
+                    Path oldDirectoryPath = Path.of(writerFileSet.getDirectory());
                     segmentByGeneration.get(writerGeneration).addSearchableFiles(
                         DataFormat.LUCENE.name(),
                         writerFileSet.withDirectoryAndFiles(indexWriter.getDirectory().toString(), new HashSet<>(segmentCommitInfo.files()))
                     );
+                    // Deletes the older path once the file path has been updated
+                    IOUtils.rm(oldDirectoryPath);
                 }
             }
         }
