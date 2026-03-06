@@ -33,6 +33,7 @@ package org.opensearch.index;
 
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.MergePolicy;
+import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.sandbox.index.MergeOnFlushMergePolicy;
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -1915,40 +1916,41 @@ public final class IndexSettings {
      * @param isTimeSeriesIndex true if index contains @timestamp field
      */
     public MergePolicy getMergePolicy(boolean isTimeSeriesIndex) {
-        String indexScopedPolicy = scopedSettings.get(INDEX_MERGE_POLICY);
-        MergePolicyProvider mergePolicyProvider = null;
-        IndexMergePolicy indexMergePolicy = IndexMergePolicy.fromString(indexScopedPolicy);
-        switch (indexMergePolicy) {
-            case TIERED:
-                mergePolicyProvider = tieredMergePolicyProvider;
-                break;
-            case LOG_BYTE_SIZE:
-                mergePolicyProvider = logByteSizeMergePolicyProvider;
-                break;
-            case DEFAULT_POLICY:
-                if (isTimeSeriesIndex) {
-                    String nodeScopedTimeSeriesIndexPolicy = TIME_SERIES_INDEX_MERGE_POLICY.get(nodeSettings);
-                    IndexMergePolicy nodeMergePolicy = IndexMergePolicy.fromString(nodeScopedTimeSeriesIndexPolicy);
-                    switch (nodeMergePolicy) {
-                        case TIERED:
-                        case DEFAULT_POLICY:
-                            mergePolicyProvider = tieredMergePolicyProvider;
-                            break;
-                        case LOG_BYTE_SIZE:
-                            mergePolicyProvider = logByteSizeMergePolicyProvider;
-                            break;
-                    }
-                } else {
-                    mergePolicyProvider = tieredMergePolicyProvider;
-                }
-                break;
-        }
-        assert mergePolicyProvider != null : "should not happen as validation for invalid merge policy values "
-            + "are part of setting definition";
-        if (logger.isTraceEnabled()) {
-            logger.trace("Index: " + this.index.getName() + ", Merge policy used: " + mergePolicyProvider);
-        }
-        return mergePolicyProvider.getMergePolicy();
+        return NoMergePolicy.INSTANCE;
+//        String indexScopedPolicy = scopedSettings.get(INDEX_MERGE_POLICY);
+//        MergePolicyProvider mergePolicyProvider = null;
+//        IndexMergePolicy indexMergePolicy = IndexMergePolicy.fromString(indexScopedPolicy);
+//        switch (indexMergePolicy) {
+//            case TIERED:
+//                mergePolicyProvider = tieredMergePolicyProvider;
+//                break;
+//            case LOG_BYTE_SIZE:
+//                mergePolicyProvider = logByteSizeMergePolicyProvider;
+//                break;
+//            case DEFAULT_POLICY:
+//                if (isTimeSeriesIndex) {
+//                    String nodeScopedTimeSeriesIndexPolicy = TIME_SERIES_INDEX_MERGE_POLICY.get(nodeSettings);
+//                    IndexMergePolicy nodeMergePolicy = IndexMergePolicy.fromString(nodeScopedTimeSeriesIndexPolicy);
+//                    switch (nodeMergePolicy) {
+//                        case TIERED:
+//                        case DEFAULT_POLICY:
+//                            mergePolicyProvider = tieredMergePolicyProvider;
+//                            break;
+//                        case LOG_BYTE_SIZE:
+//                            mergePolicyProvider = logByteSizeMergePolicyProvider;
+//                            break;
+//                    }
+//                } else {
+//                    mergePolicyProvider = tieredMergePolicyProvider;
+//                }
+//                break;
+//        }
+//        assert mergePolicyProvider != null : "should not happen as validation for invalid merge policy values "
+//            + "are part of setting definition";
+//        if (logger.isTraceEnabled()) {
+//            logger.trace("Index: " + this.index.getName() + ", Merge policy used: " + mergePolicyProvider);
+//        }
+//        return mergePolicyProvider.getMergePolicy();
     }
 
     public <T> T getValue(Setting<T> setting) {

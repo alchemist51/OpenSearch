@@ -10,8 +10,14 @@ package org.opensearch.index.engine.exec.lucene.engine;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.index.FilterMergePolicy;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.MergePolicy;
+import org.apache.lucene.index.MergeTrigger;
+import org.apache.lucene.index.NoMergePolicy;
+import org.apache.lucene.index.SegmentCommitInfo;
+import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.store.Directory;
@@ -60,7 +66,6 @@ public class LuceneExecutionEngine implements IndexingExecutionEngine<LuceneData
         this.dataFormat = DataFormat.LUCENE;
         this.isPrimaryEngine = isPrimaryEngine;
         this.shardPath = shardPath;
-
         // TODO: Add check for Lucene being the primary engine and MapperService has an unknown field, currently
         // in POC it's only a secondary engine so we don't need to have all fields in this.
     }
@@ -93,11 +98,51 @@ public class LuceneExecutionEngine implements IndexingExecutionEngine<LuceneData
         }
     }
 
+
+
+    public class ForceMergeOnlyPolicy extends FilterMergePolicy {
+
+        public ForceMergeOnlyPolicy(MergePolicy wrappedPolicy) {
+            super(wrappedPolicy);
+        }
+
+        // Block regular/automatic merges — return null
+        @Override
+        public MergeSpecification findMerges(
+            MergeTrigger mergeTrigger,
+            SegmentInfos segmentInfos,
+            MergeContext mergeContext) throws IOException {
+            // No automatic merges
+            return null;
+        }
+
+        // Allow forceMerge — delegates to wrapped policy
+        @Override
+        public MergeSpecification findForcedMerges(
+            SegmentInfos segmentInfos,
+            int maxSegmentCount,
+            Map<SegmentCommitInfo, Boolean> segmentsToMerge,
+            MergeContext mergeContext) throws IOException {
+            return in.findForcedMerges(
+                segmentInfos, maxSegmentCount, segmentsToMerge, mergeContext);
+        }
+
+        // Allow forceMergeDeletes — delegates to wrapped policy
+        @Override
+        public MergeSpecification findForcedDeletesMerges(
+            SegmentInfos segmentInfos,
+            MergeContext mergeContext) throws IOException {
+            return in.findForcedDeletesMerges(segmentInfos, mergeContext);
+        }
+    }
+
     private IndexWriterConfig getIndexWriterConfig(long writerGeneration, EngineConfig engineConfig) {
         IndexWriterConfig indexWriterConfig = new IndexWriterConfig();
         indexWriterConfig.setOpenMode(IndexWriterConfig.OpenMode.CREATE);
         indexWriterConfig.setIndexSort(new Sort(new SortField(ROW_ID, SortField.Type.LONG)));
         indexWriterConfig.setCodec(new LuceneWriterCodec(engineConfig.getCodec().getName(), engineConfig.getCodec(), writerGeneration));
+        MergePolicy mergePolicy = indexWriterConfig.getMergePolicy();
+        indexWriterConfig.setMergePolicy(new ForceMergeOnlyPolicy(mergePolicy));
         return indexWriterConfig;
     }
 
