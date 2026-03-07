@@ -1878,7 +1878,7 @@ public final class IndexSettings {
 //        if (logger.isTraceEnabled()) {
 //            logger.trace("Index: " + this.index.getName() + ", Merge policy used: " + mergePolicyProvider);
 //        }
-        return mergePolicyProvider.getMergePolicy();
+//        return mergePolicyProvider.getMergePolicy();
     }
 
     public <T> T getValue(Setting<T> setting) {
