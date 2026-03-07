@@ -204,8 +204,8 @@ public class CompositeDataFormatWriter implements Writer<CompositeDataFormatWrit
          * Skips delegation if no descriptor exists for the field name in that format.
          */
         public void addField(MappedFieldType fieldType, Object value) {
-            logger.debug("[COMPOSITE_DEBUG] addField: field=[{}] type=[{}] value=[{}] — resolving per-format descriptors for {} inputs",
-                fieldType.name(), fieldType.typeName(), value, inputs.size());
+            // logger.debug("[COMPOSITE_DEBUG] addField: field=[{}] type=[{}] value=[{}] — resolving per-format descriptors for {} inputs",
+            //     fieldType.name(), fieldType.typeName(), value, inputs.size());
             for (DocumentInput<?> input : inputs) {
                 FieldAssignments assignments = fieldAssignmentsMap.get(input.getDataFormat());
                 if (assignments == null) {

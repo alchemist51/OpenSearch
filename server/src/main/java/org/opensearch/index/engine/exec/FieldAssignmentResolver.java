@@ -89,10 +89,10 @@ public final class FieldAssignmentResolver {
                 }
             }
             result.put(format, new FieldAssignments(descriptors));
-            logger.info("[COMPOSITE_DEBUG] Field assignments for format [{}]:", format.name());
-            for (Map.Entry<String, FieldDescriptor> descEntry : descriptors.entrySet()) {
-                logger.info("[COMPOSITE_DEBUG]   field=[{}] -> {}", descEntry.getKey(), descEntry.getValue());
-            }
+            // logger.info("[COMPOSITE_DEBUG] Field assignments for format [{}]:", format.name());
+            // for (Map.Entry<String, FieldDescriptor> descEntry : descriptors.entrySet()) {
+            //     logger.info("[COMPOSITE_DEBUG]   field=[{}] -> {}", descEntry.getKey(), descEntry.getValue());
+            // }
         }
         return result;
     }
@@ -118,31 +118,31 @@ public final class FieldAssignmentResolver {
             required.add(FieldCapability.STORE);
         }
 
-        logger.info(
-            "[COMPOSITE_DEBUG] resolveField: field=[{}] type=[{}] required capabilities={} (isSearchable={}, hasDocValues={}, isStored={})",
-            fieldName,
-            typeName,
-            required,
-            fieldType.isSearchable(),
-            fieldType.hasDocValues(),
-            fieldType.isStored()
-        );
+        // logger.info(
+        //     "[COMPOSITE_DEBUG] resolveField: field=[{}] type=[{}] required capabilities={} (isSearchable={}, hasDocValues={}, isStored={})",
+        //     fieldName,
+        //     typeName,
+        //     required,
+        //     fieldType.isSearchable(),
+        //     fieldType.hasDocValues(),
+        //     fieldType.isStored()
+        // );
 
         // For each required capability, assign to primary if it supports it, else to secondary
         for (FieldCapability cap : required) {
             boolean primaryHasCap = primaryFormat != null && registry.hasCapability(typeName, primaryFormat, cap);
-            logger.info(
-                "[COMPOSITE_DEBUG]   capability [{}]: primary format [{}] hasCapability={}, registry capabilities for type={}",
-                cap,
-                primaryFormat != null ? primaryFormat.name() : "null",
-                primaryHasCap,
-                primaryFormat != null ? registry.getCapabilities(typeName, primaryFormat) : "N/A"
-            );
+            // logger.info(
+            //     "[COMPOSITE_DEBUG]   capability [{}]: primary format [{}] hasCapability={}, registry capabilities for type={}",
+            //     cap,
+            //     primaryFormat != null ? primaryFormat.name() : "null",
+            //     primaryHasCap,
+            //     primaryFormat != null ? registry.getCapabilities(typeName, primaryFormat) : "N/A"
+            // );
 
             if (primaryHasCap) {
                 // Primary handles this capability
                 perFormatCaps.get(primaryFormat).computeIfAbsent(fieldName, k -> EnumSet.noneOf(FieldCapability.class)).add(cap);
-                logger.info("[COMPOSITE_DEBUG]   -> assigned [{}] to PRIMARY format [{}]", cap, primaryFormat.name());
+                // logger.info("[COMPOSITE_DEBUG]   -> assigned [{}] to PRIMARY format [{}]", cap, primaryFormat.name());
             } else {
                 // Find a secondary format that supports it
                 boolean assignedToSecondary = false;
@@ -151,31 +151,31 @@ public final class FieldAssignmentResolver {
                     EngineRole role = entry.getValue();
                     boolean isSecondary = role != EngineRole.PRIMARY;
                     boolean secondaryHasCap = registry.hasCapability(typeName, secondaryFormat, cap);
-                    logger.info(
-                        "[COMPOSITE_DEBUG]   checking secondary format [{}] role={} isSecondary={} hasCapability={} registryCapabilities={}",
-                        secondaryFormat.name(),
-                        role,
-                        isSecondary,
-                        secondaryHasCap,
-                        registry.getCapabilities(typeName, secondaryFormat)
-                    );
+                    // logger.info(
+                    //     "[COMPOSITE_DEBUG]   checking secondary format [{}] role={} isSecondary={} hasCapability={} registryCapabilities={}",
+                    //     secondaryFormat.name(),
+                    //     role,
+                    //     isSecondary,
+                    //     secondaryHasCap,
+                    //     registry.getCapabilities(typeName, secondaryFormat)
+                    // );
 
                     if (isSecondary && secondaryHasCap) {
                         perFormatCaps.get(secondaryFormat)
                             .computeIfAbsent(fieldName, k -> EnumSet.noneOf(FieldCapability.class))
                             .add(cap);
-                        logger.info("[COMPOSITE_DEBUG]   -> assigned [{}] to SECONDARY format [{}]", cap, secondaryFormat.name());
+                        // logger.info("[COMPOSITE_DEBUG]   -> assigned [{}] to SECONDARY format [{}]", cap, secondaryFormat.name());
                         assignedToSecondary = true;
                         break;
                     }
                 }
                 if (!assignedToSecondary) {
-                    logger.warn(
-                        "[COMPOSITE_DEBUG]   -> capability [{}] for field=[{}] type=[{}] NOT assigned to any format!",
-                        cap,
-                        fieldName,
-                        typeName
-                    );
+                    // logger.warn(
+                    //     "[COMPOSITE_DEBUG]   -> capability [{}] for field=[{}] type=[{}] NOT assigned to any format!",
+                    //     cap,
+                    //     fieldName,
+                    //     typeName
+                    // );
                 }
             }
         }

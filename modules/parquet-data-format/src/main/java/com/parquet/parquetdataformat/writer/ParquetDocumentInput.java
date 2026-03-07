@@ -60,11 +60,11 @@ public class ParquetDocumentInput implements DocumentInput<ManagedVSR> {
 
         if (parquetField == null) {
             // Field type not supported by Parquet format — skip silently
-            logger.debug("[COMPOSITE_DEBUG] Parquet SKIP field=[{}] type=[{}] — no ParquetField registered in ArrowFieldRegistry", descriptor.fieldName(), descriptor.typeName());
+            // logger.debug("[COMPOSITE_DEBUG] Parquet SKIP field=[{}] type=[{}] — no ParquetField registered in ArrowFieldRegistry", descriptor.fieldName(), descriptor.typeName());
             return;
         }
 
-        logger.debug("[COMPOSITE_DEBUG] Parquet ACCEPT field=[{}] type=[{}] value=[{}] capabilities={}", descriptor.fieldName(), descriptor.typeName(), value, descriptor.assignedCapabilities());
+        // logger.debug("[COMPOSITE_DEBUG] Parquet ACCEPT field=[{}] type=[{}] value=[{}] capabilities={}", descriptor.fieldName(), descriptor.typeName(), value, descriptor.assignedCapabilities());
         parquetField.createField(descriptor, managedVSR, value);
     }
 

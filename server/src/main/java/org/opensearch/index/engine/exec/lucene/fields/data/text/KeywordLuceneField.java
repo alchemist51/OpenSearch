@@ -18,15 +18,10 @@ import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
 import org.opensearch.index.mapper.KeywordFieldMapper;
 import org.opensearch.index.mapper.ParseContext;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-
 import java.util.EnumSet;
 import java.util.Set;
 
 public class KeywordLuceneField extends LuceneField {
-
-    private static final Logger logger = LogManager.getLogger(KeywordLuceneField.class);
 
     @Override
     public void createField(FieldDescriptor descriptor, ParseContext.Document document, Object parseValue) {
@@ -36,9 +31,6 @@ public class KeywordLuceneField extends LuceneField {
         boolean shouldIndex = descriptor.isSearchable();
         boolean shouldStore = descriptor.isStored();
 
-        logger.info("[COMPOSITE_DEBUG] KeywordLuceneField.createField: field=[{}] value=[{}] capabilities={} shouldIndex={} shouldStore={} hasDocValues={}",
-            descriptor.fieldName(), value, descriptor.assignedCapabilities(), shouldIndex, shouldStore, descriptor.hasDocValues());
-
         if (shouldIndex || shouldStore) {
             FieldType fieldType = new FieldType();
             fieldType.setTokenized(false);
@@ -47,12 +39,10 @@ public class KeywordLuceneField extends LuceneField {
             fieldType.setIndexOptions(shouldIndex ? IndexOptions.DOCS : IndexOptions.NONE);
             fieldType.freeze();
             document.add(new KeywordFieldMapper.KeywordField(descriptor.fieldName(), binaryValue, fieldType));
-            logger.debug("[COMPOSITE_DEBUG] KeywordLuceneField: added KeywordField for [{}] indexed={} stored={}", descriptor.fieldName(), shouldIndex, shouldStore);
         }
 
         if (descriptor.hasDocValues()) {
             document.add(new SortedSetDocValuesField(descriptor.fieldName(), binaryValue));
-            logger.debug("[COMPOSITE_DEBUG] KeywordLuceneField: added SortedSetDocValuesField for [{}]", descriptor.fieldName());
         }
     }
 

@@ -85,7 +85,7 @@ public class VSRManager implements AutoCloseable {
             throw new IOException("Cannot add document - VSR is not active: " + currentVSR.getState());
         }
 
-        logger.debug("addToManagedVSR called for {}, current row count: {}", fileName, currentVSR.getRowCount());
+        // logger.debug("addToManagedVSR called for {}, current row count: {}", fileName, currentVSR.getRowCount());
 
         try {
             // Since ParquetDocumentInput now works directly with ManagedVSR,
@@ -94,7 +94,7 @@ public class VSRManager implements AutoCloseable {
             // which will increment the row count.
             WriteResult result = document.addToWriter();
 
-            logger.debug("After adding document to {}, row count: {}", fileName, currentVSR.getRowCount());
+            // logger.debug("After adding document to {}, row count: {}", fileName, currentVSR.getRowCount());
 
             // Check for VSR rotation AFTER successful document processing
             maybeRotateActiveVSR();
@@ -108,17 +108,17 @@ public class VSRManager implements AutoCloseable {
 
     public ParquetFileMetadata flush(FlushIn flushIn) throws IOException {
         ManagedVSR currentVSR = managedVSR.get();
-        logger.info("Flush called for {}, row count: {}", fileName, currentVSR.getRowCount());
+        // logger.info("Flush called for {}, row count: {}", fileName, currentVSR.getRowCount());
         try {
             // Only flush if we have data
             if (currentVSR.getRowCount() == 0) {
-                logger.debug("No data to flush for {}, returning null", fileName);
+                // logger.debug("No data to flush for {}, returning null", fileName);
                 return null;
             }
 
             // Transition VSR to FROZEN state before flushing
             currentVSR.moveToFrozen();
-            logger.info("Flushing {} rows for {}", currentVSR.getRowCount(), fileName);
+            // logger.info("Flushing {} rows for {}", currentVSR.getRowCount(), fileName);
             ParquetFileMetadata metadata;
 
             // Write through native writer handle
@@ -127,7 +127,7 @@ public class VSRManager implements AutoCloseable {
                 writer.close();
                 metadata = writer.getMetadata();
             }
-            logger.debug("Successfully flushed data for {} with metadata: {}", fileName, metadata);
+            // logger.debug("Successfully flushed data for {} with metadata: {}", fileName, metadata);
 
             return metadata;
         } catch (Exception e) {
@@ -184,20 +184,20 @@ public class VSRManager implements AutoCloseable {
             boolean rotated = vsrPool.maybeRotateActiveVSR();
 
             if (rotated) {
-                logger.debug("VSR rotation occurred after document addition for {}", fileName);
+                // logger.debug("VSR rotation occurred after document addition for {}", fileName);
 
                 // Get the frozen VSR that was just created by rotation
                 ManagedVSR frozenVSR = vsrPool.getFrozenVSR();
                 if (frozenVSR != null) {
-                    logger.debug("Processing frozen VSR: {} with {} rows for {}",
-                        frozenVSR.getId(), frozenVSR.getRowCount(), fileName);
+                    // logger.debug("Processing frozen VSR: {} with {} rows for {}",
+                    //     frozenVSR.getId(), frozenVSR.getRowCount(), fileName);
 
                     // Write the frozen VSR data immediately
                     try (ArrowExport export = frozenVSR.exportToArrow()) {
                         writer.write(export.getArrayAddress(), export.getSchemaAddress());
                     }
 
-                    logger.debug("Successfully wrote frozen VSR data for {}", fileName);
+                    // logger.debug("Successfully wrote frozen VSR data for {}", fileName);
 
                     // Complete the VSR processing
                     vsrPool.completeVSR(frozenVSR);
@@ -214,8 +214,8 @@ public class VSRManager implements AutoCloseable {
                 }
                 updateVSRAndReinitialize(oldVSR, newVSR);
 
-                logger.debug("VSR rotation completed for {}, new active VSR: {}, row count: {}",
-                    fileName, newVSR.getId(), newVSR.getRowCount());
+                // logger.debug("VSR rotation completed for {}, new active VSR: {}, row count: {}",
+                //     fileName, newVSR.getId(), newVSR.getRowCount());
             }
         } catch (IOException e) {
             logger.error("Error during VSR rotation for {}: {}", fileName, e.getMessage(), e);
@@ -237,13 +237,13 @@ public class VSRManager implements AutoCloseable {
         // Check if we got a different VSR (rotation occurred)
         ManagedVSR oldVSR = managedVSR.get();
         if (currentActive != oldVSR) {
-            logger.debug("VSR rotation detected for {}, updating references", fileName);
+            // logger.debug("VSR rotation detected for {}, updating references", fileName);
 
             // Update the managed VSR reference atomically with field vector map
             updateVSRAndReinitialize(oldVSR, currentActive);
 
             // Note: Writer initialization is not needed per VSR as it's per file
-            logger.debug("VSR rotation completed for {}, new row count: {}", fileName, currentActive.getRowCount());
+            // logger.debug("VSR rotation completed for {}, new row count: {}", fileName, currentActive.getRowCount());
         }
     }
 

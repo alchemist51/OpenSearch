@@ -79,7 +79,7 @@ public class RecordBatchMergeStrategy implements ParquetMergeStrategy {
             );
             try {
                 Files.deleteIfExists(Path.of(mergedFilePath));
-                logger.info("Stale Merged File Deleted at : [{}]", mergedFilePath);
+                // logger.info("Stale Merged File Deleted at : [{}]", mergedFilePath);
             } catch (Exception innerException) {
                 logger.error(
                     () -> new ParameterizedMessage(

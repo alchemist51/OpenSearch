@@ -28,7 +28,7 @@ public class ArrowBufferPool implements Closeable {
     public ArrowBufferPool(Settings settings) {
         long maxAllocationInBytes = 10L * 1024 * 1024 * 1024;
 
-        logger.info("Max native memory allocation for ArrowBufferPool: {} bytes", maxAllocationInBytes);
+        // logger.info("Max native memory allocation for ArrowBufferPool: {} bytes", maxAllocationInBytes);
         this.rootAllocator = new RootAllocator(maxAllocationInBytes);
         this.maxChildAllocation = 1024 * 1024 * 1024;
     }

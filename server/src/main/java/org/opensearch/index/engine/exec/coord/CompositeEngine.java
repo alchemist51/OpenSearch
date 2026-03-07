@@ -275,7 +275,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
 
                     // Now read the userData from the newly created commit
                     userData = store.readLastCommittedSegmentsInfo().getUserData();
-                    logger.debug("Created initial empty commit with translog UUID: {}", translogUUID);
+                    // logger.debug("Created initial empty commit with translog UUID: {}", translogUUID);
                 }
             }
             TranslogEventListener internalTranslogEventListener = new TranslogEventListener() {
@@ -317,7 +317,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                 lastCommittedWriterGeneration.set(Long.parseLong(lastCommittedData.get(LAST_COMPOSITE_WRITER_GEN_KEY)));
             }
 
-            logger.debug("While initialising Composite Engine - lst commit generation : " + lastCommittedWriterGeneration.get());
+            // logger.debug("While initialising Composite Engine - lst commit generation : " + lastCommittedWriterGeneration.get());
             this.engine = new CompositeIndexingExecutionEngine(
                 engineConfig,
                 mapperService,
@@ -429,7 +429,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                 }
             }
         }
-        logger.trace("created new CompositeEngine");
+        // logger.trace("created new CompositeEngine");
     }
 
     private LocalCheckpointTracker createLocalCheckpointTracker(
@@ -443,14 +443,14 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                 SequenceNumbers.loadSeqNoInfoFromLuceneCommit(store.readLastCommittedSegmentsInfo().getUserData().entrySet());
             maxSeqNo = seqNoStats.maxSeqNo;
             localCheckpoint = seqNoStats.localCheckpoint;
-            logger.trace("recovered maximum sequence number [{}] and local checkpoint [{}]", maxSeqNo, localCheckpoint);
+            // logger.trace("recovered maximum sequence number [{}] and local checkpoint [{}]", maxSeqNo, localCheckpoint);
         } catch (org.apache.lucene.index.IndexNotFoundException e) {
             // Local store is empty (remote store recovery scenario)
             // Initialize with NO_OPS_PERFORMED (-1) - checkpoint will be restored from CatalogSnapshot during first flush
-            logger.debug(
-                "Local store is empty during engine initialization, initializing checkpoint tracker with NO_OPS_PERFORMED. "
-                + "This is expected during remote store recovery where local store has not been initialized yet."
-            );
+            // logger.debug(
+            //     "Local store is empty during engine initialization, initializing checkpoint tracker with NO_OPS_PERFORMED. "
+            //     + "This is expected during remote store recovery where local store has not been initialized yet."
+            // );
             return localCheckpointTrackerSupplier.apply(
                 SequenceNumbers.NO_OPS_PERFORMED,
                 SequenceNumbers.NO_OPS_PERFORMED
@@ -548,10 +548,10 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
             }
         }
 
-        logger.trace(
-            "CompositeEngine initialized with {} catalog snapshot aware refresh listeners",
-            catalogSnapshotAwareRefreshListeners.size()
-        );
+        // logger.trace(
+        //     "CompositeEngine initialized with {} catalog snapshot aware refresh listeners",
+        //     catalogSnapshotAwareRefreshListeners.size()
+        // );
     }
 
     public SearchExecEngine<?, ?, ?, ?> getReadEngine(DataFormat dataFormat) {
@@ -608,8 +608,8 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                         index.documentInput.setSeqNo(index.seqNo());
                         index.documentInput.setPrimaryTerm(SeqNoFieldMapper.PRIMARY_TERM_NAME, index.primaryTerm());
                         index.documentInput.setVersion(1); // we are not supporting update in parquet
-                        logger.info("[COMPOSITE_DEBUG] Indexing doc id=[{}] seqNo=[{}] primaryTerm=[{}] — writing to engine",
-                            index.id(), index.seqNo(), index.primaryTerm());
+                        // logger.info("[COMPOSITE_DEBUG] Indexing doc id=[{}] seqNo=[{}] primaryTerm=[{}] — writing to engine",
+                        //     index.id(), index.seqNo(), index.primaryTerm());
                         WriteResult writeResult = index.documentInput.addToWriter();
                         indexResult =
                             new Engine.IndexResult(writeResult.version(), index.primaryTerm(), index.seqNo(), writeResult.success());
@@ -807,24 +807,24 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
             refreshListeners.forEach(PRE_REFRESH_LISTENER_CONSUMER);
 
             CatalogSnapshot preRefreshSnapshot = catalogSnapshotReleasableRef.getRef();
-            logger.info("[COMPOSITE_DEBUG] refresh(source=[{}]) starting. Pre-refresh CatalogSnapshot: id={}, version={}, segments={}",
-                source, preRefreshSnapshot.getId(), preRefreshSnapshot.getVersion(), preRefreshSnapshot.getSegments().size());
-            for (org.opensearch.index.engine.exec.coord.Segment seg : preRefreshSnapshot.getSegments()) {
-                logger.info("[COMPOSITE_DEBUG]   pre-refresh segment: gen={}, formats={}", seg.getGeneration(), seg.getDFGroupedSearchableFiles().keySet());
-            }
+            // logger.info("[COMPOSITE_DEBUG] refresh(source=[{}]) starting. Pre-refresh CatalogSnapshot: id={}, version={}, segments={}",
+            //     source, preRefreshSnapshot.getId(), preRefreshSnapshot.getVersion(), preRefreshSnapshot.getSegments().size());
+            // for (org.opensearch.index.engine.exec.coord.Segment seg : preRefreshSnapshot.getSegments()) {
+            //     logger.info("[COMPOSITE_DEBUG]   pre-refresh segment: gen={}, formats={}", seg.getGeneration(), seg.getDFGroupedSearchableFiles().keySet());
+            // }
 
             RefreshInput refreshInput = new RefreshInput();
             refreshInput.setExistingSegments(new ArrayList<>(catalogSnapshotReleasableRef.getRef().getSegments()));
             RefreshResult refreshResult = engine.refresh(refreshInput); // It should refresh the primary engine, i.e parquet
             if (refreshResult != null) {
-                logger.info("[COMPOSITE_DEBUG] refresh produced {} segments", refreshResult.getRefreshedSegments().size());
-                for (org.opensearch.index.engine.exec.coord.Segment seg : refreshResult.getRefreshedSegments()) {
-                    logger.info("[COMPOSITE_DEBUG]   refreshed segment: gen={}, formats={}", seg.getGeneration(), seg.getDFGroupedSearchableFiles().keySet());
-                }
+                // logger.info("[COMPOSITE_DEBUG] refresh produced {} segments", refreshResult.getRefreshedSegments().size());
+                // for (org.opensearch.index.engine.exec.coord.Segment seg : refreshResult.getRefreshedSegments()) {
+                //     logger.info("[COMPOSITE_DEBUG]   refreshed segment: gen={}, formats={}", seg.getGeneration(), seg.getDFGroupedSearchableFiles().keySet());
+                // }
                 catalogSnapshotManager.applyRefreshResult(refreshResult);
                 refreshed = true;
             } else {
-                logger.info("[COMPOSITE_DEBUG] refresh returned null (no new data to flush)");
+                // logger.info("[COMPOSITE_DEBUG] refresh returned null (no new data to flush)");
             }
 
             invokeRefreshListeners(refreshed);
@@ -1041,11 +1041,11 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                 if (waitIfOngoing == false) {
                     return;
                 }
-                logger.trace("waiting for in-flight flush to finish");
+                // logger.trace("waiting for in-flight flush to finish");
                 flushLock.lock();
-                logger.trace("acquired flush lock after blocking");
+                // logger.trace("acquired flush lock after blocking");
             } else {
-                logger.trace("acquired flush lock immediately");
+                // logger.trace("acquired flush lock immediately");
             }
             try {
                 boolean shouldPeriodicallyFlush = shouldPeriodicallyFlush();
@@ -1056,7 +1056,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
 
                     try {
                         translogManager.rollTranslogGeneration();
-                        logger.trace("starting commit for flush; commitTranslog=true");
+                        // logger.trace("starting commit for flush; commitTranslog=true");
                         CompositeEngine.ReleasableRef<CatalogSnapshot> catalogSnapshotToFlushRef = catalogSnapshotManager.acquireSnapshot();
                         final CatalogSnapshot catalogSnapshotToFlush = catalogSnapshotToFlushRef.getRef();
 
@@ -1093,7 +1093,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                             () -> commitData.entrySet().iterator(),
                             catalogSnapshotToFlush
                         );
-                        logger.trace("finished commit for flush");
+                        // logger.trace("finished commit for flush");
 
                         if (lastCommitedCatalogSnapshotRef != null && lastCommitedCatalogSnapshotRef.getRef() != null)
                             lastCommitedCatalogSnapshotRef.close();
@@ -1269,17 +1269,17 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
     @Override
     public void flushAndClose() throws IOException {
         if (isClosed.get() == false) {
-            logger.trace("flushAndClose now acquire writeLock");
+            // logger.trace("flushAndClose now acquire writeLock");
             try (ReleasableLock lock = writeLock.acquire()) {
-                logger.trace("flushAndClose now acquired writeLock");
+                // logger.trace("flushAndClose now acquired writeLock");
                 try {
-                    logger.debug("flushing shard on close - this might take some time to sync files to disk");
+                    // logger.debug("flushing shard on close - this might take some time to sync files to disk");
                     try {
                         // TODO we might force a flush in the future since we have the write lock already even though recoveries
                         // are running.
                         flush(false, true);
                     } catch (AlreadyClosedException ex) {
-                        logger.debug("engine already closed - skipping flushAndClose");
+                        // logger.debug("engine already closed - skipping flushAndClose");
                     }
                 } finally {
                     close(); // double close is not a problem
@@ -1362,21 +1362,21 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                 logger.warn("failEngine threw exception", inner); // don't bubble up these exceptions up
             }
         } else {
-            logger.debug(
-                () -> new ParameterizedMessage(
-                    "tried to fail composite engine but could not acquire lock - composite engine should " + "be failed by now [{}]",
-                    reason
-                ), failure
-            );
+            // logger.debug(
+            //     () -> new ParameterizedMessage(
+            //         "tried to fail composite engine but could not acquire lock - composite engine should " + "be failed by now [{}]",
+            //         reason
+            //     ), failure
+            // );
         }
     }
 
     @Override
     public void close() throws IOException {
         if (isClosed.get() == false) { // don't acquire the write lock if we are already closed
-            logger.debug("close now acquiring writeLock");
+            // logger.debug("close now acquiring writeLock");
             try (ReleasableLock lock = writeLock.acquire()) {
-                logger.debug("close acquired writeLock");
+                // logger.debug("close acquired writeLock");
                 closeNoLock("api", closedLatch);
             }
         }
@@ -1407,7 +1407,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                 } finally {
                     try {
                         store.decRef();
-                        logger.debug("engine closed [{}]", reason);
+                        // logger.debug("engine closed [{}]", reason);
                     } finally {
                         closedLatch.countDown();
                     }

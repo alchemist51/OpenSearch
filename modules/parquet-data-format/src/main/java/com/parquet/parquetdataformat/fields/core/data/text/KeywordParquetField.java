@@ -56,8 +56,8 @@ public class KeywordParquetField extends ParquetField {
         VarCharVector textVector = (VarCharVector) managedVSR.getVector(descriptor.fieldName());
         int rowIndex = managedVSR.getRowCount();
         textVector.setSafe(rowIndex, parseValue.toString().getBytes(StandardCharsets.UTF_8));
-        logger.info("[COMPOSITE_DEBUG] KeywordParquetField.addToGroup: field=[{}] value=[{}] rowIndex=[{}] capabilities={}",
-            descriptor.fieldName(), parseValue, rowIndex, descriptor.assignedCapabilities());
+        // logger.info("[COMPOSITE_DEBUG] KeywordParquetField.addToGroup: field=[{}] value=[{}] rowIndex=[{}] capabilities={}",
+        //     descriptor.fieldName(), parseValue, rowIndex, descriptor.assignedCapabilities());
     }
 
     @Override

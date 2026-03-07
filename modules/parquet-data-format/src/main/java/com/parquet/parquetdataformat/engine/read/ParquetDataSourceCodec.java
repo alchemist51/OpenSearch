@@ -24,7 +24,7 @@ public class ParquetDataSourceCodec implements DataSourceCodec {
     static {
         try {
             //JniLibraryLoader.loadLibrary();
-            logger.info("DataFusion JNI library loaded successfully");
+            // logger.info("DataFusion JNI library loaded successfully");
         } catch (Exception e) {
             logger.error("Failed to load DataFusion JNI library", e);
             throw new RuntimeException("Failed to initialize DataFusion JNI library", e);

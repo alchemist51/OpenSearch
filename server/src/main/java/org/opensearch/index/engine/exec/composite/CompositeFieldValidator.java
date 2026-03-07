@@ -64,8 +64,8 @@ public final class CompositeFieldValidator {
         }
         for (MappedFieldType fieldType : fieldTypes) {
             if (isInternalMetadataField(fieldType)) {
-                logger.info("[COMPOSITE_DEBUG] validatePrimaryCoverage: SKIP internal metadata field=[{}] type=[{}]",
-                    fieldType.name(), fieldType.typeName());
+                // logger.info("[COMPOSITE_DEBUG] validatePrimaryCoverage: SKIP internal metadata field=[{}] type=[{}]",
+                //     fieldType.name(), fieldType.typeName());
                 continue;
             }
             if (!registry.hasAnyCapability(fieldType.typeName(), primaryFormat)) {
@@ -74,8 +74,8 @@ public final class CompositeFieldValidator {
                         + "] has no capabilities registered for primary data format [" + primaryFormat.name() + "]"
                 );
             }
-            logger.info("[COMPOSITE_DEBUG] validatePrimaryCoverage: OK field=[{}] type=[{}] has capabilities {} in primary format [{}]",
-                fieldType.name(), fieldType.typeName(), registry.getCapabilities(fieldType.typeName(), primaryFormat), primaryFormat.name());
+            // logger.info("[COMPOSITE_DEBUG] validatePrimaryCoverage: OK field=[{}] type=[{}] has capabilities {} in primary format [{}]",
+            //     fieldType.name(), fieldType.typeName(), registry.getCapabilities(fieldType.typeName(), primaryFormat), primaryFormat.name());
         }
     }
 
