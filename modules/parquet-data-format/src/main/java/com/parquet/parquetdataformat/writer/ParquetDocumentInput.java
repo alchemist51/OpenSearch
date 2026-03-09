@@ -9,9 +9,9 @@ import com.parquet.parquetdataformat.engine.ParquetDataFormat;
 import org.opensearch.index.engine.exec.DataFormat;
 import org.opensearch.index.engine.exec.DocumentInput;
 import org.opensearch.index.engine.exec.EngineRole;
-import org.opensearch.index.engine.exec.FieldDescriptor;
 import org.opensearch.index.engine.exec.WriteResult;
 import org.opensearch.index.engine.exec.composite.CompositeDataFormatWriter;
+import org.opensearch.index.mapper.MappedFieldType;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 
 import java.io.IOException;
@@ -29,7 +29,7 @@ import java.util.Objects;
  *
  * <p>Key responsibilities:
  * <ul>
- *   <li>Direct field vector population using {@link FieldDescriptor}</li>
+ *   <li>Direct field vector population using {@link MappedFieldType}</li>
  *   <li>Document lifecycle management via ManagedVSR</li>
  *   <li>Integration with the Arrow-based Parquet writer pipeline</li>
  * </ul>
@@ -55,17 +55,17 @@ public class ParquetDocumentInput implements DocumentInput<ManagedVSR> {
     }
 
     @Override
-    public void addField(FieldDescriptor descriptor, Object value) {
-        final ParquetField parquetField = ArrowFieldRegistry.getParquetField(descriptor.typeName());
+    public void addField(MappedFieldType fieldType, Object value) {
+        final ParquetField parquetField = ArrowFieldRegistry.getParquetField(fieldType.typeName());
 
         if (parquetField == null) {
             // Field type not supported by Parquet format — skip silently
-            // logger.debug("[COMPOSITE_DEBUG] Parquet SKIP field=[{}] type=[{}] — no ParquetField registered in ArrowFieldRegistry", descriptor.fieldName(), descriptor.typeName());
+            // logger.debug("[COMPOSITE_DEBUG] Parquet SKIP field=[{}] type=[{}] — no ParquetField registered in ArrowFieldRegistry", fieldType.name(), fieldType.typeName());
             return;
         }
 
-        // logger.debug("[COMPOSITE_DEBUG] Parquet ACCEPT field=[{}] type=[{}] value=[{}] capabilities={}", descriptor.fieldName(), descriptor.typeName(), value, descriptor.assignedCapabilities());
-        parquetField.createField(descriptor, managedVSR, value);
+        // logger.debug("[COMPOSITE_DEBUG] Parquet ACCEPT field=[{}] type=[{}] value=[{}]", fieldType.name(), fieldType.typeName(), value);
+        parquetField.createField(fieldType, managedVSR, value);
     }
 
     @Override

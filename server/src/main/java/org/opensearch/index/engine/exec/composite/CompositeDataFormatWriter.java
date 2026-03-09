@@ -14,8 +14,7 @@ import org.apache.lucene.util.SetOnce;
 import org.opensearch.index.engine.exec.DataFormat;
 import org.opensearch.index.engine.exec.DocumentInput;
 import org.opensearch.index.engine.exec.FieldAssignments;
-import org.opensearch.index.engine.exec.FieldCapability;
-import org.opensearch.index.engine.exec.FieldDescriptor;
+import org.opensearch.index.engine.exec.AssignedFieldType;
 import org.opensearch.index.engine.exec.FileInfos;
 import org.opensearch.index.engine.exec.FlushIn;
 import org.opensearch.index.engine.exec.RowIdGenerator;
@@ -198,58 +197,54 @@ public class CompositeDataFormatWriter implements Writer<CompositeDataFormatWrit
         }
 
         /**
-         * Entry point from the mapper layer. Resolves {@link MappedFieldType} to {@link FieldDescriptor}
-         * per format using each delegate's {@link FieldAssignments}, then delegates to the format-specific
-         * {@link DocumentInput#addField(FieldDescriptor, Object)}.
-         * Skips delegation if no descriptor exists for the field name in that format.
+         * Entry point from the mapper layer. Resolves per-format {@link MappedFieldType}
+         * using each delegate's {@link FieldAssignments}, then delegates to the format-specific
+         * {@link DocumentInput#addField(MappedFieldType, Object)}.
+         * Skips delegation if no field type exists for the field name in that format.
          */
         public void addField(MappedFieldType fieldType, Object value) {
-            // logger.debug("[COMPOSITE_DEBUG] addField: field=[{}] type=[{}] value=[{}] — resolving per-format descriptors for {} inputs",
+            // logger.debug("[COMPOSITE_DEBUG] addField: field=[{}] type=[{}] value=[{}] — resolving per-format field types for {} inputs",
             //     fieldType.name(), fieldType.typeName(), value, inputs.size());
             for (DocumentInput<?> input : inputs) {
                 FieldAssignments assignments = fieldAssignmentsMap.get(input.getDataFormat());
                 if (assignments == null) {
                     continue;
                 }
-                FieldDescriptor descriptor = assignments.getDescriptor(fieldType.name());
-                if (descriptor == null) {
+                MappedFieldType perFormatType = assignments.getFieldType(fieldType.name());
+                if (perFormatType == null) {
                     continue;
                 }
-                input.addField(descriptor, value);
-            }
-        }
-
-        @Override
-        public void addField(FieldDescriptor descriptor, Object value) {
-            // Direct FieldDescriptor delegation — used for pre-resolved fields
-            for (DocumentInput<?> input : inputs) {
-                input.addField(descriptor, value);
+                input.addField(perFormatType, value);
             }
         }
 
         @Override
         public void setVersion(long version) {
             this.version = version;
-            FieldDescriptor versionDescriptor = new FieldDescriptor(
+            MappedFieldType versionType = new AssignedFieldType(
                 VersionFieldMapper.NAME,
                 VersionFieldMapper.CONTENT_TYPE,
-                java.util.EnumSet.of(FieldCapability.DOC_VALUES)
+                false,
+                false,
+                true
             );
             for (DocumentInput<?> input : inputs) {
-                input.addField(versionDescriptor, version);
+                input.addField(versionType, version);
             }
         }
 
         @Override
         public void setSeqNo(long seqNo) {
             this.seqNo = seqNo;
-            FieldDescriptor seqNoDescriptor = new FieldDescriptor(
+            MappedFieldType seqNoType = new AssignedFieldType(
                 SeqNoFieldMapper.NAME,
                 SeqNoFieldMapper.CONTENT_TYPE,
-                java.util.EnumSet.of(FieldCapability.INDEX, FieldCapability.DOC_VALUES)
+                true,
+                false,
+                true
             );
             for (DocumentInput<?> input : inputs) {
-                input.addField(seqNoDescriptor, seqNo);
+                input.addField(seqNoType, seqNo);
             }
         }
 

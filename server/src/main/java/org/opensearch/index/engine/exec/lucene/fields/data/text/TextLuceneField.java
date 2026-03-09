@@ -12,8 +12,8 @@ import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.index.IndexOptions;
 import org.opensearch.index.engine.exec.FieldCapability;
-import org.opensearch.index.engine.exec.FieldDescriptor;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
+import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParseContext;
 
 import java.util.EnumSet;
@@ -22,17 +22,17 @@ import java.util.Set;
 public class TextLuceneField extends LuceneField {
 
     @Override
-    public void createField(FieldDescriptor descriptor, ParseContext.Document document, Object parseValue) {
+    public void createField(MappedFieldType fieldType, ParseContext.Document document, Object parseValue) {
         final String value = (String) parseValue;
 
-        boolean shouldIndex = descriptor.isSearchable();
-        boolean shouldStore = descriptor.isStored();
+        boolean shouldIndex = fieldType.isSearchable();
+        boolean shouldStore = fieldType.isStored();
 
         if (shouldIndex || shouldStore) {
-            FieldType fieldType = new FieldType();
-            fieldType.setStored(shouldStore);
-            fieldType.setIndexOptions(shouldIndex ? IndexOptions.DOCS_AND_FREQS_AND_POSITIONS : IndexOptions.NONE);
-            Field field = new Field(descriptor.fieldName(), value, fieldType);
+            FieldType luceneFieldType = new FieldType();
+            luceneFieldType.setStored(shouldStore);
+            luceneFieldType.setIndexOptions(shouldIndex ? IndexOptions.DOCS_AND_FREQS_AND_POSITIONS : IndexOptions.NONE);
+            Field field = new Field(fieldType.name(), value, luceneFieldType);
             document.add(field);
         }
     }

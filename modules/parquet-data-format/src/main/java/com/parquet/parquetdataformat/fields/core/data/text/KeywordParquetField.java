@@ -9,7 +9,7 @@
 package com.parquet.parquetdataformat.fields.core.data.text;
 
 import org.opensearch.index.engine.exec.FieldCapability;
-import org.opensearch.index.engine.exec.FieldDescriptor;
+import org.opensearch.index.mapper.MappedFieldType;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.VarCharVector;
@@ -52,12 +52,12 @@ public class KeywordParquetField extends ParquetField {
     private static final Logger logger = LogManager.getLogger(KeywordParquetField.class);
 
     @Override
-    protected void addToGroup(FieldDescriptor descriptor, ManagedVSR managedVSR, Object parseValue) {
-        VarCharVector textVector = (VarCharVector) managedVSR.getVector(descriptor.fieldName());
+    protected void addToGroup(MappedFieldType fieldType, ManagedVSR managedVSR, Object parseValue) {
+        VarCharVector textVector = (VarCharVector) managedVSR.getVector(fieldType.name());
         int rowIndex = managedVSR.getRowCount();
         textVector.setSafe(rowIndex, parseValue.toString().getBytes(StandardCharsets.UTF_8));
         // logger.info("[COMPOSITE_DEBUG] KeywordParquetField.addToGroup: field=[{}] value=[{}] rowIndex=[{}] capabilities={}",
-        //     descriptor.fieldName(), parseValue, rowIndex, descriptor.assignedCapabilities());
+        //     fieldType.name(), parseValue, rowIndex, descriptor.assignedCapabilities());
     }
 
     @Override

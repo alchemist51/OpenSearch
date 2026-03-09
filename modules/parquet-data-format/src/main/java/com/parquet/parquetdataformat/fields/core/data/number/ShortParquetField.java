@@ -9,7 +9,7 @@
 package com.parquet.parquetdataformat.fields.core.data.number;
 
 import org.opensearch.index.engine.exec.FieldCapability;
-import org.opensearch.index.engine.exec.FieldDescriptor;
+import org.opensearch.index.mapper.MappedFieldType;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.SmallIntVector;
@@ -45,8 +45,8 @@ import java.util.Set;
 public class ShortParquetField extends ParquetField {
 
     @Override
-    protected void addToGroup(FieldDescriptor descriptor, ManagedVSR managedVSR, Object parseValue) {
-        SmallIntVector smallIntVector = (SmallIntVector) managedVSR.getVector(descriptor.fieldName());
+    protected void addToGroup(MappedFieldType fieldType, ManagedVSR managedVSR, Object parseValue) {
+        SmallIntVector smallIntVector = (SmallIntVector) managedVSR.getVector(fieldType.name());
         int rowCount = managedVSR.getRowCount();
         smallIntVector.setSafe(rowCount, (Short) parseValue);
     }

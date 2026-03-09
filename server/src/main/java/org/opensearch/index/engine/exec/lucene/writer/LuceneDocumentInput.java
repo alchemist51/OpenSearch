@@ -15,10 +15,10 @@ import org.apache.lucene.index.IndexWriter;
 import org.opensearch.index.engine.exec.DataFormat;
 import org.opensearch.index.engine.exec.DocumentInput;
 import org.opensearch.index.engine.exec.EngineRole;
-import org.opensearch.index.engine.exec.FieldDescriptor;
 import org.opensearch.index.engine.exec.WriteResult;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneFieldRegistry;
+import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParseContext;
 
 import java.io.IOException;
@@ -42,27 +42,26 @@ public class LuceneDocumentInput implements DocumentInput<ParseContext.Document>
 
     @SuppressWarnings("unchecked")
     @Override
-    public void addField(FieldDescriptor descriptor, Object value) {
-        final LuceneField luceneField = LuceneFieldRegistry.getLuceneField(descriptor.typeName());
+    public void addField(MappedFieldType fieldType, Object value) {
+        final LuceneField luceneField = LuceneFieldRegistry.getLuceneField(fieldType.typeName());
 
         if (luceneField == null) {
             // Field type not supported by Lucene format — skip silently
             logger.debug(
                 "[COMPOSITE_DEBUG] Lucene SKIP field=[{}] type=[{}] — no LuceneField registered in LuceneFieldRegistry",
-                descriptor.fieldName(),
-                descriptor.typeName()
+                fieldType.name(),
+                fieldType.typeName()
             );
             return;
         }
 
         logger.debug(
-            "[COMPOSITE_DEBUG] Lucene ACCEPT field=[{}] type=[{}] value=[{}] capabilities={}",
-            descriptor.fieldName(),
-            descriptor.typeName(),
-            value,
-            descriptor.assignedCapabilities()
+            "[COMPOSITE_DEBUG] Lucene ACCEPT field=[{}] type=[{}] value=[{}]",
+            fieldType.name(),
+            fieldType.typeName(),
+            value
         );
-        luceneField.createField(descriptor, document, value);
+        luceneField.createField(fieldType, document, value);
     }
 
     /**

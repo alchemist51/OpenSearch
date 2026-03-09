@@ -14,8 +14,8 @@ import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.index.IndexOptions;
 import org.opensearch.index.engine.exec.FieldCapability;
-import org.opensearch.index.engine.exec.FieldDescriptor;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
+import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParseContext;
 
 import java.util.EnumSet;
@@ -24,21 +24,21 @@ import java.util.Set;
 public class BooleanLuceneField extends LuceneField {
 
     @Override
-    public void createField(FieldDescriptor descriptor, ParseContext.Document document, Object parseValue) {
+    public void createField(MappedFieldType fieldType, ParseContext.Document document, Object parseValue) {
         final Boolean value = (Boolean) parseValue;
-        if (descriptor.isSearchable()) {
+        if (fieldType.isSearchable()) {
             FieldType ft = new FieldType();
             ft.setOmitNorms(true);
             ft.setIndexOptions(IndexOptions.DOCS);
             ft.setTokenized(false);
             ft.freeze();
-            document.add(new Field(descriptor.fieldName(), value ? "T" : "F", ft));
+            document.add(new Field(fieldType.name(), value ? "T" : "F", ft));
         }
-        if (descriptor.hasDocValues()) {
-            document.add(new SortedNumericDocValuesField(descriptor.fieldName(), value ? 1 : 0));
+        if (fieldType.hasDocValues()) {
+            document.add(new SortedNumericDocValuesField(fieldType.name(), value ? 1 : 0));
         }
-        if (descriptor.isStored()) {
-            document.add(new StoredField(descriptor.fieldName(), value ? "T" : "F"));
+        if (fieldType.isStored()) {
+            document.add(new StoredField(fieldType.name(), value ? "T" : "F"));
         }
     }
 

@@ -9,7 +9,7 @@
 package com.parquet.parquetdataformat.fields.core.metadata;
 
 import org.opensearch.index.engine.exec.FieldCapability;
-import org.opensearch.index.engine.exec.FieldDescriptor;
+import org.opensearch.index.mapper.MappedFieldType;
 import com.parquet.parquetdataformat.fields.ParquetField;
 import com.parquet.parquetdataformat.vsr.ManagedVSR;
 import org.apache.arrow.vector.VarBinaryVector;
@@ -45,8 +45,8 @@ import java.util.Set;
 public class IdParquetField extends ParquetField {
 
     @Override
-    protected void addToGroup(FieldDescriptor descriptor, ManagedVSR managedVSR, Object parseValue) {
-        VarBinaryVector idVector = (VarBinaryVector) managedVSR.getVector(descriptor.fieldName());
+    protected void addToGroup(MappedFieldType fieldType, ManagedVSR managedVSR, Object parseValue) {
+        VarBinaryVector idVector = (VarBinaryVector) managedVSR.getVector(fieldType.name());
         int rowIndex = managedVSR.getRowCount();
         BytesRef bytesRef = (BytesRef) parseValue;
         idVector.setSafe(rowIndex, bytesRef.bytes, bytesRef.offset, bytesRef.length);

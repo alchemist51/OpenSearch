@@ -55,9 +55,9 @@ public final class FieldAssignmentResolver {
             }
         }
 
-        // Accumulate capabilities per field name per format before creating FieldDescriptors
+        // Accumulate capabilities per field name per format before creating AssignedFieldType objects
         Map<DataFormat, Map<String, EnumSet<FieldCapability>>> perFormatCaps = new HashMap<>();
-        // Track typeName per fieldName for FieldDescriptor construction
+        // Track typeName per fieldName for AssignedFieldType construction
         Map<String, String> fieldNameToTypeName = new HashMap<>();
         for (DataFormat format : roleMap.keySet()) {
             perFormatCaps.put(format, new HashMap<>());
@@ -74,25 +74,30 @@ public final class FieldAssignmentResolver {
             resolveField(registry, roleMap, primaryFormat, perFormatCaps, fieldType, fieldName, typeName);
         }
 
-        // Convert accumulated capabilities into FieldDescriptor objects and wrap into FieldAssignments
+        // Convert accumulated capabilities into AssignedFieldType objects and wrap into FieldAssignments
         Map<DataFormat, FieldAssignments> result = new HashMap<>();
         for (Map.Entry<DataFormat, Map<String, EnumSet<FieldCapability>>> formatEntry : perFormatCaps.entrySet()) {
             DataFormat format = formatEntry.getKey();
             Map<String, EnumSet<FieldCapability>> fieldCaps = formatEntry.getValue();
-            Map<String, FieldDescriptor> descriptors = new HashMap<>();
+            Map<String, MappedFieldType> assignedTypes = new HashMap<>();
             for (Map.Entry<String, EnumSet<FieldCapability>> fieldEntry : fieldCaps.entrySet()) {
                 String fieldName = fieldEntry.getKey();
                 EnumSet<FieldCapability> caps = fieldEntry.getValue();
                 if (!caps.isEmpty()) {
                     String typeName = fieldNameToTypeName.get(fieldName);
-                    descriptors.put(fieldName, new FieldDescriptor(fieldName, typeName, caps));
+                    assignedTypes.put(
+                        fieldName,
+                        new AssignedFieldType(
+                            fieldName,
+                            typeName,
+                            caps.contains(FieldCapability.INDEX),
+                            caps.contains(FieldCapability.STORE),
+                            caps.contains(FieldCapability.DOC_VALUES)
+                        )
+                    );
                 }
             }
-            result.put(format, new FieldAssignments(descriptors));
-            // logger.info("[COMPOSITE_DEBUG] Field assignments for format [{}]:", format.name());
-            // for (Map.Entry<String, FieldDescriptor> descEntry : descriptors.entrySet()) {
-            //     logger.info("[COMPOSITE_DEBUG]   field=[{}] -> {}", descEntry.getKey(), descEntry.getValue());
-            // }
+            result.put(format, new FieldAssignments(assignedTypes));
         }
         return result;
     }

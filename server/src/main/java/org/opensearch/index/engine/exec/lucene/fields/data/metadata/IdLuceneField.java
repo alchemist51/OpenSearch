@@ -12,8 +12,8 @@ import org.apache.lucene.document.BinaryDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.index.engine.exec.FieldCapability;
-import org.opensearch.index.engine.exec.FieldDescriptor;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
+import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParseContext;
 
 import java.util.EnumSet;
@@ -22,13 +22,13 @@ import java.util.Set;
 public class IdLuceneField extends LuceneField {
 
     @Override
-    public void createField(FieldDescriptor descriptor, ParseContext.Document document, Object parseValue) {
+    public void createField(MappedFieldType fieldType, ParseContext.Document document, Object parseValue) {
         final BytesRef value = (BytesRef) parseValue;
-        if (descriptor.hasDocValues()) {
-            document.add(new BinaryDocValuesField(descriptor.fieldName(), value));
+        if (fieldType.hasDocValues()) {
+            document.add(new BinaryDocValuesField(fieldType.name(), value));
         }
-        if (descriptor.isStored()) {
-            document.add(new StoredField(descriptor.fieldName(), value));
+        if (fieldType.isStored()) {
+            document.add(new StoredField(fieldType.name(), value));
         }
     }
 
