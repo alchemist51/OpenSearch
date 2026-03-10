@@ -8,9 +8,9 @@
 
 package org.opensearch.index.engine.exec.lucene.fields.data.metadata;
 
-import org.apache.lucene.document.SortedSetDocValuesField;
-import org.apache.lucene.document.StoredField;
-import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.index.IndexOptions;
 import org.opensearch.index.engine.exec.FieldCapability;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
 import org.opensearch.index.mapper.MappedFieldType;
@@ -24,16 +24,19 @@ public class RoutingLuceneField extends LuceneField {
     @Override
     public void createField(MappedFieldType fieldType, ParseContext.Document document, Object parseValue) {
         final String value = parseValue.toString();
-        if (fieldType.hasDocValues()) {
-            document.add(new SortedSetDocValuesField(fieldType.name(), new BytesRef(value)));
-        }
-        if (fieldType.isStored()) {
-            document.add(new StoredField(fieldType.name(), value));
+        if (fieldType.isSearchable() || fieldType.isStored()) {
+            FieldType ft = new FieldType();
+            ft.setIndexOptions(fieldType.isSearchable() ? IndexOptions.DOCS : IndexOptions.NONE);
+            ft.setTokenized(false);
+            ft.setStored(fieldType.isStored());
+            ft.setOmitNorms(true);
+            ft.freeze();
+            document.add(new Field(fieldType.name(), value, ft));
         }
     }
 
     @Override
     public Set<FieldCapability> getFieldCapabilities() {
-        return EnumSet.of(FieldCapability.STORE, FieldCapability.DOC_VALUES);
+        return EnumSet.of(FieldCapability.STORE, FieldCapability.INDEX);
     }
 }

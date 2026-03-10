@@ -14,7 +14,6 @@ import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.index.engine.exec.FieldCapability;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
-import org.opensearch.index.mapper.KeywordFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParseContext;
 
@@ -38,7 +37,7 @@ public class KeywordLuceneField extends LuceneField {
             luceneFieldType.setOmitNorms(true);
             luceneFieldType.setIndexOptions(shouldIndex ? IndexOptions.DOCS : IndexOptions.NONE);
             luceneFieldType.freeze();
-            document.add(new KeywordFieldMapper.KeywordField(fieldType.name(), binaryValue, luceneFieldType));
+            document.add(new Field(fieldType.name(), binaryValue, luceneFieldType));
         }
 
         if (fieldType.hasDocValues()) {

@@ -8,8 +8,7 @@
 
 package org.opensearch.index.engine.exec.lucene.fields.data.number;
 
-import org.apache.lucene.document.SortedNumericDocValuesField;
-import org.apache.lucene.document.StoredField;
+import org.apache.lucene.document.NumericDocValuesField;
 import org.opensearch.index.engine.exec.FieldCapability;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
 import org.opensearch.index.mapper.MappedFieldType;
@@ -24,15 +23,12 @@ public class DocCountLuceneField extends LuceneField {
     public void createField(MappedFieldType fieldType, ParseContext.Document document, Object parseValue) {
         final Number value = (Number) parseValue;
         if (fieldType.hasDocValues()) {
-            document.add(new SortedNumericDocValuesField(fieldType.name(), value.longValue()));
-        }
-        if (fieldType.isStored()) {
-            document.add(new StoredField(fieldType.name(), value.longValue()));
+            document.add(new NumericDocValuesField(fieldType.name(), value.longValue()));
         }
     }
 
     @Override
     public Set<FieldCapability> getFieldCapabilities() {
-        return EnumSet.of(FieldCapability.STORE, FieldCapability.DOC_VALUES);
+        return EnumSet.of(FieldCapability.DOC_VALUES);
     }
 }

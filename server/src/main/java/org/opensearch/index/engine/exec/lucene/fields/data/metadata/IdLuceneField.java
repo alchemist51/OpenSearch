@@ -8,8 +8,9 @@
 
 package org.opensearch.index.engine.exec.lucene.fields.data.metadata;
 
-import org.apache.lucene.document.BinaryDocValuesField;
-import org.apache.lucene.document.StoredField;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.index.engine.exec.FieldCapability;
 import org.opensearch.index.engine.exec.lucene.fields.LuceneField;
@@ -24,16 +25,19 @@ public class IdLuceneField extends LuceneField {
     @Override
     public void createField(MappedFieldType fieldType, ParseContext.Document document, Object parseValue) {
         final BytesRef value = (BytesRef) parseValue;
-        if (fieldType.hasDocValues()) {
-            document.add(new BinaryDocValuesField(fieldType.name(), value));
-        }
-        if (fieldType.isStored()) {
-            document.add(new StoredField(fieldType.name(), value));
+        if (fieldType.isSearchable() || fieldType.isStored()) {
+            FieldType ft = new FieldType();
+            ft.setTokenized(false);
+            ft.setIndexOptions(fieldType.isSearchable() ? IndexOptions.DOCS : IndexOptions.NONE);
+            ft.setStored(fieldType.isStored());
+            ft.setOmitNorms(true);
+            ft.freeze();
+            document.add(new Field(fieldType.name(), value, ft));
         }
     }
 
     @Override
     public Set<FieldCapability> getFieldCapabilities() {
-        return EnumSet.of(FieldCapability.STORE, FieldCapability.DOC_VALUES);
+        return EnumSet.of(FieldCapability.STORE, FieldCapability.INDEX);
     }
 }
