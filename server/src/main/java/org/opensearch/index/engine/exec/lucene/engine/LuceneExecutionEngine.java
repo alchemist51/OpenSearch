@@ -22,6 +22,7 @@ import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.NIOFSDirectory;
+import org.opensearch.common.lucene.LoggerInfoStream;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.exec.DataFormat;
@@ -144,6 +145,7 @@ public class LuceneExecutionEngine implements IndexingExecutionEngine<LuceneData
         MergePolicy mergePolicy = indexWriterConfig.getMergePolicy();
         indexWriterConfig.setMergePolicy(new ForceMergeOnlyPolicy(mergePolicy));
         indexWriterConfig.setRAMBufferSizeMB(engineConfig.getIndexingBufferSize().getMbFrac());
+        indexWriterConfig.setInfoStream(new LoggerInfoStream(logger));
         return indexWriterConfig;
     }
 
