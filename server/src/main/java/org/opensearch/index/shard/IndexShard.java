@@ -4913,19 +4913,27 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                 && isSearchIdleSupported()
                 && isSearchIdle()
                 && indexSettings.isExplicitRefresh() == false
-                && active.get()) { // it must be active otherwise we might not free up segment memory once the shard became inactive
+                && active.get()) {
+                logger.info("Starting scheduled refresh");
+                long startTime = System.currentTimeMillis();
+                // it must be active otherwise we might not free up segment memory once the shard became inactive
                 // lets skip this refresh since we are search idle and
                 // don't necessarily need to refresh. the next searcher access will register a refreshListener and that will
                 // cause the next schedule to refresh.
                 final Engine engine = getEngine();
                 engine.maybePruneDeletes(); // try to prune the deletes in the engine if we accumulated some
                 setRefreshPending(engine);
+                logger.info("Time taken for refresh: {} ms", System.currentTimeMillis() - startTime);
                 return false;
             } else {
+                logger.info("Starting scheduled refresh on shard [{}] due to search idle or explicit refresh", shardId);
+                long startTime = System.currentTimeMillis();
                 if (logger.isTraceEnabled()) {
                     logger.trace("refresh with source [schedule]");
                 }
-                return getEngine().maybeRefresh("schedule");
+                boolean val =  getEngine().maybeRefresh("schedule");
+                logger.info("Time Taken for refresh in vanilla: {} ms", System.currentTimeMillis() - startTime);
+                return val;
             }
         }
         final Engine engine = getEngine();
