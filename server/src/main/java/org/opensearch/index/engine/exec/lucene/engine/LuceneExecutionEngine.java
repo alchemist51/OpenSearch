@@ -143,6 +143,7 @@ public class LuceneExecutionEngine implements IndexingExecutionEngine<LuceneData
         indexWriterConfig.setCodec(new LuceneWriterCodec(engineConfig.getCodec().getName(), engineConfig.getCodec(), writerGeneration));
         MergePolicy mergePolicy = indexWriterConfig.getMergePolicy();
         indexWriterConfig.setMergePolicy(new ForceMergeOnlyPolicy(mergePolicy));
+        indexWriterConfig.setRAMBufferSizeMB(engineConfig.getIndexingBufferSize().getMbFrac());
         return indexWriterConfig;
     }
 
