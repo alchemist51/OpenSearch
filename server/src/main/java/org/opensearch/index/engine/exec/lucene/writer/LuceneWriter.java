@@ -45,7 +45,7 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
 
     @Override
     public FileInfos flush(FlushIn flushIn) throws IOException {
-        logger.info("Flushing with SegmentInfosCounter: {}", writer.getSegmentInfosCounter());
+        logger.debug("Flushing with no of segments: {}", writer.getSegmentInfosCounter());
         writer.forceMerge(1);
         WriterFileSet.Builder writerFileSetBuilder =
             WriterFileSet.builder().directory(directoryPath).writerGeneration(writerGeneration).addNumRows(writer.getDocStats().numDocs);
