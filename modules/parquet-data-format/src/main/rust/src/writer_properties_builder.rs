@@ -59,10 +59,7 @@ impl WriterPropertiesBuilder {
         mut builder: parquet::file::properties::WriterPropertiesBuilder,
         config: &NativeSettings
     ) -> parquet::file::properties::WriterPropertiesBuilder {
-        let compression = Self::parse_compression_type(
-            config.get_compression_type(),
-            config.get_compression_level()
-        );
+        let compression = Compression::LZ4;
         builder = builder.set_compression(compression);
         builder
     }
