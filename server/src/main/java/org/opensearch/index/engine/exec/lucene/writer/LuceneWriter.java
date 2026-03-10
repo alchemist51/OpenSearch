@@ -8,6 +8,8 @@
 
 package org.opensearch.index.engine.exec.lucene.writer;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.IndexWriter;
 import org.opensearch.index.engine.exec.DataFormat;
 import org.opensearch.index.engine.exec.EngineRole;
@@ -27,6 +29,7 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
     private final long writerGeneration;
     private final Path directoryPath;
     private final EngineRole engineRole;
+    private static final Logger logger = LogManager.getLogger(LuceneWriter.class);
 
     public LuceneWriter(Path directoryPath, IndexWriter writer, long writerGeneration, EngineRole engineRole) {
         this.directoryPath = directoryPath;
@@ -42,6 +45,7 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
 
     @Override
     public FileInfos flush(FlushIn flushIn) throws IOException {
+        logger.info("Flushing with SegmentInfosCounter: {}", writer.getSegmentInfosCounter());
         writer.forceMerge(1);
         WriterFileSet.Builder writerFileSetBuilder =
             WriterFileSet.builder().directory(directoryPath).writerGeneration(writerGeneration).addNumRows(writer.getDocStats().numDocs);
