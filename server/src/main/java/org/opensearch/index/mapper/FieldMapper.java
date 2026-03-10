@@ -348,11 +348,7 @@ public abstract class FieldMapper extends Mapper implements Cloneable {
     }
 
     protected final boolean isPluggableDataFormatFeatureEnabled(ParseContext parseContext) {
-        if(isPluggableDataFormatFeatureEnabled == null) {
-            isPluggableDataFormatFeatureEnabled = FeatureFlags.isEnabled(FeatureFlags.PLUGGABLE_DATAFORMAT_EXPERIMENTAL_FLAG) && parseContext.indexSettings().isOptimizedIndex();
-        }
-
-        return isPluggableDataFormatFeatureEnabled;
+        return true;
     }
 
     @Override
