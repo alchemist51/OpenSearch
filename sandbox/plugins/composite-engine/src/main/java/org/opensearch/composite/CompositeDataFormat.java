@@ -36,8 +36,13 @@ public class CompositeDataFormat implements DataFormat {
      * @param primaryDataFormat the primary data format (must be contained in {@code dataFormats})
      */
     public CompositeDataFormat(List<DataFormat> dataFormats, DataFormat primaryDataFormat) {
-        this.dataFormats = List.copyOf(Objects.requireNonNull(dataFormats, "dataFormats must not be null"));
-        this.primaryDataFormat = Objects.requireNonNull(primaryDataFormat, "primaryDataFormat must not be null");
+        this.dataFormats = dataFormats;
+        this.primaryDataFormat = primaryDataFormat;
+    }
+
+    public CompositeDataFormat() {
+        this.dataFormats = List.of();
+        this.primaryDataFormat = null;
     }
 
     /**

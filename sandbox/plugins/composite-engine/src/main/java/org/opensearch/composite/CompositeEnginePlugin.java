@@ -12,46 +12,75 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.settings.Setting;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
-import org.opensearch.index.engine.EngineFactory;
-import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.DataFormatPlugin;
-import org.opensearch.plugins.EnginePlugin;
+import org.opensearch.index.mapper.MapperService;
+import org.opensearch.index.shard.ShardPath;
+import org.opensearch.plugins.ExtensiblePlugin;
 import org.opensearch.plugins.Plugin;
 
-import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 /**
  * Sandbox plugin that provides a {@link CompositeIndexingExecutionEngine} for
  * orchestrating multi-format indexing. Discovers {@link DataFormatPlugin} instances
- * during node bootstrap and creates a composite engine when composite indexing is
- * enabled for an index.
+ * during node bootstrap via the {@link ExtensiblePlugin} SPI and creates a composite
+ * engine when composite indexing is enabled for an index.
  * <p>
  * Registers two index settings:
  * <ul>
  *   <li>{@code index.composite.enabled} — activates composite indexing (default {@code false})</li>
  *   <li>{@code index.composite.primary_data_format} — designates the primary format (default {@code "lucene"})</li>
  * </ul>
+ * <p>
+ * Format plugins (e.g., Parquet) extend this plugin by declaring
+ * {@code extendedPlugins = ['composite-engine']} in their {@code build.gradle}
+ * and implementing {@link DataFormatPlugin}. The {@link ExtensiblePlugin} SPI
+ * discovers them automatically during node bootstrap.
  *
  * @opensearch.experimental
  */
 @ExperimentalApi
-public class CompositeEnginePlugin extends Plugin implements EnginePlugin {
+public class CompositeEnginePlugin extends Plugin implements ExtensiblePlugin, DataFormatPlugin {
 
     private static final Logger logger = LogManager.getLogger(CompositeEnginePlugin.class);
 
     /**
      * Index setting to enable composite indexing for an index.
      * When {@code true}, the composite engine orchestrates writes across all registered data formats.
+     * Validates that the primary data format is non-empty when enabled.
      */
     public static final Setting<Boolean> COMPOSITE_ENABLED = Setting.boolSetting(
         "index.composite.enabled",
         false,
+        new Setting.Validator<>() {
+            @Override
+            public void validate(Boolean value) {}
+
+            @Override
+            public void validate(Boolean enabled, Map<Setting<?>, Object> settings) {
+                if (enabled) {
+                    String primary = (String) settings.get(PRIMARY_DATA_FORMAT);
+                    if (primary == null || primary.isEmpty()) {
+                        throw new IllegalArgumentException(
+                            "[index.composite.enabled] requires [index.composite.primary_data_format] to be set"
+                        );
+                    }
+                }
+            }
+
+            @Override
+            public Iterator<Setting<?>> settings() {
+                return List.<Setting<?>>of(PRIMARY_DATA_FORMAT, SECONDARY_DATA_FORMATS).iterator();
+            }
+        },
         Setting.Property.IndexScope
     );
 
@@ -66,61 +95,106 @@ public class CompositeEnginePlugin extends Plugin implements EnginePlugin {
     );
 
     /**
+     * Index setting that lists the secondary data formats for an index.
+     * Secondary formats receive writes alongside the primary but are not used
+     * as the merge authority.
+     */
+    public static final Setting<List<String>> SECONDARY_DATA_FORMATS = Setting.listSetting(
+        "index.composite.secondary_data_formats",
+        Collections.emptyList(),
+        s -> s,
+        Setting.Property.IndexScope
+    );
+
+    /**
      * Discovered {@link DataFormatPlugin} instances keyed by format name.
      * When multiple plugins declare the same format name, the one with the highest
      * {@link DataFormat#priority()} is retained.
      */
     private volatile Map<String, DataFormatPlugin> dataFormatPlugins = Map.of();
 
+    /** Creates a new composite engine plugin. */
+    public CompositeEnginePlugin() {}
+
+
+    @Override
+    public void loadExtensions(ExtensionLoader loader) {
+        List<DataFormatPlugin> formatPlugins = loader.loadExtensions(DataFormatPlugin.class);
+        Map<String, DataFormatPlugin> registry = new HashMap<>();
+        for (DataFormatPlugin plugin : formatPlugins) {
+            DataFormat format = plugin.getDataFormat();
+            if (format == null) {
+                logger.warn("DataFormatPlugin [{}] returned null DataFormat, skipping", plugin.getClass().getName());
+                continue;
+            }
+            String name = format.name();
+            DataFormatPlugin existing = registry.get(name);
+            if (existing != null) {
+                long existingPriority = existing.getDataFormat().priority();
+                if (format.priority() <= existingPriority) {
+                    logger.debug(
+                        "Skipping DataFormatPlugin [{}] for format [{}] (priority {} <= existing {})",
+                        plugin.getClass().getName(),
+                        name,
+                        format.priority(),
+                        existingPriority
+                    );
+                    continue;
+                }
+                logger.info(
+                    "Replacing DataFormatPlugin for format [{}] (priority {} > existing {})",
+                    name,
+                    format.priority(),
+                    existingPriority
+                );
+            }
+            registry.put(name, plugin);
+            logger.info("Registered DataFormatPlugin [{}] for format [{}]", plugin.getClass().getName(), name);
+        }
+        this.dataFormatPlugins = Collections.unmodifiableMap(registry);
+    }
+
+
     @Override
     public List<Setting<?>> getSettings() {
-        return List.of(COMPOSITE_ENABLED, PRIMARY_DATA_FORMAT);
+        return List.of(COMPOSITE_ENABLED, PRIMARY_DATA_FORMAT, SECONDARY_DATA_FORMATS);
     }
 
     @Override
-    public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
-        if (COMPOSITE_ENABLED.get(indexSettings.getSettings()) == false) {
-            return Optional.empty();
+    public void onIndexModule(IndexModule indexModule) {
+        Settings settings = indexModule.getSettings();
+        boolean compositeEnabled = COMPOSITE_ENABLED.get(settings);
+        if (compositeEnabled == false) {
+            return;
         }
 
-        if (dataFormatPlugins.isEmpty()) {
-            logger.warn(
-                "Composite indexing is enabled for index [{}] but no DataFormatPlugin instances were discovered; "
-                    + "falling back to the standard engine",
-                indexSettings.getIndex().getName()
-            );
-            return Optional.empty();
-        }
+        String primaryFormatName = PRIMARY_DATA_FORMAT.get(settings);
+        List<String> secondaryFormatNames = SECONDARY_DATA_FORMATS.get(settings);
+        CompositeIndexingExecutionEngine.validateFormatsRegistered(dataFormatPlugins, primaryFormatName, secondaryFormatNames);
+    }
 
-        String primaryFormat = PRIMARY_DATA_FORMAT.get(indexSettings.getSettings());
-        if (dataFormatPlugins.containsKey(primaryFormat) == false) {
-            throw new IllegalArgumentException(
-                "Primary data format ["
-                    + primaryFormat
-                    + "] does not match any registered DataFormatPlugin. Available formats: "
-                    + dataFormatPlugins.keySet()
-            );
-        }
+    @Override
+    public DataFormat getDataFormat() {
+        // TODO: Dataformat for Composite is per index, while this one talks about cluster level. Switching it off for now
+        return null;
+    }
 
-        return Optional.of(config -> new InternalEngine(config));
+    @Override
+    @SuppressWarnings("unchecked")
+    public CompositeIndexingExecutionEngine indexingEngine(
+        MapperService mapperService,
+        ShardPath shardPath,
+        IndexSettings indexSettings
+    ) {
+        return new CompositeIndexingExecutionEngine(dataFormatPlugins, indexSettings, mapperService, shardPath);
     }
 
     /**
-     * Receives {@link DataFormatPlugin} instances discovered during node bootstrap.
-     * When multiple plugins declare the same {@link DataFormat#name()}, the one with
-     * the highest {@link DataFormat#priority()} is retained.
+     * Returns the discovered data format plugins keyed by format name.
      *
-     * @param plugins the discovered data format plugins
+     * @return unmodifiable map of format name to plugin
      */
-    public void onDiscovery(Collection<DataFormatPlugin> plugins) {
-        Map<String, DataFormatPlugin> resolved = new HashMap<>();
-        for (DataFormatPlugin plugin : plugins) {
-            String formatName = plugin.getDataFormat().name();
-            DataFormatPlugin existing = resolved.get(formatName);
-            if (existing == null || plugin.getDataFormat().priority() > existing.getDataFormat().priority()) {
-                resolved.put(formatName, plugin);
-            }
-        }
-        this.dataFormatPlugins = Map.copyOf(resolved);
+    public Map<String, DataFormatPlugin> getDataFormatPlugins() {
+        return dataFormatPlugins;
     }
 }

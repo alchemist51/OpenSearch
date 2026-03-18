@@ -8,8 +8,13 @@
 
 package org.opensearch.composite;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.dataformat.DataFormat;
+import org.opensearch.index.engine.dataformat.DataFormatPlugin;
 import org.opensearch.index.engine.dataformat.DocumentInput;
 import org.opensearch.index.engine.dataformat.IndexingExecutionEngine;
 import org.opensearch.index.engine.dataformat.Merger;
@@ -17,6 +22,8 @@ import org.opensearch.index.engine.dataformat.RefreshInput;
 import org.opensearch.index.engine.dataformat.RefreshResult;
 import org.opensearch.index.engine.dataformat.Writer;
 import org.opensearch.index.engine.exec.Segment;
+import org.opensearch.index.mapper.MapperService;
+import org.opensearch.index.shard.ShardPath;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -41,50 +48,120 @@ import java.util.Objects;
  * @opensearch.experimental
  */
 @ExperimentalApi
-public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine<DataFormat, CompositeDocumentInput> {
+public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine<CompositeDataFormat, CompositeDocumentInput> {
 
-    private final List<IndexingExecutionEngine<?, ?>> engines;
+    private static final Logger logger = LogManager.getLogger(CompositeIndexingExecutionEngine.class);
+
     private final IndexingExecutionEngine<?, ?> primaryEngine;
+    private final List<IndexingExecutionEngine<?, ?>> secondaryEngines;
+    private final List<IndexingExecutionEngine<?, ?>> allEngines;
     private final CompositeDataFormat compositeDataFormat;
 
     /**
-     * Constructs a CompositeIndexingExecutionEngine from the given per-format engines.
+     * Constructs a CompositeIndexingExecutionEngine by reading index settings to
+     * determine the primary and secondary data formats, validating that all configured
+     * formats are registered, and creating per-format engines via the discovered
+     * {@link DataFormatPlugin} instances.
      * <p>
-     * Identifies the primary engine by matching {@code getDataFormat().name()} to the
-     * given {@code primaryFormatName}. Builds a {@link CompositeDataFormat} from the
-     * union of all engines' supported field type capabilities.
+     * The primary engine is the authoritative format used for merge operations and
+     * commit coordination. Secondary engines receive writes alongside the primary but
+     * are not used as the merge authority.
      *
-     * @param engines the list of per-format indexing execution engines
-     * @param primaryFormatName the name of the primary data format
-     * @throws IllegalArgumentException if no engine matches the primary format name
+     * @param dataFormatPlugins the discovered data format plugins keyed by format name
+     * @param indexSettings the index settings containing composite configuration
+     * @param mapperService the mapper service for field mapping resolution
+     * @param shardPath the shard path for file storage
+     * @throws IllegalStateException if composite indexing is not enabled
+     * @throws IllegalArgumentException if any configured format is not registered
      */
-    public CompositeIndexingExecutionEngine(List<IndexingExecutionEngine<?, ?>> engines, String primaryFormatName) {
-        this.engines = List.copyOf(Objects.requireNonNull(engines, "engines must not be null"));
-        Objects.requireNonNull(primaryFormatName, "primaryFormatName must not be null");
+    public CompositeIndexingExecutionEngine(
+        Map<String, DataFormatPlugin> dataFormatPlugins,
+        IndexSettings indexSettings,
+        MapperService mapperService,
+        ShardPath shardPath
+    ) {
+        Objects.requireNonNull(dataFormatPlugins, "dataFormatPlugins must not be null");
+        Objects.requireNonNull(indexSettings, "indexSettings must not be null");
 
-        IndexingExecutionEngine<?, ?> foundPrimary = null;
-        for (IndexingExecutionEngine<?, ?> engine : this.engines) {
-            if (engine.getDataFormat().name().equals(primaryFormatName)) {
-                foundPrimary = engine;
-                break;
+        Settings settings = indexSettings.getSettings();
+        boolean compositeEnabled = CompositeEnginePlugin.COMPOSITE_ENABLED.get(settings);
+        if (compositeEnabled == false) {
+            throw new IllegalStateException(
+                "Composite indexing is not enabled for index [" + indexSettings.getIndex().getName() + "]"
+            );
+        }
+
+        String primaryFormatName = CompositeEnginePlugin.PRIMARY_DATA_FORMAT.get(settings);
+        List<String> secondaryFormatNames = CompositeEnginePlugin.SECONDARY_DATA_FORMATS.get(settings);
+
+        validateFormatsRegistered(dataFormatPlugins, primaryFormatName, secondaryFormatNames);
+
+        DataFormatPlugin primaryPlugin = dataFormatPlugins.get(primaryFormatName);
+        this.primaryEngine = primaryPlugin.indexingEngine(mapperService, shardPath, indexSettings);
+
+        List<IndexingExecutionEngine<?, ?>> secondaries = new ArrayList<>();
+        for (String secondaryName : secondaryFormatNames) {
+            if (secondaryName.equals(primaryFormatName)) {
+                logger.warn("Secondary data format [{}] is the same as primary, skipping duplicate", secondaryName);
+                continue;
             }
+            DataFormatPlugin secondaryPlugin = dataFormatPlugins.get(secondaryName);
+            secondaries.add(secondaryPlugin.indexingEngine(mapperService, shardPath, indexSettings));
         }
-        if (foundPrimary == null) {
-            throw new IllegalArgumentException("No engine found matching primary format name [" + primaryFormatName + "]");
-        }
-        this.primaryEngine = foundPrimary;
+        this.secondaryEngines = List.copyOf(secondaries);
+
+        List<IndexingExecutionEngine<?, ?>> all = new ArrayList<>();
+        all.add(this.primaryEngine);
+        all.addAll(this.secondaryEngines);
+        this.allEngines = List.copyOf(all);
 
         List<DataFormat> allFormats = new ArrayList<>();
-        for (IndexingExecutionEngine<?, ?> engine : this.engines) {
+        for (IndexingExecutionEngine<?, ?> engine : this.allEngines) {
             allFormats.add(engine.getDataFormat());
         }
-        this.compositeDataFormat = new CompositeDataFormat(allFormats, foundPrimary.getDataFormat());
+        this.compositeDataFormat = new CompositeDataFormat(allFormats, this.primaryEngine.getDataFormat());
+    }
+
+    /**
+     * Validates that the primary and all secondary data format plugins are registered.
+     *
+     * @param dataFormatPlugins the discovered data format plugins keyed by format name
+     * @param primaryFormatName the configured primary format name
+     * @param secondaryFormatNames the configured secondary format names
+     * @throws IllegalArgumentException if any configured format is not registered
+     */
+    static void validateFormatsRegistered(
+        Map<String, DataFormatPlugin> dataFormatPlugins,
+        String primaryFormatName,
+        List<String> secondaryFormatNames
+    ) {
+        if (dataFormatPlugins.containsKey(primaryFormatName) == false) {
+            throw new IllegalArgumentException(
+                "Primary data format ["
+                    + primaryFormatName
+                    + "] is not registered on this node. Available formats: "
+                    + dataFormatPlugins.keySet()
+            );
+        }
+        for (String secondaryName : secondaryFormatNames) {
+            if (secondaryName.equals(primaryFormatName)) {
+                continue;
+            }
+            if (dataFormatPlugins.containsKey(secondaryName) == false) {
+                throw new IllegalArgumentException(
+                    "Secondary data format ["
+                        + secondaryName
+                        + "] is not registered on this node. Available formats: "
+                        + dataFormatPlugins.keySet()
+                );
+            }
+        }
     }
 
     @Override
     public Writer<CompositeDocumentInput> createWriter(long writerGeneration) {
         Map<DataFormat, Writer<?>> writerMap = new LinkedHashMap<>();
-        for (IndexingExecutionEngine<?, ?> engine : engines) {
+        for (IndexingExecutionEngine<?, ?> engine : allEngines) {
             Writer<?> writer = engine.createWriter(writerGeneration);
             writerMap.put(engine.getDataFormat(), writer);
         }
@@ -99,7 +176,7 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
     @Override
     public RefreshResult refresh(RefreshInput refreshInput) throws IOException {
         List<Segment> allSegments = new ArrayList<>();
-        for (IndexingExecutionEngine<?, ?> engine : engines) {
+        for (IndexingExecutionEngine<?, ?> engine : allEngines) {
             RefreshResult result = engine.refresh(refreshInput);
             allSegments.addAll(result.refreshedSegments());
         }
@@ -107,14 +184,14 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
     }
 
     @Override
-    public DataFormat getDataFormat() {
+    public CompositeDataFormat getDataFormat() {
         return compositeDataFormat;
     }
 
     @Override
     public long getNativeBytesUsed() {
         long total = 0;
-        for (IndexingExecutionEngine<?, ?> engine : engines) {
+        for (IndexingExecutionEngine<?, ?> engine : allEngines) {
             total += engine.getNativeBytesUsed();
         }
         return total;
@@ -122,7 +199,7 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
 
     @Override
     public void deleteFiles(Map<String, Collection<String>> filesToDelete) throws IOException {
-        for (IndexingExecutionEngine<?, ?> engine : engines) {
+        for (IndexingExecutionEngine<?, ?> engine : allEngines) {
             engine.deleteFiles(filesToDelete);
         }
     }
@@ -130,10 +207,37 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
     @Override
     public CompositeDocumentInput newDocumentInput() {
         Map<DataFormat, DocumentInput<?>> inputMap = new HashMap<>();
-        for (IndexingExecutionEngine<?, ?> engine : engines) {
+        for (IndexingExecutionEngine<?, ?> engine : allEngines) {
             DocumentInput<?> input = engine.newDocumentInput();
             inputMap.put(engine.getDataFormat(), input);
         }
         return new CompositeDocumentInput(inputMap);
+    }
+
+    /**
+     * Returns the primary indexing execution engine.
+     *
+     * @return the primary engine
+     */
+    public IndexingExecutionEngine<?, ?> getPrimaryEngine() {
+        return primaryEngine;
+    }
+
+    /**
+     * Returns an unmodifiable list of secondary indexing execution engines.
+     *
+     * @return the secondary engines
+     */
+    public List<IndexingExecutionEngine<?, ?>> getSecondaryEngines() {
+        return secondaryEngines;
+    }
+
+    /**
+     * Returns an unmodifiable list of all engines (primary first, then secondaries).
+     *
+     * @return all engines
+     */
+    public List<IndexingExecutionEngine<?, ?>> getAllEngines() {
+        return allEngines;
     }
 }

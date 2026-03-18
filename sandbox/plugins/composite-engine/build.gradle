@@ -12,6 +12,7 @@ opensearchplugin {
 }
 
 dependencies {
+  api project(':sandbox:libs:composite-engine-lib')
   compileOnly project(':server')
   testImplementation project(':test:framework')
 }

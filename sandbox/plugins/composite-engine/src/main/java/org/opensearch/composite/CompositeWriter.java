@@ -22,6 +22,10 @@ import java.io.IOException;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * A composite {@link Writer} that wraps one {@link Writer} per registered data format
@@ -35,10 +39,10 @@ import java.util.Objects;
  * @opensearch.experimental
  */
 @ExperimentalApi
-public class CompositeWriter implements Writer<CompositeDocumentInput> {
+public class CompositeWriter implements Writer<CompositeDocumentInput>, Lock {
 
     private static final Logger logger = LogManager.getLogger(CompositeWriter.class);
-
+    private final ReentrantLock lock;
     private final Map<DataFormat, Writer<?>> writers;
 
     /**
@@ -48,13 +52,14 @@ public class CompositeWriter implements Writer<CompositeDocumentInput> {
      */
     public CompositeWriter(Map<DataFormat, Writer<?>> writers) {
         this.writers = Collections.unmodifiableMap(Objects.requireNonNull(writers, "writers must not be null"));
+        this.lock = new ReentrantLock();
     }
 
     @SuppressWarnings("unchecked")
     @Override
     public WriteResult addDoc(CompositeDocumentInput doc) throws IOException {
         Map<DataFormat, Object> perFormatInputs = doc.getFinalInput();
-        WriteResult lastResult = null;
+        WriteResult lastResult;
         for (Map.Entry<DataFormat, Writer<?>> entry : writers.entrySet()) {
             DataFormat format = entry.getKey();
             Writer<?> writer = entry.getValue();
@@ -64,12 +69,18 @@ public class CompositeWriter implements Writer<CompositeDocumentInput> {
                 continue;
             }
             lastResult = ((Writer<DocumentInput<?>>) writer).addDoc((DocumentInput<?>) input);
-            if (lastResult.success() == false) {
-                return lastResult;
+
+            switch (lastResult) {
+                case WriteResult.Success s -> logger.debug("Successfully added document [{}] in [{}]", s, format);
+                case WriteResult.Failure f -> {
+                    logger.debug("Failed to add document [{}] in [{}]", f, format);
+                    return lastResult;
+                }
             }
         }
+
         if (lastResult == null) {
-            return new WriteResult(true, null, -1L, -1L, -1L);
+            return new WriteResult.Success(false, null, -1L);
         }
         return lastResult;
     }
@@ -100,5 +111,35 @@ public class CompositeWriter implements Writer<CompositeDocumentInput> {
                 logger.warn(new ParameterizedMessage("Failed to close per-format Writer for format [{}]", entry.getKey().name()), e);
             }
         }
+    }
+
+    @Override
+    public void lock() {
+        lock.lock();
+    }
+
+    @Override
+    public void lockInterruptibly() throws InterruptedException {
+        lock.lockInterruptibly();
+    }
+
+    @Override
+    public boolean tryLock() {
+        return lock.tryLock();
+    }
+
+    @Override
+    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException {
+        return lock.tryLock(time, unit);
+    }
+
+    @Override
+    public void unlock() {
+        lock.unlock();
+    }
+
+    @Override
+    public Condition newCondition() {
+        throw new UnsupportedOperationException();
     }
 }
