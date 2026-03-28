@@ -31,9 +31,11 @@ import java.util.function.Supplier;
  */
 public final class LockablePool<T extends Lockable> implements Iterable<T>, Closeable {
 
-    private final Set<T> items;
-    private final LockableConcurrentQueue<T> availableItems;
+    private volatile Set<T> items;
+    private volatile LockableConcurrentQueue<T> availableItems;
     private final Supplier<T> itemSupplier;
+    private final Supplier<Queue<T>> queueSupplier;
+    private final int concurrency;
     private volatile boolean closed;
 
     /**
@@ -46,6 +48,8 @@ public final class LockablePool<T extends Lockable> implements Iterable<T>, Clos
     public LockablePool(Supplier<T> itemSupplier, Supplier<Queue<T>> queueSupplier, int concurrency) {
         this.items = Collections.newSetFromMap(new IdentityHashMap<>());
         this.itemSupplier = Objects.requireNonNull(itemSupplier, "itemSupplier must not be null");
+        this.queueSupplier = Objects.requireNonNull(queueSupplier, "queueSupplier must not be null");
+        this.concurrency = concurrency;
         this.availableItems = new LockableConcurrentQueue<>(queueSupplier, concurrency);
     }
 
@@ -70,39 +74,52 @@ public final class LockablePool<T extends Lockable> implements Iterable<T>, Clos
     }
 
     /**
-     * Releases the given item back to this pool for reuse.
+     * Releases the given item back to this pool for reuse. If the item belongs to a previous
+     * generation (swapped out during {@link #checkoutAll()}), it is silently unlocked and
+     * discarded since the checkout caller owns it.
      *
      * @param item the item to release
      */
     public void releaseAndUnlock(T item) {
-        assert isRegistered(item) : "Pool doesn't know about this item";
+        if (isRegistered(item) == false) {
+            // Item belongs to a previous generation swapped out during checkoutAll().
+            // Just unlock it — the checkout caller owns it now.
+            item.unlock();
+            return;
+        }
         availableItems.addAndUnlock(item);
     }
 
     /**
-     * Lock and checkout all items from the pool.
+     * Atomically swaps the pool's item set and queue with fresh instances, then waits for
+     * any in-flight operations on the old items to complete. This minimizes the time the pool
+     * lock is held — callers of {@link #getAndLock()} see the new empty pool immediately and
+     * can create fresh items without waiting for the checkout to finish.
      *
-     * @return unmodifiable list of all items locked by current thread
+     * @return unmodifiable list of all checked-out items
      * @throws IllegalStateException if the pool is closed
      */
     public List<T> checkoutAll() {
         ensureOpen();
-        List<T> lockedItems = new ArrayList<>();
-        List<T> checkedOutItems = new ArrayList<>();
-        for (T item : this) {
-            item.lock();
-            lockedItems.add(item);
-        }
+
+        // Step 1: Atomic swap — hold pool lock only for the reference swap.
+        Set<T> oldItems;
         synchronized (this) {
-            for (T item : lockedItems) {
-                try {
-                    if (isRegistered(item) && items.remove(item)) {
-                        availableItems.remove(item);
-                        checkedOutItems.add(item);
-                    }
-                } finally {
-                    item.unlock();
-                }
+            oldItems = this.items;
+            this.items = Collections.newSetFromMap(new IdentityHashMap<>());
+            this.availableItems = new LockableConcurrentQueue<>(queueSupplier, concurrency);
+        }
+        // Pool lock released — concurrent getAndLock() calls proceed immediately with fresh pool.
+
+        // Step 2: Wait for in-flight operations on old items to complete.
+        // No pool lock held here, so no contention with concurrent callers.
+        List<T> checkedOutItems = new ArrayList<>(oldItems.size());
+        for (T item : oldItems) {
+            item.lock();
+            try {
+                checkedOutItems.add(item);
+            } finally {
+                item.unlock();
             }
         }
         return Collections.unmodifiableList(checkedOutItems);
