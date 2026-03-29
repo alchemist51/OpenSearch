@@ -31,11 +31,9 @@ import java.util.function.Supplier;
  */
 public final class LockablePool<T extends Lockable> implements Iterable<T>, Closeable {
 
-    private volatile Set<T> items;
-    private volatile LockableConcurrentQueue<T> availableItems;
+    private final Set<T> items;
+    private final LockableConcurrentQueue<T> availableItems;
     private final Supplier<T> itemSupplier;
-    private final Supplier<Queue<T>> queueSupplier;
-    private final int concurrency;
     private volatile boolean closed;
 
     /**
@@ -48,8 +46,6 @@ public final class LockablePool<T extends Lockable> implements Iterable<T>, Clos
     public LockablePool(Supplier<T> itemSupplier, Supplier<Queue<T>> queueSupplier, int concurrency) {
         this.items = Collections.newSetFromMap(new IdentityHashMap<>());
         this.itemSupplier = Objects.requireNonNull(itemSupplier, "itemSupplier must not be null");
-        this.queueSupplier = Objects.requireNonNull(queueSupplier, "queueSupplier must not be null");
-        this.concurrency = concurrency;
         this.availableItems = new LockableConcurrentQueue<>(queueSupplier, concurrency);
     }
 
@@ -74,54 +70,64 @@ public final class LockablePool<T extends Lockable> implements Iterable<T>, Clos
     }
 
     /**
-     * Releases the given item back to this pool for reuse. If the item belongs to a previous
-     * generation (swapped out during {@link #checkoutAll()}), it is silently unlocked and
-     * discarded since the checkout caller owns it.
+     * Releases the given item back to this pool for reuse.
      *
      * @param item the item to release
      */
     public void releaseAndUnlock(T item) {
-        if (isRegistered(item) == false) {
-            // Item belongs to a previous generation swapped out during checkoutAll().
-            // Just unlock it — the checkout caller owns it now.
-            item.unlock();
-            return;
-        }
+        assert isRegistered(item) : "Pool doesn't know about this item";
         availableItems.addAndUnlock(item);
     }
 
     /**
-     * Atomically swaps the pool's item set and queue with fresh instances, then waits for
-     * any in-flight operations on the old items to complete. This minimizes the time the pool
-     * lock is held — callers of {@link #getAndLock()} see the new empty pool immediately and
-     * can create fresh items without waiting for the checkout to finish.
+     * Lock and checkout all items from the pool.
+     * <p>
+     * Phase 1: Snapshot the items set under the pool lock.
+     * Phase 2: Lock each item outside the monitor to avoid holding it while blocking on in-flight operations.
+     * Phase 3: Remove checked-out items from the set and bulk-remove from the queue in a single pass.
      *
-     * @return unmodifiable list of all checked-out items
+     * @return unmodifiable list of all items locked by current thread
      * @throws IllegalStateException if the pool is closed
      */
     public List<T> checkoutAll() {
         ensureOpen();
 
-        // Step 1: Atomic swap — hold pool lock only for the reference swap.
-        Set<T> oldItems;
+        // Phase 1: Snapshot
+        List<T> snapshot;
         synchronized (this) {
-            oldItems = this.items;
-            this.items = Collections.newSetFromMap(new IdentityHashMap<>());
-            this.availableItems = new LockableConcurrentQueue<>(queueSupplier, concurrency);
+            if (items.isEmpty()) {
+                return Collections.emptyList();
+            }
+            snapshot = new ArrayList<>(items.size());
+            snapshot.addAll(items);
         }
-        // Pool lock released — concurrent getAndLock() calls proceed immediately with fresh pool.
 
-        // Step 2: Wait for in-flight operations on old items to complete.
-        // No pool lock held here, so no contention with concurrent callers.
-        List<T> checkedOutItems = new ArrayList<>(oldItems.size());
-        for (T item : oldItems) {
+        // Phase 2: Lock outside monitor
+        for (T item : snapshot) {
             item.lock();
-            try {
-                checkedOutItems.add(item);
-            } finally {
-                item.unlock();
+        }
+
+        // Phase 3: Process + bulk cleanup
+        List<T> checkedOutItems = new ArrayList<>(snapshot.size());
+        synchronized (this) {
+            Set<T> toRemoveFromQueue = Collections.newSetFromMap(new IdentityHashMap<>(snapshot.size()));
+
+            for (T item : snapshot) {
+                try {
+                    if (items.remove(item)) {
+                        toRemoveFromQueue.add(item);
+                        checkedOutItems.add(item);
+                    }
+                } finally {
+                    item.unlock();
+                }
+            }
+
+            if (toRemoveFromQueue.isEmpty() == false) {
+                availableItems.removeIf(toRemoveFromQueue::contains);
             }
         }
+
         return Collections.unmodifiableList(checkedOutItems);
     }
 

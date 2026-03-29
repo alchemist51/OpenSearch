@@ -137,4 +137,24 @@ public final class ConcurrentQueue<T> {
         }
         return false;
     }
+
+    /**
+     * Removes all entries matching the given predicate in a single pass across all stripes.
+     * Each stripe is locked once, and all matching entries within that stripe are removed
+     * before moving to the next stripe.
+     *
+     * @param predicate the condition for removal
+     */
+    void removeIf(Predicate<T> predicate) {
+        for (int i = 0; i < concurrency; ++i) {
+            final Lock lock = locks[i];
+            final Queue<T> queue = queues[i];
+            lock.lock();
+            try {
+                queue.removeIf(predicate);
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
 }

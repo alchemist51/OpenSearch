@@ -10,6 +10,7 @@ package org.opensearch.common.queue;
 
 import java.util.Queue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 /**
@@ -64,6 +65,15 @@ public final class LockableConcurrentQueue<T extends Lockable> {
      */
     public boolean remove(T entry) {
         return queue.remove(entry);
+    }
+
+    /**
+     * Removes all entries matching the given predicate in a single pass across all stripes.
+     *
+     * @param predicate the condition for removal
+     */
+    public void removeIf(Predicate<T> predicate) {
+        queue.removeIf(predicate);
     }
 
     /**
