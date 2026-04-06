@@ -8,9 +8,18 @@
 
 package org.opensearch.be.lucene;
 
+import org.opensearch.common.settings.Settings;
+import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.exec.commit.Committer;
+import org.opensearch.index.engine.exec.commit.CommitterSettings;
+import org.opensearch.index.shard.ShardPath;
+import org.opensearch.test.IndexSettingsModule;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Optional;
 
 /**
@@ -24,11 +33,20 @@ public class LuceneSearchEnginePluginTests extends OpenSearchTestCase {
      *
      * Validates: Requirements 4.2
      */
-    public void testGetCommitterReturnsLuceneCommitter() {
+    public void testGetCommitterReturnsLuceneCommitter() throws IOException {
+        Path baseDir = createTempDir();
+        ShardId shardId = new ShardId("test", "_na_", 0);
+        Path dataPath = baseDir.resolve(shardId.getIndex().getUUID()).resolve(Integer.toString(shardId.id()));
+        Files.createDirectories(dataPath);
+        ShardPath shardPath = new ShardPath(false, dataPath, dataPath, shardId);
+        IndexSettings indexSettings = IndexSettingsModule.newIndexSettings("test", Settings.EMPTY);
+        CommitterSettings committerSettings = new CommitterSettings(shardPath, indexSettings);
+
         LuceneSearchEnginePlugin plugin = new LuceneSearchEnginePlugin();
-        Optional<Committer> committer = plugin.getCommitter(null);
+        Optional<Committer> committer = plugin.getCommitter(committerSettings);
 
         assertTrue("getCommitter() should return a non-empty Optional", committer.isPresent());
         assertTrue("getCommitter() should return a LuceneCommitter instance", committer.get() instanceof LuceneCommitter);
+        committer.get().close();
     }
 }

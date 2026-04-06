@@ -12,10 +12,10 @@ import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
-import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.exec.EngineReaderManager;
 import org.opensearch.index.engine.exec.commit.Committer;
+import org.opensearch.index.engine.exec.commit.CommitterSettings;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.SearchBackEndPlugin;
@@ -42,6 +42,8 @@ import java.util.Optional;
 @ExperimentalApi
 public class LuceneSearchEnginePlugin implements SearchBackEndPlugin<OpenSearchDirectoryReader>, EnginePlugin {
 
+    private LuceneCommitter luceneCommitter;
+
     /** Creates a new LuceneSearchEnginePlugin. */
     public LuceneSearchEnginePlugin() {}
 
@@ -53,16 +55,17 @@ public class LuceneSearchEnginePlugin implements SearchBackEndPlugin<OpenSearchD
     // --- SearchBackEndPlugin ---
 
     @Override
-    public EngineReaderManager<OpenSearchDirectoryReader> createReaderManager(Committer committer, DataFormat format, ShardPath shardPath)
+    public EngineReaderManager<OpenSearchDirectoryReader> createReaderManager(DataFormat format, ShardPath shardPath)
         throws IOException {
-        if (committer instanceof LuceneCommitter) {
-            IndexWriter writer = ((LuceneCommitter) committer).getIndexWriter();
-            if (writer != null) {
-                OpenSearchDirectoryReader osReader = OpenSearchDirectoryReader.wrap(DirectoryReader.open(writer), shardPath.getShardId());
-                return new LuceneReaderManager(format, osReader);
-            }
+        if (luceneCommitter == null) {
+            throw new IllegalStateException("getCommitter() must be called before createReaderManager()");
         }
-        throw new IllegalStateException("Cannot create LuceneReaderManager without an initialized LuceneCommitter");
+        IndexWriter writer = luceneCommitter.getIndexWriter();
+        if (writer == null) {
+            throw new IllegalStateException("LuceneCommitter not initialized");
+        }
+        OpenSearchDirectoryReader osReader = OpenSearchDirectoryReader.wrap(DirectoryReader.open(writer), shardPath.getShardId());
+        return new LuceneReaderManager(format, osReader);
     }
 
     @Override
@@ -73,7 +76,12 @@ public class LuceneSearchEnginePlugin implements SearchBackEndPlugin<OpenSearchD
     // --- EnginePlugin ---
 
     @Override
-    public Optional<Committer> getCommitter(IndexSettings indexSettings) {
-        return Optional.of(new LuceneCommitter());
+    public Optional<Committer> getCommitter(CommitterSettings committerSettings) {
+        try {
+            this.luceneCommitter = new LuceneCommitter(committerSettings);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to create LuceneCommitter", e);
+        }
+        return Optional.of(luceneCommitter);
     }
 }

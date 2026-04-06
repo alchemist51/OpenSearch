@@ -25,9 +25,6 @@ public class CommitterTests extends OpenSearchTestCase {
     private static Committer noOpCommitter() {
         return new Committer() {
             @Override
-            public void init(CommitterSettings settings) throws IOException {}
-
-            @Override
             public void commit(Map<String, String> commitData) throws IOException {}
 
             @Override
@@ -58,9 +55,6 @@ public class CommitterTests extends OpenSearchTestCase {
     public void testCloseFromCloseableIsCallable() throws IOException {
         AtomicBoolean closed = new AtomicBoolean(false);
         Committer committer = new Committer() {
-            @Override
-            public void init(CommitterSettings settings) {}
-
             @Override
             public void commit(Map<String, String> commitData) {}
 
@@ -93,9 +87,6 @@ public class CommitterTests extends OpenSearchTestCase {
         AtomicBoolean closed = new AtomicBoolean(false);
         try (Committer committer = new Committer() {
             @Override
-            public void init(CommitterSettings settings) {}
-
-            @Override
             public void commit(Map<String, String> commitData) {}
 
             @Override
@@ -123,46 +114,9 @@ public class CommitterTests extends OpenSearchTestCase {
         assertTrue("close() should have been called by try-with-resources", closed.get());
     }
 
-    public void testInitIsCallable() throws IOException {
-        AtomicBoolean initialized = new AtomicBoolean(false);
-        Committer committer = new Committer() {
-            @Override
-            public void init(CommitterSettings settings) {
-                initialized.set(true);
-            }
-
-            @Override
-            public void commit(Map<String, String> commitData) {}
-
-            @Override
-            public void close() {}
-
-            @Override
-            public Map<String, String> getLastCommittedData() {
-                return Map.of();
-            }
-
-            @Override
-            public CommitStats getCommitStats() {
-                return null;
-            }
-
-            @Override
-            public SafeCommitInfo getSafeCommitInfo() {
-                return SafeCommitInfo.EMPTY;
-            }
-        };
-
-        committer.init(null);
-        assertTrue("init() should have been called", initialized.get());
-    }
-
     public void testCommitIsCallable() throws IOException {
         AtomicBoolean committed = new AtomicBoolean(false);
         Committer committer = new Committer() {
-            @Override
-            public void init(CommitterSettings settings) {}
-
             @Override
             public void commit(Map<String, String> commitData) {
                 committed.set(true);

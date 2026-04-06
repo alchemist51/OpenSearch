@@ -34,7 +34,7 @@ import java.util.Map;
  * <p>
  * Responsibilities:
  * <ul>
- *   <li>{@link #init} — opens the IndexWriter on the shard's Lucene directory</li>
+ *   <li>Constructor — opens the IndexWriter on the shard's Lucene directory</li>
  *   <li>{@link #commit} — serializes the CatalogSnapshot as Lucene commit userData</li>
  *   <li>{@link #close} — closes the IndexWriter</li>
  * </ul>
@@ -55,11 +55,13 @@ public class LuceneCommitter implements Committer {
 
     private IndexWriter indexWriter;
 
-    /** Creates a new LuceneCommitter. */
-    public LuceneCommitter() {}
-
-    @Override
-    public void init(CommitterSettings settings) throws IOException {
+    /**
+     * Creates a new LuceneCommitter and immediately opens the IndexWriter.
+     *
+     * @param settings the committer settings (shard path, index settings, optional engine config)
+     * @throws IOException if the IndexWriter cannot be opened
+     */
+    public LuceneCommitter(CommitterSettings settings) throws IOException {
         Path luceneDir = settings.shardPath().getDataPath().resolve(LUCENE_DIR_NAME);
         Files.createDirectories(luceneDir);
         Directory directory = FSDirectory.open(luceneDir);

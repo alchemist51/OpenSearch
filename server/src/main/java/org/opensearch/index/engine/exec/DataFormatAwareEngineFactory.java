@@ -11,7 +11,6 @@ package org.opensearch.index.engine.exec;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.engine.DataFormatAwareEngine;
 import org.opensearch.index.engine.dataformat.DataFormat;
-import org.opensearch.index.engine.exec.commit.Committer;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.plugins.PluginsService;
 import org.opensearch.plugins.SearchBackEndPlugin;
@@ -45,18 +44,16 @@ public class DataFormatAwareEngineFactory {
 
     /**
      * Creates reader managers for all discovered search back-end plugins.
-     * The {@link Committer} is passed through so plugins can access the backing store.
      *
-     * @param committer the committer holding the backing store, or null if not available
      * @return a map of data format to reader manager
      * @throws IOException if reader manager creation fails
      */
     @SuppressWarnings("unchecked")
-    public Map<DataFormat, EngineReaderManager<?>> createReaderManagers(Committer committer) throws IOException {
+    public Map<DataFormat, EngineReaderManager<?>> createReaderManagers() throws IOException {
         Map<DataFormat, EngineReaderManager<?>> readerManagers = new HashMap<>();
         for (SearchBackEndPlugin<?> plugin : searchBackEndPlugins) {
             for (DataFormat format : plugin.getSupportedFormats()) {
-                readerManagers.put(format, plugin.createReaderManager(committer, format, shardPath));
+                readerManagers.put(format, plugin.createReaderManager(format, shardPath));
             }
         }
         return readerManagers;

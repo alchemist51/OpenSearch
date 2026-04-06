@@ -10,7 +10,6 @@ package org.opensearch.index.engine.dataformat.stub;
 
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.exec.EngineReaderManager;
-import org.opensearch.index.engine.exec.commit.Committer;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.plugins.SearchBackEndPlugin;
 
@@ -34,7 +33,7 @@ public class MockSearchBackEndPlugin implements SearchBackEndPlugin<Object> {
     }
 
     @Override
-    public EngineReaderManager<?> createReaderManager(Committer committer, DataFormat format, ShardPath shardPath) {
+    public EngineReaderManager<?> createReaderManager(DataFormat format, ShardPath shardPath) {
         return new MockReaderManager("mock-columnar");
     }
 }

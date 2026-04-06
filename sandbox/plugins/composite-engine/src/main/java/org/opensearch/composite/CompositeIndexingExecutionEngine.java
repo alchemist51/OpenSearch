@@ -27,7 +27,6 @@ import org.opensearch.index.engine.dataformat.Writer;
 import org.opensearch.index.engine.exec.Segment;
 import org.opensearch.index.engine.exec.WriterFileSet;
 import org.opensearch.index.engine.exec.commit.Committer;
-import org.opensearch.index.engine.exec.commit.CommitterSettings;
 import org.opensearch.index.engine.exec.coord.CatalogSnapshot;
 import org.opensearch.index.engine.exec.coord.CatalogSnapshotManager;
 import org.opensearch.index.mapper.MapperService;
@@ -136,11 +135,6 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
         );
 
         this.committer = committer;
-        try {
-            committer.init(new CommitterSettings(shardPath, indexSettings));
-        } catch (IOException e) {
-            throw new RuntimeException("Failed to initialize committer", e);
-        }
     }
 
     /**
@@ -217,7 +211,18 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
 
         // Flush each writer to disk and build segments from the file infos
         for (CompositeWriter writer : dataFormatWriters) {
-            FileInfos fileInfos = writer.flush();
+            FileInfos fileInfos;
+            try {
+                fileInfos = writer.flush();
+            } catch (IOException e) {
+                logger.error(
+                    "Writer gen={} flush failed - aborting writer and skipping its segments",
+                    writer.getWriterGeneration(), e
+                );
+                writer.abort();
+                writer.close();
+                continue;
+            }
             Segment.Builder segmentBuilder = Segment.builder(writer.getWriterGeneration());
             boolean hasFiles = false;
             for (Map.Entry<DataFormat, WriterFileSet> entry : fileInfos.writerFilesMap().entrySet()) {

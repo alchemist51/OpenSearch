@@ -17,7 +17,6 @@ import org.opensearch.index.engine.SafeCommitInfo;
 import org.opensearch.index.engine.dataformat.DataFormatPlugin;
 import org.opensearch.index.engine.dataformat.RefreshInput;
 import org.opensearch.index.engine.exec.commit.Committer;
-import org.opensearch.index.engine.exec.commit.CommitterSettings;
 import org.opensearch.index.engine.exec.coord.CatalogSnapshotManager;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -180,15 +179,8 @@ public class CompositeIndexingExecutionEngineTests extends OpenSearchTestCase {
         engine.deleteFiles(Map.of());
     }
 
-    // --- Task 8.5: Property test — Committer is required ---
+    // --- Committer is required ---
 
-    /**
-     * Property 2: Committer is required.
-     * Attempting to construct CompositeIndexingExecutionEngine with a null Committer
-     * must throw IllegalStateException.
-     *
-     * Validates: Requirements 3.2
-     */
     public void testConstructorThrowsWhenCommitterNull() {
         Map<String, DataFormatPlugin> plugins = new HashMap<>();
         plugins.put("lucene", CompositeTestHelper.stubPlugin("lucene", 1));
@@ -201,14 +193,8 @@ public class CompositeIndexingExecutionEngineTests extends OpenSearchTestCase {
         assertTrue(ex.getMessage().contains("Committer must not be null"));
     }
 
-    // --- Task 8.6: Property test — Refresh never calls Committer methods ---
+    // --- Refresh never calls Committer methods ---
 
-    /**
-     * Property 5: Refresh never calls Committer methods.
-     * Running refresh() on the composite engine must not invoke commit() on the Committer.
-     *
-     * Validates: Requirements 3.6
-     */
     public void testRefreshNeverCallsCommitterMethods() throws IOException {
         TrackingCommitter tracking = new TrackingCommitter();
         Map<String, DataFormatPlugin> plugins = new HashMap<>();
@@ -217,7 +203,6 @@ public class CompositeIndexingExecutionEngineTests extends OpenSearchTestCase {
 
         CompositeIndexingExecutionEngine engine = new CompositeIndexingExecutionEngine(plugins, indexSettings, null, null, tracking);
 
-        // Reset tracking after construction (init is called during construction)
         tracking.commitCalled = false;
 
         RefreshInput refreshInput = RefreshInput.builder().build();
@@ -226,17 +211,7 @@ public class CompositeIndexingExecutionEngineTests extends OpenSearchTestCase {
         assertFalse("commit() must not be called during refresh", tracking.commitCalled);
     }
 
-    // --- Task 8.7: Unit tests for flush and Committer lifecycle ---
-
-    public void testInitCalledDuringConstruction() {
-        CompositeTestHelper.StubCommitter stub = new CompositeTestHelper.StubCommitter();
-        Map<String, DataFormatPlugin> plugins = new HashMap<>();
-        plugins.put("lucene", CompositeTestHelper.stubPlugin("lucene", 1));
-        IndexSettings indexSettings = createIndexSettings("lucene");
-
-        new CompositeIndexingExecutionEngine(plugins, indexSettings, null, null, stub);
-        assertTrue("init() must be called during construction", stub.initCalled);
-    }
+    // --- Committer lifecycle tests ---
 
     public void testCloseCalledDuringShutdown() {
         CompositeTestHelper.StubCommitter stub = new CompositeTestHelper.StubCommitter();
@@ -249,51 +224,8 @@ public class CompositeIndexingExecutionEngineTests extends OpenSearchTestCase {
         assertTrue("close() must be called during shutdown", stub.closeCalled);
     }
 
-    public void testInitFailurePreventsConstruction() {
-        Committer failingInit = new Committer() {
-            @Override
-            public void init(CommitterSettings settings) throws IOException {
-                throw new IOException("init failed");
-            }
-
-            @Override
-            public void commit(Map<String, String> commitData) {}
-
-            @Override
-            public void close() {}
-
-            @Override
-            public Map<String, String> getLastCommittedData() {
-                return Map.of();
-            }
-
-            @Override
-            public CommitStats getCommitStats() {
-                return null;
-            }
-
-            @Override
-            public SafeCommitInfo getSafeCommitInfo() {
-                return SafeCommitInfo.EMPTY;
-            }
-        };
-
-        Map<String, DataFormatPlugin> plugins = new HashMap<>();
-        plugins.put("lucene", CompositeTestHelper.stubPlugin("lucene", 1));
-        IndexSettings indexSettings = createIndexSettings("lucene");
-
-        RuntimeException ex = expectThrows(
-            RuntimeException.class,
-            () -> new CompositeIndexingExecutionEngine(plugins, indexSettings, null, null, failingInit)
-        );
-        assertTrue(ex.getMessage().contains("Failed to initialize committer"));
-    }
-
     public void testCloseFailureIsLoggedAndShutdownContinues() {
         Committer failingClose = new Committer() {
-            @Override
-            public void init(CommitterSettings settings) {}
-
             @Override
             public void commit(Map<String, String> commitData) {}
 
@@ -347,9 +279,6 @@ public class CompositeIndexingExecutionEngineTests extends OpenSearchTestCase {
     public void testFlushPropagatesIOExceptionFromCommit() {
         Committer failingCommit = new Committer() {
             @Override
-            public void init(CommitterSettings settings) {}
-
-            @Override
             public void commit(Map<String, String> commitData) throws IOException {
                 throw new IOException("commit failed");
             }
@@ -397,15 +326,9 @@ public class CompositeIndexingExecutionEngineTests extends OpenSearchTestCase {
      * A Committer that tracks which methods were called, for test assertions.
      */
     private static class TrackingCommitter implements Committer {
-        boolean initCalled = false;
         boolean commitCalled = false;
         boolean closeCalled = false;
         Map<String, String> lastCommitData = null;
-
-        @Override
-        public void init(CommitterSettings settings) {
-            initCalled = true;
-        }
 
         @Override
         public void commit(Map<String, String> commitData) {
