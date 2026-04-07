@@ -19,6 +19,7 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.engine.CommitStats;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.SafeCommitInfo;
+import org.opensearch.index.engine.exec.IndexWriterProvider;
 import org.opensearch.index.engine.exec.commit.Committer;
 import org.opensearch.index.engine.exec.commit.CommitterSettings;
 import org.opensearch.index.seqno.SequenceNumbers;
@@ -46,7 +47,7 @@ import java.util.Map;
  * @opensearch.experimental
  */
 @ExperimentalApi
-public class LuceneCommitter implements Committer {
+public class LuceneCommitter implements Committer, IndexWriterProvider {
 
     private static final Logger logger = LogManager.getLogger(LuceneCommitter.class);
 
@@ -116,7 +117,7 @@ public class LuceneCommitter implements Committer {
      *
      * @return the IndexWriter, or null if not initialized
      */
-    IndexWriter getIndexWriter() {
+    public IndexWriter getIndexWriter() {
         return indexWriter;
     }
 

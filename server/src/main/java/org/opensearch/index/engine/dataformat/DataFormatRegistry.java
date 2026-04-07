@@ -11,9 +11,12 @@ package org.opensearch.index.engine.dataformat;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.exec.EngineReaderManager;
+import org.opensearch.index.engine.exec.IndexWriterProvider;
 import org.opensearch.index.engine.exec.commit.Committer;
+import org.opensearch.index.engine.exec.commit.CommitterSettings;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.shard.ShardPath;
+import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.PluginsService;
 import org.opensearch.plugins.SearchBackEndPlugin;
 
@@ -136,9 +139,14 @@ public class DataFormatRegistry {
 
     /**
      * Creates {@link EngineReaderManager} instances for all applicable data formats.
+     * <p>
+     * If any registered {@link SearchBackEndPlugin} also implements {@link EnginePlugin},
+     * it is queried for a {@link Committer}. When the committer implements
+     * {@link IndexWriterProvider}, it is passed to each backend so that Lucene can open
+     * NRT readers on the same IndexWriter.
      *
      * @param mapperService the mapper service (reserved for future filtering)
-     * @param indexSettings the index settings (reserved for future filtering)
+     * @param indexSettings the index settings
      * @param shardPath the shard path used to create reader managers
      * @return a map from data format to its reader manager
      * @throws IOException if reader manager creation fails
@@ -148,9 +156,25 @@ public class DataFormatRegistry {
         IndexSettings indexSettings,
         ShardPath shardPath
     ) throws IOException {
+        // Check if any SearchBackEndPlugin also provides a Committer via EnginePlugin
+        IndexWriterProvider indexWriterProvider = null;
+        CommitterSettings committerSettings = new CommitterSettings(shardPath, indexSettings);
+        for (SearchBackEndPlugin<?> plugin : readerManagerPlugins.values()) {
+            if (plugin instanceof EnginePlugin) {
+                var optCommitter = ((EnginePlugin) plugin).getCommitter(committerSettings);
+                if (optCommitter.isPresent()) {
+                    Committer committer = optCommitter.get();
+                    if (committer instanceof IndexWriterProvider) {
+                        indexWriterProvider = (IndexWriterProvider) committer;
+                    }
+                    break;
+                }
+            }
+        }
+
         Map<DataFormat, EngineReaderManager<?>> readerManagers = new HashMap<>();
         for (Map.Entry<DataFormat, SearchBackEndPlugin<?>> entry : readerManagerPlugins.entrySet()) {
-            readerManagers.put(entry.getKey(), entry.getValue().createReaderManager(entry.getKey(), shardPath));
+            readerManagers.put(entry.getKey(), entry.getValue().createReaderManager(entry.getKey(), shardPath, indexWriterProvider));
         }
         return readerManagers;
     }

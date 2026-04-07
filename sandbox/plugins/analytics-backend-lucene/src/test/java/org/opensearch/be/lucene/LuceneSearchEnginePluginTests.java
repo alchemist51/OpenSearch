@@ -27,26 +27,43 @@ import java.util.Optional;
  */
 public class LuceneSearchEnginePluginTests extends OpenSearchTestCase {
 
-    /**
-     * Test that getCommitter() returns a non-empty Optional containing
-     * a LuceneCommitter instance.
-     *
-     * Validates: Requirements 4.2
-     */
-    public void testGetCommitterReturnsLuceneCommitter() throws IOException {
+    private CommitterSettings createCommitterSettings() throws IOException {
         Path baseDir = createTempDir();
         ShardId shardId = new ShardId("test", "_na_", 0);
         Path dataPath = baseDir.resolve(shardId.getIndex().getUUID()).resolve(Integer.toString(shardId.id()));
         Files.createDirectories(dataPath);
         ShardPath shardPath = new ShardPath(false, dataPath, dataPath, shardId);
         IndexSettings indexSettings = IndexSettingsModule.newIndexSettings("test", Settings.EMPTY);
-        CommitterSettings committerSettings = new CommitterSettings(shardPath, indexSettings);
+        return new CommitterSettings(shardPath, indexSettings);
+    }
 
+    public void testGetCommitterReturnsLuceneCommitter() throws IOException {
         LuceneSearchEnginePlugin plugin = new LuceneSearchEnginePlugin();
-        Optional<Committer> committer = plugin.getCommitter(committerSettings);
+        Optional<Committer> committer = plugin.getCommitter(createCommitterSettings());
 
         assertTrue("getCommitter() should return a non-empty Optional", committer.isPresent());
         assertTrue("getCommitter() should return a LuceneCommitter instance", committer.get() instanceof LuceneCommitter);
         committer.get().close();
+    }
+
+    public void testGetCommitterReturnsNewInstancePerCall() throws IOException {
+        LuceneSearchEnginePlugin plugin = new LuceneSearchEnginePlugin();
+
+        Optional<Committer> committer1 = plugin.getCommitter(createCommitterSettings());
+        Optional<Committer> committer2 = plugin.getCommitter(createCommitterSettings());
+
+        assertNotSame("Each call should return a new instance", committer1.get(), committer2.get());
+        committer1.get().close();
+        committer2.get().close();
+    }
+
+    public void testCreateReaderManagerThrowsWithoutProvider() {
+        LuceneSearchEnginePlugin plugin = new LuceneSearchEnginePlugin();
+
+        IllegalStateException ex = expectThrows(
+            IllegalStateException.class,
+            () -> plugin.createReaderManager(null, null, null)
+        );
+        assertTrue(ex.getMessage().contains("IndexWriterProvider is required"));
     }
 }
