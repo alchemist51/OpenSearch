@@ -9,7 +9,6 @@
 package org.opensearch.index.engine;
 
 import org.opensearch.index.engine.exec.commit.Committer;
-import org.opensearch.index.engine.exec.commit.CommitterSettings;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -37,9 +36,6 @@ public class DataFormatAwareEngineCommitterTests extends OpenSearchTestCase {
     public void testSetCommitterThenGetCommitterReturnsSameInstance() {
         DataFormatAwareEngine engine = new DataFormatAwareEngine(new HashMap<>());
         Committer committer = new Committer() {
-            @Override
-            public void init(CommitterSettings settings) throws IOException {}
-
             @Override
             public void commit(Map<String, String> commitData) throws IOException {}
 

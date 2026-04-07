@@ -26,7 +26,7 @@ import java.util.Map;
  * The caller is responsible for serializing any higher-level state (e.g., CatalogSnapshot)
  * into the commit data before calling {@link #commit}.
  * <p>
- * Lifecycle: {@link #init(CommitterSettings)} is called once during engine construction,
+ * Lifecycle: implementations receive {@link CommitterSettings} at construction time,
  * {@link #commit(Map)} is called during flush, and {@link #close()} is called
  * during engine shutdown.
  *
@@ -34,15 +34,6 @@ import java.util.Map;
  */
 @ExperimentalApi
 public interface Committer extends Closeable {
-
-    /**
-     * Initializes the committer with the given settings.
-     * Called once during engine construction before any indexing operations.
-     *
-     * @param settings initialization parameters (e.g., shard path, index settings)
-     * @throws IOException if initialization fails
-     */
-    void init(CommitterSettings settings) throws IOException;
 
     /**
      * Durably commits the given data to the backing store's commit metadata.

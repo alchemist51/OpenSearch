@@ -45,9 +45,7 @@ public class LuceneIndexingExecutionEngineTests extends OpenSearchTestCase {
         ShardPath shardPath = new ShardPath(false, dataPath, dataPath, shardId);
         IndexSettings indexSettings = IndexSettingsModule.newIndexSettings("test", Settings.EMPTY);
 
-        LuceneCommitter c = new LuceneCommitter();
-        c.init(new CommitterSettings(shardPath, indexSettings));
-        return c;
+        return new LuceneCommitter(new CommitterSettings(shardPath, indexSettings));
     }
 
     @Override

@@ -12,10 +12,11 @@ import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
-import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.exec.EngineReaderManager;
+import org.opensearch.index.engine.exec.IndexWriterProvider;
 import org.opensearch.index.engine.exec.commit.Committer;
+import org.opensearch.index.engine.exec.commit.CommitterSettings;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.SearchBackEndPlugin;
@@ -33,9 +34,8 @@ import java.util.Optional;
  *   <li>{@link SearchBackEndPlugin} — provides {@link LuceneReaderManager} for search.</li>
  * </ul>
  * <p>
- * Both {@link #createReaderManager} accepts a {@link Committer}.
- * When the committer is a {@link LuceneCommitter}, the IndexWriter is extracted and shared
- * with the reader manager on a given shard.
+ * {@link #createReaderManager} uses the supplied {@link IndexWriterProvider} to obtain
+ * the shard's IndexWriter for opening NRT readers. The plugin itself holds no per-shard state.
  *
  * @opensearch.experimental
  */
@@ -53,16 +53,23 @@ public class LuceneSearchEnginePlugin implements SearchBackEndPlugin<OpenSearchD
     // --- SearchBackEndPlugin ---
 
     @Override
-    public EngineReaderManager<OpenSearchDirectoryReader> createReaderManager(Committer committer, DataFormat format, ShardPath shardPath)
-        throws IOException {
-        if (committer instanceof LuceneCommitter) {
-            IndexWriter writer = ((LuceneCommitter) committer).getIndexWriter();
-            if (writer != null) {
-                OpenSearchDirectoryReader osReader = OpenSearchDirectoryReader.wrap(DirectoryReader.open(writer), shardPath.getShardId());
-                return new LuceneReaderManager(format, osReader);
-            }
+    public EngineReaderManager<OpenSearchDirectoryReader> createReaderManager(
+        DataFormat format,
+        ShardPath shardPath,
+        IndexWriterProvider indexWriterProvider
+    ) throws IOException {
+        if (indexWriterProvider == null) {
+            throw new IllegalStateException("IndexWriterProvider is required for Lucene reader manager");
         }
-        throw new IllegalStateException("Cannot create LuceneReaderManager without an initialized LuceneCommitter");
+        IndexWriter writer = indexWriterProvider.getIndexWriter();
+        if (writer == null) {
+            throw new IllegalStateException("IndexWriterProvider returned null");
+        }
+        OpenSearchDirectoryReader osReader = OpenSearchDirectoryReader.wrap(
+            DirectoryReader.open(writer),
+            shardPath.getShardId()
+        );
+        return new LuceneReaderManager(format, osReader);
     }
 
     @Override
@@ -73,7 +80,11 @@ public class LuceneSearchEnginePlugin implements SearchBackEndPlugin<OpenSearchD
     // --- EnginePlugin ---
 
     @Override
-    public Optional<Committer> getCommitter(IndexSettings indexSettings) {
-        return Optional.of(new LuceneCommitter());
+    public Optional<Committer> getCommitter(CommitterSettings committerSettings) {
+        try {
+            return Optional.of(new LuceneCommitter(committerSettings));
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to create LuceneCommitter", e);
+        }
     }
 }

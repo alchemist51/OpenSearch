@@ -39,10 +39,8 @@ public class LuceneCommitterTests extends OpenSearchTestCase {
     }
 
     public void testInitOpensIndexWriter() throws IOException {
-        LuceneCommitter committer = new LuceneCommitter();
+        LuceneCommitter committer = new LuceneCommitter(createCommitterSettings());
         try {
-            assertNull(committer.getIndexWriter());
-            committer.init(createCommitterSettings());
             IndexWriter writer = committer.getIndexWriter();
             assertNotNull(writer);
             assertTrue(writer.isOpen());
@@ -52,8 +50,7 @@ public class LuceneCommitterTests extends OpenSearchTestCase {
     }
 
     public void testCloseReleasesIndexWriter() throws IOException {
-        LuceneCommitter committer = new LuceneCommitter();
-        committer.init(createCommitterSettings());
+        LuceneCommitter committer = new LuceneCommitter(createCommitterSettings());
         assertNotNull(committer.getIndexWriter());
 
         committer.close();
@@ -61,10 +58,8 @@ public class LuceneCommitterTests extends OpenSearchTestCase {
     }
 
     public void testCommitRoundTrip() throws IOException {
-        LuceneCommitter committer = new LuceneCommitter();
+        LuceneCommitter committer = new LuceneCommitter(createCommitterSettings());
         try {
-            committer.init(createCommitterSettings());
-
             Map<String, String> commitData = Map.of("key1", "value1", "key2", "value2", "_snapshot_", "serialized-data");
             committer.commit(commitData);
 
@@ -82,10 +77,8 @@ public class LuceneCommitterTests extends OpenSearchTestCase {
     }
 
     public void testCommitWithEmptyData() throws IOException {
-        LuceneCommitter committer = new LuceneCommitter();
+        LuceneCommitter committer = new LuceneCommitter(createCommitterSettings());
         try {
-            committer.init(createCommitterSettings());
-
             committer.commit(Map.of());
 
             Map<String, String> readBack = new HashMap<>();
@@ -100,8 +93,7 @@ public class LuceneCommitterTests extends OpenSearchTestCase {
     }
 
     public void testCommitAfterCloseThrows() throws IOException {
-        LuceneCommitter committer = new LuceneCommitter();
-        committer.init(createCommitterSettings());
+        LuceneCommitter committer = new LuceneCommitter(createCommitterSettings());
         committer.close();
 
         expectThrows(IllegalStateException.class, () -> committer.commit(Map.of("key", "value")));
