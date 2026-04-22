@@ -163,6 +163,8 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
 
         private final Parameter<String> normalizer = Parameter.stringParam("normalizer", false, m -> toType(m).normalizerName, "default");
 
+        private final Parameter<Boolean> bloomFilter = Parameter.bloomFilterParam(m -> toType(m).bloomFilter, false);
+
         private final Parameter<Boolean> splitQueriesOnWhitespace = Parameter.boolParam(
             "split_queries_on_whitespace",
             true,
@@ -220,7 +222,8 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
                 normalizer,
                 splitQueriesOnWhitespace,
                 boost,
-                meta
+                meta,
+                bloomFilter
             );
         }
 
@@ -808,6 +811,7 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
     private final boolean useSimilarity;
     private final String normalizerName;
     private final boolean splitQueriesOnWhitespace;
+    private final boolean bloomFilter;
 
     private final IndexAnalyzers indexAnalyzers;
 
@@ -832,6 +836,7 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
         this.useSimilarity = builder.useSimilarity.getValue();
         this.normalizerName = builder.normalizer.getValue();
         this.splitQueriesOnWhitespace = builder.splitQueriesOnWhitespace.getValue();
+        this.bloomFilter = builder.bloomFilter.getValue();
 
         this.indexAnalyzers = builder.indexAnalyzers;
     }

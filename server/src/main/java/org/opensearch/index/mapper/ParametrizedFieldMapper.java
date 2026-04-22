@@ -551,6 +551,10 @@ public abstract class ParametrizedFieldMapper extends FieldMapper {
             return Parameter.boolParam("doc_values", false, initializer, defaultValue);
         }
 
+        public static Parameter<Boolean> bloomFilterParam(Function<FieldMapper, Boolean> initializer, boolean defaultValue) {
+            return Parameter.boolParam("bloom_filter", false, initializer, defaultValue);
+        }
+
         public static Parameter<Float> boostParam() {
             return Parameter.floatParam("boost", true, m -> m.fieldType().boost(), 1.0f);
         }

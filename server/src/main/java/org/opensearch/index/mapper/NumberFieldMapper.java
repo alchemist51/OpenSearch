@@ -132,6 +132,7 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
 
         private final Parameter<Explicit<Boolean>> ignoreMalformed;
         private final Parameter<Explicit<Boolean>> coerce;
+        private final Parameter<Boolean> bloomFilter = Parameter.bloomFilterParam(m -> toType(m).bloomFilter, false);
 
         private final Parameter<Number> nullValue;
 
@@ -2118,6 +2119,7 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
     private final Explicit<Boolean> ignoreMalformed;
     private final Explicit<Boolean> coerce;
     private final Number nullValue;
+    private final boolean bloomFilter;
 
     private final boolean ignoreMalformedByDefault;
     private final boolean coerceByDefault;
@@ -2134,6 +2136,7 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
         this.nullValue = builder.nullValue.getValue();
         this.ignoreMalformedByDefault = builder.ignoreMalformed.getDefaultValue().value();
         this.coerceByDefault = builder.coerce.getDefaultValue().value();
+        this.bloomFilter = builder.bloomFilter.getValue();
     }
 
     boolean coerce() {
