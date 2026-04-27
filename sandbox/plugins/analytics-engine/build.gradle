@@ -91,6 +91,10 @@ dependencies {
   // (analytics-backend-datafusion) see it via the extendedPlugins classloader.
   runtimeOnly "org.slf4j:slf4j-api:${versions.slf4j}"
 
+  // httpcore5 — required at runtime by Calcite's Avatica JDBC driver (BuiltInConnectionProperty).
+  // Avatica-core is loaded by this plugin's classloader, so httpcore5 must be here too.
+  runtimeOnly "org.apache.httpcomponents.core5:httpcore5:${versions.httpcore5}"
+
   // Calcite code generation (optional in calcite-core POM, needed at runtime for Enumerable pipeline)
   testRuntimeOnly "org.codehaus.janino:janino:3.1.12"
   testRuntimeOnly "org.codehaus.janino:commons-compiler:3.1.12"
