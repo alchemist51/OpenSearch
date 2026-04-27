@@ -39,7 +39,7 @@ public class PplClickBenchIT extends DataFusionRestTestCase {
     public void testSimplePplQuery() throws Exception {
         ensureDataProvisioned();
 
-        String pplQuery = "source = " + ClickBenchTestFixture.INDEX_NAME;
+        String pplQuery = "source = " + ClickBenchTestFixture.INDEX_NAME + " | stats count()";
         logger.info("=== PPL simple query: {} ===", pplQuery);
 
         Request request = new Request("POST", "/_analytics/ppl");

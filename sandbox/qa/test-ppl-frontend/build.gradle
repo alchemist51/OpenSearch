@@ -102,10 +102,8 @@ bundlePlugin {
   exclude 'sketches-core-*.jar'
   exclude 'memory-*.jar'
   exclude 'httpclient5-*.jar'
+  exclude 'httpcore5-*.jar'
   exclude 'jts-core-*.jar'
-  exclude 'jackson-core-*.jar'
-  exclude 'checker-qual-*.jar'
-  exclude 'error_prone_annotations-*.jar'
 }
 
 configurations.all {
