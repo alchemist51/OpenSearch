@@ -56,4 +56,18 @@ public class RowIdGenerator {
     public String getSource() {
         return source;
     }
+
+    /**
+     * Rolls back the last row ID assignment, decrementing the counter by one.
+     * Used when a document write fails before any format has committed the doc,
+     * so the row ID slot can be reused by the next document.
+     *
+     * @throws IllegalStateException if the counter is already at zero
+     */
+    public void rollback() {
+        if (counter.get() <= 0) {
+            throw new IllegalStateException("Cannot rollback RowIdGenerator below zero");
+        }
+        counter.decrementAndGet();
+    }
 }
