@@ -29,7 +29,6 @@ import org.opensearch.index.engine.dataformat.DataFormatRegistry;
 import org.opensearch.index.engine.dataformat.IndexingEngineConfig;
 import org.opensearch.index.engine.dataformat.IndexingExecutionEngine;
 import org.opensearch.index.shard.IndexSettingProvider;
-import org.opensearch.index.store.FormatChecksumStrategy;
 import org.opensearch.indices.IndexCreationException;
 import org.opensearch.plugins.ExtensiblePlugin;
 import org.opensearch.plugins.Plugin;
