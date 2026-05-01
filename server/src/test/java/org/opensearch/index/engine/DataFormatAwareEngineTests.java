@@ -1824,7 +1824,7 @@ public class DataFormatAwareEngineTests extends OpenSearchTestCase {
             writer.setWriteResultSupplier(() -> new WriteResult.Failure(new IOException("simulated replica write failure"), -1, -1, -1));
 
             // Doc 4 on replica — treatDocumentFailureAsTragicError returns true → failEngine
-            Engine.IndexResult replicaResult = engine.index(replicaIndexOp(createParsedDoc("3", null), 3));
+            expectThrows(AlreadyClosedException.class, () -> engine.index(replicaIndexOp(createParsedDoc("3", null), 3)));
 
             // Engine should now be failed
             assertNotNull("engine should have failed", new FailableDataFormatAwareEngine(engine).getFailedEngine());
@@ -1883,8 +1883,8 @@ public class DataFormatAwareEngineTests extends OpenSearchTestCase {
                 assertThat("only successful docs visible", totalRows, equalTo((long) successCount));
             }
 
-            // Translog contains only successful ops (failed docs skip translog)
-            assertThat(engine.translogManager().getTranslogStats().estimatedNumberOfOperations(), equalTo(successCount));
+            // Translog contains all ops: successes as Index, failures as NoOp
+            assertThat(engine.translogManager().getTranslogStats().estimatedNumberOfOperations(), equalTo(10));
         }
     }
 
@@ -1919,9 +1919,9 @@ public class DataFormatAwareEngineTests extends OpenSearchTestCase {
 
             // Verify: 7 ops in translog (6 Index + 1 NoOp for the failed doc)
             assertThat(
-                "6 successful ops in translog after FlushAndCloseWriterException on primary",
+                "7 ops in translog (6 success + 1 NoOp)",
                 engine.translogManager().getTranslogStats().estimatedNumberOfOperations(),
-                equalTo(6)
+                equalTo(7)
             );
         }
     }
@@ -1950,7 +1950,7 @@ public class DataFormatAwareEngineTests extends OpenSearchTestCase {
             );
 
             // Doc 4 on replica — treatDocumentFailureAsTragicError returns true → failEngine
-            Engine.IndexResult replicaResult = engine.index(replicaIndexOp(createParsedDoc("3", null), 3));
+            expectThrows(AlreadyClosedException.class, () -> engine.index(replicaIndexOp(createParsedDoc("3", null), 3)));
 
             // Engine should be failed
             assertNotNull(
@@ -1990,11 +1990,11 @@ public class DataFormatAwareEngineTests extends OpenSearchTestCase {
             writer.setWriteResultSupplier(null);
 
             assertThat(
-                "10 successful ops in translog",
+                "11 ops in translog (10 success + 1 NoOp)",
                 engine.translogManager().getTranslogStats().estimatedNumberOfOperations(),
-                equalTo(10)
+                equalTo(11)
             );
-            assertThat("checkpoint reflects 10 successful ops", engine.getProcessedLocalCheckpoint(), equalTo(10L));
+            assertThat("checkpoint reflects all 11 ops", engine.getProcessedLocalCheckpoint(), equalTo(10L));
 
             // Flush to persist state, then close
             engine.flush(false, true);
@@ -2039,9 +2039,9 @@ public class DataFormatAwareEngineTests extends OpenSearchTestCase {
             assertThat(result7.getResultType(), equalTo(Engine.Result.Type.SUCCESS));
 
             assertThat(
-                "5 original + 1 new = 6 in translog",
+                "7 ops in translog (5 + 1 NoOp + 1 success)",
                 engine.translogManager().getTranslogStats().estimatedNumberOfOperations(),
-                equalTo(6)
+                equalTo(7)
             );
 
             // Engine stays open
@@ -2067,7 +2067,7 @@ public class DataFormatAwareEngineTests extends OpenSearchTestCase {
             );
 
             // Doc 4 on replica — treatDocumentFailureAsTragicError returns true → failEngine
-            Engine.IndexResult replicaResult = engine.index(replicaIndexOp(createParsedDoc("3", null), 3));
+            expectThrows(AlreadyClosedException.class, () -> engine.index(replicaIndexOp(createParsedDoc("3", null), 3)));
 
             // Engine should be failed
             assertNotNull(
@@ -2113,7 +2113,7 @@ public class DataFormatAwareEngineTests extends OpenSearchTestCase {
             writer.setWriteResultSupplier(() -> new WriteResult.Failure(corruption, -1, -1, -1));
 
             // Index doc on replica → engine fails (replica treats doc failure as tragic)
-            Engine.IndexResult replicaResult = engine.index(replicaIndexOp(createParsedDoc("6", null), 6));
+            expectThrows(AlreadyClosedException.class, () -> engine.index(replicaIndexOp(createParsedDoc("6", null), 6)));
 
             // Engine should be failed
             assertNotNull(
