@@ -59,8 +59,8 @@ use crate::indexed_table::index::RowGroupDocsCollector;
 use crate::indexed_table::page_pruner::PagePruner;
 use crate::indexed_table::segment_info::build_segments;
 use crate::indexed_table::substrait_to_tree::{
-    classify_filter, create_index_filter_udf, expr_to_bool_tree, extract_filter_expr,
-    ExtractionResult, FilterClass,
+    classify_filter, create_index_filter_udf, create_row_id_udf, expr_to_bool_tree,
+    extract_filter_expr, plan_requests_row_ids, ExtractionResult, FilterClass,
 };
 use crate::indexed_table::table_provider::{
     EvaluatorFactory, IndexedTableConfig, IndexedTableProvider, SegmentFileInfo,
@@ -431,18 +431,17 @@ pub async unsafe fn execute_indexed_with_context(
     let (segments, schema) = build_segments(Arc::clone(&store), object_metas.as_ref())
         .await
         .map_err(DataFusionError::Execution)?;
-    for (i, seg) in segments.iter().enumerate() {
-    }
-
     let placeholder: Arc<dyn TableProvider> = Arc::new(PlaceholderProvider {
         schema: schema.clone(),
     });
     ctx.register_table(&table_name, placeholder)?;
+    ctx.register_udf(create_row_id_udf());
 
     let plan = Plan::decode(substrait_bytes.as_slice())
         .map_err(|e| DataFusionError::Execution(format!("decode substrait: {}", e)))?;
     let logical_plan = from_substrait_plan(&ctx.state(), &plan).await?;
 
+    let emit_row_ids = plan_requests_row_ids(&logical_plan);
     let filter_expr = extract_filter_expr(&logical_plan);
     let extraction = match filter_expr {
         None => None,
@@ -668,6 +667,7 @@ pub async unsafe fn execute_indexed_with_context(
     let parsed = url::Url::parse(url_str)
         .map_err(|e| DataFusionError::Execution(format!("parse table_path URL: {}", e)))?;
     let store_url = ObjectStoreUrl::parse(format!("{}://{}", parsed.scheme(), parsed.authority()))?;
+
     let provider = Arc::new(IndexedTableProvider::new(IndexedTableConfig {
         schema: schema.clone(),
         segments,
@@ -680,7 +680,7 @@ pub async unsafe fn execute_indexed_with_context(
         pushdown_predicate,
         query_config: Arc::clone(&query_config),
         predicate_columns,
-        emit_row_ids: false, // POC: set to true to enable row-ID-only output
+        emit_row_ids,
     }));
     ctx.register_table(&table_name, provider)?;
 

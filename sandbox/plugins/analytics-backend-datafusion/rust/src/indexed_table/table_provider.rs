@@ -128,7 +128,7 @@ pub struct IndexedTableConfig {
     pub query_config: Arc<DatafusionQueryConfig>,
     /// Full-schema column indices referenced by BoolNode Predicate leaves.
     pub predicate_columns: Vec<usize>,
-    /// POC: When true, output only a `_row_id: UInt64` column containing
+    /// When true, output only a `_row_id: UInt64` column containing
     /// shard-global row IDs of matching rows instead of actual data.
     pub emit_row_ids: bool,
 }
@@ -193,8 +193,11 @@ impl TableProvider for IndexedTableProvider {
             Some(proj) => Arc::new(full_schema.project(proj)?),
             None => full_schema.clone(),
         };
-        // Read projection = output + predicate columns for evaluator
-        let read_projection: Option<Vec<usize>> = if self.config.predicate_columns.is_empty() {
+        // Read projection = output + predicate columns for evaluator.
+        // When emit_row_ids=true, we only need predicate columns (no output columns).
+        let read_projection: Option<Vec<usize>> = if self.config.emit_row_ids {
+            Some(self.config.predicate_columns.clone())
+        } else if self.config.predicate_columns.is_empty() {
             projection.cloned()
         } else {
             projection.map(|proj| {

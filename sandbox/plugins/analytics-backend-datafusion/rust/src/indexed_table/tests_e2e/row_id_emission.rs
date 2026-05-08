@@ -6,18 +6,11 @@
  * compatible open source license.
  */
 
-//! POC: end-to-end tests for `emit_row_ids` mode.
+//! End-to-end tests for `emit_row_ids` mode.
 //! Verifies that the indexed query path can return global row IDs
 //! instead of actual data columns.
 
-use std::sync::Arc;
-
 use datafusion::arrow::array::UInt64Array;
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::Operator;
-use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use futures::StreamExt;
 
 use super::*;
 
@@ -109,8 +102,9 @@ async fn run_tree_row_ids(tree: BoolNode) -> Vec<u64> {
         force_pushdown: Some(false),
         pushdown_predicate: None,
         query_config: Arc::new(crate::datafusion_query_config::DatafusionQueryConfig::default()),
-        predicate_columns: vec![],
-        emit_row_ids: true, // <-- POC flag
+        // All columns needed for Tree refinement (predicates reference price=1, etc.)
+        predicate_columns: vec![0, 1, 2, 3],
+        emit_row_ids: true,
     }));
 
     let ctx = SessionContext::new();
@@ -270,7 +264,7 @@ async fn run_tree_row_ids_with_global_base(tree: BoolNode, global_base: u64) -> 
         force_pushdown: Some(false),
         pushdown_predicate: None,
         query_config: Arc::new(crate::datafusion_query_config::DatafusionQueryConfig::default()),
-        predicate_columns: vec![],
+        predicate_columns: vec![0, 1, 2, 3],
         emit_row_ids: true,
     }));
 
@@ -298,4 +292,64 @@ async fn test_emit_row_ids_with_global_base_offset() {
     let tree = BoolNode::And(vec![index_leaf(0)]);
     let ids = run_tree_row_ids_with_global_base(tree, 1000).await;
     assert_eq!(ids, vec![1000, 1001, 1002, 1003, 1012]);
+}
+
+/// Verify UDF detection — `_global_row_id()` in SELECT triggers emit_row_ids mode.
+#[tokio::test]
+async fn test_udf_detection_global_row_id() {
+    use crate::indexed_table::substrait_to_tree::{create_row_id_udf, plan_requests_row_ids};
+
+    let tmp = write_fixture_parquet();
+    let path = tmp.path().to_path_buf();
+    let size = std::fs::metadata(&path).unwrap().len();
+
+    let file = std::fs::File::open(&path).unwrap();
+    let meta = datafusion::parquet::arrow::arrow_reader::ArrowReaderMetadata::load(
+        &file,
+        datafusion::parquet::arrow::arrow_reader::ArrowReaderOptions::new().with_page_index(true),
+    )
+    .unwrap();
+    let schema = meta.schema().clone();
+    let parquet_meta = meta.metadata().clone();
+    let mut rgs = Vec::new();
+    let mut offset = 0i64;
+    for i in 0..parquet_meta.num_row_groups() {
+        let n = parquet_meta.row_group(i).num_rows();
+        rgs.push(RowGroupInfo { index: i, first_row: offset, num_rows: n });
+        offset += n;
+    }
+
+    // Register the UDF and build a logical plan with SELECT _global_row_id() FROM t
+    let ctx = SessionContext::new();
+    ctx.register_udf(create_row_id_udf());
+
+    // Create a simple table to query against
+    let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(datafusion::arrow::array::StringArray::from(BRANDS.to_vec())),
+            Arc::new(datafusion::arrow::array::Int32Array::from(PRICES.to_vec())),
+            Arc::new(datafusion::arrow::array::StringArray::from(STATUSES.to_vec())),
+            Arc::new(datafusion::arrow::array::StringArray::from(CATEGORIES.to_vec())),
+        ],
+    )
+    .unwrap();
+    let mem_table = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+    ctx.register_table("t", Arc::new(mem_table)).unwrap();
+
+    // Plan with _global_row_id() in projection — should be detected
+    let df = ctx.sql("SELECT _global_row_id() FROM t").await.unwrap();
+    let plan = df.logical_plan();
+    assert!(
+        plan_requests_row_ids(plan),
+        "Should detect _global_row_id() in projection"
+    );
+
+    // Plan without _global_row_id() — should NOT be detected
+    let df2 = ctx.sql("SELECT brand FROM t").await.unwrap();
+    let plan2 = df2.logical_plan();
+    assert!(
+        !plan_requests_row_ids(plan2),
+        "Should not detect _global_row_id() in normal projection"
+    );
 }

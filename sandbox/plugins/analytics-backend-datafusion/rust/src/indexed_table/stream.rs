@@ -65,7 +65,7 @@ pub struct RowGroupInfo {
     pub num_rows: i64,
 }
 
-/// POC: Schema for row-ID-only output mode.
+/// Schema for row-ID-only output mode.
 pub fn row_id_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
         "_row_id",
@@ -281,9 +281,9 @@ pub struct IndexedExec {
     /// from the same query; read once per RG into local fields inside
     /// `IndexedStream` so the hot path never touches the Arc.
     pub(crate) query_config: Arc<DatafusionQueryConfig>,
-    /// POC: Cumulative row offset for this segment within the shard.
+    /// Cumulative row offset for this segment within the shard.
     pub(crate) global_base: u64,
-    /// POC: When true, emit `_row_id` column instead of data.
+    /// When true, emit `_row_id` column instead of data.
     pub(crate) emit_row_ids: bool,
 }
 
@@ -441,9 +441,9 @@ struct IndexedStream {
     /// calling it twice (assert panic) and to signal "no more input
     /// will arrive; drain remaining completed batches."
     coalescer_finished: bool,
-    /// POC: Cumulative row offset for this segment within the shard.
+    /// Cumulative row offset for this segment within the shard.
     global_base: u64,
-    /// POC: When true, emit `_row_id` column instead of data.
+    /// When true, emit `_row_id` column instead of data.
     emit_row_ids: bool,
 }
 
@@ -589,7 +589,7 @@ impl IndexedStream {
             t.add_duration(t_on_batch.elapsed());
         }
 
-        // POC: If emit_row_ids mode, compute global row IDs for surviving
+        // If emit_row_ids mode, compute global row IDs for surviving
         // rows before consuming the mask, then return early.
         if self.emit_row_ids {
             let batch_start_delivered = self.batch_offset;
