@@ -405,6 +405,7 @@ async fn run_large(
         parquet_size: size,
         row_groups: rgs,
         metadata: Arc::clone(&parquet_meta),
+            global_base: 0,
     };
 
     let tree = Arc::new(tree);
@@ -451,6 +452,7 @@ async fn run_large(
             crate::datafusion_query_config::DatafusionQueryConfig::default(),
         ),
         predicate_columns: vec![],
+        emit_row_ids: false,
     }));
 
     let ctx = SessionContext::new();
@@ -855,6 +857,7 @@ async fn run_large_partitioned(
         parquet_size: size,
         row_groups: rgs,
         metadata: Arc::clone(&parquet_meta),
+            global_base: 0,
     };
 
     let tree = Arc::new(tree);
@@ -900,6 +903,7 @@ async fn run_large_partitioned(
             crate::datafusion_query_config::DatafusionQueryConfig::default(),
         ),
         predicate_columns: vec![],
+        emit_row_ids: false,
     }));
     let ctx = SessionContext::new();
     ctx.register_table("t", provider).unwrap();

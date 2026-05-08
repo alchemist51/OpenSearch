@@ -212,6 +212,7 @@ fn load_segment(tmp: &NamedTempFile) -> (SegmentFileInfo, SchemaRef) {
         parquet_size: size,
         row_groups: rgs,
         metadata: parquet_meta,
+            global_base: 0,
     };
     (seg, schema)
 }
@@ -384,6 +385,7 @@ async fn execute_and_collect(
             crate::datafusion_query_config::DatafusionQueryConfig::default(),
         ),
         predicate_columns: vec![],
+        emit_row_ids: false,
     }));
 
     let ctx = SessionContext::new();

@@ -104,6 +104,7 @@ pub(in crate::indexed_table::tests_e2e) fn load_segment(corpus: &Corpus) -> Load
             parquet_size: size,
             row_groups: rgs,
             metadata: Arc::clone(&parquet_meta),
+            global_base: 0,
         });
         global_first_row += seg_rows as i64;
     }
@@ -289,6 +290,7 @@ pub(in crate::indexed_table::tests_e2e) async fn execute_tree_with_plan_pushdown
             qc
         }),
         predicate_columns: collect_predicate_column_indices(&bool_tree),
+        emit_row_ids: false,
     }));
 
     let ctx = SessionContext::new();
@@ -462,6 +464,7 @@ async fn run_single_collector_query(
             qc
         }),
         predicate_columns: pred_cols,
+        emit_row_ids: false,
     }));
     let ctx = SessionContext::new();
     ctx.register_table("t", provider).unwrap();
@@ -669,7 +672,8 @@ async fn run_with_factory_plan(
             qc.batch_size = [256, 1024, 8192][loaded.segments.len() % 3];
             qc
         }),
-        predicate_columns: vec![], // run_with_factory_plan is low-level; caller controls projection
+        predicate_columns: vec![],
+        emit_row_ids: false, // run_with_factory_plan is low-level; caller controls projection
     }));
     let ctx = SessionContext::new();
     ctx.register_table("t", provider).unwrap();

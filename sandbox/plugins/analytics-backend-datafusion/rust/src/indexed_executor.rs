@@ -680,6 +680,7 @@ pub async unsafe fn execute_indexed_with_context(
         pushdown_predicate,
         query_config: Arc::clone(&query_config),
         predicate_columns,
+        emit_row_ids: false, // POC: set to true to enable row-ID-only output
     }));
     ctx.register_table(&table_name, provider)?;
 
