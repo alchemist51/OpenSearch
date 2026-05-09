@@ -14,6 +14,7 @@
 pub mod api;
 pub mod cache;
 pub mod cancellation;
+pub mod compute_row_id_optimizer;
 pub mod cross_rt_stream;
 pub mod custom_cache_manager;
 pub mod datafusion_query_config;
@@ -26,11 +27,16 @@ pub mod io;
 pub mod local_executor;
 pub mod memory;
 pub mod partition_stream;
+pub mod project_row_id_optimizer;
 pub mod query_executor;
 pub mod query_tracker;
+pub mod row_id_benchmark;
 pub mod runtime_manager;
 pub mod session_context;
 pub mod statistics_cache;
 pub mod udf;
 pub mod stats;
 pub mod task_monitors;
+
+#[cfg(test)]
+mod row_id_tests;

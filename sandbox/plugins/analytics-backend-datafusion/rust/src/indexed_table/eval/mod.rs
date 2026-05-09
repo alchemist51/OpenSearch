@@ -39,6 +39,7 @@
 //! Swapping impls requires only passing different `Arc`s at construction.
 
 pub mod bitmap_tree;
+pub mod select_all;
 pub mod single_collector;
 
 use std::any::Any;

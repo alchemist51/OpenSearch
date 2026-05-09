@@ -40,6 +40,8 @@ pub struct SessionContextHandle {
     pub table_name: String,
     /// When set, indicates this session uses the indexed execution path with filter delegation.
     pub indexed_config: Option<IndexedExecutionConfig>,
+    /// Query-scoped configuration including row_id_strategy.
+    pub query_config: Option<Arc<crate::datafusion_query_config::DatafusionQueryConfig>>,
 }
 
 /// Configuration for indexed execution with filter delegation, provided by Java.
@@ -146,6 +148,7 @@ pub async unsafe fn create_session_context(
         query_context,
         table_name: table_name.to_string(),
         indexed_config: None,
+        query_config: None,
     };
     Ok(Box::into_raw(Box::new(handle)) as i64)
 }

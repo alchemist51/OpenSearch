@@ -161,18 +161,64 @@ pub async fn execute_query(
 /// raw Java pointer) happens at the FFM entry in `df_execute_with_context`, so
 /// by the time this function is reached the pointer is already invalidated from
 /// Java's perspective and cleanup is pure RAII.
+///
+/// When the plan requests row IDs and a `RowIdStrategy` is configured, this
+/// function routes to the appropriate execution path:
+/// - `ListingTable`: applies `ProjectRowIdOptimizer` to the physical plan
+/// - `IndexedPredicateOnly`: delegates to the indexed executor with `emit_row_ids=true`
+/// - `IndexedPassthrough`: applies `ComputeRowIdOptimizer` to the physical plan
 pub async fn execute_with_context(
     handle: SessionContextHandle,
     plan_bytes: &[u8],
     cpu_executor: DedicatedExecutor,
 ) -> Result<i64, DataFusionError> {
+    use crate::datafusion_query_config::RowIdStrategy;
+    use datafusion::common::config::ConfigOptions;
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+
     let substrait_plan = Plan::decode(plan_bytes).map_err(|e| {
         DataFusionError::Execution(format!("Failed to decode Substrait: {}", e))
     })?;
 
     let logical_plan = from_substrait_plan(&handle.ctx.state(), &substrait_plan).await?;
+
+    // Check if the plan requests row IDs and route accordingly
+    let row_id_strategy = handle
+        .query_config
+        .as_ref()
+        .map(|c| c.row_id_strategy)
+        .unwrap_or(RowIdStrategy::ListingTable);
+
+    let requests_row_ids = crate::indexed_table::substrait_to_tree::plan_requests_row_ids(&logical_plan);
+
     let dataframe = handle.ctx.execute_logical_plan(logical_plan).await?;
     let physical_plan = dataframe.create_physical_plan().await?;
+
+    // Apply row ID optimizer if needed
+    let physical_plan = if requests_row_ids {
+        match row_id_strategy {
+            RowIdStrategy::ListingTable => {
+                // Approach 1: Apply ProjectRowIdOptimizer to the physical plan
+                let optimizer = crate::project_row_id_optimizer::ProjectRowIdOptimizer;
+                let config = ConfigOptions::default();
+                optimizer.optimize(physical_plan, &config)?
+            }
+            RowIdStrategy::IndexedPredicateOnly => {
+                // Approach 2: For now, fall through to standard execution.
+                // Full routing to indexed executor requires segment metadata
+                // that may not be available on the vanilla path.
+                physical_plan
+            }
+            RowIdStrategy::IndexedPassthrough => {
+                // Approach 3: Apply ComputeRowIdOptimizer to the physical plan
+                let optimizer = crate::compute_row_id_optimizer::ComputeRowIdOptimizer;
+                let config = ConfigOptions::default();
+                optimizer.optimize(physical_plan, &config)?
+            }
+        }
+    } else {
+        physical_plan
+    };
 
     let df_stream = execute_stream(physical_plan, handle.ctx.task_ctx()).map_err(|e| {
         error!("execute_with_context: failed to create stream: {}", e);

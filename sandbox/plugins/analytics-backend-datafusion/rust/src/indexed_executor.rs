@@ -161,6 +161,7 @@ pub async fn execute_indexed_query(
         query_context: crate::query_tracker::QueryTrackingContext::new(0, runtime.runtime_env.memory_pool.clone()),
         table_name: table_name.clone(),
         indexed_config: None, // derive classification from tree
+        query_config: Some(Arc::clone(&query_config)),
     };
     let ptr = Box::into_raw(Box::new(handle)) as i64;
     unsafe { execute_indexed_with_context(ptr, substrait_bytes, cpu_executor).await }
@@ -410,7 +411,9 @@ pub async unsafe fn execute_indexed_with_context(
         }
     });
 
-    let query_config = Arc::new(crate::datafusion_query_config::DatafusionQueryConfig::default());
+    let query_config = handle.query_config.unwrap_or_else(|| {
+        Arc::new(crate::datafusion_query_config::DatafusionQueryConfig::default())
+    });
     let num_partitions = query_config.target_partitions.max(1);
     let ctx = handle.ctx;
     let table_name = handle.table_name;
@@ -481,6 +484,14 @@ pub async unsafe fn execute_indexed_with_context(
                 .as_ref()
                 .and_then(residual_bool_to_physical_expr)
         }),
+        FilterClass::None if emit_row_ids => {
+            // Predicate-only mode: no collectors, but there may be predicates.
+            // Convert the entire BoolNode tree to a PhysicalExpr for pushdown.
+            // If no predicates exist, this is None and we get a full scan.
+            extraction.as_ref().and_then(|e| {
+                residual_bool_to_physical_expr(&e.tree)
+            })
+        }
         FilterClass::Tree | FilterClass::None => None,
     };
 
@@ -488,9 +499,39 @@ pub async unsafe fn execute_indexed_with_context(
 
     let factory: EvaluatorFactory = match classification {
         FilterClass::None => {
-            return Err(DataFusionError::Execution(
-                "execute_indexed_query called with no index_filter(...) in plan".into(),
-            ));
+            if emit_row_ids {
+                // Predicate-only mode: no collectors, just parquet pushdown filtering.
+                // Row IDs are computed from position by IndexedStream.
+                // The pushdown_predicate (set above) handles filtering at decode time.
+                // No evaluator needed — use a no-op that selects all rows.
+                // Parquet's native pushdown does the actual filtering.
+                let schema_for_pruner = schema.clone();
+                let pruning_preds: Arc<HashMap<usize, Arc<PruningPredicate>>> = Arc::new(
+                    extraction.as_ref().map(|e| {
+                        let mut exprs = Vec::new();
+                        collect_predicate_exprs(&e.tree, &mut exprs);
+                        exprs.iter().filter_map(|expr| {
+                            build_pruning_predicate(expr, Arc::clone(&schema_for_pruner))
+                                .map(|pp| (Arc::as_ptr(expr) as *const () as usize, pp))
+                        }).collect::<HashMap<_, _>>()
+                    }).unwrap_or_default()
+                );
+
+                Arc::new(
+                    move |segment: &SegmentFileInfo, _chunk, stream_metrics: &StreamMetrics| {
+                        let pruner = Arc::new(PagePruner::new(
+                            &schema_for_pruner,
+                            Arc::clone(&segment.metadata),
+                        ));
+                        Ok(Arc::new(crate::indexed_table::eval::select_all::SelectAllBitsetSource)
+                            as Arc<dyn RowGroupBitsetSource>)
+                    },
+                )
+            } else {
+                return Err(DataFusionError::Execution(
+                    "execute_indexed_query called with no index_filter(...) in plan".into(),
+                ));
+            }
         }
         FilterClass::SingleCollector => {
             let extraction = extraction.as_ref().ok_or_else(|| {

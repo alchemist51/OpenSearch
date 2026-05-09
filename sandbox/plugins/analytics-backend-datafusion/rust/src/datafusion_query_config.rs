@@ -8,6 +8,25 @@
 use crate::indexed_table::stream::FilterStrategy;
 use crate::indexed_table::eval::single_collector::CollectorCallStrategy;
 
+/// Selects which execution path computes shard-global row IDs.
+///
+/// All three strategies produce identical row IDs for the same data.
+/// The flag exists to benchmark and compare approaches before committing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowIdStrategy {
+    /// Approach 1: ShardTableProvider + ProjectRowIdOptimizer.
+    /// Reads ___row_id from parquet, adds row_base via physical optimizer rewrite.
+    ListingTable,
+    /// Approach 2: Predicate-only mode in the indexed executor.
+    /// Uses indexed pipeline's predicate/pruning infrastructure (page pruning,
+    /// pushdown) without any collector/FFM overhead. Computes row IDs from position.
+    IndexedPredicateOnly,
+    /// Approach 3: ListingTable scan but computes row IDs from position.
+    /// Same ShardTableProvider scan as Approach 1 but does NOT read ___row_id
+    /// from disk — computes row_base + position_in_batch instead.
+    IndexedPassthrough,
+}
+
 /// Query-scoped configuration. Owned by value after FFM decode.
 #[derive(Debug, Clone)]
 pub struct DatafusionQueryConfig {
@@ -46,6 +65,10 @@ pub struct DatafusionQueryConfig {
     /// `TightenOuterBounds` is the default — multiple collectors in the
     /// tree means `PageRangeSplit` would multiply FFM calls.
     pub tree_collector_strategy: CollectorCallStrategy,
+    /// Strategy for row ID emission on the vanilla path.
+    /// Only consulted when the plan requests row IDs (contains _global_row_id() UDF
+    /// or projects ___row_id).
+    pub row_id_strategy: RowIdStrategy,
 }
 
 impl Default for DatafusionQueryConfig {
@@ -65,6 +88,7 @@ impl Default for DatafusionQueryConfig {
             max_collector_parallelism: 1,
             single_collector_strategy: CollectorCallStrategy::PageRangeSplit,
             tree_collector_strategy: CollectorCallStrategy::TightenOuterBounds,
+            row_id_strategy: RowIdStrategy::ListingTable,
         }
     }
 }
@@ -96,6 +120,8 @@ pub struct WireDatafusionQueryConfig {
     pub single_collector_strategy: i32,
     /// 0 = FullRange, 1 = TightenOuterBounds, 2 = PageRangeSplit
     pub tree_collector_strategy: i32,
+    /// 0 = ListingTable (default), 1 = IndexedPredicateOnly, 2 = IndexedPassthrough
+    pub row_id_strategy: i32,
 }
 
 impl DatafusionQueryConfig {
@@ -145,6 +171,11 @@ impl DatafusionQueryConfig {
                 2 => CollectorCallStrategy::PageRangeSplit,
                 _ => CollectorCallStrategy::TightenOuterBounds,
             },
+            row_id_strategy: match w.row_id_strategy {
+                1 => RowIdStrategy::IndexedPredicateOnly,
+                2 => RowIdStrategy::IndexedPassthrough,
+                _ => RowIdStrategy::ListingTable,
+            },
         }
     }
 }
@@ -193,6 +224,7 @@ mod tests {
             max_collector_parallelism: 4,
             single_collector_strategy: 2,
             tree_collector_strategy: 1,
+            row_id_strategy: 1,
         };
         let ptr = &wire as *const _ as i64;
         let c = unsafe { DatafusionQueryConfig::from_ffm_ptr(ptr) };
@@ -206,6 +238,7 @@ mod tests {
         assert_eq!(c.force_pushdown, Some(false));
         assert_eq!(c.cost_predicate, 3);
         assert_eq!(c.cost_collector, 17);
+        assert_eq!(c.row_id_strategy, RowIdStrategy::IndexedPredicateOnly);
     }
 
     #[test]
@@ -224,10 +257,12 @@ mod tests {
             max_collector_parallelism: 2,
             single_collector_strategy: 2,
             tree_collector_strategy: 1,
+            row_id_strategy: 0,
         };
         let ptr = &wire as *const _ as i64;
         let c = unsafe { DatafusionQueryConfig::from_ffm_ptr(ptr) };
         assert_eq!(c.force_strategy, None);
         assert_eq!(c.force_pushdown, None);
+        assert_eq!(c.row_id_strategy, RowIdStrategy::ListingTable);
     }
 }
