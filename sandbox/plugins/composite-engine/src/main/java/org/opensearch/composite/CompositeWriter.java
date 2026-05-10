@@ -109,9 +109,12 @@ class CompositeWriter implements Writer<CompositeDocumentInput>, Lockable {
             throw new IllegalStateException("Cannot add document to writer in state " + state.get());
         }
         // Row ID must be assigned before writing to any format — it's the cross-format correlation key
-        doc.setRowId(DocumentInput.ROW_ID_FIELD, rowIdGenerator.nextRowId());
-        // Row ID must be non-negative and sequential within this writer
-        assert rowIdGenerator.currentRowId() >= 0 : "row ID must be non-negative but was: " + rowIdGenerator.currentRowId();
+        long assignedRowId = rowIdGenerator.nextRowId();
+        doc.setRowId(DocumentInput.ROW_ID_FIELD, assignedRowId);
+        // RowId invariant: must be non-negative and equal to (counter - 1) since nextRowId does getAndIncrement
+        assert assignedRowId >= 0 : "row ID must be non-negative but was: " + assignedRowId;
+        assert assignedRowId == rowIdGenerator.currentRowId() - 1
+            : "row ID must be sequential; assigned=" + assignedRowId + " current=" + rowIdGenerator.currentRowId();
 
         // Write to primary first
         WriteResult primaryResult = primaryWriter.addDoc(doc.getPrimaryInput());
@@ -120,6 +123,9 @@ class CompositeWriter implements Writer<CompositeDocumentInput>, Lockable {
             case WriteResult.Failure f -> {
                 logger.debug("Failed to add document in primary format [{}]", primaryFormat.name());
                 rowIdGenerator.rollback();
+                // After rollback, counter must be back to the value before this doc was attempted
+                assert rowIdGenerator.currentRowId() == assignedRowId
+                    : "RowId rollback must restore counter; expected=" + assignedRowId + " got=" + rowIdGenerator.currentRowId();
                 return primaryResult;
             }
         }
@@ -148,6 +154,12 @@ class CompositeWriter implements Writer<CompositeDocumentInput>, Lockable {
             }
         }
 
+        // Multi-format atomicity: all secondaries must have succeeded if we reach here
+        assert succeededSecondaries.size() == secondaryInputs.size()
+            : "all secondaries must succeed if we reach here; succeeded="
+                + succeededSecondaries.size()
+                + " expected="
+                + secondaryInputs.size();
         return primaryResult;
     }
 
@@ -222,7 +234,25 @@ class CompositeWriter implements Writer<CompositeDocumentInput>, Lockable {
                 builder.putWriterFileSet(fileEntry.getKey(), fileEntry.getValue());
             }
         }
-        return builder.build();
+        FileInfos result = builder.build();
+        // Multi-format atomicity: flush must produce files for primary + all secondaries (or be empty for all)
+        assert result.writerFilesMap().isEmpty()
+            || result.writerFilesMap().size() == 1 + secondaryWritersByFormat.size()
+            : "flush must produce files for all formats or none; got "
+                + result.writerFilesMap().size()
+                + " expected 0 or "
+                + (1 + secondaryWritersByFormat.size());
+        // RowId invariant: all formats must report the same numRows, and it must equal the RowId counter
+        // (the counter tracks only successfully committed docs — primary rollbacks decrement it)
+        if (result.writerFilesMap().isEmpty() == false) {
+            long expectedRows = rowIdGenerator.currentRowId();
+            for (Map.Entry<DataFormat, WriterFileSet> entry : result.writerFilesMap().entrySet()) {
+                assert entry.getValue().numRows() == expectedRows
+                    : "format [" + entry.getKey().name() + "] numRows=" + entry.getValue().numRows()
+                        + " must equal RowIdGenerator count=" + expectedRows;
+            }
+        }
+        return result;
     }
 
     @Override

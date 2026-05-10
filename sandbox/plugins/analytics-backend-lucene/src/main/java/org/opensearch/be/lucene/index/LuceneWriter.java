@@ -76,6 +76,7 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
     private final IndexWriter indexWriter;
     private final ReentrantLock lock;
     private volatile long docCount;
+    private volatile boolean flushed;
 
     /**
      * Creates a new LuceneWriter for the given generation.
@@ -96,7 +97,7 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
         // Create an isolated temp directory for this writer's segment
         this.tempDirectory = baseDirectory.resolve("lucene_gen_" + writerGeneration);
         logger.info("Creating directory for temp lucene writer: " + tempDirectory);
-        Files.createDirectory(tempDirectory);
+        Files.createDirectories(tempDirectory);
         this.directory = new MMapDirectory(tempDirectory);
 
         IndexWriterConfig iwc = analyzer != null ? new IndexWriterConfig(analyzer) : new IndexWriterConfig();
@@ -194,6 +195,7 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
         // Since flush is once only, we can close the write post this.
         indexWriter.close();
         directory.close();
+        flushed = true;
 
         return FileInfos.builder().putWriterFileSet(dataFormat, wfsBuilder.build()).build();
     }
@@ -254,6 +256,8 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
         } catch (Exception e) {
             logger.warn("Failed to close directory for generation[{}]: {}", writerGeneration, e);
         }
-        IOUtils.rm(tempDirectory);
+        if (flushed == false) {
+            IOUtils.rm(tempDirectory);
+        }
     }
 }
