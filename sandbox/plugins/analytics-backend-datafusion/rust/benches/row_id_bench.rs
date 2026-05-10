@@ -1,13 +1,19 @@
-//! Benchmark comparing row ID emission strategies using two generation parquet files.
+//! Benchmark: row ID fetch — all four approaches at three selectivities.
 //!
-//! Hardcoded to use:
-//!   - /Users/abandeji/Downloads/generation-1.parquet (8.5M rows, ___row_id Int32)
-//!   - /Users/abandeji/Downloads/generation-2.parquet (5.7M rows, ___row_id Int32)
+//! Approaches:
+//!   - Baseline: SELECT ___row_id (reads from disk, no row_base, no optimizer)
+//!   - Approach 1 (ListingTable): ProjectRowIdOptimizer (___row_id + row_base)
+//!   - Approach 2 (IndexedPredicateOnly): Indexed pipeline, compute from position
+//!   - Approach 3 (IndexedPassthrough): ComputeRowIdOptimizer (___row_id + row_base, conceptual position)
+//!
+//! Files:
+//!   - /Users/abandeji/Downloads/generation-1.parquet (8.5M rows)
+//!   - /Users/abandeji/Downloads/generation-2.parquet (5.7M rows)
 //!
 //! Usage:
 //!   cargo bench --bench row_id_bench
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -15,13 +21,15 @@ use futures::TryStreamExt;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use opensearch_datafusion::api::DataFusionRuntime;
+use opensearch_datafusion::datafusion_query_config::{DatafusionQueryConfig, RowIdStrategy};
 use opensearch_datafusion::memory::DynamicLimitPool;
 use opensearch_datafusion::query_executor;
 use opensearch_datafusion::runtime_manager::RuntimeManager;
 use std::sync::Arc;
 
-const FILE1: &str = "/Users/abandeji/Downloads/generation-2.parquet";
-const DIR: &str = "/Users/abandeji/Downloads/generation-2.parquet";
+const FILE1: &str = "/Users/abandeji/Downloads/generation-1.parquet";
+const FILE2: &str = "/Users/abandeji/Downloads/generation-2.parquet";
+const DIR: &str = "/Users/abandeji/Downloads/";
 
 fn setup() -> (RuntimeManager, DataFusionRuntime) {
     let mgr = RuntimeManager::new(4);
@@ -38,7 +46,7 @@ fn setup() -> (RuntimeManager, DataFusionRuntime) {
     (mgr, df_runtime)
 }
 
-fn get_metas_for_files(mgr: &RuntimeManager, files: &[&str]) -> Arc<Vec<object_store::ObjectMeta>> {
+fn get_metas(mgr: &RuntimeManager, files: &[&str]) -> Arc<Vec<object_store::ObjectMeta>> {
     let store = Arc::new(LocalFileSystem::new());
     let metas: Vec<object_store::ObjectMeta> = files
         .iter()
@@ -50,7 +58,6 @@ fn get_metas_for_files(mgr: &RuntimeManager, files: &[&str]) -> Arc<Vec<object_s
     Arc::new(metas)
 }
 
-/// Build a substrait plan by registering a ListingTable over the given file.
 fn get_substrait(mgr: &RuntimeManager, file_path: &str, sql: &str) -> Vec<u8> {
     use datafusion::datasource::file_format::parquet::ParquetFormat;
     use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig};
@@ -77,236 +84,205 @@ fn get_substrait(mgr: &RuntimeManager, file_path: &str, sql: &str) -> Vec<u8> {
     })
 }
 
-fn bench_row_id_strategies(c: &mut Criterion) {
+fn bench_all_approaches(c: &mut Criterion) {
     let (mgr, df_runtime) = setup();
 
-    // Use single file
-    let metas = get_metas_for_files(&mgr, &[FILE1]);
-    let url = ListingTableUrl::parse(DIR).unwrap();
-    let config = opensearch_datafusion::datafusion_query_config::DatafusionQueryConfig::default();
+    let metas_single = get_metas(&mgr, &[FILE1]);
+    let metas_multi = get_metas(&mgr, &[FILE1, FILE2]);
+    let url_single = ListingTableUrl::parse(FILE1).unwrap();
+    let url_multi = ListingTableUrl::parse(DIR).unwrap();
 
-    // Build substrait plans
-    let plan_row_id = get_substrait(&mgr, DIR, "SELECT ___row_id FROM t");
-    let plan_count = get_substrait(&mgr, DIR, "SELECT COUNT(*) FROM t");
-    let plan_port = get_substrait(&mgr, DIR, "SELECT backend_port FROM t");
-    let plan_both = get_substrait(&mgr, DIR, "SELECT ___row_id, backend_port FROM t");
-    // Filtered queries: target_status_code filter + ___row_id projection
-    let plan_filter_500 = get_substrait(&mgr, DIR, "SELECT ___row_id FROM t WHERE target_status_code = 500");
-    let plan_filter_404 = get_substrait(&mgr, DIR, "SELECT ___row_id FROM t WHERE target_status_code = 404");
-    let plan_filter_200 = get_substrait(&mgr, DIR, "SELECT ___row_id FROM t WHERE target_status_code = 200");
+    // Substrait plans for three selectivities
+    let plan_200 = get_substrait(&mgr, FILE1, "SELECT \"___row_id\" FROM t WHERE target_status_code = 200");
+    let plan_404 = get_substrait(&mgr, FILE1, "SELECT \"___row_id\" FROM t WHERE target_status_code = 404");
+    let plan_500 = get_substrait(&mgr, FILE1, "SELECT \"___row_id\" FROM t WHERE target_status_code = 500");
 
-    let mut group = c.benchmark_group("row_id_strategies");
+    let selectivities = vec![
+        ("200_70pct", &plan_200),
+        ("404_5pct", &plan_404),
+        ("500_2pct", &plan_500),
+    ];
+
+    let approaches: Vec<(&str, DatafusionQueryConfig)> = vec![
+        ("baseline", DatafusionQueryConfig { target_partitions: 10, ..Default::default() }),
+        ("listing_table", DatafusionQueryConfig { target_partitions: 10, row_id_strategy: RowIdStrategy::ListingTable, ..Default::default() }),
+        ("indexed_pred", DatafusionQueryConfig { target_partitions: 10, row_id_strategy: RowIdStrategy::IndexedPredicateOnly, ..Default::default() }),
+        ("indexed_pass", DatafusionQueryConfig { target_partitions: 10, row_id_strategy: RowIdStrategy::IndexedPassthrough, ..Default::default() }),
+    ];
+
+    let mut group = c.benchmark_group("row_id");
     group.sample_size(10);
-    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.warm_up_time(std::time::Duration::from_secs(2));
     group.measurement_time(std::time::Duration::from_secs(5));
 
-    // Baseline: COUNT(*) — metadata only, no column reads
-    group.bench_function("count_star", |b| {
-        b.to_async(mgr.io_runtime.as_ref()).iter(|| {
-            let url = url.clone();
-            let metas = metas.clone();
-            let plan = plan_count.clone();
-            let exec = mgr.cpu_executor();
-            async {
-                let ptr = query_executor::execute_query(
-                    url, metas, "t".into(), plan, &df_runtime, exec, None, &config,
-                )
-                .await
-                .unwrap();
-                let mut stream = unsafe {
-                    Box::from_raw(
-                        ptr as *mut datafusion::physical_plan::stream::RecordBatchStreamAdapter<
-                            opensearch_datafusion::cross_rt_stream::CrossRtStream,
-                        >,
-                    )
-                };
-                let mut rows = 0u64;
-                while let Some(batch) = stream.try_next().await.unwrap() {
-                    rows += batch.num_rows() as u64;
-                }
-                rows
-            }
-        });
-    });
+    // === Single segment ===
+    for (sel_label, plan) in &selectivities {
+        for (approach_label, config) in &approaches {
+            let id = BenchmarkId::new(
+                format!("1seg/{}", approach_label),
+                sel_label,
+            );
+            group.bench_with_input(id, plan, |b, plan| {
+                let config = config.clone();
+                let df_rt = &df_runtime;
+                b.to_async(mgr.io_runtime.as_ref()).iter(|| {
+                    let url = url_single.clone();
+                    let metas = metas_single.clone();
+                    let plan = (*plan).clone();
+                    let exec = mgr.cpu_executor();
+                    let config = config.clone();
+                    async move {
+                        let ptr = query_executor::execute_query(
+                            url, metas, "t".into(), plan, df_rt, exec, None, &config,
+                        ).await.unwrap();
+                        let mut stream = unsafe {
+                            Box::from_raw(ptr as *mut datafusion::physical_plan::stream::RecordBatchStreamAdapter<
+                                opensearch_datafusion::cross_rt_stream::CrossRtStream,
+                            >)
+                        };
+                        let mut rows = 0u64;
+                        while let Some(batch) = stream.try_next().await.unwrap() {
+                            rows += batch.num_rows() as u64;
+                        }
+                        rows
+                    }
+                });
+            });
+        }
+    }
 
-    // Baseline: SELECT ___row_id — reads the column from disk
-    group.bench_function("select_row_id_from_disk", |b| {
-        b.to_async(mgr.io_runtime.as_ref()).iter(|| {
-            let url = url.clone();
-            let metas = metas.clone();
-            let plan = plan_row_id.clone();
-            let exec = mgr.cpu_executor();
-            async {
-                let ptr = query_executor::execute_query(
-                    url, metas, "t".into(), plan, &df_runtime, exec, None, &config,
-                )
-                .await
-                .unwrap();
-                let mut stream = unsafe {
-                    Box::from_raw(
-                        ptr as *mut datafusion::physical_plan::stream::RecordBatchStreamAdapter<
-                            opensearch_datafusion::cross_rt_stream::CrossRtStream,
-                        >,
-                    )
-                };
-                let mut rows = 0u64;
-                while let Some(batch) = stream.try_next().await.unwrap() {
-                    rows += batch.num_rows() as u64;
-                }
-                rows
-            }
-        });
-    });
-
-    // SELECT backend_port — reads a different Int32 column (comparison)
-    group.bench_function("select_backend_port", |b| {
-        b.to_async(mgr.io_runtime.as_ref()).iter(|| {
-            let url = url.clone();
-            let metas = metas.clone();
-            let plan = plan_port.clone();
-            let exec = mgr.cpu_executor();
-            async {
-                let ptr = query_executor::execute_query(
-                    url, metas, "t".into(), plan, &df_runtime, exec, None, &config,
-                )
-                .await
-                .unwrap();
-                let mut stream = unsafe {
-                    Box::from_raw(
-                        ptr as *mut datafusion::physical_plan::stream::RecordBatchStreamAdapter<
-                            opensearch_datafusion::cross_rt_stream::CrossRtStream,
-                        >,
-                    )
-                };
-                let mut rows = 0u64;
-                while let Some(batch) = stream.try_next().await.unwrap() {
-                    rows += batch.num_rows() as u64;
-                }
-                rows
-            }
-        });
-    });
-
-    // SELECT ___row_id, backend_port — two columns
-    group.bench_function("select_row_id_and_port", |b| {
-        b.to_async(mgr.io_runtime.as_ref()).iter(|| {
-            let url = url.clone();
-            let metas = metas.clone();
-            let plan = plan_both.clone();
-            let exec = mgr.cpu_executor();
-            async {
-                let ptr = query_executor::execute_query(
-                    url, metas, "t".into(), plan, &df_runtime, exec, None, &config,
-                )
-                .await
-                .unwrap();
-                let mut stream = unsafe {
-                    Box::from_raw(
-                        ptr as *mut datafusion::physical_plan::stream::RecordBatchStreamAdapter<
-                            opensearch_datafusion::cross_rt_stream::CrossRtStream,
-                        >,
-                    )
-                };
-                let mut rows = 0u64;
-                while let Some(batch) = stream.try_next().await.unwrap() {
-                    rows += batch.num_rows() as u64;
-                }
-                rows
-            }
-        });
-    });
-
-    // Filter: target_status_code = 500 (~2% selectivity, 113K rows)
-    group.bench_function("filter_500_select_row_id", |b| {
-        b.to_async(mgr.io_runtime.as_ref()).iter(|| {
-            let url = url.clone();
-            let metas = metas.clone();
-            let plan = plan_filter_500.clone();
-            let exec = mgr.cpu_executor();
-            async {
-                let ptr = query_executor::execute_query(
-                    url, metas, "t".into(), plan, &df_runtime, exec, None, &config,
-                )
-                .await
-                .unwrap();
-                let mut stream = unsafe {
-                    Box::from_raw(
-                        ptr as *mut datafusion::physical_plan::stream::RecordBatchStreamAdapter<
-                            opensearch_datafusion::cross_rt_stream::CrossRtStream,
-                        >,
-                    )
-                };
-                let mut rows = 0u64;
-                while let Some(batch) = stream.try_next().await.unwrap() {
-                    rows += batch.num_rows() as u64;
-                }
-                rows
-            }
-        });
-    });
-
-    // Filter: target_status_code = 404 (~5% selectivity, 286K rows)
-    group.bench_function("filter_404_select_row_id", |b| {
-        b.to_async(mgr.io_runtime.as_ref()).iter(|| {
-            let url = url.clone();
-            let metas = metas.clone();
-            let plan = plan_filter_404.clone();
-            let exec = mgr.cpu_executor();
-            async {
-                let ptr = query_executor::execute_query(
-                    url, metas, "t".into(), plan, &df_runtime, exec, None, &config,
-                )
-                .await
-                .unwrap();
-                let mut stream = unsafe {
-                    Box::from_raw(
-                        ptr as *mut datafusion::physical_plan::stream::RecordBatchStreamAdapter<
-                            opensearch_datafusion::cross_rt_stream::CrossRtStream,
-                        >,
-                    )
-                };
-                let mut rows = 0u64;
-                while let Some(batch) = stream.try_next().await.unwrap() {
-                    rows += batch.num_rows() as u64;
-                }
-                rows
-            }
-        });
-    });
-
-    // Filter: target_status_code = 200 (~70% selectivity, 4M rows)
-    group.bench_function("filter_200_select_row_id", |b| {
-        b.to_async(mgr.io_runtime.as_ref()).iter(|| {
-            let url = url.clone();
-            let metas = metas.clone();
-            let plan = plan_filter_200.clone();
-            let exec = mgr.cpu_executor();
-            async {
-                let ptr = query_executor::execute_query(
-                    url, metas, "t".into(), plan, &df_runtime, exec, None, &config,
-                )
-                .await
-                .unwrap();
-                let mut stream = unsafe {
-                    Box::from_raw(
-                        ptr as *mut datafusion::physical_plan::stream::RecordBatchStreamAdapter<
-                            opensearch_datafusion::cross_rt_stream::CrossRtStream,
-                        >,
-                    )
-                };
-                let mut rows = 0u64;
-                while let Some(batch) = stream.try_next().await.unwrap() {
-                    rows += batch.num_rows() as u64;
-                }
-                rows
-            }
-        });
-    });
+    // === Multi segment ===
+    for (sel_label, plan) in &selectivities {
+        for (approach_label, config) in &approaches {
+            let id = BenchmarkId::new(
+                format!("2seg/{}", approach_label),
+                sel_label,
+            );
+            group.bench_with_input(id, plan, |b, plan| {
+                let config = config.clone();
+                let df_rt = &df_runtime;
+                b.to_async(mgr.io_runtime.as_ref()).iter(|| {
+                    let url = url_multi.clone();
+                    let metas = metas_multi.clone();
+                    let plan = (*plan).clone();
+                    let exec = mgr.cpu_executor();
+                    let config = config.clone();
+                    async move {
+                        let ptr = query_executor::execute_query(
+                            url, metas, "t".into(), plan, df_rt, exec, None, &config,
+                        ).await.unwrap();
+                        let mut stream = unsafe {
+                            Box::from_raw(ptr as *mut datafusion::physical_plan::stream::RecordBatchStreamAdapter<
+                                opensearch_datafusion::cross_rt_stream::CrossRtStream,
+                            >)
+                        };
+                        let mut rows = 0u64;
+                        while let Some(batch) = stream.try_next().await.unwrap() {
+                            rows += batch.num_rows() as u64;
+                        }
+                        rows
+                    }
+                });
+            });
+        }
+    }
 
     group.finish();
     mgr.cpu_executor.shutdown();
     std::mem::forget(mgr);
 }
 
-criterion_group!(benches, bench_row_id_strategies);
+/// Correctness check: all four approaches must return the same row count
+/// for the same query. Runs once per selectivity, asserts equality.
+fn verify_correctness(c: &mut Criterion) {
+    let (mgr, df_runtime) = setup();
+
+    let metas = get_metas(&mgr, &[FILE1]);
+    let url = ListingTableUrl::parse(FILE1).unwrap();
+
+    let queries = vec![
+        ("200", "SELECT \"___row_id\" FROM t WHERE target_status_code = 200"),
+        ("404", "SELECT \"___row_id\" FROM t WHERE target_status_code = 404"),
+        ("500", "SELECT \"___row_id\" FROM t WHERE target_status_code = 500"),
+    ];
+
+    let strategies = vec![
+        ("baseline", RowIdStrategy::ListingTable),
+        ("listing_table", RowIdStrategy::ListingTable),
+        ("indexed_pred", RowIdStrategy::IndexedPredicateOnly),
+        ("indexed_pass", RowIdStrategy::IndexedPassthrough),
+    ];
+
+    println!("\n=== Correctness verification ===");
+    for (q_label, sql) in &queries {
+        let plan = get_substrait(&mgr, FILE1, sql);
+        let mut row_counts: Vec<(&str, u64)> = Vec::new();
+
+        for (s_label, strategy) in &strategies {
+            let config = DatafusionQueryConfig {
+                target_partitions: 10,
+                row_id_strategy: *strategy,
+                ..Default::default()
+            };
+            let rows = mgr.io_runtime.block_on(async {
+                let ptr = query_executor::execute_query(
+                    url.clone(),
+                    metas.clone(),
+                    "t".into(),
+                    plan.clone(),
+                    &df_runtime,
+                    mgr.cpu_executor(),
+                    None,
+                    &config,
+                )
+                .await
+                .unwrap();
+                let mut stream = unsafe {
+                    Box::from_raw(
+                        ptr as *mut datafusion::physical_plan::stream::RecordBatchStreamAdapter<
+                            opensearch_datafusion::cross_rt_stream::CrossRtStream,
+                        >,
+                    )
+                };
+                let mut rows = 0u64;
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    rows += batch.num_rows() as u64;
+                }
+                rows
+            });
+            row_counts.push((s_label, rows));
+        }
+
+        let first = row_counts[0].1;
+        let all_match = row_counts.iter().all(|(_, r)| *r == first);
+        println!(
+            "  filter={}: rows={} | all_match={}",
+            q_label, first, all_match
+        );
+        for (label, count) in &row_counts {
+            if *count != first {
+                println!("    MISMATCH: {} returned {} (expected {})", label, count, first);
+            }
+        }
+        assert!(
+            all_match,
+            "Row counts differ for filter={}: {:?}",
+            q_label, row_counts
+        );
+    }
+    println!("  ✓ All approaches return identical row counts\n");
+
+    // Dummy bench so criterion doesn't complain about empty group
+    let mut group = c.benchmark_group("correctness");
+    group.sample_size(10);
+    group.bench_function("verify", |b| {
+        b.iter(|| 1 + 1);
+    });
+    group.finish();
+
+    mgr.cpu_executor.shutdown();
+    std::mem::forget(mgr);
+}
+
+criterion_group!(benches, bench_all_approaches, verify_correctness);
 criterion_main!(benches);
