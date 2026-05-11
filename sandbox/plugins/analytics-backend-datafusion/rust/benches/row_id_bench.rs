@@ -1,10 +1,11 @@
-//! Benchmark: row ID fetch — all four approaches at three selectivities.
+//! Benchmark: row ID fetch — baseline vs ShardTableProvider+optimizer.
 //!
 //! Approaches:
-//!   - Baseline: SELECT ___row_id (reads from disk, no row_base, no optimizer)
-//!   - Approach 1 (ListingTable): ProjectRowIdOptimizer (___row_id + row_base)
-//!   - Approach 2 (IndexedPredicateOnly): Indexed pipeline, compute from position
-//!   - Approach 3 (IndexedPassthrough): ComputeRowIdOptimizer (___row_id + row_base, conceptual position)
+//!   - Baseline: ListingTable, reads ___row_id as plain column (local per-file IDs)
+//!   - ListingTable: ShardTableProvider + ProjectRowIdOptimizer (___row_id + row_base = absolute IDs)
+//!
+//! IndexedPredicateOnly (compute from position, zero ___row_id I/O) requires the
+//! indexed executor path and is tested separately in tests_e2e/row_id_emission.rs.
 //!
 //! Files:
 //!   - /Users/abandeji/Downloads/generation-1.parquet (8.5M rows)
@@ -106,8 +107,6 @@ fn bench_all_approaches(c: &mut Criterion) {
     let approaches: Vec<(&str, DatafusionQueryConfig)> = vec![
         ("baseline", DatafusionQueryConfig { target_partitions: 10, ..Default::default() }),
         ("listing_table", DatafusionQueryConfig { target_partitions: 10, row_id_strategy: RowIdStrategy::ListingTable, ..Default::default() }),
-        ("indexed_pred", DatafusionQueryConfig { target_partitions: 10, row_id_strategy: RowIdStrategy::IndexedPredicateOnly, ..Default::default() }),
-        ("indexed_pass", DatafusionQueryConfig { target_partitions: 10, row_id_strategy: RowIdStrategy::IndexedPassthrough, ..Default::default() }),
     ];
 
     let mut group = c.benchmark_group("row_id");
@@ -187,12 +186,95 @@ fn bench_all_approaches(c: &mut Criterion) {
         }
     }
 
+    // === IndexedPredicateOnly (single segment): direct IndexedTableProvider ===
+    // Exercises the true position-based row ID computation path.
+    {
+        use opensearch_datafusion::indexed_table::table_provider::{
+            IndexedTableConfig, IndexedTableProvider, SegmentFileInfo,
+        };
+        use opensearch_datafusion::indexed_table::eval::RowGroupBitsetSource;
+        use opensearch_datafusion::indexed_table::eval::select_all::SelectAllBitsetSource;
+        use opensearch_datafusion::indexed_table::stream::RowGroupInfo;
+        use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+
+        let path = std::path::Path::new(FILE1);
+        let size = std::fs::metadata(path).unwrap().len();
+        let file = std::fs::File::open(path).unwrap();
+        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new().with_page_index(true)).unwrap();
+        let schema = meta.schema().clone();
+        let parquet_meta = meta.metadata().clone();
+        let mut rgs = Vec::new();
+        let mut offset = 0i64;
+        for i in 0..parquet_meta.num_row_groups() {
+            let n = parquet_meta.row_group(i).num_rows();
+            rgs.push(RowGroupInfo { index: i, first_row: offset, num_rows: n });
+            offset += n;
+        }
+        let total_rows = offset;
+
+        let object_path = object_store::path::Path::from(path.to_string_lossy().as_ref());
+        let segment = SegmentFileInfo {
+            segment_ord: 0,
+            max_doc: total_rows,
+            object_path,
+            parquet_size: size,
+            row_groups: rgs,
+            metadata: Arc::clone(&parquet_meta),
+            global_base: 0,
+        };
+
+        // Single bench: all rows (no filter), emit_row_ids from position
+        let segment_clone = segment.clone();
+        let schema_clone = schema.clone();
+        let id = BenchmarkId::new("1seg/indexed_pred", "all_rows");
+        group.bench_function(id, |b| {
+            b.to_async(mgr.io_runtime.as_ref()).iter(|| {
+                let segment = segment_clone.clone();
+                let schema = schema_clone.clone();
+                async move {
+                    let factory: opensearch_datafusion::indexed_table::table_provider::EvaluatorFactory =
+                        Arc::new(move |_seg, _chunk, _sm| {
+                            Ok(Arc::new(SelectAllBitsetSource) as Arc<dyn RowGroupBitsetSource>)
+                        });
+                    let store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+                    let store_url = datafusion::execution::object_store::ObjectStoreUrl::local_filesystem();
+                    let provider = Arc::new(IndexedTableProvider::new(IndexedTableConfig {
+                        schema,
+                        segments: vec![segment],
+                        store,
+                        store_url,
+                        evaluator_factory: factory,
+                        target_partitions: 10,
+                        force_strategy: None,
+                        force_pushdown: Some(false),
+                        pushdown_predicate: None,
+                        query_config: Arc::new(opensearch_datafusion::datafusion_query_config::DatafusionQueryConfig {
+                            target_partitions: 10,
+                            ..Default::default()
+                        }),
+                        predicate_columns: vec![],
+                        emit_row_ids: true,
+                    }));
+                    let ctx = datafusion::prelude::SessionContext::new();
+                    ctx.register_table("t", provider).unwrap();
+                    let df = ctx.sql("SELECT * FROM t").await.unwrap();
+                    let mut stream = df.execute_stream().await.unwrap();
+                    let mut rows = 0u64;
+                    while let Some(batch) = stream.try_next().await.unwrap() {
+                        rows += batch.num_rows() as u64;
+                    }
+                    rows
+                }
+            });
+        });
+    }
+
     group.finish();
     mgr.cpu_executor.shutdown();
     std::mem::forget(mgr);
 }
 
-/// Correctness check: all four approaches must return the same row count
+/// Correctness check: all approaches must return the same row count
 /// for the same query. Runs once per selectivity, asserts equality.
 fn verify_correctness(c: &mut Criterion) {
     let (mgr, df_runtime) = setup();
@@ -207,10 +289,8 @@ fn verify_correctness(c: &mut Criterion) {
     ];
 
     let strategies = vec![
-        ("baseline", RowIdStrategy::ListingTable),
+        ("baseline", RowIdStrategy::None),
         ("listing_table", RowIdStrategy::ListingTable),
-        ("indexed_pred", RowIdStrategy::IndexedPredicateOnly),
-        ("indexed_pass", RowIdStrategy::IndexedPassthrough),
     ];
 
     println!("\n=== Correctness verification ===");

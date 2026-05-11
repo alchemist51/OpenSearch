@@ -10,21 +10,22 @@ use crate::indexed_table::eval::single_collector::CollectorCallStrategy;
 
 /// Selects which execution path computes shard-global row IDs.
 ///
-/// All three strategies produce identical row IDs for the same data.
-/// The flag exists to benchmark and compare approaches before committing.
+/// Selects which execution path computes shard-global row IDs.
+/// `None` = no row ID computation (baseline — reads ___row_id as a regular column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowIdStrategy {
-    /// Approach 1: ShardTableProvider + ProjectRowIdOptimizer.
+    /// No row ID optimizer applied. ___row_id is read as a regular column
+    /// without any row_base addition. Returns local (per-file) row IDs only.
+    None,
+    /// ShardTableProvider + ProjectRowIdOptimizer.
     /// Reads ___row_id from parquet, adds row_base via physical optimizer rewrite.
+    /// Produces shard-global absolute row IDs.
     ListingTable,
-    /// Approach 2: Predicate-only mode in the indexed executor.
-    /// Uses indexed pipeline's predicate/pruning infrastructure (page pruning,
-    /// pushdown) without any collector/FFM overhead. Computes row IDs from position.
+    /// Predicate-only mode in the indexed executor.
+    /// Uses indexed pipeline (segment partitioning, prefetch, PositionMap).
+    /// Does NOT read ___row_id from disk — computes from position:
+    /// global_base + rg.first_row + position_in_rg. Zero column I/O for row ID.
     IndexedPredicateOnly,
-    /// Approach 3: ListingTable scan but computes row IDs from position.
-    /// Same ShardTableProvider scan as Approach 1 but does NOT read ___row_id
-    /// from disk — computes row_base + position_in_batch instead.
-    IndexedPassthrough,
 }
 
 /// Query-scoped configuration. Owned by value after FFM decode.
@@ -88,7 +89,7 @@ impl Default for DatafusionQueryConfig {
             max_collector_parallelism: 1,
             single_collector_strategy: CollectorCallStrategy::PageRangeSplit,
             tree_collector_strategy: CollectorCallStrategy::TightenOuterBounds,
-            row_id_strategy: RowIdStrategy::ListingTable,
+            row_id_strategy: RowIdStrategy::None,
         }
     }
 }
@@ -120,7 +121,7 @@ pub struct WireDatafusionQueryConfig {
     pub single_collector_strategy: i32,
     /// 0 = FullRange, 1 = TightenOuterBounds, 2 = PageRangeSplit
     pub tree_collector_strategy: i32,
-    /// 0 = ListingTable (default), 1 = IndexedPredicateOnly, 2 = IndexedPassthrough
+    /// 0 = None (baseline), 1 = ListingTable, 2 = IndexedPredicateOnly
     pub row_id_strategy: i32,
 }
 
@@ -172,9 +173,9 @@ impl DatafusionQueryConfig {
                 _ => CollectorCallStrategy::TightenOuterBounds,
             },
             row_id_strategy: match w.row_id_strategy {
-                1 => RowIdStrategy::IndexedPredicateOnly,
-                2 => RowIdStrategy::IndexedPassthrough,
-                _ => RowIdStrategy::ListingTable,
+                1 => RowIdStrategy::ListingTable,
+                2 => RowIdStrategy::IndexedPredicateOnly,
+                _ => RowIdStrategy::None,
             },
         }
     }

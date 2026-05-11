@@ -26,7 +26,6 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::api::{build_shard_files, FileRowMetadata};
-    use crate::compute_row_id_optimizer::ComputeRowIdOptimizer;
     use crate::datafusion_query_config::RowIdStrategy;
     use crate::project_row_id_optimizer::ProjectRowIdOptimizer;
 
@@ -285,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_row_id_optimizer_no_op_without_row_id() {
+    fn test_project_row_id_optimizer_no_op_without_row_id() {
         // Schema without ___row_id — optimizer should be a no-op
         let schema = Arc::new(Schema::new(vec![
             Field::new("x", DataType::Float64, false),
@@ -295,7 +294,7 @@ mod tests {
         let empty = datafusion::physical_plan::empty::EmptyExec::new(schema.clone());
         let plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> = Arc::new(empty);
 
-        let optimizer = ComputeRowIdOptimizer;
+        let optimizer = ProjectRowIdOptimizer;
         let config = ConfigOptions::default();
         let result = optimizer.optimize(plan.clone(), &config).unwrap();
 

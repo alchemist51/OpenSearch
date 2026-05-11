@@ -21,7 +21,6 @@
 //! Set `WireDatafusionQueryConfig.row_id_strategy` to:
 //! - `0` for ListingTable (Approach 1)
 //! - `1` for IndexedPredicateOnly (Approach 2)
-//! - `2` for IndexedPassthrough (Approach 3)
 //!
 //! ### Baseline
 //!
@@ -58,8 +57,6 @@ pub enum BenchmarkMode {
     ListingTable,
     /// Approach 2: Full indexed executor with select-all evaluator.
     IndexedPredicateOnly,
-    /// Approach 3: Indexed passthrough with no bitmap overhead.
-    IndexedPassthrough,
 }
 
 impl BenchmarkMode {
@@ -69,7 +66,6 @@ impl BenchmarkMode {
             BenchmarkMode::Baseline => None,
             BenchmarkMode::ListingTable => Some(RowIdStrategy::ListingTable),
             BenchmarkMode::IndexedPredicateOnly => Some(RowIdStrategy::IndexedPredicateOnly),
-            BenchmarkMode::IndexedPassthrough => Some(RowIdStrategy::IndexedPassthrough),
         }
     }
 }
@@ -86,8 +82,6 @@ mod tests {
         let c2 = config_for_strategy(RowIdStrategy::IndexedPredicateOnly);
         assert_eq!(c2.row_id_strategy, RowIdStrategy::IndexedPredicateOnly);
 
-        let c3 = config_for_strategy(RowIdStrategy::IndexedPassthrough);
-        assert_eq!(c3.row_id_strategy, RowIdStrategy::IndexedPassthrough);
     }
 
     #[test]
@@ -102,8 +96,6 @@ mod tests {
             Some(RowIdStrategy::IndexedPredicateOnly)
         );
         assert_eq!(
-            BenchmarkMode::IndexedPassthrough.to_strategy(),
-            Some(RowIdStrategy::IndexedPassthrough)
         );
     }
 }
