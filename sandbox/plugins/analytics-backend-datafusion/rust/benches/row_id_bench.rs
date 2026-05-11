@@ -314,6 +314,115 @@ fn bench_all_approaches(c: &mut Criterion) {
                 });
             });
         }
+
+        // Multi-segment: both files
+        let path2 = std::path::Path::new(FILE2);
+        let size2 = std::fs::metadata(path2).unwrap().len();
+        let file2 = std::fs::File::open(path2).unwrap();
+        let meta2 = ArrowReaderMetadata::load(&file2, ArrowReaderOptions::new().with_page_index(true)).unwrap();
+        let parquet_meta2 = meta2.metadata().clone();
+        let mut rgs2 = Vec::new();
+        let mut offset2 = 0i64;
+        for i in 0..parquet_meta2.num_row_groups() {
+            let n = parquet_meta2.row_group(i).num_rows();
+            rgs2.push(RowGroupInfo { index: i, first_row: offset2, num_rows: n });
+            offset2 += n;
+        }
+        let object_path2 = object_store::path::Path::from(path2.to_string_lossy().as_ref());
+        let segment2 = SegmentFileInfo {
+            segment_ord: 1,
+            max_doc: offset2,
+            object_path: object_path2,
+            parquet_size: size2,
+            row_groups: rgs2,
+            metadata: Arc::clone(&parquet_meta2),
+            global_base: total_rows as u64, // second segment starts after first
+        };
+
+        for &(sel_label, filter_value) in &[("200_70pct", 200i32), ("404_5pct", 404), ("500_2pct", 500)] {
+            let segment = segment.clone();
+            let segment2 = segment2.clone();
+            let schema = schema.clone();
+            let id = BenchmarkId::new("2seg/indexed_pred", sel_label);
+            group.bench_function(id, |b| {
+                let segment = segment.clone();
+                let segment2 = segment2.clone();
+                let schema = schema.clone();
+                b.to_async(mgr.io_runtime.as_ref()).iter(|| {
+                    let segment = segment.clone();
+                    let segment2 = segment2.clone();
+                    let schema = schema.clone();
+                    async move {
+                        let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
+                            datafusion::physical_expr::expressions::Column::new("target_status_code", col_idx),
+                        );
+                        let lit_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
+                            datafusion::physical_expr::expressions::Literal::new(ScalarValue::Int32(Some(filter_value))),
+                        );
+                        let pred = BoolNode::Predicate(Arc::new(
+                            datafusion::physical_expr::expressions::BinaryExpr::new(
+                                col_expr, datafusion::logical_expr::Operator::Eq, lit_expr,
+                            ),
+                        ));
+                        let tree = Arc::new(BoolNode::And(vec![pred]).push_not_down());
+
+                        let factory: opensearch_datafusion::indexed_table::table_provider::EvaluatorFactory = {
+                            let tree = Arc::clone(&tree);
+                            let schema = schema.clone();
+                            Arc::new(move |seg, _chunk, _sm| {
+                                let resolved = tree.resolve(&[])?;
+                                let pruner = Arc::new(PagePruner::new(&schema, Arc::clone(&seg.metadata)));
+                                let eval: Arc<dyn RowGroupBitsetSource> = Arc::new(TreeBitsetSource {
+                                    tree: Arc::new(resolved),
+                                    evaluator: Arc::new(BitmapTreeEvaluator),
+                                    leaves: Arc::new(CollectorLeafBitmaps {
+                                        ffm_collector_calls: _sm.ffm_collector_calls.clone(),
+                                    }),
+                                    page_pruner: pruner,
+                                    cost_predicate: 1, cost_collector: 10, max_collector_parallelism: 1,
+                                    pruning_predicates: Arc::new(std::collections::HashMap::new()),
+                                    page_prune_metrics: Some(
+                                        opensearch_datafusion::indexed_table::page_pruner::PagePruneMetrics::from_stream_metrics(_sm),
+                                    ),
+                                    collector_strategy: opensearch_datafusion::indexed_table::eval::CollectorCallStrategy::TightenOuterBounds,
+                                });
+                                Ok(eval)
+                            })
+                        };
+
+                        let store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+                        let store_url = datafusion::execution::object_store::ObjectStoreUrl::local_filesystem();
+                        let provider = Arc::new(IndexedTableProvider::new(IndexedTableConfig {
+                            schema,
+                            segments: vec![segment, segment2],
+                            store,
+                            store_url,
+                            evaluator_factory: factory,
+                            target_partitions: 10,
+                            force_strategy: Some(FilterStrategy::BooleanMask),
+                            force_pushdown: Some(false),
+                            pushdown_predicate: None,
+                            query_config: Arc::new(opensearch_datafusion::datafusion_query_config::DatafusionQueryConfig {
+                                target_partitions: 10,
+                                ..Default::default()
+                            }),
+                            predicate_columns: vec![col_idx],
+                            emit_row_ids: true,
+                        }));
+
+                        let ctx = datafusion::prelude::SessionContext::new();
+                        ctx.register_table("t", provider).unwrap();
+                        let df = ctx.sql("SELECT * FROM t").await.unwrap();
+                        let mut stream = df.execute_stream().await.unwrap();
+                        let mut rows = 0u64;
+                        while let Some(batch) = stream.try_next().await.unwrap() {
+                            rows += batch.num_rows() as u64;
+                        }
+                        rows
+                    }
+                });
+            });
+        }
     }
 
     group.finish();
