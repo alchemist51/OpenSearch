@@ -186,16 +186,20 @@ fn bench_all_approaches(c: &mut Criterion) {
         }
     }
 
-    // === IndexedPredicateOnly (single segment): direct IndexedTableProvider ===
-    // Exercises the true position-based row ID computation path.
+    // === IndexedPredicateOnly (single segment): BoolTree with Predicate filter ===
+    // Uses the same target_status_code filter as other approaches but through
+    // the indexed pipeline with position-based row ID computation.
     {
         use opensearch_datafusion::indexed_table::table_provider::{
             IndexedTableConfig, IndexedTableProvider, SegmentFileInfo,
         };
-        use opensearch_datafusion::indexed_table::eval::RowGroupBitsetSource;
-        use opensearch_datafusion::indexed_table::eval::select_all::SelectAllBitsetSource;
-        use opensearch_datafusion::indexed_table::stream::RowGroupInfo;
+        use opensearch_datafusion::indexed_table::eval::{RowGroupBitsetSource, TreeBitsetSource};
+        use opensearch_datafusion::indexed_table::eval::bitmap_tree::{BitmapTreeEvaluator, CollectorLeafBitmaps};
+        use opensearch_datafusion::indexed_table::bool_tree::BoolNode;
+        use opensearch_datafusion::indexed_table::page_pruner::PagePruner;
+        use opensearch_datafusion::indexed_table::stream::{RowGroupInfo, FilterStrategy};
         use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+        use datafusion::common::ScalarValue;
 
         let path = std::path::Path::new(FILE1);
         let size = std::fs::metadata(path).unwrap().len();
@@ -223,50 +227,93 @@ fn bench_all_approaches(c: &mut Criterion) {
             global_base: 0,
         };
 
-        // Single bench: all rows (no filter), emit_row_ids from position
-        let segment_clone = segment.clone();
-        let schema_clone = schema.clone();
-        let id = BenchmarkId::new("1seg/indexed_pred", "all_rows");
-        group.bench_function(id, |b| {
-            b.to_async(mgr.io_runtime.as_ref()).iter(|| {
-                let segment = segment_clone.clone();
-                let schema = schema_clone.clone();
-                async move {
-                    let factory: opensearch_datafusion::indexed_table::table_provider::EvaluatorFactory =
-                        Arc::new(move |_seg, _chunk, _sm| {
-                            Ok(Arc::new(SelectAllBitsetSource) as Arc<dyn RowGroupBitsetSource>)
-                        });
-                    let store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
-                    let store_url = datafusion::execution::object_store::ObjectStoreUrl::local_filesystem();
-                    let provider = Arc::new(IndexedTableProvider::new(IndexedTableConfig {
-                        schema,
-                        segments: vec![segment],
-                        store,
-                        store_url,
-                        evaluator_factory: factory,
-                        target_partitions: 10,
-                        force_strategy: None,
-                        force_pushdown: Some(false),
-                        pushdown_predicate: None,
-                        query_config: Arc::new(opensearch_datafusion::datafusion_query_config::DatafusionQueryConfig {
+        // target_status_code is column index 21 in the file
+        let col_idx = schema.index_of("target_status_code").unwrap();
+
+        for &(sel_label, filter_value) in &[("200_70pct", 200i32), ("404_5pct", 404), ("500_2pct", 500)] {
+            let segment = segment.clone();
+            let schema = schema.clone();
+            let id = BenchmarkId::new("1seg/indexed_pred", sel_label);
+            group.bench_function(id, |b| {
+                let segment = segment.clone();
+                let schema = schema.clone();
+                b.to_async(mgr.io_runtime.as_ref()).iter(|| {
+                    let segment = segment.clone();
+                    let schema = schema.clone();
+                    async move {
+                        // Build predicate: target_status_code == filter_value
+                        let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
+                            datafusion::physical_expr::expressions::Column::new("target_status_code", col_idx),
+                        );
+                        let lit_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
+                            datafusion::physical_expr::expressions::Literal::new(ScalarValue::Int32(Some(filter_value))),
+                        );
+                        let pred = BoolNode::Predicate(Arc::new(
+                            datafusion::physical_expr::expressions::BinaryExpr::new(
+                                col_expr, datafusion::logical_expr::Operator::Eq, lit_expr,
+                            ),
+                        ));
+                        let tree = Arc::new(BoolNode::And(vec![pred]).push_not_down());
+
+                        let factory: opensearch_datafusion::indexed_table::table_provider::EvaluatorFactory = {
+                            let tree = Arc::clone(&tree);
+                            let schema = schema.clone();
+                            Arc::new(move |seg, _chunk, _sm| {
+                                let resolved = tree.resolve(&[])?;
+                                let pruner = Arc::new(PagePruner::new(&schema, Arc::clone(&seg.metadata)));
+                                let eval: Arc<dyn RowGroupBitsetSource> = Arc::new(TreeBitsetSource {
+                                    tree: Arc::new(resolved),
+                                    evaluator: Arc::new(BitmapTreeEvaluator),
+                                    leaves: Arc::new(CollectorLeafBitmaps {
+                                        ffm_collector_calls: _sm.ffm_collector_calls.clone(),
+                                    }),
+                                    page_pruner: pruner,
+                                    cost_predicate: 1,
+                                    cost_collector: 10,
+                                    max_collector_parallelism: 1,
+                                    pruning_predicates: Arc::new(std::collections::HashMap::new()),
+                                    page_prune_metrics: Some(
+                                        opensearch_datafusion::indexed_table::page_pruner::PagePruneMetrics::from_stream_metrics(_sm),
+                                    ),
+                                    collector_strategy: opensearch_datafusion::indexed_table::eval::CollectorCallStrategy::TightenOuterBounds,
+                                });
+                                Ok(eval)
+                            })
+                        };
+
+                        let store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+                        let store_url = datafusion::execution::object_store::ObjectStoreUrl::local_filesystem();
+                        let provider = Arc::new(IndexedTableProvider::new(IndexedTableConfig {
+                            schema,
+                            segments: vec![segment],
+                            store,
+                            store_url,
+                            evaluator_factory: factory,
                             target_partitions: 10,
-                            ..Default::default()
-                        }),
-                        predicate_columns: vec![],
-                        emit_row_ids: true,
-                    }));
-                    let ctx = datafusion::prelude::SessionContext::new();
-                    ctx.register_table("t", provider).unwrap();
-                    let df = ctx.sql("SELECT * FROM t").await.unwrap();
-                    let mut stream = df.execute_stream().await.unwrap();
-                    let mut rows = 0u64;
-                    while let Some(batch) = stream.try_next().await.unwrap() {
-                        rows += batch.num_rows() as u64;
+                            force_strategy: Some(FilterStrategy::BooleanMask),
+                            force_pushdown: Some(false),
+                            pushdown_predicate: None,
+                            query_config: Arc::new(opensearch_datafusion::datafusion_query_config::DatafusionQueryConfig {
+                                target_partitions: 10,
+                                ..Default::default()
+                            }),
+                            predicate_columns: vec![col_idx],
+                            emit_row_ids: true,
+                        }));
+
+                        let ctx = datafusion::prelude::SessionContext::new();
+                        ctx.register_table("t", provider).unwrap();
+                        let df = ctx.sql("SELECT * FROM t").await.unwrap();
+                        let mut stream = df.execute_stream().await.unwrap();
+                        let mut rows = 0u64;
+                        while let Some(batch) = stream.try_next().await.unwrap() {
+                            rows += batch.num_rows() as u64;
+                        }
+                        rows
                     }
-                    rows
-                }
+                });
             });
-        });
+        }
     }
 
     group.finish();

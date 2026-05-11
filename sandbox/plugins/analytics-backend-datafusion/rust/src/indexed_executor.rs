@@ -75,6 +75,7 @@ use crate::indexed_table::bool_tree::residual_bool_to_physical_expr;
 use crate::indexed_table::metrics::StreamMetrics;
 use crate::indexed_table::page_pruner::{build_pruning_predicate, PagePruneMetrics};
 
+
 /// Execute an indexed query.
 ///
 /// `shard_view` carries the segment's parquet paths (populated when the reader
@@ -500,22 +501,18 @@ pub async unsafe fn execute_indexed_with_context(
     let factory: EvaluatorFactory = match classification {
         FilterClass::None => {
             if emit_row_ids {
-                // Predicate-only mode: no collectors, just parquet pushdown filtering.
+                // Predicate-only mode with emit_row_ids: use SingleCollectorEvaluator
+                // with a no-op collector (returns all docs). The residual predicate
+                // handles filtering via page pruning + on_batch_mask.
                 // Row IDs are computed from position by IndexedStream.
-                // The pushdown_predicate (set above) handles filtering at decode time.
-                // No evaluator needed — use a no-op that selects all rows.
-                // Parquet's native pushdown does the actual filtering.
                 let schema_for_pruner = schema.clone();
-                let pruning_preds: Arc<HashMap<usize, Arc<PruningPredicate>>> = Arc::new(
-                    extraction.as_ref().map(|e| {
-                        let mut exprs = Vec::new();
-                        collect_predicate_exprs(&e.tree, &mut exprs);
-                        exprs.iter().filter_map(|expr| {
-                            build_pruning_predicate(expr, Arc::clone(&schema_for_pruner))
-                                .map(|pp| (Arc::as_ptr(expr) as *const () as usize, pp))
-                        }).collect::<HashMap<_, _>>()
-                    }).unwrap_or_default()
-                );
+                let residual_expr: Option<Arc<dyn PhysicalExpr>> = extraction.as_ref().and_then(|e| {
+                    residual_bool_to_physical_expr(&e.tree)
+                });
+                let residual_pruning_predicate: Option<Arc<PruningPredicate>> = residual_expr
+                    .as_ref()
+                    .and_then(|expr| build_pruning_predicate(expr, Arc::clone(&schema_for_pruner)));
+                let call_strategy = query_config.single_collector_strategy;
 
                 Arc::new(
                     move |segment: &SegmentFileInfo, _chunk, stream_metrics: &StreamMetrics| {
@@ -523,8 +520,15 @@ pub async unsafe fn execute_indexed_with_context(
                             &schema_for_pruner,
                             Arc::clone(&segment.metadata),
                         ));
-                        Ok(Arc::new(crate::indexed_table::eval::select_all::SelectAllBitsetSource)
-                            as Arc<dyn RowGroupBitsetSource>)
+                        let eval: Arc<dyn RowGroupBitsetSource> =
+                            Arc::new(SingleCollectorEvaluator::predicate_only(
+                                pruner,
+                                residual_pruning_predicate.clone(),
+                                residual_expr.clone(),
+                                Some(PagePruneMetrics::from_stream_metrics(stream_metrics)),
+                                call_strategy,
+                            ));
+                        Ok(eval)
                     },
                 )
             } else {
