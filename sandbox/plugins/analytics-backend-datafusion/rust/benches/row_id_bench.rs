@@ -1,18 +1,12 @@
-//! Benchmark: row ID fetch — baseline vs ShardTableProvider+optimizer.
+//! Benchmark: row ID fetch across all three approaches.
 //!
 //! Approaches:
-//!   - Baseline: ListingTable, reads ___row_id as plain column (local per-file IDs)
-//!   - ListingTable: ShardTableProvider + ProjectRowIdOptimizer (___row_id + row_base = absolute IDs)
-//!
-//! IndexedPredicateOnly (compute from position, zero ___row_id I/O) requires the
-//! indexed executor path and is tested separately in tests_e2e/row_id_emission.rs.
-//!
-//! Files:
-//!   - /Users/abandeji/Downloads/generation-1.parquet (8.5M rows)
-//!   - /Users/abandeji/Downloads/generation-2.parquet (5.7M rows)
+//!   - baseline: ListingTable, reads ___row_id as plain column (local per-file IDs)
+//!   - listing_table: ShardTableProvider + ProjectRowIdOptimizer (___row_id + row_base = absolute IDs)
+//!   - indexed_pred: IndexedTableProvider + SingleCollectorEvaluator::predicate_only() (position math, zero ___row_id I/O)
 //!
 //! Usage:
-//!   cargo bench --bench row_id_bench
+//!   ROW_ID_BENCH_FILES=/path/seg1.parquet,/path/seg2.parquet cargo bench --bench row_id_bench
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use datafusion::datasource::listing::ListingTableUrl;

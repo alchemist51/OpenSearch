@@ -294,6 +294,143 @@ async fn test_emit_row_ids_with_global_base_offset() {
     assert_eq!(ids, vec![1000, 1001, 1002, 1003, 1012]);
 }
 
+// ── Comprehensive correctness: verify emitted row IDs match actual positions ──
+//
+// For each query type (SingleCollector, Collector+Predicate, Tree OR, Tree AND,
+// Predicate-only), we compute the EXPECTED row IDs by scanning the fixture data
+// directly, then compare against what emit_row_ids produces.
+//
+// The fixture (16 rows):
+// | row | brand  | price | status    | category    |
+// |  0  | amazon |    50 | active    | electronics |
+// |  1  | amazon |   150 | archived  | electronics |
+// |  2  | amazon |    80 | active    | books       |
+// |  3  | amazon |   120 | active    | electronics |
+// |  4  | apple  |    90 | active    | electronics |
+// |  5  | apple  |    95 | archived  | electronics |
+// |  6  | apple  |   200 | active    | books       |
+// |  7  | apple  |    60 | active    | electronics |
+// |  8  | google |    40 | active    | electronics |
+// |  9  | google |   300 | archived  | electronics |
+// | 10  | samsung|    70 | active    | electronics |
+// | 11  | samsung|   150 | active    | books       |
+// | 12  | amazon |    30 | archived  | electronics |
+// | 13  | apple  |    45 | archived  | electronics |
+// | 14  | samsung|    99 | active    | electronics |
+// | 15  | google |    55 | active    | electronics |
+
+/// Helper: compute expected row positions from fixture data given a filter.
+fn expected_rows(filter: impl Fn(usize) -> bool) -> Vec<u64> {
+    (0..16).filter(|&i| filter(i)).map(|i| i as u64).collect()
+}
+
+/// Exhaustive test: all query types produce correct row IDs matching fixture positions.
+#[tokio::test]
+async fn test_all_query_types_match_fixture_positions() {
+    // SingleCollector: brand="amazon" → rows 0,1,2,3,12
+    let ids = run_tree_row_ids(BoolNode::And(vec![index_leaf(0)])).await;
+    let expected = expected_rows(|i| BRANDS[i] == "amazon");
+    assert_eq!(ids, expected, "SingleCollector(amazon) mismatch");
+
+    // SingleCollector: brand="apple" → rows 4,5,6,7,13
+    let ids = run_tree_row_ids(BoolNode::And(vec![index_leaf(1)])).await;
+    let expected = expected_rows(|i| BRANDS[i] == "apple");
+    assert_eq!(ids, expected, "SingleCollector(apple) mismatch");
+
+    // SingleCollector: status="archived" → rows 1,5,9,12,13
+    let ids = run_tree_row_ids(BoolNode::And(vec![index_leaf(2)])).await;
+    let expected = expected_rows(|i| STATUSES[i] == "archived");
+    assert_eq!(ids, expected, "SingleCollector(archived) mismatch");
+
+    // Collector + Predicate: amazon AND price > 100 → rows 1,3
+    let ids = run_tree_row_ids(BoolNode::And(vec![
+        index_leaf(0),
+        pred_int("price", Operator::Gt, 100),
+    ])).await;
+    let expected = expected_rows(|i| BRANDS[i] == "amazon" && PRICES[i] > 100);
+    assert_eq!(ids, expected, "Collector+Predicate(amazon,price>100) mismatch");
+
+    // Collector + Predicate: apple AND price < 90 → rows 7,13
+    let ids = run_tree_row_ids(BoolNode::And(vec![
+        index_leaf(1),
+        pred_int("price", Operator::Lt, 90),
+    ])).await;
+    let expected = expected_rows(|i| BRANDS[i] == "apple" && PRICES[i] < 90);
+    assert_eq!(ids, expected, "Collector+Predicate(apple,price<90) mismatch");
+
+    // Tree OR: amazon OR apple → rows 0-7,12,13
+    let ids = run_tree_row_ids(BoolNode::Or(vec![index_leaf(0), index_leaf(1)])).await;
+    let expected = expected_rows(|i| BRANDS[i] == "amazon" || BRANDS[i] == "apple");
+    assert_eq!(ids, expected, "Tree OR(amazon,apple) mismatch");
+
+    // Tree AND: apple AND archived → rows 5,13
+    let ids = run_tree_row_ids(BoolNode::And(vec![index_leaf(1), index_leaf(2)])).await;
+    let expected = expected_rows(|i| BRANDS[i] == "apple" && STATUSES[i] == "archived");
+    assert_eq!(ids, expected, "Tree AND(apple,archived) mismatch");
+
+    // Tree OR + Predicate: (amazon OR apple) AND price > 100 → rows 1,3,6,9? no...
+    // amazon(0,1,2,3,12) OR apple(4,5,6,7,13) = 0-7,12,13. price>100: 1,3,6
+    let ids = run_tree_row_ids(BoolNode::And(vec![
+        BoolNode::Or(vec![index_leaf(0), index_leaf(1)]),
+        pred_int("price", Operator::Gt, 100),
+    ])).await;
+    let expected = expected_rows(|i| (BRANDS[i] == "amazon" || BRANDS[i] == "apple") && PRICES[i] > 100);
+    assert_eq!(ids, expected, "Tree OR+Predicate mismatch");
+
+    // Predicate only: price >= 150 → rows 1,6,9,11
+    let ids = run_tree_row_ids(BoolNode::And(vec![
+        pred_int("price", Operator::GtEq, 150),
+    ])).await;
+    let expected = expected_rows(|i| PRICES[i] >= 150);
+    assert_eq!(ids, expected, "Predicate-only(price>=150) mismatch");
+
+    // Predicate only: price < 50 → rows 8,12,13
+    let ids = run_tree_row_ids(BoolNode::And(vec![
+        pred_int("price", Operator::Lt, 50),
+    ])).await;
+    let expected = expected_rows(|i| PRICES[i] < 50);
+    assert_eq!(ids, expected, "Predicate-only(price<50) mismatch");
+
+    // Multi-predicate: price > 50 AND price < 100 → rows 2,4,5,7,10,14,15
+    let ids = run_tree_row_ids(BoolNode::And(vec![
+        pred_int("price", Operator::Gt, 50),
+        pred_int("price", Operator::Lt, 100),
+    ])).await;
+    let expected = expected_rows(|i| PRICES[i] > 50 && PRICES[i] < 100);
+    assert_eq!(ids, expected, "Multi-predicate(50<price<100) mismatch");
+
+    // String predicate: status = "active" → rows 0,2,3,4,6,7,8,10,11,14,15
+    let ids = run_tree_row_ids(BoolNode::And(vec![
+        pred_str("status", Operator::Eq, "active"),
+    ])).await;
+    let expected = expected_rows(|i| STATUSES[i] == "active");
+    assert_eq!(ids, expected, "Predicate(status=active) mismatch");
+
+    // Collector + string predicate: amazon AND category = "books" → rows 2
+    let ids = run_tree_row_ids(BoolNode::And(vec![
+        index_leaf(0),
+        pred_str("category", Operator::Eq, "books"),
+    ])).await;
+    let expected = expected_rows(|i| BRANDS[i] == "amazon" && CATEGORIES[i] == "books");
+    assert_eq!(ids, expected, "Collector+String(amazon,books) mismatch");
+
+    // NOT(collector): NOT(amazon) → rows 4-11,13-15
+    let ids = run_tree_row_ids(BoolNode::Not(Box::new(index_leaf(0)))).await;
+    let expected = expected_rows(|i| BRANDS[i] != "amazon");
+    assert_eq!(ids, expected, "NOT(amazon) mismatch");
+
+    // Complex: (amazon AND price>80) OR (apple AND archived)
+    let ids = run_tree_row_ids(BoolNode::Or(vec![
+        BoolNode::And(vec![index_leaf(0), pred_int("price", Operator::Gt, 80)]),
+        BoolNode::And(vec![index_leaf(1), index_leaf(2)]),
+    ])).await;
+    let expected = expected_rows(|i| {
+        (BRANDS[i] == "amazon" && PRICES[i] > 80)
+            || (BRANDS[i] == "apple" && STATUSES[i] == "archived")
+    });
+    assert_eq!(ids, expected, "Complex OR(AND,AND) mismatch");
+}
+
 /// Verify UDF detection — `_global_row_id()` in SELECT triggers emit_row_ids mode.
 #[tokio::test]
 async fn test_udf_detection_global_row_id() {

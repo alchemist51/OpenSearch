@@ -284,30 +284,9 @@ mod tests {
     }
 
     #[test]
-    fn test_project_row_id_optimizer_no_op_without_row_id() {
-        // Schema without ___row_id — optimizer should be a no-op
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("x", DataType::Float64, false),
-            Field::new("y", DataType::Float64, false),
-        ]));
-
-        let empty = datafusion::physical_plan::empty::EmptyExec::new(schema.clone());
-        let plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> = Arc::new(empty);
-
-        let optimizer = ProjectRowIdOptimizer;
-        let config = ConfigOptions::default();
-        let result = optimizer.optimize(plan.clone(), &config).unwrap();
-
-        // Schema should be unchanged
-        assert_eq!(result.schema().fields().len(), 2);
-        assert_eq!(result.schema().field(0).name(), "x");
-        assert_eq!(result.schema().field(1).name(), "y");
-    }
-
-    #[test]
-    fn test_row_id_strategy_default_is_listing_table() {
+    fn test_row_id_strategy_default_is_none() {
         let config = crate::datafusion_query_config::DatafusionQueryConfig::default();
-        assert_eq!(config.row_id_strategy, RowIdStrategy::ListingTable);
+        assert_eq!(config.row_id_strategy, RowIdStrategy::None);
     }
 
 

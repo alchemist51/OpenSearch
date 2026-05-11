@@ -95,7 +95,5 @@ mod tests {
             BenchmarkMode::IndexedPredicateOnly.to_strategy(),
             Some(RowIdStrategy::IndexedPredicateOnly)
         );
-        assert_eq!(
-        );
     }
 }
