@@ -36,18 +36,40 @@ use std::sync::Arc;
 /// Single file → single-segment bench only.
 /// Two+ files → both single-segment (first file) and multi-segment (all files).
 ///
-/// Example:
+/// Files MUST contain a `___row_id` Int32 column and `target_status_code` Int32 column.
+///
+/// Examples:
 ///   ROW_ID_BENCH_FILES=/data/generation-1.parquet,/data/generation-2.parquet \
 ///     cargo bench --bench row_id_bench
+///
+///   # Use repo test resources (only 2 rows — for smoke test, not real benchmarking)
+///   ROW_ID_BENCH_FILES=src/test/resources/test.parquet cargo bench --bench row_id_bench
 fn bench_files() -> Vec<String> {
-    std::env::var("ROW_ID_BENCH_FILES")
+    let files: Vec<String> = std::env::var("ROW_ID_BENCH_FILES")
         .unwrap_or_else(|_| {
-            "/Users/abandeji/Downloads/generation-1.parquet,/Users/abandeji/Downloads/generation-2.parquet".to_string()
+            panic!(
+                "ROW_ID_BENCH_FILES not set.\n\
+                 Pass comma-separated paths to parquet files with ___row_id and target_status_code columns.\n\n\
+                 Example:\n  \
+                 ROW_ID_BENCH_FILES=/data/generation-1.parquet,/data/generation-2.parquet \\\n    \
+                 cargo bench --bench row_id_bench"
+            );
         })
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .collect()
+        .collect();
+
+    // Verify files exist
+    for f in &files {
+        assert!(
+            std::path::Path::new(f).exists(),
+            "Benchmark file not found: {}",
+            f
+        );
+    }
+    assert!(!files.is_empty(), "ROW_ID_BENCH_FILES must contain at least one file path");
+    files
 }
 
 /// Derive the directory (common prefix) from the file list for ListingTable URL.
