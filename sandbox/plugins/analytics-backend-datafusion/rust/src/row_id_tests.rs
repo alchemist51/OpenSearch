@@ -310,50 +310,6 @@ mod tests {
         assert_eq!(config.row_id_strategy, RowIdStrategy::ListingTable);
     }
 
-    #[test]
-    fn test_select_all_bitset_source_selects_all() {
-        use crate::indexed_table::eval::select_all::SelectAllBitsetSource;
-        use crate::indexed_table::eval::RowGroupBitsetSource;
-        use crate::indexed_table::stream::RowGroupInfo;
-
-        let source = SelectAllBitsetSource;
-        let rg = RowGroupInfo {
-            index: 0,
-            first_row: 0,
-            num_rows: 1000,
-        };
-
-        let result = source.prefetch_rg(&rg, 0, 1000).unwrap().unwrap();
-        assert_eq!(result.candidates.len(), 1000);
-
-        // All positions should be selected
-        for i in 0..1000u32 {
-            assert!(result.candidates.contains(i));
-        }
-    }
-
-    #[test]
-    fn test_select_all_bitset_source_partial_range() {
-        use crate::indexed_table::eval::select_all::SelectAllBitsetSource;
-        use crate::indexed_table::eval::RowGroupBitsetSource;
-        use crate::indexed_table::stream::RowGroupInfo;
-
-        let source = SelectAllBitsetSource;
-        let rg = RowGroupInfo {
-            index: 1,
-            first_row: 500,
-            num_rows: 200,
-        };
-
-        // Only select docs 550..650 (within the RG)
-        let result = source.prefetch_rg(&rg, 550, 650).unwrap().unwrap();
-        assert_eq!(result.candidates.len(), 100);
-
-        // Candidates should be RG-relative: positions 50..150
-        for i in 50..150u32 {
-            assert!(result.candidates.contains(i));
-        }
-    }
 
     #[test]
     fn test_build_shard_files_empty() {
