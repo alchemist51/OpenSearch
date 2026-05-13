@@ -107,32 +107,16 @@ public class QueryScheduler implements Scheduler {
             listener.onFailure(e);
         });
 
-        // QTF POC: wrap EVERY query with QTFCompletionListener.
-        // The listener checks if __row_id__ + shard_id columns exist in the result.
-        // If not, it passes through unchanged. If yes, it triggers fetch+assembly.
-        // shardTargets are resolved lazily via supplier (populated after start()).
-        final PlanWalker[] walkerRef = new PlanWalker[1];
         wrapped = new QTFCompletionListener(
             wrapped,
             queryId,
             transportService,
             config.bufferAllocator(),
-            () -> {
-                // Lazily resolve shard targets from the leaf execution
-                if (walkerRef[0] != null && walkerRef[0].getGraph() != null) {
-                    for (var exec : walkerRef[0].getGraph().allExecutions()) {
-                        if (exec instanceof org.opensearch.analytics.exec.stage.ShardFragmentStageExecution shardExec) {
-                            return shardExec.getResolvedTargets();
-                        }
-                    }
-                }
-                return List.of();
-            },
+            () -> config.getResolvedShardTargets(),
             config.parentTask()
         );
 
         PlanWalker walker = new PlanWalker(config, stageExecutionBuilder, wrapped);
-        walkerRef[0] = walker;
         return walker;
     }
 
