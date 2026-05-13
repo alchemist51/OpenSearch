@@ -139,10 +139,75 @@ public class LateMaterializationIT extends AnalyticsRestTestCase {
         assertEquals("Should have all 5 docs", 5, rows.size());
     }
 
+    // ── Multi-shard test ──
+
+    private static final String INDEX_MULTI = "late_mat_multi_shard";
+    private static boolean multiReady = false;
+
+    private void setupMultiShard() throws IOException {
+        if (multiReady) return;
+
+        try { client().performRequest(new Request("DELETE", "/" + INDEX_MULTI)); } catch (Exception ignored) {}
+
+        Request create = new Request("PUT", "/" + INDEX_MULTI);
+        create.setJsonEntity("{"
+            + "\"settings\":{"
+            + "  \"number_of_shards\":2,\"number_of_replicas\":0,"
+            + "  \"index.pluggable.dataformat.enabled\":true,"
+            + "  \"index.pluggable.dataformat\":\"composite\","
+            + "  \"index.composite.primary_data_format\":\"parquet\","
+            + "  \"index.composite.secondary_data_formats\":\"lucene\""
+            + "},"
+            + "\"mappings\":{\"properties\":{"
+            + "  \"name\":{\"type\":\"keyword\"},"
+            + "  \"score\":{\"type\":\"integer\"},"
+            + "  \"city\":{\"type\":\"keyword\"}"
+            + "}}}");
+        client().performRequest(create);
+
+        Request health = new Request("GET", "/_cluster/health/" + INDEX_MULTI);
+        health.addParameter("wait_for_status", "green");
+        health.addParameter("timeout", "30s");
+        client().performRequest(health);
+
+        bulkTo(INDEX_MULTI,
+            "{\"index\":{}}\n{\"name\":\"alice\",\"score\":100,\"city\":\"NYC\"}\n"
+          + "{\"index\":{}}\n{\"name\":\"bob\",\"score\":200,\"city\":\"SF\"}\n"
+          + "{\"index\":{}}\n{\"name\":\"carol\",\"score\":150,\"city\":\"NYC\"}\n"
+          + "{\"index\":{}}\n{\"name\":\"dave\",\"score\":50,\"city\":\"LA\"}\n"
+          + "{\"index\":{}}\n{\"name\":\"eve\",\"score\":300,\"city\":\"SF\"}\n");
+        client().performRequest(new Request("POST", "/" + INDEX_MULTI + "/_flush?force=true"));
+
+        multiReady = true;
+    }
+
+    /**
+     * Multi-shard QTF: 2 shards, 5 docs.
+     * Tests whether the position map + fetch correctly handles multiple shards.
+     */
+    public void testQtfMultiShard() throws IOException {
+        setupMultiShard();
+
+        String ppl = "source = " + INDEX_MULTI + " | sort score | fields __row_id__, name, score";
+        List<List<Object>> rows = executePplRows(ppl);
+
+        logger.info("[LateMat-IT] Results for multi-shard sort:");
+        for (int i = 0; i < rows.size(); i++) {
+            logger.info("  row {}: {}", i, rows.get(i));
+        }
+
+        assertNotNull(rows);
+        assertEquals("Should have all 5 docs from 2 shards", 5, rows.size());
+    }
+
     // ── Helpers ──
 
     private void bulk(String body) throws IOException {
-        Request req = new Request("POST", "/" + INDEX + "/_bulk");
+        bulkTo(INDEX, body);
+    }
+
+    private void bulkTo(String index, String body) throws IOException {
+        Request req = new Request("POST", "/" + index + "/_bulk");
         req.setJsonEntity(body);
         req.addParameter("refresh", "true");
         client().performRequest(req);

@@ -464,8 +464,9 @@ pub async unsafe fn execute_query(
 /// valid DataFusion identifier anywhere else a plan would naturally contain
 /// QTF fetch phase: read specific rows by global row ID.
 ///
-/// Resolves global row IDs to per-segment positions, builds a RowIdSetEvaluator
-/// per segment, and reads only the requested rows + columns via IndexedTableProvider.
+/// Uses direct ParquetAccessPlan + DataSourceExec for efficient row retrieval.
+/// Resolves global row IDs to per-file positions, builds RowSelection per row group,
+/// and reads only the targeted rows + columns. No indexed evaluator path.
 pub async unsafe fn fetch_by_row_ids(
     shard_view: &ShardView,
     runtime: &DataFusionRuntime,
@@ -474,37 +475,68 @@ pub async unsafe fn fetch_by_row_ids(
     columns: Vec<String>,
 ) -> Result<i64, DataFusionError> {
     use std::collections::HashMap;
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::common::ScalarValue;
+    use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccess};
+    use datafusion::datasource::physical_plan::ParquetSource;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion::execution::SessionStateBuilder;
+    use datafusion::execution::cache::{CacheAccessor, DefaultListFilesCache, TableScopedPath};
+    use datafusion::execution::cache::cache_manager::{CacheManagerConfig, CachedFileList};
+    use datafusion::parquet::arrow::arrow_reader::RowSelection;
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::*;
+    use datafusion_datasource::file_groups::FileGroup;
+    use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+    use datafusion_datasource::table_schema::TableSchema;
+    use datafusion_datasource::PartitionedFile;
     use roaring::RoaringBitmap;
 
     use crate::cross_rt_stream::CrossRtStream;
-    use crate::indexed_table::eval::row_id_set_evaluator::RowIdSetEvaluator;
-    use crate::indexed_table::eval::RowGroupBitsetSource;
+    use crate::indexed_table::row_selection::build_row_selection_with_min_skip_run;
     use crate::indexed_table::segment_info::build_segments;
-    use crate::indexed_table::table_provider::{
-        EvaluatorFactory, IndexedTableConfig, IndexedTableProvider, SegmentFileInfo,
+
+    let list_file_cache = Arc::new(DefaultListFilesCache::default());
+    let table_scoped_path = TableScopedPath {
+        table: None,
+        path: shard_view.table_path.prefix().clone(),
     };
+    list_file_cache.put(
+        &table_scoped_path,
+        CachedFileList::new(shard_view.object_metas.as_ref().clone()),
+    );
+
+    let runtime_env = RuntimeEnvBuilder::from_runtime_env(&runtime.runtime_env)
+        .with_cache_manager(
+            CacheManagerConfig::default()
+                .with_list_files_cache(Some(list_file_cache))
+                .with_file_metadata_cache(Some(
+                    runtime.runtime_env.cache_manager.get_file_metadata_cache(),
+                ))
+                .with_files_statistics_cache(
+                    runtime.runtime_env.cache_manager.get_file_statistic_cache(),
+                ),
+        )
+        .build()
+        .map_err(|e| DataFusionError::Execution(format!("fetch runtime: {}", e)))?;
 
     let store = {
-        let runtime_env = RuntimeEnvBuilder::from_runtime_env(&runtime.runtime_env)
-            .build()
-            .map_err(|e| DataFusionError::Execution(format!("fetch runtime: {}", e)))?;
         let state = SessionStateBuilder::new()
-            .with_runtime_env(Arc::from(runtime_env))
+            .with_runtime_env(Arc::from(runtime_env.clone()))
             .with_default_features()
             .build();
-        let ctx = datafusion::prelude::SessionContext::new_with_state(state);
+        let ctx = SessionContext::new_with_state(state);
         ctx.state().runtime_env().object_store(&shard_view.table_path)?
     };
 
-    // Build segments to get file layout with global_base
+    // Build segments to get file layout with global_base + row group metadata
     let (segments, schema) = build_segments(Arc::clone(&store), shard_view.object_metas.as_ref())
         .await
         .map_err(DataFusionError::Execution)?;
 
-    // Distribute global row_ids across segments
+    // Distribute global row_ids across segments (file-relative positions)
     let mut per_segment: HashMap<usize, RoaringBitmap> = HashMap::new();
     for &gid in &row_ids {
         let seg_idx = segments
@@ -514,7 +546,7 @@ pub async unsafe fn fetch_by_row_ids(
         per_segment.entry(seg_idx).or_default().insert(local_pos);
     }
 
-    // Determine column indices for projection
+    // Determine column projection indices
     let mut proj_indices: Vec<usize> = Vec::new();
     for col_name in &columns {
         if let Ok(idx) = schema.index_of(col_name) {
@@ -529,50 +561,113 @@ pub async unsafe fn fetch_by_row_ids(
             proj_indices.push(idx);
         }
     }
+    let num_file_cols = schema.fields().len();
+    // Add row_base partition column index
+    proj_indices.push(num_file_cols);
 
-    // Build evaluator factory: returns RowIdSetEvaluator for segments with requested rows,
-    // empty evaluator (skips all RGs) for segments without.
-    let per_segment_arc = Arc::new(per_segment);
-    let factory: EvaluatorFactory = {
-        let per_segment = Arc::clone(&per_segment_arc);
-        Arc::new(move |segment: &SegmentFileInfo, _chunk, _stream_metrics| {
-            let bitmap = per_segment
-                .get(&(segment.segment_ord as usize))
-                .cloned()
-                .unwrap_or_default();
-            let eval: Arc<dyn RowGroupBitsetSource> = Arc::new(RowIdSetEvaluator::new(bitmap));
-            Ok(eval)
-        })
-    };
+    // Build per-file PartitionedFiles with ParquetAccessPlan
+    let store_url = ObjectStoreUrl::local_filesystem();
+    let mut partitioned_files: Vec<PartitionedFile> = Vec::new();
 
-    // Build IndexedTableProvider
-    let store_url = datafusion::execution::object_store::ObjectStoreUrl::local_filesystem();
-    let query_config = crate::datafusion_query_config::DatafusionQueryConfig::test_default();
+    for seg in &segments {
+        let bitmap = match per_segment.get(&(seg.segment_ord as usize)) {
+            Some(bm) => bm.clone(),
+            None => continue, // no rows requested from this file
+        };
 
-    let provider = Arc::new(IndexedTableProvider::new(IndexedTableConfig {
-        schema: schema.clone(),
-        segments,
-        store: Arc::clone(&store),
-        store_url,
-        evaluator_factory: factory,
-        pushdown_predicate: None,
-        query_config: Arc::new(query_config),
-        predicate_columns: vec![],
-        emit_row_ids: true,
-    }));
+        let num_rgs = seg.row_groups.len();
+        let mut access_plan = ParquetAccessPlan::new_none(num_rgs);
 
-    // Execute query: SELECT projected_columns FROM provider
-    let ctx = datafusion::prelude::SessionContext::new();
-    ctx.register_table("t", provider)
-        .map_err(|e| DataFusionError::Execution(format!("register table: {}", e)))?;
+        for rg in &seg.row_groups {
+            let rg_start = rg.first_row as u32;
+            let rg_end = rg_start + rg.num_rows as u32;
 
-    let col_list = columns.iter()
-        .map(|c| format!("\"{}\"", c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("SELECT \"__row_id__\", {} FROM t", col_list);
-    let df = ctx.sql(&sql).await?;
-    let stream = df.execute_stream().await?;
+            // Intersect requested positions with this row group's range
+            let rg_bitmap: RoaringBitmap = bitmap
+                .iter()
+                .filter(|&pos| pos >= rg_start && pos < rg_end)
+                .map(|pos| pos - rg_start)
+                .collect();
+
+            if rg_bitmap.is_empty() {
+                continue; // skip this row group entirely
+            }
+
+            let selection = build_row_selection_with_min_skip_run(
+                &rg_bitmap,
+                rg.num_rows as usize,
+                1, // row-granular for fetch (exact positions)
+            );
+            access_plan.set(rg.index, RowGroupAccess::Selection(selection));
+        }
+
+        let mut pf = PartitionedFile::new(seg.object_path.to_string(), seg.parquet_size);
+        pf.partition_values = vec![ScalarValue::Int64(Some(seg.global_base as i64))];
+        pf = pf.with_extensions(Arc::new(access_plan));
+        partitioned_files.push(pf);
+    }
+
+    // Build DataSourceExec with ParquetSource + row_base partition column
+    let table_schema = TableSchema::new(
+        schema.clone(),
+        vec![Arc::new(Field::new("row_base", DataType::Int64, false))],
+    );
+    let parquet_source = ParquetSource::new(table_schema);
+
+    let file_group = FileGroup::new(partitioned_files);
+    let builder = FileScanConfigBuilder::new(store_url, Arc::new(parquet_source))
+        .with_file_group(file_group)
+        .with_projection_indices(Some(proj_indices))
+        .map_err(|e| DataFusionError::Execution(format!("projection: {}", e)))?;
+
+    let exec: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(builder.build());
+
+    // Add projection: compute __row_id__ = ___row_id + row_base
+    let projected_schema = exec.schema();
+    let mut projection_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> = Vec::new();
+
+    let row_id_col_name = "__row_id__";
+    let row_base_col_name = "row_base";
+
+    for (idx, field) in projected_schema.fields().iter().enumerate() {
+        if field.name() == row_id_col_name {
+            // Replace __row_id__ with __row_id__ + row_base (global row ID)
+            let row_id_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+                Arc::new(datafusion::physical_expr::expressions::Column::new(row_id_col_name, idx));
+            let row_base_idx = projected_schema.index_of(row_base_col_name)
+                .map_err(|e| DataFusionError::Execution(format!("row_base not in schema: {}", e)))?;
+            let row_base_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+                Arc::new(datafusion::physical_expr::expressions::Column::new(row_base_col_name, row_base_idx));
+            let sum_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+                Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                    row_id_expr,
+                    datafusion::logical_expr::Operator::Plus,
+                    row_base_expr,
+                ));
+            projection_exprs.push((sum_expr, "__row_id__".to_string()));
+        } else if field.name() == row_base_col_name {
+            // Skip row_base from final output
+            continue;
+        } else {
+            let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+                Arc::new(datafusion::physical_expr::expressions::Column::new(field.name(), idx));
+            projection_exprs.push((col_expr, field.name().clone()));
+        }
+    }
+
+    let projection_exec = Arc::new(
+        datafusion::physical_plan::projection::ProjectionExec::try_new(projection_exprs, exec)?
+    );
+
+    let config = SessionConfig::new();
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_runtime_env(Arc::from(runtime_env))
+        .with_default_features()
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    let task_ctx = ctx.task_ctx();
+    let stream = projection_exec.execute(0, task_ctx)?;
 
     let cpu_executor = manager.cpu_executor();
     let cross_rt_stream = CrossRtStream::new_with_df_error_stream(stream, cpu_executor);
