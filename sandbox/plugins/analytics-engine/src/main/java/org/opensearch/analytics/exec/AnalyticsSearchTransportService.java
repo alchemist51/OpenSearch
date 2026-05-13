@@ -427,11 +427,8 @@ public class AnalyticsSearchTransportService {
 
             @Override
             public void handleResponse(T response) {
-                try {
-                    listener.onStreamResponse(response, true);
-                } finally {
-                    pending.finishAndRunNext();
-                }
+                listener.onStreamResponse(response, true);
+                pending.finishAndRunNext();
             }
 
             @Override

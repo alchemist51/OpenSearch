@@ -98,9 +98,13 @@ public final class QueryThenFetchFragmentExecution extends AbstractStageExecutio
         for (ExecutionTarget target : resolved) {
             ShardExecutionTarget shardTarget = (ShardExecutionTarget) target;
             resolvedTargets.add(shardTarget);
-            dispatchShardTask(shardTarget, ordinal++);
         }
+        // Populate targets on context BEFORE dispatching — local dispatch is synchronous
+        // and the completion listener may fire before start() returns.
         config.getResolvedShardTargets().addAll(resolvedTargets);
+        for (int i = 0; i < resolvedTargets.size(); i++) {
+            dispatchShardTask(resolvedTargets.get(i), i);
+        }
     }
 
     private void dispatchShardTask(ShardExecutionTarget target, int shardOrdinal) {

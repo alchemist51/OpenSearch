@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, BooleanArray, UInt64Array};
+use datafusion::arrow::array::{Array, BooleanArray, Int64Array};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Result;
@@ -65,7 +65,8 @@ pub fn inject_row_ids(
         )
     };
 
-    let row_id_array: Arc<dyn Array> = Arc::new(UInt64Array::from(row_ids));
+    let row_ids_i64: Vec<i64> = row_ids.iter().map(|&id| id as i64).collect();
+    let row_id_array: Arc<dyn Array> = Arc::new(Int64Array::from(row_ids_i64));
 
     // Build output columns: data columns from filtered batch + row_id at correct position.
     let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
