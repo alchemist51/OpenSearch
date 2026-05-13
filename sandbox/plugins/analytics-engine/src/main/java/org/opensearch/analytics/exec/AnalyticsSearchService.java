@@ -130,37 +130,46 @@ public class AnalyticsSearchService implements AutoCloseable {
         long startNanos = System.nanoTime();
         String shardIdStr = shard.shardId().toString();
         try {
-            IndexReaderProvider readerProvider = shard.getReaderProvider();
-            if (readerProvider == null) {
-                throw new IllegalStateException("No ReaderProvider on " + shard.shardId());
-            }
-            try (GatedCloseable<Reader> gatedReader = readerProvider.acquireReader()) {
-                long[] rowIds = request.getRowIds();
-                org.apache.arrow.vector.BigIntVector rowIdVector = new org.apache.arrow.vector.BigIntVector("__row_id__", allocator);
-                rowIdVector.allocateNew(rowIds.length);
-                for (int i = 0; i < rowIds.length; i++) {
-                    rowIdVector.set(i, rowIds[i]);
-                }
-                rowIdVector.setValueCount(rowIds.length);
-
-                AnalyticsSearchBackendPlugin backend = backends.values().iterator().next();
-                EngineResultStream stream = backend.fetchByRowIds(
-                    gatedReader.get(),
-                    rowIdVector,
-                    request.getColumns(),
-                    allocator
-                );
-                FragmentExecutionResponse fragmentResp = collectResponse(stream, task);
-                rowIdVector.close();
-                long tookNanos = System.nanoTime() - startNanos;
-                listener.onFragmentSuccess(request.getQueryId(), 0, shardIdStr, tookNanos, fragmentResp.getRowCount());
-                return new org.opensearch.analytics.exec.action.FetchByRowIdsResponse(
-                    fragmentResp.getIpcPayload(), fragmentResp.getRowCount()
-                );
-            }
+            EngineResultStream stream = executeFetchStreaming(request, shard, task);
+            FragmentExecutionResponse fragmentResp = collectResponse(stream, task);
+            long tookNanos = System.nanoTime() - startNanos;
+            listener.onFragmentSuccess(request.getQueryId(), 0, shardIdStr, tookNanos, fragmentResp.getRowCount());
+            return new org.opensearch.analytics.exec.action.FetchByRowIdsResponse(
+                fragmentResp.getIpcPayload(), fragmentResp.getRowCount()
+            );
         } catch (Exception e) {
             listener.onFragmentFailure(request.getQueryId(), 0, shardIdStr, e);
             throw new RuntimeException("Failed to execute fetch-by-row-ids on " + shard.shardId(), e);
+        }
+    }
+
+    /**
+     * Streaming variant: returns the raw EngineResultStream for the fetch phase.
+     * Used by the streaming transport handler to send Arrow batches directly.
+     */
+    public EngineResultStream executeFetchStreaming(
+        org.opensearch.analytics.exec.action.FetchByRowIdsRequest request,
+        IndexShard shard,
+        AnalyticsShardTask task
+    ) {
+        IndexReaderProvider readerProvider = shard.getReaderProvider();
+        if (readerProvider == null) {
+            throw new IllegalStateException("No ReaderProvider on " + shard.shardId());
+        }
+        try {
+            GatedCloseable<Reader> gatedReader = readerProvider.acquireReader();
+            long[] rowIds = request.getRowIds();
+            org.apache.arrow.vector.BigIntVector rowIdVector = new org.apache.arrow.vector.BigIntVector("__row_id__", allocator);
+            rowIdVector.allocateNew(rowIds.length);
+            for (int i = 0; i < rowIds.length; i++) {
+                rowIdVector.set(i, rowIds[i]);
+            }
+            rowIdVector.setValueCount(rowIds.length);
+
+            AnalyticsSearchBackendPlugin backend = backends.values().iterator().next();
+            return backend.fetchByRowIds(gatedReader.get(), rowIdVector, request.getColumns(), allocator);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to start fetch-by-row-ids on " + shard.shardId(), e);
         }
     }
 

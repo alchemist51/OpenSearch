@@ -52,40 +52,24 @@ pub async fn execute_query(
     query_memory_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
     query_config: &crate::datafusion_query_config::DatafusionQueryConfig,
 ) -> Result<i64, DataFusionError> {
-    // Pre-populate the list-files cache so DataFusion doesn't re-list the directory
-    let list_file_cache = Arc::new(DefaultListFilesCache::default());
-    let table_scoped_path = datafusion::execution::cache::TableScopedPath {
-        table: None,
-        path: table_path.prefix().clone(),
-    };
-    list_file_cache.put(&table_scoped_path, CachedFileList::new(object_metas.as_ref().clone()));
+    // Build per-query RuntimeEnv with list-files cache pre-populated.
+    let runtime_env = build_query_runtime_env(runtime, &table_path, object_metas.as_ref())?;
 
-    // Build a per-query RuntimeEnv sharing the global memory pool + caches,
-    // but with a fresh list-files cache for this query's shard files.
-    let mut runtime_env_builder = RuntimeEnvBuilder::from_runtime_env(&runtime.runtime_env)
-        .with_cache_manager(
-            CacheManagerConfig::default()
-                .with_list_files_cache(Some(list_file_cache))
-                .with_file_metadata_cache(Some(
-                    runtime.runtime_env.cache_manager.get_file_metadata_cache(),
-                ))
-                .with_files_statistics_cache(
-                    runtime.runtime_env.cache_manager.get_file_statistic_cache(),
-                ),
-        );
-
-    // If a per-query memory pool is provided, set it on the same builder.
+    // If a per-query memory pool is provided, rebuild with it overlaid.
     // The per-query pool wraps the global pool, so global limits are still enforced.
-    if let Some(pool) = query_memory_pool {
-        runtime_env_builder = runtime_env_builder.with_memory_pool(pool);
-    }
-
-    let runtime_env = runtime_env_builder
-        .build()
-        .map_err(|e| {
-            error!("Failed to build runtime env: {}", e);
-            e
-        })?;
+    let runtime_env = if let Some(pool) = query_memory_pool {
+        Arc::from(
+            RuntimeEnvBuilder::from_runtime_env(&runtime_env)
+                .with_memory_pool(pool)
+                .build()
+                .map_err(|e| {
+                    error!("Failed to build runtime env with query pool: {}", e);
+                    e
+                })?,
+        )
+    } else {
+        runtime_env
+    };
 
     // Build a fresh session state per query. TODO : Tune this during planning per query
     let mut config = SessionConfig::new();
@@ -95,7 +79,7 @@ pub async fn execute_query(
 
     let state = SessionStateBuilder::new()
         .with_config(config)
-        .with_runtime_env(Arc::from(runtime_env))
+        .with_runtime_env(runtime_env)
         .with_default_features()
         .build();
 
@@ -114,8 +98,7 @@ pub async fn execute_query(
             ));
         }
         FetchStrategy::ListingTable => {
-            // Use ShardTableProvider with row_base partition column
-            use crate::shard_table_provider::{ShardTableConfig, ShardFileInfo, ShardTableProvider};
+            use crate::shard_table_provider::{ShardTableConfig, ShardTableProvider};
 
             // Infer schema from the first file
             let file_format = ParquetFormat::new();
@@ -129,37 +112,9 @@ pub async fn execute_query(
 
             // Build ShardFileInfo with row_base from cumulative row counts
             let store = ctx.state().runtime_env().object_store(&table_path)?;
-            let mut files: Vec<ShardFileInfo> = Vec::new();
-            let mut cumulative_rows: i64 = 0;
-            for meta in object_metas.iter() {
-                let reader = datafusion::parquet::arrow::async_reader::ParquetObjectReader::new(
-                    Arc::clone(&store), meta.location.clone(),
-                ).with_file_size(meta.size);
-                let builder = datafusion::parquet::arrow::ParquetRecordBatchStreamBuilder::new(reader)
-                    .await
-                    .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {}", e)))?;
-                let num_rows: i64 = (0..builder.metadata().num_row_groups())
-                    .map(|i| builder.metadata().row_group(i).num_rows())
-                    .sum();
+            let files = build_shard_file_infos(&store, object_metas.as_ref()).await?;
 
-                files.push(ShardFileInfo {
-                    object_meta: meta.clone(),
-                    row_base: cumulative_rows,
-                    num_rows: num_rows as u64,
-                    row_group_row_counts: (0..builder.metadata().num_row_groups())
-                        .map(|i| builder.metadata().row_group(i).num_rows() as u64)
-                        .collect(),
-                    access_plan: None,
-                });
-                cumulative_rows += num_rows;
-            }
-
-            let url_str = table_path.as_str();
-            let parsed = url::Url::parse(url_str)
-                .map_err(|e| DataFusionError::Execution(format!("parse URL: {}", e)))?;
-            let store_url = datafusion::execution::object_store::ObjectStoreUrl::parse(
-                format!("{}://{}", parsed.scheme(), parsed.authority()),
-            )?;
+            let store_url = store_url_from_table_path(&table_path)?;
 
             let provider = Arc::new(ShardTableProvider::new(ShardTableConfig {
                 file_schema: resolved_schema,
@@ -250,8 +205,6 @@ pub async fn execute_with_context(
     cpu_executor: DedicatedExecutor,
 ) -> Result<i64, DataFusionError> {
     use crate::datafusion_query_config::FetchStrategy;
-    use datafusion::common::config::ConfigOptions;
-    use datafusion::physical_optimizer::PhysicalOptimizerRule;
 
     let fetch_strategy = handle.query_config.fetch_strategy;
 
@@ -259,8 +212,7 @@ pub async fn execute_with_context(
     // that adds row_base partition column for ProjectRowIdOptimizer.
     // Also register the ProjectRowIdAnalyzer to ensure __row_id__ survives logical optimization.
     if fetch_strategy == FetchStrategy::ListingTable {
-        use crate::shard_table_provider::{ShardTableConfig, ShardFileInfo as ShardFile, ShardTableProvider};
-
+        use crate::shard_table_provider::{ShardTableConfig, ShardTableProvider};
 
         handle.ctx.deregister_table(&handle.table_name)?;
 
@@ -275,38 +227,9 @@ pub async fn execute_with_context(
             .await?;
 
         // Build ShardFileInfo with cumulative row_base from parquet metadata.
-        let mut files: Vec<ShardFile> = Vec::new();
-        let mut cumulative_rows: i64 = 0;
-        for meta in handle.object_metas.iter() {
-            let reader = datafusion::parquet::arrow::async_reader::ParquetObjectReader::new(
-                Arc::clone(&store), meta.location.clone(),
-            ).with_file_size(meta.size);
-            let builder = datafusion::parquet::arrow::ParquetRecordBatchStreamBuilder::new(reader)
-                .await
-                .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {}", e)))?;
-            let pq_meta = builder.metadata().clone();
-            let num_rows: i64 = (0..pq_meta.num_row_groups())
-                .map(|i| pq_meta.row_group(i).num_rows())
-                .sum();
+        let files = build_shard_file_infos(&store, handle.object_metas.as_ref()).await?;
 
-            files.push(ShardFile {
-                object_meta: meta.clone(),
-                row_base: cumulative_rows,
-                num_rows: num_rows as u64,
-                row_group_row_counts: (0..pq_meta.num_row_groups())
-                    .map(|i| pq_meta.row_group(i).num_rows() as u64)
-                    .collect(),
-                access_plan: None,
-            });
-            cumulative_rows += num_rows;
-        }
-
-        let url_str = handle.table_path.as_str();
-        let parsed = url::Url::parse(url_str)
-            .map_err(|e| DataFusionError::Execution(format!("parse URL: {}", e)))?;
-        let store_url = datafusion::execution::object_store::ObjectStoreUrl::parse(
-            format!("{}://{}", parsed.scheme(), parsed.authority()),
-        )?;
+        let store_url = store_url_from_table_path(&handle.table_path)?;
 
         let provider = Arc::new(ShardTableProvider::new(ShardTableConfig {
             file_schema: resolved_schema,
@@ -353,4 +276,98 @@ pub async fn execute_with_context(
 
     let stream_handle = crate::api::QueryStreamHandle::with_session_context(wrapped, handle.query_context, handle.ctx);
     Ok(Box::into_raw(Box::new(stream_handle)) as i64)
+}
+
+// ── Shared helpers ──────────────────────────────────────────────────────────
+
+/// Build a per-query RuntimeEnv sharing global caches, with a fresh list-files
+/// cache pre-populated for the given table path and object metas.
+pub fn build_query_runtime_env(
+    runtime: &DataFusionRuntime,
+    table_path: &ListingTableUrl,
+    object_metas: &[ObjectMeta],
+) -> Result<Arc<datafusion::execution::runtime_env::RuntimeEnv>, DataFusionError> {
+    let list_file_cache = Arc::new(DefaultListFilesCache::default());
+    let table_scoped_path = datafusion::execution::cache::TableScopedPath {
+        table: None,
+        path: table_path.prefix().clone(),
+    };
+    list_file_cache.put(&table_scoped_path, CachedFileList::new(object_metas.to_vec()));
+
+    let runtime_env = RuntimeEnvBuilder::from_runtime_env(&runtime.runtime_env)
+        .with_cache_manager(
+            CacheManagerConfig::default()
+                .with_list_files_cache(Some(list_file_cache))
+                .with_file_metadata_cache(Some(
+                    runtime.runtime_env.cache_manager.get_file_metadata_cache(),
+                ))
+                .with_files_statistics_cache(
+                    runtime.runtime_env.cache_manager.get_file_statistic_cache(),
+                ),
+        )
+        .build()?;
+    Ok(Arc::from(runtime_env))
+}
+
+/// Build ShardFileInfo list from object metas by reading parquet footers.
+/// Each file gets a cumulative `row_base` and per-RG row counts.
+pub async fn build_shard_file_infos(
+    store: &Arc<dyn object_store::ObjectStore>,
+    object_metas: &[ObjectMeta],
+) -> Result<Vec<ShardFileInfo>, DataFusionError> {
+    let mut files: Vec<ShardFileInfo> = Vec::new();
+    let mut cumulative_rows: i64 = 0;
+    for meta in object_metas {
+        let reader = datafusion::parquet::arrow::async_reader::ParquetObjectReader::new(
+            Arc::clone(store), meta.location.clone(),
+        ).with_file_size(meta.size);
+        let builder = datafusion::parquet::arrow::ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {}", e)))?;
+        let pq_meta = builder.metadata().clone();
+        let num_rows: i64 = (0..pq_meta.num_row_groups())
+            .map(|i| pq_meta.row_group(i).num_rows())
+            .sum();
+
+        files.push(ShardFileInfo {
+            object_meta: meta.clone(),
+            row_base: cumulative_rows,
+            num_rows: num_rows as u64,
+            row_group_row_counts: (0..pq_meta.num_row_groups())
+                .map(|i| pq_meta.row_group(i).num_rows() as u64)
+                .collect(),
+            access_plan: None,
+        });
+        cumulative_rows += num_rows;
+    }
+    Ok(files)
+}
+
+/// Parse a ListingTableUrl into an ObjectStoreUrl (scheme + authority).
+pub fn store_url_from_table_path(table_path: &ListingTableUrl) -> Result<datafusion::execution::object_store::ObjectStoreUrl, DataFusionError> {
+    let url_str = table_path.as_str();
+    let parsed = url::Url::parse(url_str)
+        .map_err(|e| DataFusionError::Execution(format!("parse URL: {}", e)))?;
+    datafusion::execution::object_store::ObjectStoreUrl::parse(
+        format!("{}://{}", parsed.scheme(), parsed.authority()),
+    )
+}
+
+/// Wrap a DataFusion stream in CrossRtStream and package as a QueryStreamHandle pointer.
+pub fn wrap_stream_as_handle(
+    df_stream: datafusion::execution::SendableRecordBatchStream,
+    cpu_executor: DedicatedExecutor,
+    runtime: &DataFusionRuntime,
+) -> i64 {
+    let cross_rt_stream = CrossRtStream::new_with_df_error_stream(df_stream, cpu_executor);
+    let wrapped = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+        cross_rt_stream.schema(),
+        cross_rt_stream,
+    );
+    let query_context = crate::query_tracker::QueryTrackingContext::new(
+        0,
+        runtime.runtime_env.memory_pool.clone(),
+    );
+    let handle = crate::api::QueryStreamHandle::new(wrapped, query_context);
+    Box::into_raw(Box::new(handle)) as i64
 }

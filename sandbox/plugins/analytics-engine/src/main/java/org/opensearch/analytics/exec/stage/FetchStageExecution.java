@@ -24,6 +24,7 @@ import org.opensearch.analytics.exec.action.FetchByRowIdsResponse;
 import org.opensearch.analytics.planner.dag.ShardExecutionTarget;
 import org.opensearch.analytics.planner.dag.Stage;
 import org.opensearch.analytics.spi.ExchangeSink;
+import org.opensearch.analytics.exec.StreamingResponseListener;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.tasks.Task;
 
@@ -188,7 +189,7 @@ public class FetchStageExecution {
 
     // ── Assembly ─────────────────────────────────────────────────────────────────
 
-    private class FetchResponseListener implements ActionListener<FetchByRowIdsResponse> {
+    private class FetchResponseListener implements StreamingResponseListener<FetchByRowIdsResponse> {
         private final int shardOrdinal;
         private final PositionMap positionMap;
         private final List<FetchResult> fetchResults;
@@ -202,9 +203,9 @@ public class FetchStageExecution {
         }
 
         @Override
-        public void onResponse(FetchByRowIdsResponse response) {
+        public void onStreamResponse(FetchByRowIdsResponse response, boolean isLast) {
             fetchResults.add(new FetchResult(shardOrdinal, response));
-            if (remaining.decrementAndGet() == 0) {
+            if (isLast && remaining.decrementAndGet() == 0) {
                 assembleAndDeliver();
             }
         }
