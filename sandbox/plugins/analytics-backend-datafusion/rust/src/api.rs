@@ -488,7 +488,6 @@ pub async unsafe fn fetch_by_row_ids(
     use datafusion::execution::cache::cache_manager::{CacheManagerConfig, CachedFileList};
     use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion::execution::SessionStateBuilder;
-    use datafusion::physical_optimizer::PhysicalOptimizerRule;
     use datafusion::physical_plan::execute_stream;
     use datafusion::prelude::*;
     use roaring::RoaringBitmap;
@@ -610,23 +609,20 @@ pub async unsafe fn fetch_by_row_ids(
     }));
     ctx.register_table("t", provider)?;
 
-    // ── 4. Execute SQL: SELECT __row_id__, requested_columns FROM t ──
+    // ── 4. Execute SQL: compute global __row_id__ = __row_id__ + row_base ──
 
     let col_list = columns.iter()
         .map(|c| format!("\"{}\"", c))
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!("SELECT \"__row_id__\", {} FROM t", col_list);
+    let sql = format!(
+        "SELECT (\"__row_id__\" + \"row_base\") AS \"__row_id__\", {} FROM t",
+        col_list
+    );
     let df = ctx.sql(&sql).await?;
     let physical_plan = df.create_physical_plan().await?;
 
-    // ── 5. Apply ProjectRowIdOptimizer: __row_id__ → __row_id__ + row_base ──
-
-    let optimizer = crate::project_row_id_optimizer::ProjectRowIdOptimizer;
-    let opt_config = datafusion::common::config::ConfigOptions::default();
-    let physical_plan = optimizer.optimize(physical_plan, &opt_config)?;
-
-    // ── 6. Execute and wrap in CrossRtStream ──
+    // ── 5. Execute and wrap in CrossRtStream ──
 
     let df_stream = execute_stream(physical_plan, ctx.task_ctx())?;
 
