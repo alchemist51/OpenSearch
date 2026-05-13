@@ -21,7 +21,6 @@ import org.opensearch.analytics.exec.action.FragmentExecutionRequest;
 import org.opensearch.analytics.exec.action.FragmentExecutionResponse;
 import org.opensearch.analytics.planner.dag.ShardExecutionTarget;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.core.index.shard.ShardId;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -44,25 +43,25 @@ public class QTFCompletionListener implements ActionListener<Iterable<VectorSche
 
     private final ActionListener<Iterable<VectorSchemaRoot>> realListener;
     private final String queryId;
-    private final String[] fetchColumns;
-    private final List<ShardExecutionTarget> shardTargets;
     private final AnalyticsSearchTransportService dispatcher;
     private final BufferAllocator allocator;
+    private final java.util.function.Supplier<List<ShardExecutionTarget>> shardTargetsSupplier;
+    private final org.opensearch.analytics.exec.task.AnalyticsQueryTask parentTask;
 
     public QTFCompletionListener(
         ActionListener<Iterable<VectorSchemaRoot>> realListener,
         String queryId,
-        String[] fetchColumns,
-        List<ShardExecutionTarget> shardTargets,
         AnalyticsSearchTransportService dispatcher,
-        BufferAllocator allocator
+        BufferAllocator allocator,
+        java.util.function.Supplier<List<ShardExecutionTarget>> shardTargetsSupplier,
+        org.opensearch.analytics.exec.task.AnalyticsQueryTask parentTask
     ) {
         this.realListener = realListener;
         this.queryId = queryId;
-        this.fetchColumns = fetchColumns;
-        this.shardTargets = shardTargets;
         this.dispatcher = dispatcher;
         this.allocator = allocator;
+        this.shardTargetsSupplier = shardTargetsSupplier;
+        this.parentTask = parentTask;
     }
 
     @Override
@@ -79,18 +78,29 @@ public class QTFCompletionListener implements ActionListener<Iterable<VectorSche
                 return;
             }
 
+            // Derive fetch columns from reduced result schema (all columns except __row_id__ and shard_id)
+            String[] fetchColumns = firstBatch.getSchema().getFields().stream()
+                .map(Field::getName)
+                .filter(name -> !"__row_id__".equals(name) && !"shard_id".equals(name))
+                .toArray(String[]::new);
+
             // Phase 2.5: Build position map from reduced output
             PositionMap positionMap = buildPositionMap(reducedResult);
             logger.info("[QTF] Position map built: totalRows={}, shards={}",
                 positionMap.totalRows(), positionMap.shardCount());
 
+            // Close the reduced result batches — we've extracted what we need (position map)
+            for (VectorSchemaRoot batch : reducedResult) {
+                batch.close();
+            }
+
             if (positionMap.totalRows() == 0) {
-                realListener.onResponse(reducedResult);
+                realListener.onResponse(List.of());
                 return;
             }
 
             // Phase 3: Dispatch fetch requests per shard
-            dispatchFetches(positionMap);
+            dispatchFetches(positionMap, fetchColumns);
         } catch (Exception e) {
             realListener.onFailure(e);
         }
@@ -108,10 +118,11 @@ public class QTFCompletionListener implements ActionListener<Iterable<VectorSche
         int pos = 0;
 
         for (VectorSchemaRoot batch : reducedResult) {
-            BigIntVector rowIdCol = (BigIntVector) batch.getVector("__row_id__");
+            // __row_id__ may come as UInt8Vector (Arrow UInt64) or BigIntVector (Int64)
+            org.apache.arrow.vector.FieldVector rowIdRaw = batch.getVector("__row_id__");
             IntVector shardIdCol = (IntVector) batch.getVector("shard_id");
 
-            if (rowIdCol == null || shardIdCol == null) {
+            if (rowIdRaw == null || shardIdCol == null) {
                 throw new IllegalStateException(
                     "[QTF] Reduced result missing __row_id__ or shard_id columns. "
                     + "Schema: " + batch.getSchema()
@@ -120,7 +131,15 @@ public class QTFCompletionListener implements ActionListener<Iterable<VectorSche
 
             for (int i = 0; i < batch.getRowCount(); i++) {
                 int shard = shardIdCol.get(i);
-                long rowId = rowIdCol.get(i);
+                long rowId;
+                if (rowIdRaw instanceof BigIntVector bigInt) {
+                    rowId = bigInt.get(i);
+                } else if (rowIdRaw instanceof org.apache.arrow.vector.UInt8Vector uint8) {
+                    rowId = uint8.get(i);
+                } else {
+                    // Generic fallback: read as object and convert
+                    rowId = ((Number) rowIdRaw.getObject(i)).longValue();
+                }
                 map.put(shard, rowId, pos);
                 pos++;
             }
@@ -130,11 +149,10 @@ public class QTFCompletionListener implements ActionListener<Iterable<VectorSche
 
     // ── Phase 3: Dispatch Fetches ──────────────────────────────────────────────
 
-    private void dispatchFetches(PositionMap positionMap) {
+    private void dispatchFetches(PositionMap positionMap, String[] fetchColumns) {
+        List<ShardExecutionTarget> shardTargets = shardTargetsSupplier.get();
         Map<Integer, long[]> fetchPlan = positionMap.getPerShardFetchPlan();
 
-        // Pre-allocate final result buffer
-        // For POC: we'll collect fetch results and assemble at the end
         AtomicInteger remaining = new AtomicInteger(fetchPlan.size());
         List<FetchResult> fetchResults = java.util.Collections.synchronizedList(new ArrayList<>());
 
@@ -161,8 +179,8 @@ public class QTFCompletionListener implements ActionListener<Iterable<VectorSche
                 fetchReq,
                 target.node(),
                 new FetchResponseListener(shardOrdinal, positionMap, fetchResults, remaining),
-                null,  // parentTask — POC simplification
-                null   // pending — POC simplification
+                parentTask,
+                new PendingExecutions(10)
             );
         }
     }
@@ -216,28 +234,71 @@ public class QTFCompletionListener implements ActionListener<Iterable<VectorSche
 
     /**
      * Assemble fetched rows into a single result buffer in globally-sorted order.
+     * Decodes fetch responses (Arrow IPC), strips __row_id__, and places rows at
+     * their correct position using the position map.
      */
     private VectorSchemaRoot assembleResult(List<FetchResult> fetchResults, PositionMap positionMap) {
-        // TODO: Full implementation — decode responses, copy rows to correct positions.
-        // For now, return a placeholder that demonstrates the flow.
-        //
-        // Production logic:
-        // 1. Allocate VectorSchemaRoot with fetchColumns schema, totalRows capacity
-        // 2. For each FetchResult:
-        //    - Decode to VectorSchemaRoot (batch has __row_id__ + data columns)
-        //    - For each row in batch:
-        //      - Read __row_id__ from the batch
-        //      - Look up position: positionMap.getPosition(shardOrdinal, rowId)
-        //      - Copy data columns to finalResult at that position
-        // 3. Strip __row_id__ from final output
-        // 4. Return
-
         logger.info("[QTF] Assembling {} fetch results into {} positions",
             fetchResults.size(), positionMap.totalRows());
 
-        // Placeholder: just return the first fetch result as-is for now
-        // TODO: implement proper positional assembly
-        throw new UnsupportedOperationException("[QTF] Assembly not yet implemented");
+        int totalRows = positionMap.totalRows();
+        VectorSchemaRoot output = null;
+        List<Field> outputFields = null;
+
+        for (FetchResult fr : fetchResults) {
+            byte[] ipc = fr.response().getIpcPayload();
+            if (ipc == null || ipc.length == 0) continue;
+            int shardOrdinal = fr.shardOrdinal();
+
+            try (var reader = new org.apache.arrow.vector.ipc.ArrowStreamReader(
+                    new java.io.ByteArrayInputStream(ipc), allocator)) {
+                while (reader.loadNextBatch()) {
+                    VectorSchemaRoot batch = reader.getVectorSchemaRoot();
+                    int batchRows = batch.getRowCount();
+
+                    // Lazy-init output on first batch
+                    if (output == null) {
+                        outputFields = batch.getSchema().getFields().stream()
+                            .filter(f -> !"__row_id__".equals(f.getName()))
+                            .toList();
+                        output = VectorSchemaRoot.create(new Schema(outputFields), allocator);
+                        output.allocateNew();
+                        output.setRowCount(totalRows);
+                        for (FieldVector v : output.getFieldVectors()) {
+                            v.setValueCount(totalRows);
+                        }
+                    }
+
+                    // Read __row_id__ from fetch response to place rows at correct positions
+                    FieldVector rowIdRaw = batch.getVector("__row_id__");
+                    for (int i = 0; i < batchRows; i++) {
+                        long rowId;
+                        if (rowIdRaw instanceof BigIntVector bigInt) {
+                            rowId = bigInt.get(i);
+                        } else if (rowIdRaw instanceof org.apache.arrow.vector.UInt8Vector uint8) {
+                            rowId = uint8.get(i);
+                        } else {
+                            rowId = ((Number) rowIdRaw.getObject(i)).longValue();
+                        }
+
+                        int destPos = positionMap.getPosition(shardOrdinal, rowId);
+                        for (Field f : outputFields) {
+                            FieldVector src = batch.getVector(f.getName());
+                            FieldVector dst = output.getVector(f.getName());
+                            dst.copyFrom(i, destPos, src);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                if (output != null) output.close();
+                throw new RuntimeException("[QTF] Failed to decode fetch response", e);
+            }
+        }
+
+        if (output == null) {
+            return VectorSchemaRoot.create(new Schema(List.of()), allocator);
+        }
+        return output;
     }
 
     // ── Supporting types ───────────────────────────────────────────────────────

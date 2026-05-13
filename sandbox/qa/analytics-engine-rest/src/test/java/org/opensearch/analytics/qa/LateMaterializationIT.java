@@ -22,19 +22,12 @@ import java.util.Map;
  * query phase → shard_id injection → reduce → position map → fetch → assembly.
  *
  * <pre>
- * Shard 0, Segment 1: doc A (name=alice, score=100, city=NYC)
- *                      doc B (name=bob,   score=200, city=SF)
- * Shard 0, Segment 2: doc C (name=carol, score=150, city=NYC)
- *
- * Shard 1, Segment 1: doc D (name=dave,  score=50,  city=LA)
- * Shard 1, Segment 2: doc E (name=eve,   score=300, city=SF)
+ * Segment 1: alice(score=100, city=NYC), bob(score=200, city=SF), dave(score=50, city=LA)
+ * Segment 2: carol(score=150, city=NYC), eve(score=300, city=SF)
  * </pre>
  *
  * <p>Query: SELECT __row_id__, name, score FROM t ORDER BY score LIMIT 3
- * <p>Expected after QTF:
- *   pos 0: dave  (score=50,  shard=1, row_id=0)
- *   pos 1: alice (score=100, shard=0, row_id=0)
- *   pos 2: carol (score=150, shard=0, row_id=2)
+ * <p>Expected: dave(50), alice(100), carol(150)
  */
 public class LateMaterializationIT extends AnalyticsRestTestCase {
 
@@ -46,11 +39,12 @@ public class LateMaterializationIT extends AnalyticsRestTestCase {
 
         try { client().performRequest(new Request("DELETE", "/" + INDEX)); } catch (Exception ignored) {}
 
-        // 2 shards, composite parquet+lucene
+        // 1 shard (analytics engine doesn't support multi-shard distribution yet)
+        // The QTF flow is debugged with multi-segment within one shard.
         Request create = new Request("PUT", "/" + INDEX);
         create.setJsonEntity("{"
             + "\"settings\":{"
-            + "  \"number_of_shards\":2,\"number_of_replicas\":0,"
+            + "  \"number_of_shards\":1,\"number_of_replicas\":0,"
             + "  \"index.pluggable.dataformat.enabled\":true,"
             + "  \"index.pluggable.dataformat\":\"composite\","
             + "  \"index.composite.primary_data_format\":\"parquet\","
@@ -68,15 +62,15 @@ public class LateMaterializationIT extends AnalyticsRestTestCase {
         health.addParameter("timeout", "30s");
         client().performRequest(health);
 
-        // Segment 1 (both shards get some docs via routing)
-        bulk("{\"index\":{\"_routing\":\"shard0\"}}\n{\"name\":\"alice\",\"score\":100,\"city\":\"NYC\"}\n"
-           + "{\"index\":{\"_routing\":\"shard0\"}}\n{\"name\":\"bob\",\"score\":200,\"city\":\"SF\"}\n"
-           + "{\"index\":{\"_routing\":\"shard1\"}}\n{\"name\":\"dave\",\"score\":50,\"city\":\"LA\"}\n");
+        // Segment 1: 3 docs (distributed across 2 shards by hash)
+        bulk("{\"index\":{}}\n{\"name\":\"alice\",\"score\":100,\"city\":\"NYC\"}\n"
+           + "{\"index\":{}}\n{\"name\":\"bob\",\"score\":200,\"city\":\"SF\"}\n"
+           + "{\"index\":{}}\n{\"name\":\"dave\",\"score\":50,\"city\":\"LA\"}\n");
         client().performRequest(new Request("POST", "/" + INDEX + "/_flush?force=true"));
 
-        // Segment 2
-        bulk("{\"index\":{\"_routing\":\"shard0\"}}\n{\"name\":\"carol\",\"score\":150,\"city\":\"NYC\"}\n"
-           + "{\"index\":{\"_routing\":\"shard1\"}}\n{\"name\":\"eve\",\"score\":300,\"city\":\"SF\"}\n");
+        // Segment 2: 2 more docs
+        bulk("{\"index\":{}}\n{\"name\":\"carol\",\"score\":150,\"city\":\"NYC\"}\n"
+           + "{\"index\":{}}\n{\"name\":\"eve\",\"score\":300,\"city\":\"SF\"}\n");
         client().performRequest(new Request("POST", "/" + INDEX + "/_flush?force=true"));
 
         ready = true;

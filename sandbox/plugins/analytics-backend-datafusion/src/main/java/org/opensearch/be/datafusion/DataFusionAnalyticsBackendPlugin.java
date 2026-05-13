@@ -522,4 +522,37 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
         // (createProvider, createCollector, collectDocs, release*) route to it.
         FilterTreeCallbacks.setHandle(handle);
     }
+
+    @Override
+    public org.opensearch.analytics.backend.EngineResultStream fetchByRowIds(
+        org.opensearch.index.engine.exec.IndexReaderProvider.Reader reader,
+        long[] rowIds,
+        String[] columns,
+        org.apache.arrow.memory.BufferAllocator allocator
+    ) {
+        DataFusionService dataFusionService = plugin.getDataFusionService();
+        if (dataFusionService == null) {
+            throw new IllegalStateException("DataFusionService not initialized");
+        }
+
+        DatafusionReader dfReader = null;
+        DataFormatRegistry registry = plugin.getDataFormatRegistry();
+        for (String formatName : plugin.getSupportedFormats()) {
+            dfReader = reader.getReader(registry.format(formatName), DatafusionReader.class);
+            if (dfReader != null) break;
+        }
+        if (dfReader == null) {
+            throw new IllegalStateException("No DatafusionReader available for fetch-by-row-ids");
+        }
+
+        long streamPtr = org.opensearch.be.datafusion.nativelib.NativeBridge.fetchByRowIds(
+            dfReader.getReaderHandle().getPointer(),
+            rowIds,
+            columns,
+            dataFusionService.getNativeRuntime().get()
+        );
+        org.opensearch.be.datafusion.nativelib.StreamHandle streamHandle =
+            new org.opensearch.be.datafusion.nativelib.StreamHandle(streamPtr, dataFusionService.getNativeRuntime());
+        return new DatafusionResultStream(streamHandle, allocator);
+    }
 }

@@ -84,6 +84,7 @@ public final class NativeBridge {
     private static final MethodHandle PREPARE_PARTIAL_PLAN;
     private static final MethodHandle PREPARE_FINAL_PLAN;
     private static final MethodHandle EXECUTE_LOCAL_PREPARED_PLAN;
+    private static final MethodHandle FETCH_BY_ROW_IDS;
 
     static {
         SymbolLookup lib = NativeLibraryLoader.symbolLookup();
@@ -409,6 +410,22 @@ public final class NativeBridge {
         EXECUTE_LOCAL_PREPARED_PLAN = linker.downcallHandle(
             lib.find("df_execute_local_prepared_plan").orElseThrow(),
             FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
+        );
+
+        // i64 df_fetch_by_row_ids(shard_view_ptr, row_ids_ptr, row_ids_len,
+        //     col_names_ptr, col_names_len_ptr, col_names_count, runtime_ptr)
+        FETCH_BY_ROW_IDS = linker.downcallHandle(
+            lib.find("df_fetch_by_row_ids").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG
+            )
         );
     }
 
@@ -958,6 +975,35 @@ public final class NativeBridge {
         NativeHandle.validatePointer(sessionPtr, "session");
         try (var call = new NativeCall()) {
             return call.invoke(EXECUTE_LOCAL_PREPARED_PLAN, sessionPtr);
+        }
+    }
+
+    /**
+     * QTF fetch phase: reads specific rows by global row ID from parquet.
+     * Returns a stream pointer (same as execute_query) that can be drained
+     * via {@link #streamNext} and freed by {@link #streamClose}.
+     *
+     * @param readerPtr pointer to the shard view (DatafusionReader)
+     * @param rowIds global row IDs to fetch
+     * @param columns column names to read (["*"] for all columns)
+     * @param runtimePtr pointer to the DataFusion runtime
+     * @return opaque stream pointer
+     */
+    public static long fetchByRowIds(long readerPtr, long[] rowIds, String[] columns, long runtimePtr) {
+        NativeHandle.validatePointer(readerPtr, "reader");
+        NativeHandle.validatePointer(runtimePtr, "runtime");
+        try (var call = new NativeCall()) {
+            var colNames = call.strArray(columns);
+            return call.invoke(
+                FETCH_BY_ROW_IDS,
+                readerPtr,
+                call.longs(rowIds),
+                (long) rowIds.length,
+                colNames.ptrs(),
+                colNames.lens(),
+                colNames.count(),
+                runtimePtr
+            );
         }
     }
 

@@ -42,7 +42,7 @@ import java.util.function.Function;
  *
  * @opensearch.internal
  */
-final class ShardFragmentStageExecution extends AbstractStageExecution implements DataProducer {
+public final class ShardFragmentStageExecution extends AbstractStageExecution implements DataProducer {
 
     private final AtomicInteger inFlight = new AtomicInteger(0);
 
@@ -53,6 +53,9 @@ final class ShardFragmentStageExecution extends AbstractStageExecution implement
     private final AnalyticsSearchTransportService dispatcher;
     private final ResponseCodec<FragmentExecutionResponse> responseCodec;
     private final Map<String, PendingExecutions> pendingPerNode = new ConcurrentHashMap<>();
+
+    // QTF: ordinal → target mapping so coordinator can dispatch fetches to the right shard/node.
+    private final List<ShardExecutionTarget> resolvedTargets = new java.util.ArrayList<>();
 
     ShardFragmentStageExecution(
         Stage stage,
@@ -87,7 +90,9 @@ final class ShardFragmentStageExecution extends AbstractStageExecution implement
         inFlight.set(resolved.size());
         int ordinal = 0;
         for (ExecutionTarget target : resolved) {
-            dispatchShardTask((ShardExecutionTarget) target, ordinal++);
+            ShardExecutionTarget shardTarget = (ShardExecutionTarget) target;
+            resolvedTargets.add(shardTarget);
+            dispatchShardTask(shardTarget, ordinal++);
         }
     }
 
@@ -177,6 +182,11 @@ final class ShardFragmentStageExecution extends AbstractStageExecution implement
             return source;
         }
         throw new UnsupportedOperationException("outputSink does not implement ExchangeSource");
+    }
+
+    /** QTF: returns the ordered list of shard targets for fetch dispatch. */
+    public List<ShardExecutionTarget> getResolvedTargets() {
+        return java.util.Collections.unmodifiableList(resolvedTargets);
     }
 
     private boolean isDone() {

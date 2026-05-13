@@ -123,18 +123,30 @@ public class AnalyticsSearchService implements AutoCloseable {
 
     /**
      * QTF fetch phase: read specific rows by global row ID.
-     * Bypasses Substrait plan resolution — calls directly into Rust FFM.
+     * Bypasses Substrait plan resolution — calls directly into backend's FFM.
      */
     private FragmentExecutionResponse executeFetchByRowIds(FragmentExecutionRequest request, IndexShard shard, AnalyticsShardTask task) {
         long startNanos = System.nanoTime();
         String shardIdStr = shard.shardId().toString();
         try {
-            // TODO: Wire to NativeBridge.fetchByRowIds() via the DataFusion backend plugin.
-            // For now this is a placeholder — the actual FFM call will be wired through
-            // DatafusionSearchExecEngine or a dedicated FetchEngine.
-            throw new UnsupportedOperationException(
-                "QTF fetch-by-row-id not yet wired to native backend on shard " + shardIdStr
-            );
+            IndexReaderProvider readerProvider = shard.getReaderProvider();
+            if (readerProvider == null) {
+                throw new IllegalStateException("No ReaderProvider on " + shard.shardId());
+            }
+            try (GatedCloseable<Reader> gatedReader = readerProvider.acquireReader()) {
+                // Find the first backend that supports fetchByRowIds (POC: use first available)
+                AnalyticsSearchBackendPlugin backend = backends.values().iterator().next();
+                EngineResultStream stream = backend.fetchByRowIds(
+                    gatedReader.get(),
+                    request.getFetchRowIds(),
+                    request.getFetchColumns(),
+                    allocator
+                );
+                FragmentExecutionResponse response = collectResponse(stream, task);
+                long tookNanos = System.nanoTime() - startNanos;
+                listener.onFragmentSuccess(request.getQueryId(), request.getStageId(), shardIdStr, tookNanos, response.getRowCount());
+                return response;
+            }
         } catch (Exception e) {
             listener.onFragmentFailure(request.getQueryId(), request.getStageId(), shardIdStr, e);
             throw new RuntimeException("Failed to execute fetch-by-row-ids on " + shard.shardId(), e);

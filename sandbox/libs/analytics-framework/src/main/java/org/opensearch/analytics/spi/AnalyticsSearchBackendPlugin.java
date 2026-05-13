@@ -8,6 +8,10 @@
 
 package org.opensearch.analytics.spi;
 
+import org.apache.arrow.memory.BufferAllocator;
+import org.opensearch.analytics.backend.EngineResultStream;
+import org.opensearch.index.engine.exec.IndexReaderProvider;
+
 import java.util.List;
 
 /**
@@ -112,5 +116,19 @@ public interface AnalyticsSearchBackendPlugin {
      */
     default void configureFilterDelegation(FilterDelegationHandle handle, BackendExecutionContext backendContext) {
         throw new UnsupportedOperationException("configureFilterDelegation not implemented for [" + name() + "]");
+    }
+
+    /**
+     * QTF fetch phase: reads specific rows by global row ID.
+     * Called by the coordinator when assembling query-then-fetch results.
+     *
+     * @param reader the index reader for the target shard
+     * @param rowIds global row IDs to fetch
+     * @param columns column names to read
+     * @param allocator Arrow buffer allocator for result import
+     * @return a result stream containing the requested rows
+     */
+    default EngineResultStream fetchByRowIds(IndexReaderProvider.Reader reader, long[] rowIds, String[] columns, BufferAllocator allocator) {
+        throw new UnsupportedOperationException("fetchByRowIds not implemented for [" + name() + "]");
     }
 }
