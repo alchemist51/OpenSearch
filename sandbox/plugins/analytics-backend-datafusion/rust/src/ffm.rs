@@ -177,6 +177,53 @@ pub unsafe extern "C" fn df_execute_query(
         .map_err(|e| e.to_string())
 }
 
+/// Fetch specific rows by global row ID — QTF fetch phase.
+///
+/// Row IDs are passed as a direct pointer to i64 values (from BigIntVector's
+/// off-heap ArrowBuf). Zero-copy at FFM boundary: Rust reads directly from
+/// Java's off-heap buffer without any intermediate allocation.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_fetch_by_row_ids(
+    shard_view_ptr: i64,
+    row_ids_ptr: i64,
+    row_ids_count: i64,
+    col_names_ptr: *const *const u8,
+    col_names_len_ptr: *const i64,
+    col_names_count: i64,
+    runtime_ptr: i64,
+) -> i64 {
+    let mgr = get_rt_manager()?;
+    let shard_view = &*(shard_view_ptr as *const crate::api::ShardView);
+    let runtime = &*(runtime_ptr as *const crate::api::DataFusionRuntime);
+
+    // Zero-copy read from BigIntVector's direct buffer
+    let row_ids: Vec<i64> = slice::from_raw_parts(
+        row_ids_ptr as *const i64,
+        row_ids_count as usize,
+    ).to_vec();
+
+    // Parse column names
+    let mut columns: Vec<String> = Vec::with_capacity(col_names_count as usize);
+    for i in 0..col_names_count as usize {
+        let ptr = *col_names_ptr.add(i);
+        let len = *col_names_len_ptr.add(i);
+        let name = str_from_raw(ptr, len)
+            .map_err(|e| format!("df_fetch_by_row_ids: column name: {}", e))?;
+        columns.push(name.to_string());
+    }
+
+    mgr.io_runtime
+        .block_on(crate::api::fetch_by_row_ids(
+            shard_view,
+            runtime,
+            &mgr,
+            row_ids,
+            columns,
+        ))
+        .map_err(|e| e.to_string())
+}
+
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn df_stream_get_schema(stream_ptr: i64) -> i64 {

@@ -31,6 +31,7 @@
 //! - `stream_get_schema`, `stream_close` must NOT be called
 //!   concurrently on the same stream pointer.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -43,16 +44,19 @@ use arrow_array::{Array, StructArray};
 use arrow_schema::ffi::FFI_ArrowSchema;
 use datafusion::common::DataFusionError;
 use datafusion::datasource::listing::ListingTableUrl;
+use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccess};
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::TrackConsumersPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::cache::cache_manager::CacheManagerConfig;
 use datafusion::execution::RecordBatchStream;
-use datafusion::execution::{SessionState, SessionStateBuilder};
+use datafusion::execution::SessionStateBuilder;
+use datafusion::physical_plan::execute_stream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::prelude::SessionConfig;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::TryStreamExt;
 use object_store::ObjectStoreExt;
+use roaring::RoaringBitmap;
 
 use crate::cancellation;
 use crate::cross_rt_stream::CrossRtStream;
@@ -62,6 +66,7 @@ use crate::memory::{DynamicLimitHandle, DynamicLimitPool};
 use crate::partition_stream::PartitionStreamSender;
 use crate::query_tracker::{self, QueryTrackingContext};
 use crate::runtime_manager::RuntimeManager;
+use crate::shard_table_provider::{ShardTableConfig, ShardTableProvider};
 
 /// Bundles a stream with its query tracking context so that dropping the
 /// handle automatically marks the query completed in the registry.
@@ -154,6 +159,10 @@ pub struct ShardFileInfo {
     pub num_rows: u64,
     /// Per-row-group row counts.
     pub row_group_row_counts: Vec<u64>,
+    /// Optional access plan for targeted row retrieval (QTF fetch phase).
+    /// When set, ShardTableProvider attaches it to the PartitionedFile so
+    /// DataSourceExec skips row groups and applies RowSelection.
+    pub access_plan: Option<datafusion::datasource::physical_plan::parquet::ParquetAccessPlan>,
 }
 
 /// FFM wire format for per-file metadata.
@@ -213,6 +222,7 @@ pub fn build_shard_files(
                 row_base,
                 num_rows,
                 row_group_row_counts: fm.row_group_row_counts.clone(),
+                access_plan: None,
             };
             row_base += num_rows as i64;
             info
@@ -462,6 +472,123 @@ pub async unsafe fn execute_query(
 /// is no automatic retry on the vanilla path — a false positive is a hard
 /// query error. In practice this is unreachable because the needle is not a
 /// valid DataFusion identifier anywhere else a plan would naturally contain
+/// QTF fetch phase: read specific rows by global row ID.
+///
+/// Uses shared helpers from query_executor for runtime setup, file info building,
+/// and stream wrapping. The fetch-specific logic is building ParquetAccessPlans
+/// from row IDs and computing global __row_id__ = __row_id__ + row_base in SQL.
+pub async unsafe fn fetch_by_row_ids(
+    shard_view: &ShardView,
+    runtime: &DataFusionRuntime,
+    manager: &crate::runtime_manager::RuntimeManager,
+    row_ids: Vec<i64>,
+    columns: Vec<String>,
+) -> Result<i64, DataFusionError> {
+    use crate::indexed_table::row_selection::build_row_selection_with_min_skip_run;
+    use crate::indexed_table::segment_info::build_segments;
+    use crate::query_executor::{build_query_runtime_env, store_url_from_table_path, wrap_stream_as_handle};
+
+    // ── 1. Build RuntimeEnv + SessionContext ──
+
+    let runtime_env = build_query_runtime_env(runtime, &shard_view.table_path, shard_view.object_metas.as_ref())?;
+
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.parquet.pushdown_filters = true;
+    config.options_mut().execution.target_partitions = 1;
+
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_runtime_env(runtime_env)
+        .with_default_features()
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+
+    // ── 2. Build ShardFileInfo with ParquetAccessPlan per file ──
+
+    let store = ctx.state().runtime_env().object_store(&shard_view.table_path)?;
+    let (segments, _schema) = build_segments(Arc::clone(&store), shard_view.object_metas.as_ref())
+        .await
+        .map_err(DataFusionError::Execution)?;
+
+    // Distribute global row_ids to per-file local positions
+    let mut per_segment: HashMap<usize, RoaringBitmap> = HashMap::new();
+    for &gid in &row_ids {
+        let seg_idx = segments
+            .partition_point(|s| s.global_base <= gid as u64)
+            .saturating_sub(1);
+        let local_pos = (gid as u64 - segments[seg_idx].global_base) as u32;
+        per_segment.entry(seg_idx).or_default().insert(local_pos);
+    }
+
+    // Build file infos with access plans for targeted row retrieval
+    let mut files: Vec<ShardFileInfo> = Vec::new();
+    for seg in &segments {
+        let num_rgs = seg.row_groups.len();
+        let access_plan = if let Some(bm) = per_segment.get(&(seg.segment_ord as usize)) {
+            let mut plan = ParquetAccessPlan::new_none(num_rgs);
+            for rg in &seg.row_groups {
+                let rg_start = rg.first_row as u32;
+                let rg_end = rg_start + rg.num_rows as u32;
+                let rg_bitmap: RoaringBitmap = bm
+                    .iter()
+                    .filter(|&pos| pos >= rg_start && pos < rg_end)
+                    .map(|pos| pos - rg_start)
+                    .collect();
+                if !rg_bitmap.is_empty() {
+                    let selection = build_row_selection_with_min_skip_run(
+                        &rg_bitmap, rg.num_rows as usize, 1,
+                    );
+                    plan.set(rg.index, RowGroupAccess::Selection(selection));
+                }
+            }
+            Some(plan)
+        } else {
+            Some(ParquetAccessPlan::new_none(num_rgs))
+        };
+
+        files.push(ShardFileInfo {
+            object_meta: shard_view.object_metas[seg.segment_ord as usize].clone(),
+            row_base: seg.global_base as i64,
+            num_rows: seg.max_doc as u64,
+            row_group_row_counts: seg.row_groups.iter().map(|rg| rg.num_rows as u64).collect(),
+            access_plan,
+        });
+    }
+
+    // ── 3. Register ShardTableProvider ──
+
+    let store_url = store_url_from_table_path(&shard_view.table_path)?;
+    let listing_options = datafusion::datasource::listing::ListingOptions::new(
+        Arc::new(datafusion::datasource::file_format::parquet::ParquetFormat::new())
+    ).with_file_extension(".parquet").with_collect_stat(true);
+    let resolved_schema = listing_options.infer_schema(&ctx.state(), &shard_view.table_path).await?;
+
+    let provider = Arc::new(ShardTableProvider::new(ShardTableConfig {
+        file_schema: resolved_schema,
+        files,
+        store_url,
+    }));
+    ctx.register_table("t", provider)?;
+
+    // ── 4. Execute SQL: compute global __row_id__ = __row_id__ + row_base ──
+
+    let col_list = columns.iter()
+        .map(|c| format!("\"{}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT (\"__row_id__\" + \"row_base\") AS \"__row_id__\", {} FROM t",
+        col_list
+    );
+    let df = ctx.sql(&sql).await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let df_stream = execute_stream(physical_plan, ctx.task_ctx())?;
+
+    // ── 5. Wrap and return ──
+
+    Ok(wrap_stream_as_handle(df_stream, manager.cpu_executor(), runtime))
+}
+
 /// it; the failure mode is documented here to keep the dispatch contract
 /// explicit.
 fn plan_bytes_mentions_index_filter(plan_bytes: &[u8]) -> bool {

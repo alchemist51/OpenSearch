@@ -206,7 +206,7 @@ impl TableProvider for IndexedTableProvider {
             };
             if let Some(idx) = row_id_output_index {
                 let mut fields: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
-                fields[idx] = Field::new("__row_id__", DataType::UInt64, false);
+                fields[idx] = Field::new("__row_id__", DataType::Int64, false);
                 Arc::new(Schema::new(fields))
             } else {
                 base

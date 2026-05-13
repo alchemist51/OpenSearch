@@ -95,7 +95,7 @@ impl ScalarUDFImpl for RowIdUdf {
         &self.signature
     }
     fn return_type(&self, _: &[DataType]) -> datafusion::common::Result<DataType> {
-        Ok(DataType::UInt64)
+        Ok(DataType::Int64)
     }
     fn invoke_with_args(
         &self,
