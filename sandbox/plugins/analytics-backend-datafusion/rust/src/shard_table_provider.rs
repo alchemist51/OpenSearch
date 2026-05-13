@@ -91,6 +91,9 @@ impl TableProvider for ShardTableProvider {
                     ],
                 });
                 pf = pf.with_statistics(file_stats);
+                if let Some(ref plan) = file_info.access_plan {
+                    pf = pf.with_extensions(Arc::new(plan.clone()));
+                }
                 pf
             })
             .collect();

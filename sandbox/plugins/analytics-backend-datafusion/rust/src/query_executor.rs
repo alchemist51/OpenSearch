@@ -149,6 +149,7 @@ pub async fn execute_query(
                     row_group_row_counts: (0..builder.metadata().num_row_groups())
                         .map(|i| builder.metadata().row_group(i).num_rows() as u64)
                         .collect(),
+                    access_plan: None,
                 });
                 cumulative_rows += num_rows;
             }
@@ -295,6 +296,7 @@ pub async fn execute_with_context(
                 row_group_row_counts: (0..pq_meta.num_row_groups())
                     .map(|i| pq_meta.row_group(i).num_rows() as u64)
                     .collect(),
+                access_plan: None,
             });
             cumulative_rows += num_rows;
         }
