@@ -526,7 +526,7 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
     @Override
     public org.opensearch.analytics.backend.EngineResultStream fetchByRowIds(
         org.opensearch.index.engine.exec.IndexReaderProvider.Reader reader,
-        long[] rowIds,
+        org.apache.arrow.vector.BigIntVector rowIdVector,
         String[] columns,
         org.apache.arrow.memory.BufferAllocator allocator
     ) {
@@ -545,9 +545,15 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
             throw new IllegalStateException("No DatafusionReader available for fetch-by-row-ids");
         }
 
+        // Pass row IDs to Rust via direct buffer address (zero-copy read).
+        // BigIntVector stores values in a contiguous off-heap ArrowBuf.
+        long bufAddr = rowIdVector.getDataBuffer().memoryAddress();
+        int count = rowIdVector.getValueCount();
+
         long streamPtr = org.opensearch.be.datafusion.nativelib.NativeBridge.fetchByRowIds(
             dfReader.getReaderHandle().getPointer(),
-            rowIds,
+            bufAddr,
+            count,
             columns,
             dataFusionService.getNativeRuntime().get()
         );

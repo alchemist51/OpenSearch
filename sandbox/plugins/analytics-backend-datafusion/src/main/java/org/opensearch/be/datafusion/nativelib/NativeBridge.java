@@ -412,14 +412,14 @@ public final class NativeBridge {
             FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
         );
 
-        // i64 df_fetch_by_row_ids(shard_view_ptr, row_ids_ptr, row_ids_len,
+        // i64 df_fetch_by_row_ids(shard_view_ptr, row_ids_buf_ptr, row_ids_count,
         //     col_names_ptr, col_names_len_ptr, col_names_count, runtime_ptr)
         FETCH_BY_ROW_IDS = linker.downcallHandle(
             lib.find("df_fetch_by_row_ids").orElseThrow(),
             FunctionDescriptor.of(
                 ValueLayout.JAVA_LONG,
                 ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
                 ValueLayout.JAVA_LONG,
                 ValueLayout.ADDRESS,
                 ValueLayout.ADDRESS,
@@ -980,25 +980,28 @@ public final class NativeBridge {
 
     /**
      * QTF fetch phase: reads specific rows by global row ID from parquet.
-     * Returns a stream pointer (same as execute_query) that can be drained
-     * via {@link #streamNext} and freed by {@link #streamClose}.
+     * Row IDs are passed as a direct buffer pointer (zero-copy from BigIntVector's ArrowBuf).
      *
      * @param readerPtr pointer to the shard view (DatafusionReader)
-     * @param rowIds global row IDs to fetch
-     * @param columns column names to read (["*"] for all columns)
+     * @param rowIdsBufAddr memory address of the BigIntVector's data buffer (i64 values)
+     * @param rowIdsCount number of row IDs
+     * @param columns column names to read
      * @param runtimePtr pointer to the DataFusion runtime
      * @return opaque stream pointer
      */
-    public static long fetchByRowIds(long readerPtr, long[] rowIds, String[] columns, long runtimePtr) {
+    public static long fetchByRowIds(long readerPtr, long rowIdsBufAddr, int rowIdsCount, String[] columns, long runtimePtr) {
         NativeHandle.validatePointer(readerPtr, "reader");
         NativeHandle.validatePointer(runtimePtr, "runtime");
+        if (rowIdsBufAddr == 0) {
+            throw new IllegalArgumentException("rowIdsBufAddr must be non-zero");
+        }
         try (var call = new NativeCall()) {
             var colNames = call.strArray(columns);
             return call.invoke(
                 FETCH_BY_ROW_IDS,
                 readerPtr,
-                call.longs(rowIds),
-                (long) rowIds.length,
+                rowIdsBufAddr,
+                (long) rowIdsCount,
                 colNames.ptrs(),
                 colNames.lens(),
                 colNames.count(),

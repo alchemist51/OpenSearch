@@ -120,15 +120,20 @@ public interface AnalyticsSearchBackendPlugin {
 
     /**
      * QTF fetch phase: reads specific rows by global row ID.
-     * Called by the coordinator when assembling query-then-fetch results.
+     * Row IDs are passed as a BigIntVector for zero-copy transfer to native.
      *
      * @param reader the index reader for the target shard
-     * @param rowIds global row IDs to fetch
+     * @param rowIdVector Arrow BigIntVector containing global row IDs
      * @param columns column names to read
      * @param allocator Arrow buffer allocator for result import
      * @return a result stream containing the requested rows
      */
-    default EngineResultStream fetchByRowIds(IndexReaderProvider.Reader reader, long[] rowIds, String[] columns, BufferAllocator allocator) {
+    default EngineResultStream fetchByRowIds(
+        IndexReaderProvider.Reader reader,
+        org.apache.arrow.vector.BigIntVector rowIdVector,
+        String[] columns,
+        BufferAllocator allocator
+    ) {
         throw new UnsupportedOperationException("fetchByRowIds not implemented for [" + name() + "]");
     }
 }

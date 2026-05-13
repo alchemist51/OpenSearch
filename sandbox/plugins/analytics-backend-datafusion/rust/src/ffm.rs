@@ -179,15 +179,15 @@ pub unsafe extern "C" fn df_execute_query(
 
 /// Fetch specific rows by global row ID — QTF fetch phase.
 ///
-/// Given a set of global row IDs and column names, reads only those rows from
-/// parquet and returns them as a stream (same as execute_query return type).
-/// The output includes `__row_id__` so the coordinator can match rows to positions.
+/// Row IDs are passed as a direct pointer to i64 values (from BigIntVector's
+/// off-heap ArrowBuf). Zero-copy at FFM boundary: Rust reads directly from
+/// Java's off-heap buffer without any intermediate allocation.
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn df_fetch_by_row_ids(
     shard_view_ptr: i64,
-    row_ids_ptr: *const i64,
-    row_ids_len: i64,
+    row_ids_ptr: i64,
+    row_ids_count: i64,
     col_names_ptr: *const *const u8,
     col_names_len_ptr: *const i64,
     col_names_count: i64,
@@ -197,8 +197,11 @@ pub unsafe extern "C" fn df_fetch_by_row_ids(
     let shard_view = &*(shard_view_ptr as *const crate::api::ShardView);
     let runtime = &*(runtime_ptr as *const crate::api::DataFusionRuntime);
 
-    // Parse row_ids
-    let row_ids: Vec<i64> = slice::from_raw_parts(row_ids_ptr, row_ids_len as usize).to_vec();
+    // Zero-copy read from BigIntVector's direct buffer
+    let row_ids: Vec<i64> = slice::from_raw_parts(
+        row_ids_ptr as *const i64,
+        row_ids_count as usize,
+    ).to_vec();
 
     // Parse column names
     let mut columns: Vec<String> = Vec::with_capacity(col_names_count as usize);

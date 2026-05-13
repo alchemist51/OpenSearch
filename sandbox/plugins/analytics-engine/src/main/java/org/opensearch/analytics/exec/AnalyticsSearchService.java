@@ -134,15 +134,24 @@ public class AnalyticsSearchService implements AutoCloseable {
                 throw new IllegalStateException("No ReaderProvider on " + shard.shardId());
             }
             try (GatedCloseable<Reader> gatedReader = readerProvider.acquireReader()) {
-                // Find the first backend that supports fetchByRowIds (POC: use first available)
+                // Build BigIntVector from row IDs for zero-copy transfer to native
+                long[] rowIds = request.getFetchRowIds();
+                org.apache.arrow.vector.BigIntVector rowIdVector = new org.apache.arrow.vector.BigIntVector("__row_id__", allocator);
+                rowIdVector.allocateNew(rowIds.length);
+                for (int i = 0; i < rowIds.length; i++) {
+                    rowIdVector.set(i, rowIds[i]);
+                }
+                rowIdVector.setValueCount(rowIds.length);
+
                 AnalyticsSearchBackendPlugin backend = backends.values().iterator().next();
                 EngineResultStream stream = backend.fetchByRowIds(
                     gatedReader.get(),
-                    request.getFetchRowIds(),
+                    rowIdVector,
                     request.getFetchColumns(),
                     allocator
                 );
                 FragmentExecutionResponse response = collectResponse(stream, task);
+                rowIdVector.close();
                 long tookNanos = System.nanoTime() - startNanos;
                 listener.onFragmentSuccess(request.getQueryId(), request.getStageId(), shardIdStr, tookNanos, response.getRowCount());
                 return response;
