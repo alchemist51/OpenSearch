@@ -102,9 +102,6 @@ public class AnalyticsSearchService implements AutoCloseable {
     }
 
     public FragmentExecutionResponse executeFragment(FragmentExecutionRequest request, IndexShard shard, AnalyticsShardTask task) {
-        if (request.isFetchMode()) {
-            return executeFetchByRowIds(request, shard, task);
-        }
         ResolvedFragment resolved = resolveFragment(request, shard);
         long startNanos = System.nanoTime();
         try (FragmentResources ctx = startFragment(request, resolved, shard, task)) {
@@ -125,7 +122,11 @@ public class AnalyticsSearchService implements AutoCloseable {
      * QTF fetch phase: read specific rows by global row ID.
      * Bypasses Substrait plan resolution — calls directly into backend's FFM.
      */
-    private FragmentExecutionResponse executeFetchByRowIds(FragmentExecutionRequest request, IndexShard shard, AnalyticsShardTask task) {
+    public org.opensearch.analytics.exec.action.FetchByRowIdsResponse executeFetchByRowIds(
+        org.opensearch.analytics.exec.action.FetchByRowIdsRequest request,
+        IndexShard shard,
+        AnalyticsShardTask task
+    ) {
         long startNanos = System.nanoTime();
         String shardIdStr = shard.shardId().toString();
         try {
@@ -134,8 +135,7 @@ public class AnalyticsSearchService implements AutoCloseable {
                 throw new IllegalStateException("No ReaderProvider on " + shard.shardId());
             }
             try (GatedCloseable<Reader> gatedReader = readerProvider.acquireReader()) {
-                // Build BigIntVector from row IDs for zero-copy transfer to native
-                long[] rowIds = request.getFetchRowIds();
+                long[] rowIds = request.getRowIds();
                 org.apache.arrow.vector.BigIntVector rowIdVector = new org.apache.arrow.vector.BigIntVector("__row_id__", allocator);
                 rowIdVector.allocateNew(rowIds.length);
                 for (int i = 0; i < rowIds.length; i++) {
@@ -147,17 +147,19 @@ public class AnalyticsSearchService implements AutoCloseable {
                 EngineResultStream stream = backend.fetchByRowIds(
                     gatedReader.get(),
                     rowIdVector,
-                    request.getFetchColumns(),
+                    request.getColumns(),
                     allocator
                 );
-                FragmentExecutionResponse response = collectResponse(stream, task);
+                FragmentExecutionResponse fragmentResp = collectResponse(stream, task);
                 rowIdVector.close();
                 long tookNanos = System.nanoTime() - startNanos;
-                listener.onFragmentSuccess(request.getQueryId(), request.getStageId(), shardIdStr, tookNanos, response.getRowCount());
-                return response;
+                listener.onFragmentSuccess(request.getQueryId(), 0, shardIdStr, tookNanos, fragmentResp.getRowCount());
+                return new org.opensearch.analytics.exec.action.FetchByRowIdsResponse(
+                    fragmentResp.getIpcPayload(), fragmentResp.getRowCount()
+                );
             }
         } catch (Exception e) {
-            listener.onFragmentFailure(request.getQueryId(), request.getStageId(), shardIdStr, e);
+            listener.onFragmentFailure(request.getQueryId(), 0, shardIdStr, e);
             throw new RuntimeException("Failed to execute fetch-by-row-ids on " + shard.shardId(), e);
         }
     }

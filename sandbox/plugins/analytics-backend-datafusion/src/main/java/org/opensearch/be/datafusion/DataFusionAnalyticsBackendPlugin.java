@@ -545,18 +545,23 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
             throw new IllegalStateException("No DatafusionReader available for fetch-by-row-ids");
         }
 
-        // Pass row IDs to Rust via direct buffer address (zero-copy read).
-        // BigIntVector stores values in a contiguous off-heap ArrowBuf.
+        // Pass row IDs to Rust via BigIntVector's direct buffer (zero-copy at FFM).
+        // BigIntVector data buffer is a contiguous off-heap array of i64 values.
         long bufAddr = rowIdVector.getDataBuffer().memoryAddress();
         int count = rowIdVector.getValueCount();
 
-        long streamPtr = org.opensearch.be.datafusion.nativelib.NativeBridge.fetchByRowIds(
-            dfReader.getReaderHandle().getPointer(),
-            bufAddr,
-            count,
-            columns,
-            dataFusionService.getNativeRuntime().get()
-        );
+        long streamPtr;
+        if (bufAddr != 0 && count > 0) {
+            streamPtr = org.opensearch.be.datafusion.nativelib.NativeBridge.fetchByRowIds(
+                dfReader.getReaderHandle().getPointer(),
+                bufAddr,
+                count,
+                columns,
+                dataFusionService.getNativeRuntime().get()
+            );
+        } else {
+            throw new IllegalStateException("BigIntVector buffer address is 0 or count is 0");
+        }
         org.opensearch.be.datafusion.nativelib.StreamHandle streamHandle =
             new org.opensearch.be.datafusion.nativelib.StreamHandle(streamPtr, dataFusionService.getNativeRuntime());
         return new DatafusionResultStream(streamHandle, allocator);
