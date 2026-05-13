@@ -146,6 +146,56 @@ public class AnalyticsSearchService implements AutoCloseable {
         }
     }
 
+    /**
+     * QTF fetch phase: retrieves specific rows by global row ID.
+     * Uses the reader from the ReaderContextStore (acquired during query phase).
+     */
+    public org.opensearch.analytics.backend.EngineResultStream executeFetchByRowIds(
+        String queryId,
+        long[] rowIds,
+        String[] columns,
+        IndexShard shard
+    ) {
+        if (readerContextStore == null) {
+            throw new IllegalStateException("ReaderContextStore not initialized");
+        }
+
+        ReaderContext readerCtx = readerContextStore.acquireContext(queryId);
+        if (readerCtx == null) {
+            throw new IllegalStateException("No reader context for queryId=" + queryId + " on shard " + shard.shardId());
+        }
+
+        try {
+            org.apache.arrow.vector.BigIntVector rowIdVector = new org.apache.arrow.vector.BigIntVector("__row_id__", allocator);
+            rowIdVector.allocateNew(rowIds.length);
+            for (int i = 0; i < rowIds.length; i++) {
+                rowIdVector.set(i, rowIds[i]);
+            }
+            rowIdVector.setValueCount(rowIds.length);
+
+            AnalyticsSearchBackendPlugin backend = backends.values().iterator().next();
+            org.opensearch.analytics.backend.EngineResultStream stream = backend.fetchByRowIds(
+                readerCtx.getReader(),
+                rowIdVector,
+                columns,
+                allocator
+            );
+            return stream;
+        } catch (Exception e) {
+            readerCtx.markDone();
+            throw new RuntimeException("Failed to execute fetch-by-row-ids on " + shard.shardId(), e);
+        }
+    }
+
+    /**
+     * Called after fetch completes to free the reader context.
+     */
+    public void completeFetch(String queryId) {
+        if (readerContextStore != null) {
+            readerContextStore.freeContext(queryId);
+        }
+    }
+
     private FragmentResources startFragment(FragmentExecutionRequest request, ResolvedFragment resolved, IndexShard shard, Task task)
         throws IOException {
         GatedCloseable<Reader> gatedReader = resolved.readerProvider.acquireReader();
