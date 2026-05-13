@@ -72,13 +72,14 @@ public class AnalyticsSearchService implements AutoCloseable {
     private final AnalyticsOperationListener listener;
     private final BufferAllocator allocator;
     private final NamedWriteableRegistry namedWriteableRegistry;
+    private final ReaderContextStore readerContextStore;
 
     public AnalyticsSearchService(Map<String, AnalyticsSearchBackendPlugin> backends) {
-        this(backends, List.of(), null);
+        this(backends, List.of(), null, null);
     }
 
     public AnalyticsSearchService(Map<String, AnalyticsSearchBackendPlugin> backends, NamedWriteableRegistry namedWriteableRegistry) {
-        this(backends, List.of(), namedWriteableRegistry);
+        this(backends, List.of(), namedWriteableRegistry, null);
     }
 
     public AnalyticsSearchService(
@@ -86,15 +87,29 @@ public class AnalyticsSearchService implements AutoCloseable {
         List<AnalyticsOperationListener> listeners,
         NamedWriteableRegistry namedWriteableRegistry
     ) {
+        this(backends, listeners, namedWriteableRegistry, null);
+    }
+
+    public AnalyticsSearchService(
+        Map<String, AnalyticsSearchBackendPlugin> backends,
+        List<AnalyticsOperationListener> listeners,
+        NamedWriteableRegistry namedWriteableRegistry,
+        org.opensearch.threadpool.ThreadPool threadPool
+    ) {
         this.backends = backends;
         this.listener = new AnalyticsOperationListener.CompositeListener(listeners);
         this.allocator = ArrowAllocatorProvider.newChildAllocator("analytics-search-service", Long.MAX_VALUE);
         this.namedWriteableRegistry = namedWriteableRegistry;
+        this.readerContextStore = threadPool != null ? new ReaderContextStore(threadPool) : null;
     }
 
     @Override
     public void close() {
         allocator.close();
+    }
+
+    public ReaderContextStore getReaderContextStore() {
+        return readerContextStore;
     }
 
     public FragmentExecutionResponse executeFragment(FragmentExecutionRequest request, IndexShard shard) {
@@ -134,6 +149,16 @@ public class AnalyticsSearchService implements AutoCloseable {
     private FragmentResources startFragment(FragmentExecutionRequest request, ResolvedFragment resolved, IndexShard shard, Task task)
         throws IOException {
         GatedCloseable<Reader> gatedReader = resolved.readerProvider.acquireReader();
+
+        // QTF: store reader in context so the fetch phase can reuse it.
+        // The context owns the reader lifecycle — FragmentResources gets a non-closing wrapper.
+        GatedCloseable<Reader> readerForFragment = gatedReader;
+        if (readerContextStore != null) {
+            readerContextStore.createContext(resolved.queryId, gatedReader);
+            readerForFragment = new GatedCloseable<>(gatedReader.get(), () -> {
+                readerContextStore.releaseContext(resolved.queryId);
+            });
+        }
         SearchExecEngine<ShardScanExecutionContext, EngineResultStream> engine = null;
         EngineResultStream stream = null;
         BackendExecutionContext backendContext = null;
@@ -164,10 +189,10 @@ public class AnalyticsSearchService implements AutoCloseable {
 
             engine = backend.getSearchExecEngineProvider().createSearchExecEngine(ctx, backendContext);
             stream = engine.execute(ctx);
-            return new FragmentResources(gatedReader, engine, stream);
+            return new FragmentResources(readerForFragment, engine, stream);
         } catch (Exception e) {
             try {
-                new FragmentResources(gatedReader, engine, stream).close();
+                new FragmentResources(readerForFragment, engine, stream).close();
             } catch (Exception suppressed) {
                 e.addSuppressed(suppressed);
             }
