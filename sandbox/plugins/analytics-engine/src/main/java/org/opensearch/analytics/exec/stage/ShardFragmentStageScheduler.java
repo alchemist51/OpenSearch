@@ -30,6 +30,8 @@ import java.util.function.Function;
  * and doesn't care whether it is a root sink or a parent-provided child sink
  * — {@link StageExecutionBuilder} resolves that distinction before calling.
  *
+ * <p>Uses Arrow streaming transport for shard communication.
+ *
  * @opensearch.internal
  */
 final class ShardFragmentStageScheduler implements StageScheduler {

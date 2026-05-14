@@ -22,6 +22,8 @@ import org.opensearch.analytics.planner.dag.Stage;
 import org.opensearch.analytics.spi.ExchangeSink;
 import org.opensearch.cluster.service.ClusterService;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -48,6 +50,7 @@ final class ShardFragmentStageExecution extends AbstractStageExecution implement
     private final Function<ShardExecutionTarget, FragmentExecutionRequest> requestBuilder;
     private final AnalyticsSearchTransportService dispatcher;
     private final Map<String, PendingExecutions> pendingPerNode = new ConcurrentHashMap<>();
+    private final List<ShardExecutionTarget> resolvedTargets = new ArrayList<>();
 
     ShardFragmentStageExecution(
         Stage stage,
@@ -75,22 +78,25 @@ final class ShardFragmentStageExecution extends AbstractStageExecution implement
         if (transitionTo(StageExecution.State.RUNNING) == false) return;
         inFlight.set(resolved.size());
         for (ExecutionTarget target : resolved) {
-            dispatchShardTask((ShardExecutionTarget) target);
+            resolvedTargets.add((ShardExecutionTarget) target);
+        }
+        // QTF: populate context targets BEFORE dispatch (local dispatch is synchronous)
+        if (stage.isInjectShardOrdinal()) {
+            config.getResolvedShardTargets().addAll(resolvedTargets);
+        }
+        for (int i = 0; i < resolvedTargets.size(); i++) {
+            dispatchShardTask(resolvedTargets.get(i), i);
         }
     }
 
-    private void dispatchShardTask(ShardExecutionTarget target) {
+    private void dispatchShardTask(ShardExecutionTarget target, int shardOrdinal) {
         FragmentExecutionRequest request = requestBuilder.apply(target);
         PendingExecutions pending = pendingFor(target);
-        dispatcher.dispatchFragmentStreaming(request, target.node(), responseListener(), config.parentTask(), pending);
+        dispatcher.dispatchFragmentStreaming(request, target.node(), responseListener(shardOrdinal), config.parentTask(), pending);
     }
 
-    private StreamingResponseListener<FragmentExecutionArrowResponse> responseListener() {
+    private StreamingResponseListener<FragmentExecutionArrowResponse> responseListener(int shardOrdinal) {
         return new StreamingResponseListener<>() {
-            // Runs inline on the per-stream virtual thread driving handleStreamResponse.
-            // Must NOT offload to a thread pool: reordering across batches would let the
-            // isLast=true task race ahead, flip state to SUCCEEDED, and drop queued
-            // earlier batches via the isDone() short-circuit.
             @Override
             public void onStreamResponse(FragmentExecutionArrowResponse response, boolean isLast) {
                 if (isDone()) {
@@ -103,10 +109,11 @@ final class ShardFragmentStageExecution extends AbstractStageExecution implement
 
                 VectorSchemaRoot vsr = response.getRoot();
                 try {
+                    if (stage.isInjectShardOrdinal()) {
+                        vsr = injectShardId(vsr, shardOrdinal);
+                    }
                     outputSink.feed(vsr);
                 } catch (Exception e) {
-                    // Without this guard the exception only surfaces on the stream's virtual
-                    // thread; inFlight never decrements and the stage hangs to QUERY_TIMEOUT.
                     captureFailure(new RuntimeException("Stage " + stage.getStageId() + " sink feed failed", e));
                     metrics.incrementTasksFailed();
                     onShardTerminated();
@@ -139,7 +146,6 @@ final class ShardFragmentStageExecution extends AbstractStageExecution implement
     @Override
     public void cancel(String reason) {
         if (transitionTo(StageExecution.State.CANCELLED) == false) return;
-        // Cancelling the parent task propagates to data-node shard tasks via TaskCancellationService.
         org.opensearch.tasks.Task parentTask = config.parentTask();
         if (parentTask instanceof org.opensearch.tasks.CancellableTask ct && ct.isCancelled() == false) {
             ct.cancel(reason);
@@ -154,6 +160,11 @@ final class ShardFragmentStageExecution extends AbstractStageExecution implement
         throw new UnsupportedOperationException("outputSink does not implement ExchangeSource");
     }
 
+    /** Returns the ordered list of resolved shard targets. */
+    public List<ShardExecutionTarget> getResolvedTargets() {
+        return Collections.unmodifiableList(resolvedTargets);
+    }
+
     private boolean isDone() {
         StageExecution.State s = getState();
         return s == StageExecution.State.SUCCEEDED || s == StageExecution.State.FAILED || s == StageExecution.State.CANCELLED;
@@ -161,5 +172,21 @@ final class ShardFragmentStageExecution extends AbstractStageExecution implement
 
     private PendingExecutions pendingFor(ShardExecutionTarget target) {
         return pendingPerNode.computeIfAbsent(target.node().getId(), n -> new PendingExecutions(config.maxConcurrentShardRequests()));
+    }
+
+    private static VectorSchemaRoot injectShardId(VectorSchemaRoot batch, int shardId) {
+        org.apache.arrow.vector.IntVector shardIdVector = new org.apache.arrow.vector.IntVector(
+            "shard_id",
+            batch.getFieldVectors().get(0).getAllocator()
+        );
+        shardIdVector.allocateNew(batch.getRowCount());
+        for (int i = 0; i < batch.getRowCount(); i++) {
+            shardIdVector.set(i, shardId);
+        }
+        shardIdVector.setValueCount(batch.getRowCount());
+
+        List<org.apache.arrow.vector.FieldVector> vectors = new ArrayList<>(batch.getFieldVectors());
+        vectors.add(shardIdVector);
+        return new VectorSchemaRoot(vectors);
     }
 }

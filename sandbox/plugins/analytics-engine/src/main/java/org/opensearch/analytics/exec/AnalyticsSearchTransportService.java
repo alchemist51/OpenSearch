@@ -9,6 +9,9 @@
 package org.opensearch.analytics.exec;
 
 import org.opensearch.analytics.backend.EngineResultBatch;
+import org.opensearch.analytics.exec.action.FetchByRowIdsAction;
+import org.opensearch.analytics.exec.action.FetchByRowIdsRequest;
+import org.opensearch.analytics.exec.action.FetchByRowIdsResponse;
 import org.opensearch.analytics.exec.action.FragmentExecutionAction;
 import org.opensearch.analytics.exec.action.FragmentExecutionArrowResponse;
 import org.opensearch.analytics.exec.action.FragmentExecutionRequest;
@@ -69,6 +72,7 @@ public class AnalyticsSearchTransportService {
         this.transportService = streamTransportService;
         this.clusterService = clusterService;
         registerStreamingFragmentHandler(this.transportService, searchService, indicesService);
+        registerFetchHandler(this.transportService, searchService, indicesService);
     }
 
     private static void registerStreamingFragmentHandler(
@@ -188,5 +192,68 @@ public class AnalyticsSearchTransportService {
                 }
             }
         });
+    }
+
+    // ── QTF Fetch ────────────────────────────────────────────────────────────────
+
+    private static void registerFetchHandler(
+        StreamTransportService transportService,
+        AnalyticsSearchService searchService,
+        IndicesService indicesService
+    ) {
+        transportService.registerRequestHandler(
+            FetchByRowIdsAction.NAME,
+            ThreadPool.Names.SAME,
+            false,
+            true,
+            AdmissionControlActionType.SEARCH,
+            FetchByRowIdsRequest::new,
+            (request, channel, task) -> {
+                IndexShard shard = indicesService.indexServiceSafe(request.getShardId().getIndex()).getShard(request.getShardId().id());
+                FetchByRowIdsResponse response = searchService.executeFetchByRowIds(request, shard, (AnalyticsShardTask) task);
+                channel.sendResponse(response);
+            }
+        );
+    }
+
+    public void dispatchFetch(
+        FetchByRowIdsRequest request,
+        DiscoveryNode targetNode,
+        StreamingResponseListener<FetchByRowIdsResponse> listener,
+        Task parentTask
+    ) {
+        try {
+            Transport.Connection connection = getConnection(null, targetNode.getId());
+            transportService.sendChildRequest(
+                connection,
+                FetchByRowIdsAction.NAME,
+                request,
+                parentTask,
+                TransportRequestOptions.EMPTY,
+                new TransportResponseHandler<FetchByRowIdsResponse>() {
+                    @Override
+                    public FetchByRowIdsResponse read(StreamInput in) throws IOException {
+                        return new FetchByRowIdsResponse(in);
+                    }
+
+                    @Override
+                    public String executor() {
+                        return ThreadPool.Names.SAME;
+                    }
+
+                    @Override
+                    public void handleResponse(FetchByRowIdsResponse response) {
+                        listener.onStreamResponse(response, true);
+                    }
+
+                    @Override
+                    public void handleException(TransportException e) {
+                        listener.onFailure(e);
+                    }
+                }
+            );
+        } catch (Exception e) {
+            listener.onFailure(e);
+        }
     }
 }

@@ -226,4 +226,64 @@ public class AnalyticsSearchService implements AutoCloseable {
         return ctx;
     }
 
+    /**
+     * QTF fetch phase: retrieves specific rows by global row ID.
+     */
+    public org.opensearch.analytics.exec.action.FetchByRowIdsResponse executeFetchByRowIds(
+        org.opensearch.analytics.exec.action.FetchByRowIdsRequest request,
+        IndexShard shard,
+        AnalyticsShardTask task
+    ) {
+        try {
+            IndexReaderProvider readerProvider = shard.getReaderProvider();
+            if (readerProvider == null) {
+                throw new IllegalStateException("No ReaderProvider on " + shard.shardId());
+            }
+            try (GatedCloseable<Reader> gatedReader = readerProvider.acquireReader()) {
+                long[] rowIds = request.getRowIds();
+                org.apache.arrow.vector.BigIntVector rowIdVector = new org.apache.arrow.vector.BigIntVector("__row_id__", allocator);
+                rowIdVector.allocateNew(rowIds.length);
+                for (int i = 0; i < rowIds.length; i++) {
+                    rowIdVector.set(i, rowIds[i]);
+                }
+                rowIdVector.setValueCount(rowIds.length);
+
+                AnalyticsSearchBackendPlugin backend = backends.values().iterator().next();
+                EngineResultStream stream = backend.fetchByRowIds(gatedReader.get(), rowIdVector, request.getColumns(), allocator);
+
+                // Serialize stream to Arrow IPC bytes
+                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                org.apache.arrow.vector.ipc.WriteChannel channel =
+                    new org.apache.arrow.vector.ipc.WriteChannel(java.nio.channels.Channels.newChannel(baos));
+                org.apache.arrow.vector.types.pojo.Schema schema = null;
+                int totalRows = 0;
+                java.util.Iterator<org.opensearch.analytics.backend.EngineResultBatch> it = stream.iterator();
+                while (it.hasNext()) {
+                    org.opensearch.analytics.backend.EngineResultBatch batch = it.next();
+                    org.apache.arrow.vector.VectorSchemaRoot root = batch.getArrowRoot();
+                    try {
+                        if (schema == null) {
+                            schema = root.getSchema();
+                            org.apache.arrow.vector.ipc.message.MessageSerializer.serialize(channel, schema);
+                        }
+                        try (org.apache.arrow.vector.ipc.message.ArrowRecordBatch rb =
+                                 new org.apache.arrow.vector.VectorUnloader(root).getRecordBatch()) {
+                            org.apache.arrow.vector.ipc.message.MessageSerializer.serialize(channel, rb);
+                        }
+                        totalRows += root.getRowCount();
+                    } finally {
+                        root.close();
+                    }
+                }
+                if (schema != null) {
+                    org.apache.arrow.vector.ipc.ArrowStreamWriter.writeEndOfStream(
+                        channel, org.apache.arrow.vector.ipc.message.IpcOption.DEFAULT);
+                }
+                rowIdVector.close();
+                return new org.opensearch.analytics.exec.action.FetchByRowIdsResponse(baos.toByteArray(), totalRows);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to execute fetch-by-row-ids on " + shard.shardId(), e);
+        }
+    }
 }
