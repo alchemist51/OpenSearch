@@ -73,7 +73,7 @@ final class ShardFragmentStageScheduler implements StageScheduler {
         // This keeps target resolution out of the build phase so cancellation before
         // dispatch doesn't pay for cluster-state routing, and leaves room for shuffle
         // reads whose targets depend on child manifests only available at dispatch time.
-        return new ShardFragmentStageExecution(stage, config, sink, clusterService, requestBuilder, transport, responseCodec);
+        return new QueryThenFetchFragmentExecution(stage, config, sink, clusterService, requestBuilder, transport, responseCodec);
     }
 
     private static List<FragmentExecutionRequest.PlanAlternative> buildPlanAlternatives(Stage stage) {

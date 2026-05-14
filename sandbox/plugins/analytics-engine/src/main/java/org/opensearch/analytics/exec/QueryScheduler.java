@@ -18,6 +18,7 @@ import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 
 import java.util.Collection;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -41,11 +42,13 @@ public class QueryScheduler implements Scheduler {
     private static final Logger logger = LogManager.getLogger(QueryScheduler.class);
 
     private final StageExecutionBuilder stageExecutionBuilder;
+    private final AnalyticsSearchTransportService transportService;
     private final Map<String, PlanWalker> walkerPool = new ConcurrentHashMap<>();
 
     @Inject
-    public QueryScheduler(StageExecutionBuilder stageExecutionBuilder) {
+    public QueryScheduler(StageExecutionBuilder stageExecutionBuilder, AnalyticsSearchTransportService transportService) {
         this.stageExecutionBuilder = stageExecutionBuilder;
+        this.transportService = transportService;
     }
 
     /**
@@ -103,7 +106,18 @@ public class QueryScheduler implements Scheduler {
             opListener.onQueryFailure(queryId, e);
             listener.onFailure(e);
         });
-        return new PlanWalker(config, stageExecutionBuilder, wrapped);
+
+        wrapped = new QTFCompletionListener(
+            wrapped,
+            queryId,
+            transportService,
+            config.bufferAllocator(),
+            () -> config.getResolvedShardTargets(),
+            config.parentTask()
+        );
+
+        PlanWalker walker = new PlanWalker(config, stageExecutionBuilder, wrapped);
+        return walker;
     }
 
     /** Pool-level lookup for observability / metrics. */

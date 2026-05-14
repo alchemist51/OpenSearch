@@ -9,6 +9,9 @@
 package org.opensearch.analytics.exec;
 
 import org.opensearch.analytics.backend.EngineResultBatch;
+import org.opensearch.analytics.exec.action.FetchByRowIdsAction;
+import org.opensearch.analytics.exec.action.FetchByRowIdsRequest;
+import org.opensearch.analytics.exec.action.FetchByRowIdsResponse;
 import org.opensearch.analytics.exec.action.FragmentExecutionAction;
 import org.opensearch.analytics.exec.action.FragmentExecutionArrowResponse;
 import org.opensearch.analytics.exec.action.FragmentExecutionRequest;
@@ -73,6 +76,7 @@ public class AnalyticsSearchTransportService {
         } else {
             registerFragmentHandler(this.transportService, searchService, indicesService);
         }
+        registerFetchHandler(this.transportService, searchService, indicesService);
     }
 
     public boolean isStreamingEnabled() {
@@ -130,6 +134,202 @@ public class AnalyticsSearchTransportService {
                 }
             }
         );
+    }
+
+    private static void registerFetchHandler(
+        TransportService transportService,
+        AnalyticsSearchService searchService,
+        IndicesService indicesService
+    ) {
+        if (transportService instanceof StreamTransportService) {
+            // Streaming path: send Arrow batches directly
+            transportService.registerRequestHandler(
+                FetchByRowIdsAction.NAME,
+                ThreadPool.Names.SAME,
+                false,
+                true,
+                AdmissionControlActionType.SEARCH,
+                FetchByRowIdsRequest::new,
+                (request, channel, task) -> {
+                    IndexShard shard = indicesService.indexServiceSafe(request.getShardId().getIndex()).getShard(request.getShardId().id());
+                    try {
+                        org.opensearch.analytics.backend.EngineResultStream stream =
+                            searchService.executeFetchStreaming(request, shard, (AnalyticsShardTask) task);
+                        Iterator<org.opensearch.analytics.backend.EngineResultBatch> it = stream.iterator();
+                        while (it.hasNext()) {
+                            org.opensearch.analytics.backend.EngineResultBatch batch = it.next();
+                            channel.sendResponseBatch(new org.opensearch.analytics.exec.action.FetchByRowIdsArrowResponse(batch.getArrowRoot()));
+                        }
+                        channel.completeStream();
+                    } catch (StreamException e) {
+                        if (e.getErrorCode() != StreamErrorCode.CANCELLED) {
+                            channel.sendResponse(e);
+                        }
+                    } catch (Exception e) {
+                        channel.sendResponse(e);
+                    }
+                }
+            );
+        } else {
+            // Non-streaming path: serialize to IPC bytes
+            transportService.registerRequestHandler(
+                FetchByRowIdsAction.NAME,
+                ThreadPool.Names.SAME,
+                false,
+                true,
+                AdmissionControlActionType.SEARCH,
+                FetchByRowIdsRequest::new,
+                (request, channel, task) -> {
+                    IndexShard shard = indicesService.indexServiceSafe(request.getShardId().getIndex()).getShard(request.getShardId().id());
+                    FetchByRowIdsResponse response = searchService.executeFetchByRowIds(request, shard, (AnalyticsShardTask) task);
+                    channel.sendResponse(response);
+                }
+            );
+        }
+    }
+
+    public void dispatchFetch(
+        FetchByRowIdsRequest request,
+        DiscoveryNode targetNode,
+        StreamingResponseListener<FetchByRowIdsResponse> listener,
+        Task parentTask
+    ) {
+        if (streamingEnabled) {
+            dispatchFetchStreaming(request, targetNode, listener, parentTask);
+        } else {
+            dispatchFetchNonStreaming(request, targetNode, listener, parentTask);
+        }
+    }
+
+    private void dispatchFetchStreaming(
+        FetchByRowIdsRequest request,
+        DiscoveryNode targetNode,
+        StreamingResponseListener<FetchByRowIdsResponse> listener,
+        Task parentTask
+    ) {
+        try {
+            Transport.Connection connection = getConnection(null, targetNode.getId());
+            transportService.sendChildRequest(
+                connection,
+                FetchByRowIdsAction.NAME,
+                request,
+                parentTask,
+                TransportRequestOptions.builder().withType(TransportRequestOptions.Type.STREAM).build(),
+                new TransportResponseHandler<org.opensearch.analytics.exec.action.FetchByRowIdsArrowResponse>() {
+                    @Override
+                    public org.opensearch.analytics.exec.action.FetchByRowIdsArrowResponse read(StreamInput in) throws IOException {
+                        return new org.opensearch.analytics.exec.action.FetchByRowIdsArrowResponse(in);
+                    }
+
+                    @Override
+                    public boolean skipsDeserialization() {
+                        return true;
+                    }
+
+                    @Override
+                    public String executor() {
+                        return ThreadPool.Names.SAME;
+                    }
+
+                    @Override
+                    public void handleStreamResponse(StreamTransportResponse<org.opensearch.analytics.exec.action.FetchByRowIdsArrowResponse> stream) {
+                        try {
+                            org.opensearch.analytics.exec.action.FetchByRowIdsArrowResponse current;
+                            org.opensearch.analytics.exec.action.FetchByRowIdsArrowResponse last = null;
+                            while ((current = stream.nextResponse()) != null) {
+                                if (last != null) {
+                                    listener.onStreamResponse(wrapArrowAsResponse(last), false);
+                                }
+                                last = current;
+                            }
+                            if (last != null) {
+                                listener.onStreamResponse(wrapArrowAsResponse(last), true);
+                            }
+                        } catch (Exception e) {
+                            listener.onFailure(e);
+                        } finally {
+                            try { stream.close(); } catch (Exception ignore) {}
+                        }
+                    }
+
+                    @Override
+                    public void handleResponse(org.opensearch.analytics.exec.action.FetchByRowIdsArrowResponse response) {
+                        listener.onStreamResponse(wrapArrowAsResponse(response), true);
+                    }
+
+                    @Override
+                    public void handleException(TransportException e) {
+                        listener.onFailure(e);
+                    }
+                }
+            );
+        } catch (Exception e) {
+            listener.onFailure(e);
+        }
+    }
+
+    private void dispatchFetchNonStreaming(
+        FetchByRowIdsRequest request,
+        DiscoveryNode targetNode,
+        StreamingResponseListener<FetchByRowIdsResponse> listener,
+        Task parentTask
+    ) {
+        try {
+            Transport.Connection connection = getConnection(null, targetNode.getId());
+            transportService.sendChildRequest(
+                connection,
+                FetchByRowIdsAction.NAME,
+                request,
+                parentTask,
+                TransportRequestOptions.EMPTY,
+                new TransportResponseHandler<FetchByRowIdsResponse>() {
+                    @Override
+                    public FetchByRowIdsResponse read(StreamInput in) throws IOException {
+                        return new FetchByRowIdsResponse(in);
+                    }
+
+                    @Override
+                    public String executor() {
+                        return ThreadPool.Names.SAME;
+                    }
+
+                    @Override
+                    public void handleResponse(FetchByRowIdsResponse response) {
+                        listener.onStreamResponse(response, true);
+                    }
+
+                    @Override
+                    public void handleException(TransportException e) {
+                        listener.onFailure(e);
+                    }
+                }
+            );
+        } catch (Exception e) {
+            listener.onFailure(e);
+        }
+    }
+
+    private static FetchByRowIdsResponse wrapArrowAsResponse(org.opensearch.analytics.exec.action.FetchByRowIdsArrowResponse arrowResp) {
+        // For the streaming path, wrap the Arrow batch as IPC bytes for uniform handling
+        // in FetchStageExecution's assembler. TODO: pass VectorSchemaRoot directly.
+        org.apache.arrow.vector.VectorSchemaRoot root = arrowResp.getRoot();
+        if (root == null) return new FetchByRowIdsResponse(new byte[0], 0);
+        try {
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            org.apache.arrow.vector.ipc.WriteChannel channel =
+                new org.apache.arrow.vector.ipc.WriteChannel(java.nio.channels.Channels.newChannel(baos));
+            org.apache.arrow.vector.ipc.message.MessageSerializer.serialize(channel, root.getSchema());
+            try (org.apache.arrow.vector.ipc.message.ArrowRecordBatch batch =
+                     new org.apache.arrow.vector.VectorUnloader(root).getRecordBatch()) {
+                org.apache.arrow.vector.ipc.message.MessageSerializer.serialize(channel, batch);
+            }
+            org.apache.arrow.vector.ipc.ArrowStreamWriter.writeEndOfStream(channel, org.apache.arrow.vector.ipc.message.IpcOption.DEFAULT);
+            return new FetchByRowIdsResponse(baos.toByteArray(), root.getRowCount());
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize Arrow batch to IPC", e);
+        } finally {
+            root.close();
+        }
     }
 
     Transport.Connection getConnection(String clusterAlias, String nodeId) {
@@ -227,11 +427,8 @@ public class AnalyticsSearchTransportService {
 
             @Override
             public void handleResponse(T response) {
-                try {
-                    listener.onStreamResponse(response, true);
-                } finally {
-                    pending.finishAndRunNext();
-                }
+                listener.onStreamResponse(response, true);
+                pending.finishAndRunNext();
             }
 
             @Override

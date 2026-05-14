@@ -9,9 +9,10 @@
 package org.opensearch.analytics.exec.stage;
 
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.backend.ExchangeSource;
 import org.opensearch.analytics.exec.AnalyticsSearchTransportService;
-import org.opensearch.analytics.exec.PendingExecutions;
 import org.opensearch.analytics.exec.QueryContext;
 import org.opensearch.analytics.exec.StreamingResponseListener;
 import org.opensearch.analytics.exec.action.FragmentExecutionArrowResponse;
@@ -32,17 +33,23 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
 /**
- * Leaf stage execution that dispatches fragment work to data-node shards.
+ * QTF leaf stage execution: dispatches query-phase fragments to data-node shards,
+ * collects results with __row_id__ + shard_id, then triggers the fetch phase
+ * via {@link FetchStageExecution} to materialize the final result.
  *
- * <p>Handles both Arrow streaming and row (codec-decoded) responses, feeding
- * resulting batches into the parent stage's {@link ExchangeSink}.
+ * <p>Replaces {@link ShardFragmentStageExecution} in the POC — every query goes
+ * through the QTF path. The query phase returns __row_id__ + sort columns + shard_id.
+ * After reduce, the coordinator builds a position map and fetches full rows.
  *
- * <p>One-shot: constructed, {@link #start()} called once, listener
- * signaled on completion, then discarded.
+ * <p>This execution handles the query dispatch phase. The fetch phase is triggered
+ * by the {@code QTFCompletionListener} which wraps the walker's completion listener
+ * and invokes {@link FetchStageExecution} after reduce.
  *
  * @opensearch.internal
  */
-public final class ShardFragmentStageExecution extends AbstractStageExecution implements DataProducer {
+public final class QueryThenFetchFragmentExecution extends AbstractStageExecution implements DataProducer {
+
+    private static final Logger logger = LogManager.getLogger(QueryThenFetchFragmentExecution.class);
 
     private final AtomicInteger inFlight = new AtomicInteger(0);
 
@@ -52,12 +59,11 @@ public final class ShardFragmentStageExecution extends AbstractStageExecution im
     private final Function<ShardExecutionTarget, FragmentExecutionRequest> requestBuilder;
     private final AnalyticsSearchTransportService dispatcher;
     private final ResponseCodec<FragmentExecutionResponse> responseCodec;
-    private final Map<String, PendingExecutions> pendingPerNode = new ConcurrentHashMap<>();
+    private final Map<String, org.opensearch.analytics.exec.PendingExecutions> pendingPerNode = new ConcurrentHashMap<>();
 
-    // QTF: ordinal → target mapping so coordinator can dispatch fetches to the right shard/node.
     private final List<ShardExecutionTarget> resolvedTargets = new java.util.ArrayList<>();
 
-    ShardFragmentStageExecution(
+    QueryThenFetchFragmentExecution(
         Stage stage,
         QueryContext config,
         ExchangeSink outputSink,
@@ -92,13 +98,18 @@ public final class ShardFragmentStageExecution extends AbstractStageExecution im
         for (ExecutionTarget target : resolved) {
             ShardExecutionTarget shardTarget = (ShardExecutionTarget) target;
             resolvedTargets.add(shardTarget);
-            dispatchShardTask(shardTarget, ordinal++);
+        }
+        // Populate targets on context BEFORE dispatching — local dispatch is synchronous
+        // and the completion listener may fire before start() returns.
+        config.getResolvedShardTargets().addAll(resolvedTargets);
+        for (int i = 0; i < resolvedTargets.size(); i++) {
+            dispatchShardTask(resolvedTargets.get(i), i);
         }
     }
 
     private void dispatchShardTask(ShardExecutionTarget target, int shardOrdinal) {
         FragmentExecutionRequest request = requestBuilder.apply(target);
-        PendingExecutions pending = pendingFor(target);
+        org.opensearch.analytics.exec.PendingExecutions pending = pendingFor(target);
         if (useArrowStreaming()) {
             dispatcher.dispatchFragmentStreaming(
                 request,
@@ -130,9 +141,6 @@ public final class ShardFragmentStageExecution extends AbstractStageExecution im
                 }
 
                 VectorSchemaRoot vsr = toVsr.apply(response);
-
-                // QTF POC: always inject shard_id for coordinator provenance tracking.
-                // The QTF completion listener uses it; non-QTF queries ignore it.
                 vsr = injectShardId(vsr, shardOrdinal);
 
                 outputSink.feed(vsr);
@@ -169,7 +177,6 @@ public final class ShardFragmentStageExecution extends AbstractStageExecution im
     @Override
     public void cancel(String reason) {
         if (transitionTo(StageExecution.State.CANCELLED) == false) return;
-        // Cancelling the parent task propagates to data-node shard tasks via TaskCancellationService.
         org.opensearch.tasks.Task parentTask = config.parentTask();
         if (parentTask instanceof org.opensearch.tasks.CancellableTask ct && ct.isCancelled() == false) {
             ct.cancel(reason);
@@ -184,7 +191,6 @@ public final class ShardFragmentStageExecution extends AbstractStageExecution im
         throw new UnsupportedOperationException("outputSink does not implement ExchangeSource");
     }
 
-    /** QTF: returns the ordered list of shard targets for fetch dispatch. */
     public List<ShardExecutionTarget> getResolvedTargets() {
         return java.util.Collections.unmodifiableList(resolvedTargets);
     }
@@ -194,14 +200,13 @@ public final class ShardFragmentStageExecution extends AbstractStageExecution im
         return s == StageExecution.State.SUCCEEDED || s == StageExecution.State.FAILED || s == StageExecution.State.CANCELLED;
     }
 
-    private PendingExecutions pendingFor(ShardExecutionTarget target) {
-        return pendingPerNode.computeIfAbsent(target.node().getId(), n -> new PendingExecutions(config.maxConcurrentShardRequests()));
+    private org.opensearch.analytics.exec.PendingExecutions pendingFor(ShardExecutionTarget target) {
+        return pendingPerNode.computeIfAbsent(
+            target.node().getId(),
+            n -> new org.opensearch.analytics.exec.PendingExecutions(config.maxConcurrentShardRequests())
+        );
     }
 
-    /**
-     * QTF: Inject a shard_id column into the Arrow batch so the coordinator
-     * can track which shard each row came from after the reduce merge.
-     */
     private static VectorSchemaRoot injectShardId(VectorSchemaRoot batch, int shardId) {
         org.apache.arrow.vector.IntVector shardIdVector =
             new org.apache.arrow.vector.IntVector("shard_id", batch.getFieldVectors().get(0).getAllocator());
