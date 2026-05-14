@@ -97,4 +97,21 @@ public class ReaderContextTests extends OpenSearchTestCase {
 
         assertEquals("test-query-123", ctx.getQueryId());
     }
+
+    public void testLastAccessTimeUpdatedOnMarkInUse() throws Exception {
+        GatedCloseable<Reader> gated = mockGatedReader();
+        ReaderContext ctx = new ReaderContext("q1", gated, 30_000);
+
+        long timeAfterCreate = ctx.getLastAccessTime();
+
+        Thread.sleep(20);
+        ctx.markInUse();
+        long timeAfterMarkInUse = ctx.getLastAccessTime();
+        assertTrue("lastAccessTime should advance on markInUse", timeAfterMarkInUse > timeAfterCreate);
+
+        Thread.sleep(20);
+        ctx.markDone();
+        long timeAfterDone = ctx.getLastAccessTime();
+        assertTrue("lastAccessTime should advance on markDone", timeAfterDone > timeAfterMarkInUse);
+    }
 }

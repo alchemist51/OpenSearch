@@ -85,6 +85,10 @@ public class ReaderContext implements Closeable {
         this.keepAliveMillis = keepAliveMillis;
     }
 
+    long getLastAccessTime() {
+        return lastAccessTime.get();
+    }
+
     @Override
     public void close() throws IOException {
         if (closed) return;

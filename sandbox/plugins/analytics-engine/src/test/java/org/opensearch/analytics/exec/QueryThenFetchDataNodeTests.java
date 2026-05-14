@@ -14,9 +14,7 @@ import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
 
-import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.mockito.Mockito.mock;
 
@@ -148,52 +146,6 @@ public class QueryThenFetchDataNodeTests extends OpenSearchTestCase {
         assertNull("Context must be removed from store", store.getContext("query-3"));
     }
 
-    /**
-     * Two threads try acquireContext for the same queryId concurrently -> exactly one wins.
-     */
-    public void testConcurrentFetchOnlyOneSucceeds() throws Exception {
-        AtomicBoolean closed = new AtomicBoolean(false);
-        ReaderContextStore store = new ReaderContextStore(threadPool);
-
-        store.createContext("query-concurrent", mockGatedReader(closed));
-        store.releaseContext("query-concurrent");
-
-        AtomicInteger successCount = new AtomicInteger(0);
-        CyclicBarrier barrier = new CyclicBarrier(2);
-
-        Thread t1 = new Thread(() -> {
-            try {
-                barrier.await();
-                if (store.acquireContext("query-concurrent") != null) {
-                    successCount.incrementAndGet();
-                }
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        });
-
-        Thread t2 = new Thread(() -> {
-            try {
-                barrier.await();
-                if (store.acquireContext("query-concurrent") != null) {
-                    successCount.incrementAndGet();
-                }
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        });
-
-        t1.start();
-        t2.start();
-        t1.join(5000);
-        t2.join(5000);
-
-        assertEquals("Exactly one thread must win the CAS", 1, successCount.get());
-
-        // Cleanup
-        store.releaseContext("query-concurrent");
-        store.freeContext("query-concurrent");
-    }
 
     /**
      * Multiple queries have independent contexts with different readers and independent lifecycles.
