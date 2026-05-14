@@ -413,7 +413,7 @@ public final class NativeBridge {
         );
 
         // i64 df_fetch_by_row_ids(shard_view_ptr, row_ids_buf_ptr, row_ids_count,
-        //     col_names_ptr, col_names_len_ptr, col_names_count, runtime_ptr)
+        // col_names_ptr, col_names_len_ptr, col_names_count, runtime_ptr)
         FETCH_BY_ROW_IDS = linker.downcallHandle(
             lib.find("df_fetch_by_row_ids").orElseThrow(),
             FunctionDescriptor.of(

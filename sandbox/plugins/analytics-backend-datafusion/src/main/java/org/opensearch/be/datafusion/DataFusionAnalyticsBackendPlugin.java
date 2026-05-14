@@ -562,8 +562,10 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
         } else {
             throw new IllegalStateException("BigIntVector buffer address is 0 or count is 0");
         }
-        org.opensearch.be.datafusion.nativelib.StreamHandle streamHandle =
-            new org.opensearch.be.datafusion.nativelib.StreamHandle(streamPtr, dataFusionService.getNativeRuntime());
+        org.opensearch.be.datafusion.nativelib.StreamHandle streamHandle = new org.opensearch.be.datafusion.nativelib.StreamHandle(
+            streamPtr,
+            dataFusionService.getNativeRuntime()
+        );
         return new DatafusionResultStream(streamHandle, allocator);
     }
 }

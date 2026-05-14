@@ -205,9 +205,7 @@ public class AnalyticsSearchService implements AutoCloseable {
         GatedCloseable<Reader> readerForFragment = gatedReader;
         if (readerContextStore != null) {
             readerContextStore.createContext(resolved.queryId, gatedReader);
-            readerForFragment = new GatedCloseable<>(gatedReader.get(), () -> {
-                readerContextStore.releaseContext(resolved.queryId);
-            });
+            readerForFragment = new GatedCloseable<>(gatedReader.get(), () -> { readerContextStore.releaseContext(resolved.queryId); });
         }
         SearchExecEngine<ShardScanExecutionContext, EngineResultStream> engine = null;
         EngineResultStream stream = null;

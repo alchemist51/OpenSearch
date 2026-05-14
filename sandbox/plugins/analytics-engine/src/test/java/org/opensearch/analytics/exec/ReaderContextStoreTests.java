@@ -9,7 +9,6 @@
 package org.opensearch.analytics.exec;
 
 import org.opensearch.common.concurrent.GatedCloseable;
-import org.opensearch.common.settings.Settings;
 import org.opensearch.index.engine.exec.IndexReaderProvider.Reader;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;

@@ -43,6 +43,7 @@ mod metrics;
 mod multi_segment;
 mod null_columns;
 mod page_pruning;
+mod qtf_fetch_phase;
 mod row_id_emission;
 mod schema_drift;
 mod streaming_at_scale;

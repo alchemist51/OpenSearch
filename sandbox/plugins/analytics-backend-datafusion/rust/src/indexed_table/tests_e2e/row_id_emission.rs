@@ -10,7 +10,7 @@
 //! Verifies that the indexed query path can return global row IDs
 //! instead of actual data columns.
 
-use datafusion::arrow::array::UInt64Array;
+use datafusion::arrow::array::Int64Array;
 
 use super::*;
 
@@ -21,7 +21,7 @@ use super::*;
 
 
 /// Helper: run a tree with `emit_row_ids: true` and return the collected row IDs.
-async fn run_tree_row_ids(tree: BoolNode) -> Vec<u64> {
+async fn run_tree_row_ids(tree: BoolNode) -> Vec<i64> {
     let tmp = write_fixture_parquet();
     let path = tmp.path().to_path_buf();
     let size = std::fs::metadata(&path).unwrap().len();
@@ -122,12 +122,12 @@ async fn run_tree_row_ids(tree: BoolNode) -> Vec<u64> {
     let plan = df.create_physical_plan().await.unwrap();
     let task_ctx = ctx.task_ctx();
     let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx).unwrap();
-    let mut row_ids: Vec<u64> = Vec::new();
+    let mut row_ids: Vec<i64> = Vec::new();
     while let Some(batch) = stream.next().await {
         let b = batch.unwrap();
         assert_eq!(b.num_columns(), 1, "should have only __row_id__ column");
         assert_eq!(b.schema().field(0).name(), "__row_id__");
-        let col = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+        let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         for i in 0..b.num_rows() {
             row_ids.push(col.value(i));
         }
@@ -185,7 +185,7 @@ async fn test_emit_row_ids_two_collectors_and() {
 }
 
 /// Verify global_base offset works: set global_base=1000 and check IDs are shifted.
-async fn run_tree_row_ids_with_global_base(tree: BoolNode, global_base: u64) -> Vec<u64> {
+async fn run_tree_row_ids_with_global_base(tree: BoolNode, global_base: u64) -> Vec<i64> {
     let tmp = write_fixture_parquet();
     let path = tmp.path().to_path_buf();
     let size = std::fs::metadata(&path).unwrap().len();
@@ -285,11 +285,11 @@ async fn run_tree_row_ids_with_global_base(tree: BoolNode, global_base: u64) -> 
     let plan = df.create_physical_plan().await.unwrap();
     let task_ctx = ctx.task_ctx();
     let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx).unwrap();
-    let mut row_ids: Vec<u64> = Vec::new();
+    let mut row_ids: Vec<i64> = Vec::new();
     while let Some(batch) = stream.next().await {
         let b = batch.unwrap();
         assert_eq!(b.schema().field(0).name(), "__row_id__");
-        let col = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+        let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         for i in 0..b.num_rows() {
             row_ids.push(col.value(i));
         }
@@ -332,8 +332,8 @@ async fn test_emit_row_ids_with_global_base_offset() {
 // | 15  | google |    55 | active    | electronics |
 
 /// Helper: compute expected row positions from fixture data given a filter.
-fn expected_rows(filter: impl Fn(usize) -> bool) -> Vec<u64> {
-    (0..16).filter(|&i| filter(i)).map(|i| i as u64).collect()
+fn expected_rows(filter: impl Fn(usize) -> bool) -> Vec<i64> {
+    (0..16).filter(|&i| filter(i)).map(|i| i as i64).collect()
 }
 
 /// Exhaustive test: all query types produce correct row IDs matching fixture positions.
@@ -552,14 +552,14 @@ async fn test_row_id_with_data_columns() {
     let task_ctx = ctx.task_ctx();
     let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx).unwrap();
 
-    let mut rows: Vec<(u64, String, i32)> = Vec::new();
+    let mut rows: Vec<(i64, String, i32)> = Vec::new();
     while let Some(batch) = stream.next().await {
         let b = batch.unwrap();
         assert_eq!(b.num_columns(), 3, "should have 3 columns: __row_id__, brand, price");
         assert_eq!(b.schema().field(0).name(), "__row_id__");
         assert_eq!(b.schema().field(1).name(), "brand");
         assert_eq!(b.schema().field(2).name(), "price");
-        let ids = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+        let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let brands = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
         let prices = b.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
         for i in 0..b.num_rows() {
@@ -683,7 +683,7 @@ fn write_row_id_fixture_parquet() -> NamedTempFile {
 /// Helper: run a query with `emit_row_ids=true` across two segments and return sorted row IDs.
 /// Each segment is a separate parquet file with 16 rows. Segment 1 has global_base=0,
 /// segment 2 has global_base=16, so combined IDs span 0..31.
-async fn run_two_segments_row_ids(tree: BoolNode) -> Vec<u64> {
+async fn run_two_segments_row_ids(tree: BoolNode) -> Vec<i64> {
     let tmp1 = write_row_id_fixture_parquet();
     let tmp2 = write_row_id_fixture_parquet();
 
@@ -816,12 +816,12 @@ async fn run_two_segments_row_ids(tree: BoolNode) -> Vec<u64> {
     let plan = df.create_physical_plan().await.unwrap();
     let task_ctx = ctx.task_ctx();
     let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx).unwrap();
-    let mut row_ids: Vec<u64> = Vec::new();
+    let mut row_ids: Vec<i64> = Vec::new();
     while let Some(batch) = stream.next().await {
         let b = batch.unwrap();
         assert_eq!(b.num_columns(), 1, "should have only __row_id__ column");
         assert_eq!(b.schema().field(0).name(), "__row_id__");
-        let col = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+        let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         for i in 0..b.num_rows() {
             row_ids.push(col.value(i));
         }
@@ -841,12 +841,12 @@ async fn test_emit_row_ids_two_segments_global_base() {
 
     // Each segment has 16 rows. With global_base=0 and global_base=16,
     // we expect all IDs from 0 through 31 inclusive.
-    let expected: Vec<u64> = (0..32).collect();
+    let expected: Vec<i64> = (0..32).collect();
     assert_eq!(ids.len(), 32, "should have 32 row IDs (16 per segment)");
     assert_eq!(ids, expected, "row IDs should cover 0..31 with no gaps");
 
     // Verify uniqueness explicitly
-    let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
+    let unique: std::collections::HashSet<i64> = ids.iter().copied().collect();
     assert_eq!(unique.len(), 32, "all 32 row IDs should be unique");
 }
 
@@ -862,7 +862,7 @@ async fn test_emit_row_ids_two_segments_with_filter() {
 
     // Segment 1: amazon rows at positions 0,1,2,3,12 + global_base 0 = 0,1,2,3,12
     // Segment 2: amazon rows at positions 0,1,2,3,12 + global_base 16 = 16,17,18,19,28
-    let expected: Vec<u64> = vec![0, 1, 2, 3, 12, 16, 17, 18, 19, 28];
+    let expected: Vec<i64> = vec![0, 1, 2, 3, 12, 16, 17, 18, 19, 28];
     assert_eq!(
         ids.len(),
         10,

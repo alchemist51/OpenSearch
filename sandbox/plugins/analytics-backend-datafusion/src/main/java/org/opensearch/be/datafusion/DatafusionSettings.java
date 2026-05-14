@@ -195,8 +195,7 @@ public final class DatafusionSettings {
                     break;
                 default:
                     throw new IllegalArgumentException(
-                        "datafusion.indexed.fetch_strategy must be one of "
-                            + "[none, listing_table, indexed], got: " + value
+                        "datafusion.indexed.fetch_strategy must be one of " + "[none, listing_table, indexed], got: " + value
                     );
             }
         },
