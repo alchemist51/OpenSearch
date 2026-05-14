@@ -33,7 +33,7 @@ public class ReaderContextStore {
 
     public static final Setting<TimeValue> READER_CONTEXT_KEEP_ALIVE = Setting.positiveTimeSetting(
         "analytics.qtf.reader_context.keep_alive",
-        TimeValue.timeValueSeconds(30),
+        TimeValue.timeValueMinutes(5),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
