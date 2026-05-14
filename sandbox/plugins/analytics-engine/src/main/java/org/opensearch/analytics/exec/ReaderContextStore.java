@@ -11,6 +11,7 @@ package org.opensearch.analytics.exec;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.concurrent.GatedCloseable;
+import org.opensearch.common.settings.Setting;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.engine.exec.IndexReaderProvider.Reader;
 import org.opensearch.threadpool.ThreadPool;
@@ -28,19 +29,29 @@ import java.util.concurrent.ConcurrentHashMap;
 public class ReaderContextStore {
 
     private static final Logger logger = LogManager.getLogger(ReaderContextStore.class);
-    private static final long DEFAULT_KEEP_ALIVE_MILLIS = 30_000;
     private static final TimeValue REAPER_INTERVAL = TimeValue.timeValueSeconds(10);
 
+    public static final Setting<TimeValue> READER_CONTEXT_KEEP_ALIVE = Setting.positiveTimeSetting(
+        "analytics.qtf.reader_context.keep_alive",
+        TimeValue.timeValueSeconds(30),
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     private final Map<String, ReaderContext> activeContexts = new ConcurrentHashMap<>();
-    private final long defaultKeepAliveMillis;
+    private volatile long defaultKeepAliveMillis;
 
     public ReaderContextStore(ThreadPool threadPool) {
-        this(threadPool, DEFAULT_KEEP_ALIVE_MILLIS);
+        this(threadPool, READER_CONTEXT_KEEP_ALIVE.getDefault(null).millis());
     }
 
     public ReaderContextStore(ThreadPool threadPool, long defaultKeepAliveMillis) {
         this.defaultKeepAliveMillis = defaultKeepAliveMillis;
         threadPool.scheduleWithFixedDelay(new Reaper(), REAPER_INTERVAL, ThreadPool.Names.SAME);
+    }
+
+    public void setKeepAlive(TimeValue keepAlive) {
+        this.defaultKeepAliveMillis = keepAlive.millis();
     }
 
     /**
