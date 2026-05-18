@@ -134,15 +134,16 @@ public final class OpenSearchLateMaterializationRewriter {
             fetch.fetchStorage,
             anchor.getViableBackends()
         );
-        return Optional.of(graftWrapperIntoParents(root, anchor, wrapper, fetch, below));
+        return Optional.of(wrapWithLateMatRel(root, anchor, wrapper, fetch, below));
     }
 
     // ── Detect ─────────────────────────────────────────────────────────
 
     /**
      * Walks {@code root} downward to a leaf, then finds the lowest {@link OpenSearchSort}
-     * on the chain with non-empty collation and non-null fetch. For two-Sort PPL shapes
-     * ({@code Sort(fetch) ← Sort(collation+fetch) ← ...}) this picks the inner one.
+     * on the chain with non-empty collation and non-null fetch. For two-Sort shapes
+     * ({@code Sort(fetch) ← Sort(collation+fetch) ← ...}) the lower (inner) Sort becomes
+     * the anchor; the upper Sort lands in the parent chain and is allowed there.
      */
     private static AnchorContext findAnchor(RelNode root) {
         List<RelNode> chainTopDown = new ArrayList<>();
@@ -177,7 +178,6 @@ public final class OpenSearchLateMaterializationRewriter {
      */
     private static BelowSubtree analyzeBelow(RelNode subtree) {
         List<RelNode> chain = new ArrayList<>();
-        OpenSearchProject belowProject = null;
         int[] belowProjOutToScan = null;
         OpenSearchTableScan scan = null;
         RelNode n = RelNodeUtils.unwrapHep(subtree);
@@ -188,7 +188,7 @@ public final class OpenSearchLateMaterializationRewriter {
             }
             if (!BELOW_INTERMEDIATE_ALLOWED.contains(n.getClass())) return null;
             if (n instanceof OpenSearchProject p) {
-                if (belowProject != null) {
+                if (belowProjOutToScan != null) {
                     LOGGER.debug("[QTF] multiple Projects below anchor (rare ER-between-Projects shape) — skipping");
                     return null;
                 }
@@ -197,7 +197,6 @@ public final class OpenSearchLateMaterializationRewriter {
                     LOGGER.debug("[QTF] expression below-Project — skipping (TODO follow-up)");
                     return null;
                 }
-                belowProject = p;
                 belowProjOutToScan = outToScan;
             }
             chain.add(n);
@@ -205,7 +204,7 @@ public final class OpenSearchLateMaterializationRewriter {
             n = RelNodeUtils.unwrapHep(n.getInput(0));
         }
         if (scan == null) return null;
-        return new BelowSubtree(chain, belowProject, belowProjOutToScan, scan);
+        return new BelowSubtree(chain, belowProjOutToScan, scan);
     }
 
     /** Returns output→scanIdx map iff every project is a {@link RexInputRef}; else null. */
@@ -274,7 +273,7 @@ public final class OpenSearchLateMaterializationRewriter {
     /**
      * Collects RexInputRef indices from the immediate parent's RexNodes (in anchor.rowType
      * space). Other parents reference each other's outputs, not anchor's directly — those
-     * are handled by graftWrapperIntoParents during M5.
+     * are handled by wrapWithLateMatRel during M5.
      */
     private static Set<Integer> collectAboveRefs(List<RelNode> parentChain) {
         Set<Integer> out = new HashSet<>();
@@ -354,11 +353,13 @@ public final class OpenSearchLateMaterializationRewriter {
                 rebuilt = new OpenSearchProject(p.getCluster(), p.getTraitSet(), rebuilt, newProjects, pb.build(), p.getViableBackends());
                 remapAnchor = outputRemap;
             } else if (orig instanceof OpenSearchExchangeReducer er) {
+                // UGSI on the wire is an INTEGER ordinal — coord maintains the ordinal →
+                // (shardOrd, indexUUID, nodeId) mapping side-table for the Scatter-Gather stage.
                 RelDataType erRowType = RelNodeUtils.appendField(
                     typeFactory,
                     rebuilt.getRowType(),
                     OpenSearchLateMaterialization.UGSI_FIELD,
-                    typeFactory.createSqlType(SqlTypeName.VARCHAR)
+                    typeFactory.createSqlType(SqlTypeName.INTEGER)
                 );
                 rebuilt = new OpenSearchExchangeReducer(
                     er.getCluster(),
@@ -404,7 +405,7 @@ public final class OpenSearchLateMaterializationRewriter {
      * <p>Wrapper output layout: {@code [keepBelow cols (in original scan order), then
      * fetched cols]}. Helper cols ({@code ___row_id}, {@code ___ugsi}) are stripped.
      */
-    private static RelNode graftWrapperIntoParents(
+    private static RelNode wrapWithLateMatRel(
         RelNode root,
         OpenSearchSort origAnchor,
         OpenSearchLateMaterialization wrapper,
@@ -476,7 +477,7 @@ public final class OpenSearchLateMaterializationRewriter {
 
     private record AnchorContext(OpenSearchSort anchor, List<RelNode> parentChain) {}
 
-    private record BelowSubtree(List<RelNode> chain, OpenSearchProject belowProject, int[] belowProjOutToScan, OpenSearchTableScan scan) {}
+    private record BelowSubtree(List<RelNode> chain, int[] belowProjOutToScan, OpenSearchTableScan scan) {}
 
     private record SubtreeRebuild(RelNode rebuiltSubtree, int[] remapAnchor) {}
 
