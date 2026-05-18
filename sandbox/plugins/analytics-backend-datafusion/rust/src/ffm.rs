@@ -194,6 +194,20 @@ pub unsafe extern "C" fn df_fetch_by_row_ids(
     col_names_count: i64,
     runtime_ptr: i64,
 ) -> i64 {
+    // Hard FFM-boundary checks (UB risk if violated): pointers must be non-zero before any deref.
+    // Always-on `assert!` (not debug_assert!) — these protect against use-after-close from Java.
+    assert!(shard_view_ptr != 0, "df_fetch_by_row_ids: shard_view_ptr is null");
+    assert!(runtime_ptr != 0, "df_fetch_by_row_ids: runtime_ptr is null");
+    assert!(row_ids_count >= 0, "df_fetch_by_row_ids: negative row_ids_count {}", row_ids_count);
+    assert!(col_names_count >= 0, "df_fetch_by_row_ids: negative col_names_count {}", col_names_count);
+    if row_ids_count > 0 {
+        assert!(row_ids_ptr != 0, "df_fetch_by_row_ids: row_ids_ptr is null but count={}", row_ids_count);
+    }
+    if col_names_count > 0 {
+        assert!(!col_names_ptr.is_null(), "df_fetch_by_row_ids: col_names_ptr is null but count={}", col_names_count);
+        assert!(!col_names_len_ptr.is_null(), "df_fetch_by_row_ids: col_names_len_ptr is null but count={}", col_names_count);
+    }
+
     let mgr = get_rt_manager()?;
     let shard_view = &*(shard_view_ptr as *const crate::api::ShardView);
     let runtime = &*(runtime_ptr as *const crate::api::DataFusionRuntime);

@@ -19,6 +19,7 @@ import org.opensearch.analytics.exec.AnalyticsSearchService;
 import org.opensearch.analytics.exec.DefaultPlanExecutor;
 import org.opensearch.analytics.exec.QueryPlanExecutor;
 import org.opensearch.analytics.exec.QueryScheduler;
+import org.opensearch.analytics.exec.ReaderContextStore;
 import org.opensearch.analytics.exec.Scheduler;
 import org.opensearch.analytics.exec.action.AnalyticsQueryAction;
 import org.opensearch.analytics.planner.CapabilityRegistry;
@@ -68,6 +69,7 @@ public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionP
     private final List<AnalyticsSearchBackendPlugin> backEnds = new ArrayList<>();
     private SqlOperatorTable operatorTable;
     private AnalyticsSearchService searchService;
+    private ReaderContextStore readerContextStore;
 
     @SuppressWarnings("rawtypes")
     @Override
@@ -97,12 +99,20 @@ public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionP
         for (AnalyticsSearchBackendPlugin be : backEnds) {
             backEndsByName.put(be.name(), be);
         }
-        searchService = new AnalyticsSearchService(backEndsByName, namedWriteableRegistry);
+        readerContextStore = new ReaderContextStore(threadPool);
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(ReaderContextStore.READER_CONTEXT_KEEP_ALIVE, readerContextStore::setKeepAlive);
+        searchService = new AnalyticsSearchService(backEndsByName, namedWriteableRegistry, readerContextStore);
 
         // Returned as components so Guice can inject them into DefaultPlanExecutor
         // (a HandledTransportAction registered via getActions() — constructed by Guice
         // after createComponents) and into AnalyticsSearchTransportService.
         return List.of(searchService, ctx, capabilityRegistry);
+    }
+
+    @Override
+    public List<org.opensearch.common.settings.Setting<?>> getSettings() {
+        return List.of(ReaderContextStore.READER_CONTEXT_KEEP_ALIVE);
     }
 
     @Override

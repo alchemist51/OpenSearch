@@ -77,6 +77,12 @@ impl TableProvider for ShardTableProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Invariant: files are ordered by ascending row_base (build_shard_files contract).
+        // ProjectRowIdOptimizer relies on the partition value matching the file's true offset.
+        debug_assert!(
+            self.config.files.windows(2).all(|w| w[0].row_base <= w[1].row_base),
+            "ShardTableProvider: files not ordered by row_base — ProjectRowIdOptimizer would compute wrong global IDs"
+        );
         let num_file_cols = self.config.file_schema.fields().len();
         let partitioned_files: Vec<PartitionedFile> = self.config.files.iter()
             .map(|file_info| {

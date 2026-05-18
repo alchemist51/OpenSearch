@@ -134,5 +134,7 @@ fn position_to_global_id(delivered_idx: usize, pm: Option<&PositionMap>, base: u
         Some(p) => p.rg_position(delivered_idx).unwrap_or(delivered_idx),
         None => delivered_idx,
     };
-    base + rg_pos as u64
+    let id = base + rg_pos as u64;
+    debug_assert!(id >= base, "position_to_global_id: underflow base={} rg_pos={}", base, rg_pos);
+    id
 }

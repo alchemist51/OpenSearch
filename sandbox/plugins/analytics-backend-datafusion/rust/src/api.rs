@@ -209,6 +209,11 @@ pub fn build_shard_files(
     object_metas: &[object_store::ObjectMeta],
     file_metadata: &[FileRowMetadata],
 ) -> Vec<ShardFileInfo> {
+    debug_assert_eq!(
+        object_metas.len(),
+        file_metadata.len(),
+        "build_shard_files: object_metas and file_metadata must have matching length"
+    );
     let mut row_base: i64 = 0;
     object_metas
         .iter()
@@ -536,13 +541,22 @@ pub async unsafe fn fetch_by_row_ids(
         .await
         .map_err(DataFusionError::Execution)?;
 
-    // Distribute global row_ids to per-file local positions
+    // Distribute global row_ids to per-file local positions.
+    // Note: Java validates non-empty + ascending row_ids before the FFM call; we don't repeat that here.
+    debug_assert!(!segments.is_empty(), "fetch_by_row_ids: build_segments returned empty for non-empty shard view");
     let mut per_segment: HashMap<usize, RoaringBitmap> = HashMap::new();
     for &gid in &row_ids {
+        debug_assert!(gid >= 0, "fetch_by_row_ids: negative row id {}", gid);
         let seg_idx = segments
             .partition_point(|s| s.global_base <= gid as u64)
             .saturating_sub(1);
-        let local_pos = (gid as u64 - segments[seg_idx].global_base) as u32;
+        let seg = &segments[seg_idx];
+        debug_assert!(
+            (gid as u64) >= seg.global_base && (gid as u64) < seg.global_base + seg.max_doc as u64,
+            "fetch_by_row_ids: row id {} out of bounds for segment {} (base={}, max_doc={})",
+            gid, seg_idx, seg.global_base, seg.max_doc
+        );
+        let local_pos = (gid as u64 - seg.global_base) as u32;
         per_segment.entry(seg_idx).or_default().insert(local_pos);
     }
 
@@ -597,21 +611,36 @@ pub async unsafe fn fetch_by_row_ids(
     ctx.register_table("t", provider)?;
 
     // ── 4. Execute SQL: compute global __row_id__ = __row_id__ + row_base ──
-
-    let col_list = columns.iter()
-        .map(|c| format!("\"{}\"", c))
+    //
+    // Caller-supplied `columns` includes __row_id__ in its desired position. We project
+    // each column verbatim except __row_id__, which we replace with the synthesized
+    // expression. This preserves caller column order and guarantees a single __row_id__
+    // column in the result.
+    let projection = columns.iter()
+        .map(|c| {
+            if c == crate::ROW_ID_COLUMN_NAME {
+                format!("(\"{}\" + \"row_base\") AS \"{}\"", crate::ROW_ID_COLUMN_NAME, crate::ROW_ID_COLUMN_NAME)
+            } else {
+                format!("\"{}\"", c)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!(
-        "SELECT (\"__row_id__\" + \"row_base\") AS \"__row_id__\", {} FROM t",
-        col_list
-    );
+    let sql = format!("SELECT {} FROM t", projection);
     let df = ctx.sql(&sql).await?;
     let physical_plan = df.create_physical_plan().await?;
     let df_stream = execute_stream(physical_plan, ctx.task_ctx())?;
 
+    // Post-condition: returned stream schema must contain __row_id__ plus every requested column.
+    // Catches drift if SQL synthesis or the optimizer ever drops a projection silently.
+    debug_assert!(assert_fetch_result_schema(df_stream.schema().as_ref(), &columns));
+
     // ── 5. Wrap and return ──
 
+    // In debug builds, interpose an adapter that asserts __row_id__ values are
+    // monotonically nondecreasing across the entire stream. target_partitions=1
+    // means a single ordered execution, so the check is global, not per-batch only.
+    let df_stream = ascending_row_id_check_stream(df_stream);
     Ok(wrap_stream_as_handle(df_stream, manager.cpu_executor(), runtime))
 }
 
@@ -1174,4 +1203,68 @@ pub unsafe fn register_memtable(
 
     session.register_memtable(input_id, table_schema, batches)?;
     Ok(schema_ipc)
+}
+
+// ── QTF fetch-phase assertion helpers (kept at the bottom of the file) ────────
+
+/// Wraps a stream in an adapter that asserts each emitted batch's `__row_id__` column
+/// is monotonically nondecreasing, including across batch boundaries. No-op in release.
+fn ascending_row_id_check_stream(
+    stream: datafusion::execution::SendableRecordBatchStream,
+) -> datafusion::execution::SendableRecordBatchStream {
+    if !cfg!(debug_assertions) {
+        return stream;
+    }
+    use arrow_array::Int64Array;
+    use futures::StreamExt;
+    let schema = stream.schema();
+    let row_id_idx = match schema.column_with_name(crate::ROW_ID_COLUMN_NAME) {
+        Some((idx, _)) => idx,
+        None => return stream, // schema-presence checked elsewhere; nothing to validate here
+    };
+    let mut last_seen: Option<i64> = None;
+    let checked = stream.map(move |batch_res| {
+        let batch = match batch_res {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+        let col = batch.column(row_id_idx);
+        let arr = col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("ascending_row_id_check_stream: __row_id__ column must be Int64");
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                continue;
+            }
+            let v = arr.value(i);
+            if let Some(prev) = last_seen {
+                if v < prev {
+                    panic!(
+                        "fetch_by_row_ids: __row_id__ not ascending — prev={}, next={} at row {}",
+                        prev, v, i
+                    );
+                }
+            }
+            last_seen = Some(v);
+        }
+        Ok(batch)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, checked))
+}
+
+/// Verify the fetch-result schema carries `__row_id__` plus every requested column.
+/// Body only runs under `debug_assertions` (called from a `debug_assert!`).
+fn assert_fetch_result_schema(schema: &datafusion::arrow::datatypes::Schema, columns: &[String]) -> bool {
+    if schema.column_with_name(crate::ROW_ID_COLUMN_NAME).is_none() {
+        let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        panic!("fetch_by_row_ids: result schema missing {}, got {:?}", crate::ROW_ID_COLUMN_NAME, names);
+    }
+    for col in columns {
+        if schema.column_with_name(col).is_none() {
+            let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+            panic!("fetch_by_row_ids: result schema missing requested column {}, got {:?}", col, names);
+        }
+    }
+    true
 }
