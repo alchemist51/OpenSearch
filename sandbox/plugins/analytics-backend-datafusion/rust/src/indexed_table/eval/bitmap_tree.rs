@@ -69,6 +69,7 @@ use datafusion::logical_expr::{ColumnarValue, Operator};
 use datafusion::physical_expr::expressions::{BinaryExpr, Column as PhysColumn, Literal};
 use roaring::RoaringBitmap;
 
+use super::single_collector::remap_expr_to_batch;
 use super::{LeafBitmapSource, RgEvalContext, TreeEvaluator, TreePrefetch};
 use crate::indexed_table::bool_tree::ResolvedNode;
 use crate::indexed_table::page_pruner::{PagePruneMetrics, PagePruner};
@@ -853,6 +854,15 @@ fn predicate_to_batch_mask(
                 }
                 Some(col_arr) => {
                     let scalar = lit.value().to_scalar().map_err(|e| e.to_string())?;
+                    // Cast scalar to match column type if they differ (e.g. Utf8View vs Utf8)
+                    let scalar_inner = scalar.into_inner();
+                    let scalar_inner = if scalar_inner.data_type() != col_arr.data_type() {
+                        datafusion::arrow::compute::cast(scalar_inner.as_ref(), col_arr.data_type())
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        scalar_inner
+                    };
+                    let scalar = datafusion::arrow::array::Scalar::new(scalar_inner);
                     let kernel_result = match *bin.op() {
                         Operator::Eq => eq(col_arr, &scalar),
                         Operator::NotEq => neq(col_arr, &scalar),
@@ -894,7 +904,14 @@ fn evaluate_via_df(
         }
     }
 
-    let result = expr
+    // Remap column indices to match the projected batch schema.
+    // The expression was built against the full table schema where e.g.
+    // AdvEngineID is at index 20, but the batch only has read_projection
+    // columns where it might be at index 3. Without remapping,
+    // expr.evaluate() panics with "index out of bounds".
+    let remapped = remap_expr_to_batch(expr, batch)?;
+
+    let result = remapped
         .evaluate(batch)
         .map_err(|e| format!("expr.evaluate: {}", e))?;
     match result {

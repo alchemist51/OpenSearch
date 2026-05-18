@@ -524,7 +524,7 @@ mod tests {
 }
 
 /// Remap Column indices in a PhysicalExpr to match the batch schema by name.
-fn remap_expr_to_batch(
+pub(super) fn remap_expr_to_batch(
     expr: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
     batch: &RecordBatch,
 ) -> Result<Arc<dyn datafusion::physical_expr::PhysicalExpr>, String> {
