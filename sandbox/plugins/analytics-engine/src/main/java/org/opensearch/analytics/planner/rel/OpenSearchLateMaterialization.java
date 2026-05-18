@@ -96,6 +96,11 @@ public class OpenSearchLateMaterialization extends SingleRel implements OpenSear
         return fetchList;
     }
 
+    /** Per-column storage info for {@link #fetchList}, in the same order. */
+    public List<FieldStorageInfo> getFetchListStorage() {
+        return fetchListStorage;
+    }
+
     @Override
     public List<String> getViableBackends() {
         return viableBackends;
@@ -154,14 +159,13 @@ public class OpenSearchLateMaterialization extends SingleRel implements OpenSear
 
     @Override
     public RelNode stripAnnotations(List<RelNode> strippedChildren) {
-        // Stage marker, no backend Substrait conversion — keep the node itself with stripped child.
-        return new OpenSearchLateMaterialization(
-            getCluster(),
-            getTraitSet(),
-            strippedChildren.getFirst(),
-            fetchList,
-            fetchListStorage,
-            viableBackends
+        // Stage marker — must be cut by DAGBuilder.cutAtLateMaterialization so it never
+        // reaches FragmentConversionDriver. If we hit this path, DAGBuilder didn't cut
+        // at the wrapper and the backend's FragmentConvertor would choke on an unknown
+        // RelNode. Fail loud instead.
+        throw new IllegalStateException(
+            "OpenSearchLateMaterialization reached FragmentConversionDriver — DAGBuilder "
+                + "must cut at the wrapper. This is a planner / DAGBuilder bug."
         );
     }
 }

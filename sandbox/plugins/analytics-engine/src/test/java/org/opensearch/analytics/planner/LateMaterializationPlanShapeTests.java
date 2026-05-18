@@ -100,6 +100,7 @@ public class LateMaterializationPlanShapeTests extends BasePlannerRulesTests {
             2,
             Expect.scanCols("EventDate"),
             Expect.fetchList("URL"),
+            Expect.erHasUgsi(true),
             Expect.collationDirections(RelFieldCollation.Direction.DESCENDING)
         );
     }
@@ -110,7 +111,8 @@ public class LateMaterializationPlanShapeTests extends BasePlannerRulesTests {
             "SELECT URL, EventDate, CounterID FROM hits ORDER BY EventDate, CounterID LIMIT 10",
             2,
             Expect.scanCols("CounterID", "EventDate"),
-            Expect.fetchList("URL")
+            Expect.fetchList("URL"),
+            Expect.erHasUgsi(true)
         );
     }
 
@@ -121,13 +123,20 @@ public class LateMaterializationPlanShapeTests extends BasePlannerRulesTests {
             2,
             Expect.scanCols("CounterID", "EventDate"),
             Expect.fetchList("URL"),
+            Expect.erHasUgsi(true),
             Expect.wrapperOutput("CounterID", "EventDate", "URL")
         );
     }
 
     public void testQtfFires_offset() {
         // OFFSET preserved on the rebuilt anchor Sort.
-        assertQtfFired("SELECT URL, EventDate FROM hits ORDER BY EventDate LIMIT 10 OFFSET 5", 2, Expect.fetchList("URL"));
+        assertQtfFired(
+            "SELECT URL, EventDate FROM hits ORDER BY EventDate LIMIT 10 OFFSET 5",
+            2,
+            Expect.scanCols("EventDate"),
+            Expect.fetchList("URL"),
+            Expect.erHasUgsi(true)
+        );
     }
 
     // ── Tests that decline QTF ─────────────────────────────────────────

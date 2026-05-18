@@ -58,6 +58,12 @@ public class StageExecutionBuilder {
         registerScheduler(StageExecutionType.COORDINATOR_REDUCE, new LocalStageScheduler());
         registerScheduler(StageExecutionType.LOCAL_PASSTHROUGH, (stage, sink, config) -> new PassThroughStageExecution(stage, sink));
         registerScheduler(StageExecutionType.LOCAL_COMPUTE, new LocalComputeStageScheduler());
+        // QTF (late-materialization) Scatter-Gather. Skeleton today —
+        // LateMaterializationStageExecution.start() throws UnsupportedOperationException.
+        // The DAG, FragmentConversion, and stage wiring are all in place; the four phases
+        // (drain → scatter fetch → gather → stitch) are documented inside the execution
+        // class and the new transport action / data-node handler are the remaining work.
+        registerScheduler(StageExecutionType.LATE_MATERIALIZATION, new LateMaterializationStageScheduler(clusterService, dispatcher));
     }
 
     /**
@@ -90,7 +96,10 @@ public class StageExecutionBuilder {
      */
     public StageExecution buildExecution(Stage stage, StageExecution parentExec, QueryContext config) {
         ExchangeSink sink = switch (stage.getExecutionType()) {
-            case SHARD_FRAGMENT, COORDINATOR_REDUCE, LOCAL_PASSTHROUGH, LOCAL_COMPUTE -> resolveRowSink(stage, parentExec);
+            case SHARD_FRAGMENT, COORDINATOR_REDUCE, LOCAL_PASSTHROUGH, LOCAL_COMPUTE, LATE_MATERIALIZATION -> resolveRowSink(
+                stage,
+                parentExec
+            );
         };
         return buildStageExecution(stage, sink, config);
     }
