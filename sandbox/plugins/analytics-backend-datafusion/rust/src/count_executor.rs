@@ -79,21 +79,32 @@ fn build_count_array(dtype: &DataType, total: i64) -> Result<ArrayRef, DataFusio
     }
 }
 
-/// Walk the BoolNode tree to pick the single Collector annotation. Accepts a bare
-/// Collector, or an AND of one Collector with no Predicate siblings (the planner is
-/// expected to fuse multi-Collector AND chains into one before COUNT_DELEGATION fires;
-/// we still tolerate the un-fused shape and fail loudly on anything richer).
+/// Walk the BoolNode tree to pick the single delegated leaf's annotation_id. Accepts:
+///
+/// - `Collector` — correctness-delegated (e.g. `match()` only Lucene can evaluate)
+/// - `DelegationPossible` — performance-delegated (planner narrowed onto driver but the
+///   peer can also evaluate; for COUNT we delegate to the peer for the metadata fast path)
+///
+/// Both variants expose `annotation_id`; that's all we need to call `createProvider` and
+/// then `countDocs` per segment. The original expression carried by `DelegationPossible`
+/// is irrelevant on the count path — we never decode rows.
+///
+/// A bare leaf or an AND of one leaf is acceptable. Anything richer (multiple leaves, OR,
+/// NOT, native Predicate) is rejected — those wouldn't pass the planner-side detector
+/// either, but defend at runtime in case the contract drifts.
 fn extract_single_count_collector(tree: &BoolNode) -> Result<i32, DataFusionError> {
     match tree {
         BoolNode::Collector { annotation_id } => Ok(*annotation_id),
+        BoolNode::DelegationPossible { annotation_id, .. } => Ok(*annotation_id),
         BoolNode::And(children) => {
             let mut found: Option<i32> = None;
             for child in children {
                 match child {
-                    BoolNode::Collector { annotation_id } => {
+                    BoolNode::Collector { annotation_id }
+                    | BoolNode::DelegationPossible { annotation_id, .. } => {
                         if found.is_some() {
                             return Err(DataFusionError::Execution(
-                                "COUNT_DELEGATION expects one Collector leaf; \
+                                "COUNT_DELEGATION expects one delegated leaf; \
                                  multiple found — planner should have fused them"
                                     .into(),
                             ));
@@ -107,7 +118,7 @@ fn extract_single_count_collector(tree: &BoolNode) -> Result<i32, DataFusionErro
                     }
                     other => {
                         return Err(DataFusionError::Execution(format!(
-                            "COUNT_DELEGATION supports flat AND of Collectors only; got {:?}",
+                            "COUNT_DELEGATION supports flat AND of delegated leaves only; got {:?}",
                             other
                         )));
                     }
@@ -115,7 +126,7 @@ fn extract_single_count_collector(tree: &BoolNode) -> Result<i32, DataFusionErro
             }
             found.ok_or_else(|| {
                 DataFusionError::Execution(
-                    "COUNT_DELEGATION tree had no Collector leaves".into(),
+                    "COUNT_DELEGATION tree had no delegated leaves".into(),
                 )
             })
         }
@@ -165,6 +176,11 @@ pub async fn execute(
     .await
     .map_err(DataFusionError::Execution)?;
     let schema = crate::schema_coerce::coerce_inferred_schema(schema);
+    log::info!(
+        "[count-delegation] Rust: entering count_executor with {} segment(s), target_partitions={}",
+        segments.len(),
+        query_config.target_partitions
+    );
 
     // Decode substrait → LogicalPlan → BoolNode tree. The default ListingTable registered
     // by create_session_context is left in place — `from_substrait_plan` only needs it to
@@ -214,6 +230,25 @@ pub async fn execute(
         .collect();
     let assignments =
         SegmentGrouped.assign(&layouts, query_config.target_partitions.max(1));
+    log::info!(
+        "[count-delegation] Rust: SegmentGrouped produced {} partition(s) for {} segment(s); annotation_id={}",
+        assignments.len(),
+        segments.len(),
+        annotation_id
+    );
+    for (idx, assignment) in assignments.iter().enumerate() {
+        let total_rows: i64 = assignment
+            .chunks
+            .iter()
+            .map(|c| (c.doc_max - c.doc_min) as i64)
+            .sum();
+        log::info!(
+            "[count-delegation] Rust: partition {} owns {} segment(s), {} rows total",
+            idx,
+            assignment.chunks.len(),
+            total_rows
+        );
+    }
 
     let exec: Arc<dyn ExecutionPlan> = Arc::new(CountExec::new(
         provider,
@@ -379,6 +414,12 @@ impl ExecutionPlan for CountExec {
                         "FfmSegmentCollector::count_docs returned negative {} despite Ok",
                         n
                     );
+                    log::info!(
+                        "[count-delegation] Rust: partition={} writer_generation={} → {} docs",
+                        partition,
+                        segment.writer_generation,
+                        n
+                    );
                     total += n;
                     // collector dropped here → releaseCollector FFM upcall
                 }
@@ -405,6 +446,14 @@ mod tests {
 
     fn collector(id: i32) -> BoolNode {
         BoolNode::Collector { annotation_id: id }
+    }
+
+    fn delegation_possible(id: i32) -> BoolNode {
+        let col: Arc<dyn PhysicalExpr> = Arc::new(PhysColumn::new("BrowserCountry", 0));
+        BoolNode::DelegationPossible {
+            annotation_id: id,
+            original_expr: col,
+        }
     }
 
     fn predicate() -> BoolNode {
@@ -441,6 +490,35 @@ mod tests {
     #[test]
     fn extract_rejects_or_tree() {
         let t = BoolNode::Or(vec![collector(1), collector(2)]);
+        assert!(extract_single_count_collector(&t).is_err());
+    }
+
+    #[test]
+    fn extract_bare_delegation_possible() {
+        // Performance-delegated leaf — the post-CBO shape of a dual-viable predicate
+        // that the planner narrowed onto the driving backend with the peer recorded
+        // in performanceDelegationBackends. Same annotation_id semantics as Collector,
+        // count_executor only needs the id to call createProvider.
+        let t = delegation_possible(42);
+        assert_eq!(extract_single_count_collector(&t).unwrap(), 42);
+    }
+
+    #[test]
+    fn extract_and_with_one_delegation_possible() {
+        let t = BoolNode::And(vec![delegation_possible(99)]);
+        assert_eq!(extract_single_count_collector(&t).unwrap(), 99);
+    }
+
+    #[test]
+    fn extract_rejects_two_delegation_possible_leaves() {
+        let t = BoolNode::And(vec![delegation_possible(1), delegation_possible(2)]);
+        assert!(extract_single_count_collector(&t).is_err());
+    }
+
+    #[test]
+    fn extract_rejects_mixed_collector_and_delegation_possible() {
+        // Two delegated leaves of different kinds — still two leaves, still ambiguous.
+        let t = BoolNode::And(vec![collector(1), delegation_possible(2)]);
         assert!(extract_single_count_collector(&t).is_err());
     }
 

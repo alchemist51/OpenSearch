@@ -319,8 +319,18 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
             try {
                 int fast = handle.weight.count(handle.leaf);
                 if (fast >= 0) {
+                    LOGGER.info(
+                        "[count-delegation] Lucene fast-path Weight.count(leaf) collectorKey={} → {} (segment={}, fullSpan=[0,{}))",
+                        collectorKey,
+                        fast,
+                        ((SegmentReader) handle.leaf.reader()).getSegmentInfo().info.name,
+                        leafMaxDoc
+                    );
                     return fast;
                 }
+                LOGGER.info(
+                    "[count-delegation] Lucene Weight.count returned -1 (no metadata fast path); falling back to iterate"
+                );
             } catch (IOException exception) {
                 LOGGER.warn("Weight.count failed, falling back to iterate-and-count", exception);
             }
@@ -354,6 +364,13 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         } catch (IOException exception) {
             LOGGER.warn("IOException during countDocs, returning partial count", exception);
         }
+        LOGGER.info(
+            "[count-delegation] Lucene iterate-fallback collectorKey={} range=[{},{}) → {} (no Weight.count fast path)",
+            collectorKey,
+            scanFrom,
+            scanTo,
+            matches
+        );
         return matches;
     }
 

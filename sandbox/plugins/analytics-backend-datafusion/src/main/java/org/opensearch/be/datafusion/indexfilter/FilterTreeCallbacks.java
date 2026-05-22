@@ -207,7 +207,9 @@ public final class FilterTreeCallbacks {
             if (handle.isCancelled()) {
                 return -1L;
             }
-            return handle.countDocs(collectorKey, minDoc, maxDoc);
+            long n = handle.countDocs(collectorKey, minDoc, maxDoc);
+            LOGGER.info("[count-delegation] countDocs collectorKey={} [{}, {}) → {}", collectorKey, minDoc, maxDoc, n);
+            return n;
         } catch (Throwable throwable) {
             LOGGER.error(
                 new ParameterizedMessage("countDocs(collectorKey={}, [{}, {})) failed", collectorKey, minDoc, maxDoc),

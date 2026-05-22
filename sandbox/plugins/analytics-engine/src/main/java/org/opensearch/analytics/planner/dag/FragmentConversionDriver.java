@@ -99,6 +99,16 @@ public class FragmentConversionDriver {
             FilterTreeShape treeShape = filter != null
                 ? FilterTreeShapeDeriver.derive(filter, plan.backendId())
                 : FilterTreeShape.NO_DELEGATION;
+            // Strict-narrowing pass: a CONJUNCTIVE shape with only delegated predicates and
+            // a count(*) aggregate above (no projection between) qualifies for the
+            // COUNT_DELEGATION fast path. The detector is a no-op when any condition fails.
+            treeShape = CountDelegationDetector.upgradeIfEligible(
+                plan.resolvedFragment(),
+                filter,
+                treeShape,
+                plan.backendId()
+            );
+            LOGGER.info("[fragment-conversion] backend={} treeShape={}", plan.backendId(), treeShape);
 
             IntraOperatorDelegationBytes delegationBytes = new IntraOperatorDelegationBytes(registry);
             byte[] bytes = convert(plan.resolvedFragment(), convertor, delegationBytes);
