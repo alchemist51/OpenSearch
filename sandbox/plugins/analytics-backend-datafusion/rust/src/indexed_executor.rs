@@ -426,8 +426,15 @@ pub async unsafe fn execute_indexed_with_context(
     cpu_executor: DedicatedExecutor,
 ) -> Result<i64, DataFusionError> {
     let handle = *Box::from_raw(session_ctx_ptr as *mut crate::session_context::SessionContextHandle);
-    let classification_override = handle.indexed_config.map(|config| {
-        // FilterTreeShape: 1 = CONJUNCTIVE → SingleCollector, 2 = INTERLEAVED → Tree.
+    // FilterTreeShape integer mapping (kept in sync with the Java enum ordinals):
+    //   0 = NO_DELEGATION              → FilterClass::None
+    //   1 = CONJUNCTIVE                → FilterClass::SingleCollector  (bitmap path)
+    //   2 = INTERLEAVED_BOOLEAN_EXPR.  → FilterClass::Tree             (bitmap path)
+    //   3 = COUNT_DELEGATION           → count_executor (no parquet decode, no bitset)
+    if handle.indexed_config.as_ref().map(|c| c.tree_shape) == Some(3) {
+        return crate::count_executor::execute(handle, substrait_bytes, cpu_executor).await;
+    }
+    let classification_override = handle.indexed_config.as_ref().map(|config| {
         match (config.tree_shape, config.delegated_predicate_count) {
             (1, _) => FilterClass::SingleCollector,
             (2, _) => FilterClass::Tree,

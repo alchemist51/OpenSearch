@@ -28,5 +28,13 @@ public enum FilterTreeShape {
      * mixes predicates from different backends under non-AND operators. Backend needs a
      * tree evaluator to combine bitsets from both backends per the boolean structure.
      */
-    INTERLEAVED_BOOLEAN_EXPRESSION
+    INTERLEAVED_BOOLEAN_EXPRESSION,
+    /**
+     * Strictly narrower than {@link #CONJUNCTIVE}: every predicate is delegated, the tree is a
+     * single Collector leaf (or pure AND of Collectors fused upstream), and the surrounding plan
+     * is a {@code count(*)} aggregate with no projection and no native predicates. The backend
+     * may answer per-segment with a {@code long} count instead of materializing a doc-id bitset,
+     * unlocking Lucene's {@code Weight.count(LeafReaderContext)} fast path.
+     */
+    COUNT_DELEGATION
 }

@@ -181,7 +181,7 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         try {
             Scorer scorer = weight.scorer(leaf);
             int collectorKey = nextCollectorKey.getAndIncrement();
-            scorersByCollectorKey.put(collectorKey, new ScorerHandle(scorer, minDoc, maxDoc));
+            scorersByCollectorKey.put(collectorKey, new ScorerHandle(weight, leaf, scorer, minDoc, maxDoc));
             LOGGER.debug(
                 "[scf] createCollector providerKey={} writerGeneration={} range=[{},{}) → collectorKey={}",
                 providerKey,
@@ -273,13 +273,101 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         scorersByCollectorKey.clear();
     }
 
+    @Override
+    public long countDocs(int collectorKey, int minDoc, int maxDoc) {
+        ScorerHandle handle = scorersByCollectorKey.get(collectorKey);
+        if (handle == null) {
+            return -1L;
+        }
+        if (maxDoc <= minDoc) {
+            return 0L;
+        }
+
+        // Bounds invariant — mirrors createCollector's contract: the [minDoc, maxDoc) range
+        // must lie within the segment's doc-id space. Catches contract drift between
+        // createCollector and countDocs where the latter is called with a wider range than
+        // the former allowed.
+        int leafMaxDoc = handle.leaf.reader().maxDoc();
+        assert minDoc >= 0 && minDoc <= maxDoc && maxDoc <= leafMaxDoc : "countDocs(collectorKey="
+            + collectorKey
+            + "): range ["
+            + minDoc
+            + ","
+            + maxDoc
+            + ") exceeds leaf maxDoc="
+            + leafMaxDoc;
+
+        // Fast path: when the partition spans the whole segment, ask Lucene for a metadata-only
+        // count. TermQuery returns docFreq from the term dictionary, MatchAllDocsQuery returns
+        // numDocs, FieldExistsQuery uses BKD/inverted index doc counts. Returns -1 when the
+        // query type doesn't support it (e.g. with deletions present or unsupported shapes).
+        boolean fullSegment = (minDoc == 0 && maxDoc == leafMaxDoc);
+        if (!fullSegment && LOGGER.isDebugEnabled()) {
+            // Sub-segment ranges are correct but slow — they bypass Weight.count(leaf) and
+            // force the iterate-and-count fallback. Surface this so partitioning regressions
+            // show up in logs even when results stay correct.
+            LOGGER.debug(
+                "[scf] countDocs collectorKey={} range=[{},{}) is sub-segment (leafMaxDoc={}); "
+                    + "Weight.count fast path will be skipped",
+                collectorKey,
+                minDoc,
+                maxDoc,
+                leafMaxDoc
+            );
+        }
+        if (fullSegment && handle.weight != null) {
+            try {
+                int fast = handle.weight.count(handle.leaf);
+                if (fast >= 0) {
+                    return fast;
+                }
+            } catch (IOException exception) {
+                LOGGER.warn("Weight.count failed, falling back to iterate-and-count", exception);
+            }
+        }
+
+        // Fallback: iterate the scorer and increment a counter — no FixedBitSet allocation.
+        // Mirrors the partition-bound iteration in collectDocs but skips bitset materialization.
+        if (handle.scorer == null) {
+            return 0L;
+        }
+        int scanFrom = Math.max(minDoc, handle.partitionMinDoc);
+        int scanTo = Math.min(maxDoc, handle.partitionMaxDoc);
+        if (scanFrom >= scanTo) {
+            return 0L;
+        }
+        long matches = 0L;
+        try {
+            DocIdSetIterator iterator = handle.scorer.iterator();
+            int docId = handle.currentDoc;
+            if (docId == DocIdSetIterator.NO_MORE_DOCS) {
+                return 0L;
+            }
+            if (docId < scanFrom) {
+                docId = iterator.advance(scanFrom);
+            }
+            while (docId != DocIdSetIterator.NO_MORE_DOCS && docId < scanTo) {
+                matches++;
+                docId = iterator.nextDoc();
+            }
+            handle.currentDoc = docId;
+        } catch (IOException exception) {
+            LOGGER.warn("IOException during countDocs, returning partial count", exception);
+        }
+        return matches;
+    }
+
     private static final class ScorerHandle {
+        final Weight weight;
+        final LeafReaderContext leaf;
         final Scorer scorer;
         final int partitionMinDoc;
         final int partitionMaxDoc;
         int currentDoc = -1;
 
-        ScorerHandle(Scorer scorer, int partitionMinDoc, int partitionMaxDoc) {
+        ScorerHandle(Weight weight, LeafReaderContext leaf, Scorer scorer, int partitionMinDoc, int partitionMaxDoc) {
+            this.weight = weight;
+            this.leaf = leaf;
             this.scorer = scorer;
             this.partitionMinDoc = partitionMinDoc;
             this.partitionMaxDoc = partitionMaxDoc;
