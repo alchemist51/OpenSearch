@@ -88,6 +88,34 @@ incremental = true
 debug = "line-tables-only"
 strip = false
 
+# Patched DataFusion 53.1.0: cherry-picks from upstream main:
+# - #21633: Fix massive spill files for StringView/BinaryView columns
+# - #20381: Compact more aggressively in TopK based upon memory usage
+[patch.crates-io]
+datafusion = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-catalog = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-catalog-listing = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-common = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-common-runtime = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-datasource = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-datasource-parquet = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-execution = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-expr = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-expr-common = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-functions = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-functions-aggregate = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-functions-aggregate-common = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-functions-nested = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-functions-table = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-functions-window = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-functions-window-common = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-optimizer = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-physical-expr = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-physical-expr-common = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-physical-optimizer = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-physical-plan = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+datafusion-substrait = { git = "https://github.com/bowenlan-amzn/datafusion.git", branch = "opensearch-53.1.0-patched" }
+
 [profile.dev]
 opt-level = 1
 lto = false
