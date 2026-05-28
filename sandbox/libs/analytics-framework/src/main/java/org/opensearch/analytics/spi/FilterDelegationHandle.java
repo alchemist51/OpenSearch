@@ -88,4 +88,23 @@ public interface FilterDelegationHandle extends Closeable {
     default boolean isCancelled() {
         return false;
     }
+
+    /**
+     * Count matching docs in {@code [minDoc, maxDoc)} for the given collector. Used by the
+     * COUNT_DELEGATION fast path: when the surrounding plan is a {@code count(*)} aggregate
+     * with no projection and only delegated predicates, the driving backend asks the
+     * accepting backend for a per-segment count instead of materializing a doc-id bitset.
+     *
+     * <p>Implementations that own a metadata-driven count (e.g. Lucene's
+     * {@code Weight.count(LeafReaderContext)}) should override this to short-circuit. The
+     * default returns {@code -1} so callers can detect lack of support and fall back.
+     *
+     * @param collectorKey key returned by {@link #createCollector(int, long, int, int)}
+     * @param minDoc inclusive lower bound
+     * @param maxDoc exclusive upper bound
+     * @return number of matching docs {@code >= 0}, or {@code -1} on error / unsupported
+     */
+    default long countDocs(int collectorKey, int minDoc, int maxDoc) {
+        return -1L;
+    }
 }

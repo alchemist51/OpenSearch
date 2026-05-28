@@ -57,14 +57,30 @@ public final class FilterTreeCallbacks {
     }
 
     private static long trackStart() {
-        DelegationThreadTracker t = TRACKER.get();
-        return (t != null) ? t.trackStart() : -1;
+        // Must never throw — runs OUTSIDE the try/catch in each upcall target, so any
+        // escaping exception (e.g. an `assert false` in TaskResourceTrackingService when
+        // the thread is already tracked) crosses the FFM boundary and aborts the JVM
+        // with `Unrecoverable uncaught exception encountered`. Swallow everything and
+        // disable tracking for the remainder of this upcall by returning -1.
+        try {
+            DelegationThreadTracker t = TRACKER.get();
+            return (t != null) ? t.trackStart() : -1;
+        } catch (Throwable throwable) {
+            LOGGER.warn("trackStart failed; resource attribution disabled for this upcall", throwable);
+            return -1;
+        }
     }
 
     private static void trackEnd(long threadId) {
         if (threadId < 0) return;
-        DelegationThreadTracker t = TRACKER.get();
-        if (t != null) t.trackEnd(threadId);
+        // Same FFM safety rule as trackStart — runs in a `finally` block, so any
+        // exception escaping here would mask the actual upcall result and abort the JVM.
+        try {
+            DelegationThreadTracker t = TRACKER.get();
+            if (t != null) t.trackEnd(threadId);
+        } catch (Throwable throwable) {
+            LOGGER.warn("trackEnd failed", throwable);
+        }
     }
 
     // ── Provider lifecycle (cold path, once per query) ────────────────
@@ -154,6 +170,49 @@ public final class FilterTreeCallbacks {
         } catch (Throwable throwable) {
             LOGGER.error(
                 new ParameterizedMessage("collectDocs(collectorKey={}, [{}, {})) failed", collectorKey, minDoc, maxDoc),
+                throwable
+            );
+            return -1L;
+        } finally {
+            trackEnd(tid);
+        }
+    }
+
+    /**
+     * {@code countDocs(collectorKey, minDoc, maxDoc) -> count|-1}.
+     *
+     * <p>Used by the COUNT_DELEGATION fast path. Implementations that own a metadata-driven
+     * count (e.g. Lucene {@code Weight.count(LeafReaderContext)}) short-circuit; otherwise
+     * the SPI default returns {@code -1}.
+     */
+    public static long countDocs(int collectorKey, int minDoc, int maxDoc) {
+        long tid = trackStart();
+        try {
+            // FFM-boundary bounds check. Native side uses i32 ranges; defense in depth
+            // against a contract regression on the Rust caller (e.g. negative or
+            // inverted bounds). Cheap — no allocation, no Lucene dispatch on bad input.
+            if (minDoc < 0 || maxDoc < minDoc) {
+                LOGGER.error(
+                    "countDocs received invalid bounds collectorKey={}, [{}, {})",
+                    collectorKey,
+                    minDoc,
+                    maxDoc
+                );
+                return -1L;
+            }
+            FilterDelegationHandle handle = HANDLE.get();
+            if (handle == null) {
+                return -1L;
+            }
+            if (handle.isCancelled()) {
+                return -1L;
+            }
+            long n = handle.countDocs(collectorKey, minDoc, maxDoc);
+            LOGGER.info("[count-delegation] countDocs collectorKey={} [{}, {}) → {}", collectorKey, minDoc, maxDoc, n);
+            return n;
+        } catch (Throwable throwable) {
+            LOGGER.error(
+                new ParameterizedMessage("countDocs(collectorKey={}, [{}, {})) failed", collectorKey, minDoc, maxDoc),
                 throwable
             );
             return -1L;

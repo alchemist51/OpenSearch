@@ -324,10 +324,12 @@ public final class NativeBridge {
             )
         );
 
-        // void df_register_filter_tree_callbacks(createCollector, collectDocs, releaseCollector)
+        // void df_register_filter_tree_callbacks(createProvider, releaseProvider,
+        //                                       createCollector, collectDocs, countDocs, releaseCollector)
         REGISTER_FILTER_TREE_CALLBACKS = linker.downcallHandle(
             lib.find("df_register_filter_tree_callbacks").orElseThrow(),
             FunctionDescriptor.ofVoid(
+                ValueLayout.ADDRESS,
                 ValueLayout.ADDRESS,
                 ValueLayout.ADDRESS,
                 ValueLayout.ADDRESS,
@@ -557,6 +559,11 @@ public final class NativeBridge {
                     long.class
                 )
             );
+            MethodHandle countDocs = lookup.findStatic(
+                cb,
+                "countDocs",
+                java.lang.invoke.MethodType.methodType(long.class, int.class, int.class, int.class)
+            );
             MethodHandle releaseCollector = lookup.findStatic(
                 cb,
                 "releaseCollector",
@@ -596,6 +603,16 @@ public final class NativeBridge {
                 ),
                 arena
             );
+            java.lang.foreign.MemorySegment countDocsStub = linker.upcallStub(
+                countDocs,
+                FunctionDescriptor.of(
+                    ValueLayout.JAVA_LONG,
+                    ValueLayout.JAVA_INT,
+                    ValueLayout.JAVA_INT,
+                    ValueLayout.JAVA_INT
+                ),
+                arena
+            );
             java.lang.foreign.MemorySegment releaseCollectorStub = linker.upcallStub(
                 releaseCollector,
                 FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT),
@@ -607,6 +624,7 @@ public final class NativeBridge {
                 releaseProviderStub,
                 createCollectorStub,
                 collectDocsStub,
+                countDocsStub,
                 releaseCollectorStub
             );
         } catch (Throwable t) {

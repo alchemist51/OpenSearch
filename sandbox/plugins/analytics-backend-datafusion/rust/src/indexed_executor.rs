@@ -443,8 +443,21 @@ pub async unsafe fn execute_indexed_with_context(
 
     // Java-side QTF signal: scan must emit __row_id__. Captured before consuming indexed_config below.
     let requests_row_ids = handle.indexed_config.as_ref().is_some_and(|c| c.requests_row_ids);
+
+    // FilterTreeShape integer mapping (kept in sync with the Java enum ordinals):
+    //   0 = NO_DELEGATION              → FilterClass::None
+    //   1 = CONJUNCTIVE                → FilterClass::SingleCollector  (bitmap path)
+    //   2 = INTERLEAVED_BOOLEAN_EXPR.  → FilterClass::Tree             (bitmap path)
+    //   3 = COUNT_DELEGATION           → count_executor (no parquet decode, no bitset)
+    if handle.indexed_config.as_ref().map(|c| c.tree_shape) == Some(3) {
+        log::info!("[count-delegation] Rust: dispatch tree_shape=3 → count_executor");
+        return crate::count_executor::execute(handle, substrait_bytes, cpu_executor).await;
+    }
+    log::info!(
+        "[count-delegation] Rust: dispatch tree_shape={:?} → bitmap path (indexed_executor)",
+        handle.indexed_config.as_ref().map(|c| c.tree_shape)
+    );
     let classification_override = handle.indexed_config.map(|config| {
-        // FilterTreeShape: 1 = CONJUNCTIVE → SingleCollector, 2 = INTERLEAVED → Tree.
         match (config.tree_shape, config.delegated_predicate_count) {
             (1, _) => FilterClass::SingleCollector,
             (2, _) => FilterClass::Tree,
