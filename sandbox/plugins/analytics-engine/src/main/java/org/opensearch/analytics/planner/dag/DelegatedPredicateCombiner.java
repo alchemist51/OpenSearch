@@ -41,6 +41,17 @@ final class DelegatedPredicateCombiner {
     private final CapabilityRegistry registry;
     private final RexBuilder rexBuilder;
     private final List<DelegatedExpression> delegatedExpressions;
+    /**
+     * When true, performance-delegated predicates fuse with correctness-delegated siblings
+     * even under OR/NOT — the entire boolean structure ships to the accepting backend.
+     * When false (legacy), performance leaves under OR/NOT are thrown back to native because
+     * the opportunistic peer-consultation pattern is incorrect under disjunction.
+     *
+     * <p>Forced true under count-context (count fast path needs the whole filter answerable
+     * by the accepting backend); otherwise sourced from the cluster setting
+     * {@code analytics.delegation.fuse_dual_viable}.
+     */
+    private final boolean fuseDualViable;
 
     DelegatedPredicateCombiner(
         String operatorBackend,
@@ -49,11 +60,23 @@ final class DelegatedPredicateCombiner {
         RexBuilder rexBuilder,
         List<DelegatedExpression> delegatedExpressions
     ) {
+        this(operatorBackend, fieldStorage, registry, rexBuilder, delegatedExpressions, false);
+    }
+
+    DelegatedPredicateCombiner(
+        String operatorBackend,
+        List<FieldStorageInfo> fieldStorage,
+        CapabilityRegistry registry,
+        RexBuilder rexBuilder,
+        List<DelegatedExpression> delegatedExpressions,
+        boolean fuseDualViable
+    ) {
         this.operatorBackend = operatorBackend;
         this.fieldStorage = fieldStorage;
         this.registry = registry;
         this.rexBuilder = rexBuilder;
         this.delegatedExpressions = delegatedExpressions;
+        this.fuseDualViable = fuseDualViable;
     }
 
     /** Bottom-up: classify each node as Delegated (carries the RexNode subtree) or Resolved. */
@@ -99,7 +122,12 @@ final class DelegatedPredicateCombiner {
 
         for (Classified c : kids) {
             if (c instanceof Delegated d) {
-                if (isOrNot && d.performanceDelegation()) {
+                // Under OR/NOT, performance-delegated leaves are thrown back to native by default —
+                // the opportunistic peer-consultation pattern doesn't apply under disjunction. When
+                // {@code fuseDualViable} is true (or count-context forces it), keep them in the pool
+                // so Lucene evaluates the full boolean structure; the driver loses opportunistic
+                // peer-pre-filter but gains a single Lucene query for the whole filter.
+                if (isOrNot && d.performanceDelegation() && !fuseDualViable) {
                     ordered.add(applyFn.apply((AnnotatedPredicate) d.subtree()));
                 } else {
                     (d.performanceDelegation() ? performanceChildren : correctnessChildren).add(d);
@@ -131,6 +159,21 @@ final class DelegatedPredicateCombiner {
             // All children are performance-delegated to the same backend — bubble up
             int firstId = performanceChildren.getFirst().firstAnnotationId();
             return new Delegated(commonBackend, call, firstId, true);
+        }
+
+        // With fuseDualViable, treat correctness + performance same-backend as one class:
+        // if every child is delegated (no native residual), bubble up as a single Delegated.
+        // Resulting subtree has both kinds of leaves; finalizeDelegated emits one
+        // DelegatedExpression covering everything. Performance-delegation flag carries through
+        // so the data node knows the driver could have evaluated some leaves natively — but
+        // for count-context (the typical caller) this is irrelevant since the driver runs no
+        // residual evaluation anyway.
+        if (fuseDualViable
+            && ordered.size() == correctnessChildren.size() + performanceChildren.size()
+            && !correctnessChildren.isEmpty()
+            && !performanceChildren.isEmpty()) {
+            int firstId = correctnessChildren.getFirst().firstAnnotationId();
+            return new Delegated(commonBackend, call, firstId, false);
         }
 
         // Mixed: combine correctness-delegated into one expression, performance-delegated into another.

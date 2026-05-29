@@ -93,6 +93,23 @@ public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionP
     );
 
     /**
+     * When true, performance-delegated predicates (dual-viable: driver natively evaluable,
+     * accepting backend also viable) fuse with correctness-delegated siblings even under
+     * OR/NOT. Default true: most analytic workloads benefit from Lucene evaluating the full
+     * boolean structure rather than DataFusion peer-consulting opportunistically.
+     *
+     * <p>Flip false if your workload sees parquet-side column pruning beat Lucene's term
+     * dictionary on dual-viable predicates (rare for keyword fields). Count-eligible plans
+     * force fusion regardless of this setting.
+     */
+    public static final Setting<Boolean> DELEGATION_FUSE_DUAL_VIABLE = Setting.boolSetting(
+        "analytics.delegation.fuse_dual_viable",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * Creates a new analytics engine hub plugin.
      */
     public AnalyticsPlugin() {}
@@ -171,7 +188,7 @@ public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionP
 
     @Override
     public List<Setting<?>> getSettings() {
-        return List.of(COORDINATOR_BUFFER_LIMIT, ReaderContextStore.READER_CONTEXT_KEEP_ALIVE);
+        return List.of(COORDINATOR_BUFFER_LIMIT, DELEGATION_FUSE_DUAL_VIABLE, ReaderContextStore.READER_CONTEXT_KEEP_ALIVE);
     }
 
     @Override

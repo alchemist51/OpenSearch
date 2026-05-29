@@ -301,8 +301,12 @@ public class LuceneAnalyticsBackendPluginTests extends OpenSearchTestCase {
         public FragmentInstructionHandlerFactory getInstructionHandlerFactory() {
             return new FragmentInstructionHandlerFactory() {
                 @Override
-                public Optional<InstructionNode> createShardScanNode(boolean requestsRowIds) {
-                    return Optional.of(new ShardScanInstructionNode(requestsRowIds));
+                public Optional<InstructionNode> createShardScanNode(
+                    boolean requestsRowIds,
+                    boolean countQuery,
+                    List<String> countExistenceFields
+                ) {
+                    return Optional.of(new ShardScanInstructionNode(requestsRowIds, countQuery, countExistenceFields));
                 }
 
                 @Override
@@ -318,9 +322,19 @@ public class LuceneAnalyticsBackendPluginTests extends OpenSearchTestCase {
                 public Optional<InstructionNode> createShardScanWithDelegationNode(
                     FilterTreeShape treeShape,
                     int delegatedPredicateCount,
-                    boolean requestsRowIds
+                    boolean requestsRowIds,
+                    boolean countQuery,
+                    List<String> countExistenceFields
                 ) {
-                    return Optional.of(new ShardScanWithDelegationInstructionNode(treeShape, delegatedPredicateCount, requestsRowIds));
+                    return Optional.of(
+                        new ShardScanWithDelegationInstructionNode(
+                            treeShape,
+                            delegatedPredicateCount,
+                            requestsRowIds,
+                            countQuery,
+                            countExistenceFields
+                        )
+                    );
                 }
 
                 @Override

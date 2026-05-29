@@ -12,6 +12,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 
 import java.io.IOException;
+import java.util.List;
 
 /**
  * Instruction node for shard scan with filter delegation — extends base shard scan
@@ -27,11 +28,21 @@ public class ShardScanWithDelegationInstructionNode extends ShardScanInstruction
     private final int delegatedPredicateCount;
 
     public ShardScanWithDelegationInstructionNode(FilterTreeShape treeShape, int delegatedPredicateCount) {
-        this(treeShape, delegatedPredicateCount, false);
+        this(treeShape, delegatedPredicateCount, false, false, List.of());
     }
 
     public ShardScanWithDelegationInstructionNode(FilterTreeShape treeShape, int delegatedPredicateCount, boolean requestsRowIds) {
-        super(requestsRowIds);
+        this(treeShape, delegatedPredicateCount, requestsRowIds, false, List.of());
+    }
+
+    public ShardScanWithDelegationInstructionNode(
+        FilterTreeShape treeShape,
+        int delegatedPredicateCount,
+        boolean requestsRowIds,
+        boolean countQuery,
+        List<String> countExistenceFields
+    ) {
+        super(requestsRowIds, countQuery, countExistenceFields);
         this.treeShape = treeShape;
         this.delegatedPredicateCount = delegatedPredicateCount;
     }

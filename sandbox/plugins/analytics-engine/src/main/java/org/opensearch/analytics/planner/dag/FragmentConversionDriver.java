@@ -78,10 +78,22 @@ public class FragmentConversionDriver {
 
     /**
      * Converts all {@link StagePlan} alternatives in the DAG, populating
-     * {@link StagePlan#convertedBytes()} on each plan.
+     * {@link StagePlan#convertedBytes()} on each plan. Backwards-compatible overload that
+     * leaves {@code fuseDualViable} false; production callers should use the variant taking
+     * the cluster setting explicitly.
      */
     public static void convertAll(QueryDAG dag, CapabilityRegistry registry) {
-        convertStage(dag.rootStage(), registry);
+        convertAll(dag, registry, false);
+    }
+
+    /**
+     * @param fuseDualViable when true, performance-delegated predicates fuse with
+     *     correctness-delegated siblings even under OR/NOT (cluster setting
+     *     {@code analytics.delegation.fuse_dual_viable}). Count-eligible plans force this on
+     *     per-stage regardless of the setting.
+     */
+    public static void convertAll(QueryDAG dag, CapabilityRegistry registry, boolean fuseDualViable) {
+        convertStage(dag.rootStage(), registry, fuseDualViable);
         // Root stage executes locally at coordinator — store factory for instruction dispatch.
         Stage root = dag.rootStage();
         if (root.getExchangeSinkProvider() != null && !root.getPlanAlternatives().isEmpty()) {
@@ -90,9 +102,9 @@ public class FragmentConversionDriver {
         }
     }
 
-    private static void convertStage(Stage stage, CapabilityRegistry registry) {
+    private static void convertStage(Stage stage, CapabilityRegistry registry, boolean fuseDualViable) {
         for (Stage child : stage.getChildStages()) {
-            convertStage(child, registry);
+            convertStage(child, registry, fuseDualViable);
         }
         // After children are converted, surface any decorator-induced schema delta as
         // postDecorationSchemaBytes on the child plans. The reduce sink consults this when
@@ -115,30 +127,49 @@ public class FragmentConversionDriver {
             FilterTreeShape treeShape = filter != null
                 ? FilterTreeShapeDeriver.derive(filter, plan.backendId())
                 : FilterTreeShape.NO_DELEGATION;
-            // Strict-narrowing pass: a CONJUNCTIVE shape with only delegated predicates and
-            // a count(*) aggregate above (no projection between) qualifies for the
-            // COUNT_DELEGATION fast path. The detector is a no-op when any condition fails.
-            treeShape = CountDelegationDetector.upgradeIfEligible(
+
+            // Pre-conversion eligibility for the count fast path. When eligible, force
+            // fuseDualViable for this plan so the combiner produces one DelegatedExpression
+            // covering the entire filter (which is what tryCountQuery on the data node ANDs).
+            CountFastPathDetector.Eligibility countEligibility = CountFastPathDetector.preCheck(
                 plan.resolvedFragment(),
-                filter,
-                treeShape,
                 plan.backendId()
             );
-            LOGGER.info("[fragment-conversion] backend={} treeShape={}", plan.backendId(), treeShape);
+            boolean effectiveFuseDualViable = fuseDualViable || countEligibility.eligible();
 
-            IntraOperatorDelegationBytes delegationBytes = new IntraOperatorDelegationBytes(registry);
+            LOGGER.info(
+                "[fragment-conversion] backend={} treeShape={} countEligible={} fuseDualViable={}",
+                plan.backendId(),
+                treeShape,
+                countEligibility.eligible(),
+                effectiveFuseDualViable
+            );
+
+            IntraOperatorDelegationBytes delegationBytes = new IntraOperatorDelegationBytes(registry, effectiveFuseDualViable);
             byte[] bytes = convert(plan.resolvedFragment(), convertor, delegationBytes);
 
-            // Assemble instruction list
+            // Assemble instruction list. Count fast path fires only if the combiner actually
+            // produced a single fused DelegatedExpression — otherwise the data node would have
+            // to AND multiple queries and we'd lose the metadata-fast property in some cases.
             List<DelegatedExpression> delegated = delegationBytes.getResult();
-            List<InstructionNode> instructions = assembleInstructions(backend, plan, treeShape, delegationBytes);
+            boolean countQuery = countEligibility.eligible() && delegated.size() == 1;
+            List<String> existenceFields = countQuery ? countEligibility.existenceFields() : List.of();
+            List<InstructionNode> instructions = assembleInstructions(
+                backend,
+                plan,
+                treeShape,
+                delegationBytes,
+                countQuery,
+                existenceFields
+            );
 
             converted.add(plan.withConvertedBytes(bytes, delegated).withInstructions(instructions));
             LOGGER.debug(
-                "Stage [{}] converted: treeShape={}, delegatedExpressions={}{}",
+                "Stage [{}] converted: treeShape={}, delegatedExpressions={}, countQuery={}{}",
                 plan.backendId(),
                 treeShape,
                 delegated.size(),
+                countQuery,
                 delegated.isEmpty() ? "" : " [ids=" + delegated.stream().map(d -> String.valueOf(d.getAnnotationId())).toList() + "]"
             );
         }
@@ -208,7 +239,9 @@ public class FragmentConversionDriver {
         AnalyticsSearchBackendPlugin backend,
         StagePlan plan,
         FilterTreeShape treeShape,
-        IntraOperatorDelegationBytes delegationBytes
+        IntraOperatorDelegationBytes delegationBytes,
+        boolean countQuery,
+        List<String> countExistenceFields
     ) {
         FragmentInstructionHandlerFactory factory = backend.getInstructionHandlerFactory();
         LinkedList<InstructionNode> instructions = new LinkedList<>();
@@ -220,9 +253,10 @@ public class FragmentConversionDriver {
             boolean requestsRowIds = tableScan.getRowType().getFieldNames().contains(OpenSearchLateMaterialization.ROW_ID_FIELD);
             List<DelegatedExpression> delegated = delegationBytes.getResult();
             if (!delegated.isEmpty()) {
-                factory.createShardScanWithDelegationNode(treeShape, delegated.size(), requestsRowIds).ifPresent(instructions::add);
+                factory.createShardScanWithDelegationNode(treeShape, delegated.size(), requestsRowIds, countQuery, countExistenceFields)
+                    .ifPresent(instructions::add);
             } else {
-                factory.createShardScanNode(requestsRowIds).ifPresent(instructions::add);
+                factory.createShardScanNode(requestsRowIds, countQuery, countExistenceFields).ifPresent(instructions::add);
             }
         }
         return instructions;
@@ -238,10 +272,21 @@ public class FragmentConversionDriver {
      */
     static final class IntraOperatorDelegationBytes {
         private final CapabilityRegistry registry;
+        /**
+         * When true, the combiner fuses performance-delegated leaves with correctness-delegated
+         * siblings under all boolean positions (AND/OR/NOT) instead of throwing perf back to
+         * native under OR/NOT. See {@link DelegatedPredicateCombiner} for semantics.
+         */
+        private final boolean fuseDualViable;
         private List<DelegatedExpression> delegatedExpressions;
 
         IntraOperatorDelegationBytes(CapabilityRegistry registry) {
+            this(registry, false);
+        }
+
+        IntraOperatorDelegationBytes(CapabilityRegistry registry, boolean fuseDualViable) {
             this.registry = registry;
+            this.fuseDualViable = fuseDualViable;
         }
 
         /**
@@ -258,7 +303,8 @@ public class FragmentConversionDriver {
                 fieldStorage,
                 registry,
                 rexBuilder,
-                delegatedExpressions
+                delegatedExpressions,
+                fuseDualViable
             );
             return new AnnotationResolver() {
 
