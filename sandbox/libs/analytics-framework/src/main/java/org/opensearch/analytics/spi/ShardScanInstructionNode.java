@@ -27,8 +27,10 @@ import java.util.List;
  * a count fast path (skipping engine execution) before falling through to the standard
  * scan. {@code countExistenceFields} carries the column names that must satisfy
  * {@code IS NOT NULL} when the aggregate is {@code count(col)} — empty when only
- * {@code count(*)} appears. Eligibility decision is the planner's; the data node decides
- * whether the fast path actually fires.
+ * {@code count(*)} appears. {@code partialCountColumnNames} carries the partial-aggregate
+ * output column name(s) so the data node can build a one-row Arrow batch matching the
+ * coordinator's FINAL-aggregate input schema. Eligibility decision is the planner's; the
+ * data node decides whether the fast path actually fires.
  *
  * @opensearch.internal
  */
@@ -37,25 +39,33 @@ public class ShardScanInstructionNode implements InstructionNode, Writeable {
     private final boolean requestsRowIds;
     private final boolean countQuery;
     private final List<String> countExistenceFields;
+    private final List<String> partialCountColumnNames;
 
     public ShardScanInstructionNode() {
-        this(false, false, List.of());
+        this(false, false, List.of(), List.of());
     }
 
     public ShardScanInstructionNode(boolean requestsRowIds) {
-        this(requestsRowIds, false, List.of());
+        this(requestsRowIds, false, List.of(), List.of());
     }
 
-    public ShardScanInstructionNode(boolean requestsRowIds, boolean countQuery, List<String> countExistenceFields) {
+    public ShardScanInstructionNode(
+        boolean requestsRowIds,
+        boolean countQuery,
+        List<String> countExistenceFields,
+        List<String> partialCountColumnNames
+    ) {
         this.requestsRowIds = requestsRowIds;
         this.countQuery = countQuery;
         this.countExistenceFields = List.copyOf(countExistenceFields);
+        this.partialCountColumnNames = List.copyOf(partialCountColumnNames);
     }
 
     public ShardScanInstructionNode(StreamInput in) throws IOException {
         this.requestsRowIds = in.readBoolean();
         this.countQuery = in.readBoolean();
         this.countExistenceFields = in.readStringList();
+        this.partialCountColumnNames = in.readStringList();
     }
 
     public boolean requestsRowIds() {
@@ -70,6 +80,10 @@ public class ShardScanInstructionNode implements InstructionNode, Writeable {
         return countExistenceFields;
     }
 
+    public List<String> partialCountColumnNames() {
+        return partialCountColumnNames;
+    }
+
     @Override
     public InstructionType type() {
         return InstructionType.SETUP_SHARD_SCAN;
@@ -80,5 +94,6 @@ public class ShardScanInstructionNode implements InstructionNode, Writeable {
         out.writeBoolean(requestsRowIds);
         out.writeBoolean(countQuery);
         out.writeStringCollection(countExistenceFields);
+        out.writeStringCollection(partialCountColumnNames);
     }
 }

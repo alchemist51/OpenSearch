@@ -463,9 +463,12 @@ public class FilterDelegationForIndexFullConversionTests extends OpenSearchTestC
                 public Optional<InstructionNode> createShardScanNode(
                     boolean requestsRowIds,
                     boolean countQuery,
-                    List<String> countExistenceFields
+                    List<String> countExistenceFields,
+                    List<String> partialCountColumnNames
                 ) {
-                    return Optional.of(new ShardScanInstructionNode(requestsRowIds, countQuery, countExistenceFields));
+                    return Optional.of(
+                        new ShardScanInstructionNode(requestsRowIds, countQuery, countExistenceFields, partialCountColumnNames)
+                    );
                 }
 
                 @Override
@@ -483,7 +486,8 @@ public class FilterDelegationForIndexFullConversionTests extends OpenSearchTestC
                     int delegatedPredicateCount,
                     boolean requestsRowIds,
                     boolean countQuery,
-                    List<String> countExistenceFields
+                    List<String> countExistenceFields,
+                    List<String> partialCountColumnNames
                 ) {
                     return Optional.of(
                         new ShardScanWithDelegationInstructionNode(
@@ -491,7 +495,8 @@ public class FilterDelegationForIndexFullConversionTests extends OpenSearchTestC
                             delegatedPredicateCount,
                             requestsRowIds,
                             countQuery,
-                            countExistenceFields
+                            countExistenceFields,
+                            partialCountColumnNames
                         )
                     );
                 }

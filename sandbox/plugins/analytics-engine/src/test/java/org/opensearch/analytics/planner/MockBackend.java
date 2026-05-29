@@ -157,8 +157,13 @@ abstract class MockBackend implements AnalyticsSearchBackendPlugin {
     public FragmentInstructionHandlerFactory getInstructionHandlerFactory() {
         return new FragmentInstructionHandlerFactory() {
             @Override
-            public Optional<InstructionNode> createShardScanNode(boolean requestsRowIds, boolean countQuery, List<String> countExistenceFields) {
-                return Optional.of(new ShardScanInstructionNode(requestsRowIds, countQuery, countExistenceFields));
+            public Optional<InstructionNode> createShardScanNode(
+                boolean requestsRowIds,
+                boolean countQuery,
+                List<String> countExistenceFields,
+                List<String> partialCountColumnNames
+            ) {
+                return Optional.of(new ShardScanInstructionNode(requestsRowIds, countQuery, countExistenceFields, partialCountColumnNames));
             }
 
             @Override
@@ -176,7 +181,8 @@ abstract class MockBackend implements AnalyticsSearchBackendPlugin {
                 int delegatedPredicateCount,
                 boolean requestsRowIds,
                 boolean countQuery,
-                List<String> countExistenceFields
+                List<String> countExistenceFields,
+                List<String> partialCountColumnNames
             ) {
                 return Optional.of(
                     new ShardScanWithDelegationInstructionNode(
@@ -184,7 +190,8 @@ abstract class MockBackend implements AnalyticsSearchBackendPlugin {
                         delegatedPredicateCount,
                         requestsRowIds,
                         countQuery,
-                        countExistenceFields
+                        countExistenceFields,
+                        partialCountColumnNames
                     )
                 );
             }

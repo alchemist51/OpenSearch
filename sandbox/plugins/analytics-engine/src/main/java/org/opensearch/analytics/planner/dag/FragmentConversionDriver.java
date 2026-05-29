@@ -154,13 +154,15 @@ public class FragmentConversionDriver {
             List<DelegatedExpression> delegated = delegationBytes.getResult();
             boolean countQuery = countEligibility.eligible() && delegated.size() == 1;
             List<String> existenceFields = countQuery ? countEligibility.existenceFields() : List.of();
+            List<String> partialCountColumnNames = countQuery ? countEligibility.partialCountColumnNames() : List.of();
             List<InstructionNode> instructions = assembleInstructions(
                 backend,
                 plan,
                 treeShape,
                 delegationBytes,
                 countQuery,
-                existenceFields
+                existenceFields,
+                partialCountColumnNames
             );
 
             converted.add(plan.withConvertedBytes(bytes, delegated).withInstructions(instructions));
@@ -241,7 +243,8 @@ public class FragmentConversionDriver {
         FilterTreeShape treeShape,
         IntraOperatorDelegationBytes delegationBytes,
         boolean countQuery,
-        List<String> countExistenceFields
+        List<String> countExistenceFields,
+        List<String> partialCountColumnNames
     ) {
         FragmentInstructionHandlerFactory factory = backend.getInstructionHandlerFactory();
         LinkedList<InstructionNode> instructions = new LinkedList<>();
@@ -253,10 +256,17 @@ public class FragmentConversionDriver {
             boolean requestsRowIds = tableScan.getRowType().getFieldNames().contains(OpenSearchLateMaterialization.ROW_ID_FIELD);
             List<DelegatedExpression> delegated = delegationBytes.getResult();
             if (!delegated.isEmpty()) {
-                factory.createShardScanWithDelegationNode(treeShape, delegated.size(), requestsRowIds, countQuery, countExistenceFields)
-                    .ifPresent(instructions::add);
+                factory.createShardScanWithDelegationNode(
+                    treeShape,
+                    delegated.size(),
+                    requestsRowIds,
+                    countQuery,
+                    countExistenceFields,
+                    partialCountColumnNames
+                ).ifPresent(instructions::add);
             } else {
-                factory.createShardScanNode(requestsRowIds, countQuery, countExistenceFields).ifPresent(instructions::add);
+                factory.createShardScanNode(requestsRowIds, countQuery, countExistenceFields, partialCountColumnNames)
+                    .ifPresent(instructions::add);
             }
         }
         return instructions;

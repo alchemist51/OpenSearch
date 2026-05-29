@@ -23,7 +23,6 @@ import org.opensearch.analytics.planner.rel.OpenSearchFilter;
 import org.opensearch.analytics.planner.rel.OpenSearchProject;
 import org.opensearch.analytics.spi.FieldStorageInfo;
 
-import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -67,13 +66,15 @@ final class CountFastPathDetector {
     /**
      * Result of the pre-conversion eligibility check.
      *
-     * @param eligible            true iff every gate above passed
-     * @param acceptingBackendId  backend id all annotations target (e.g. "lucene"); null when not eligible
-     * @param existenceFields     ordered, deduplicated list of column names from {@code count(col)} calls;
-     *                            empty when only {@code count(*)} appears or when not eligible
+     * @param eligible                  true iff every gate above passed
+     * @param acceptingBackendId        backend id all annotations target (e.g. "lucene"); null when not eligible
+     * @param existenceFields           ordered, deduplicated list of column names from {@code count(col)} calls;
+     *                                  empty when only {@code count(*)} appears or when not eligible
+     * @param partialCountColumnNames   one entry per aggregate call, in call order — the column names the
+     *                                  data-node fast path should use when building the one-row Arrow batch
      */
-    record Eligibility(boolean eligible, String acceptingBackendId, List<String> existenceFields) {
-        static final Eligibility NOT_ELIGIBLE = new Eligibility(false, null, List.of());
+    record Eligibility(boolean eligible, String acceptingBackendId, List<String> existenceFields, List<String> partialCountColumnNames) {
+        static final Eligibility NOT_ELIGIBLE = new Eligibility(false, null, List.of(), List.of());
     }
 
     /**
@@ -124,9 +125,16 @@ final class CountFastPathDetector {
         String acceptingBackend = acceptingBackends.iterator().next();
 
         // Validate every aggregate call: count(*) or count(col), col must be indexed by the accepting backend.
+        // Scope for this PR: all calls in the aggregate must share semantics — either all count(*),
+        // or all count(SAME_col). Mixed shapes (count(*) + count(col), or count(col_a) + count(col_b))
+        // would need per-call existence-field tracking and a multi-count fast path; treated as
+        // TODO and rejected here so the data-node side stays one-Lucene-count-per-fragment.
         List<FieldStorageInfo> filterFsi = filter.getOutputFieldStorage();
-        LinkedHashSet<String> existenceFields = new LinkedHashSet<>();
+        String singleExistenceField = null;
+        boolean haveCountStar = false;
+        List<String> callNames = new java.util.ArrayList<>(aggregate.getAggCallList().size());
         for (AggregateCall call : aggregate.getAggCallList()) {
+            callNames.add(call.getName());
             if (call.getAggregation().getKind() != SqlKind.COUNT) {
                 LOGGER.debug("[count-fast-path] skip: non-count aggregate call {}", call);
                 return Eligibility.NOT_ELIGIBLE;
@@ -136,7 +144,12 @@ final class CountFastPathDetector {
                 return Eligibility.NOT_ELIGIBLE;
             }
             if (call.getArgList().isEmpty()) {
-                continue;  // count(*) — always OK
+                if (singleExistenceField != null) {
+                    LOGGER.debug("[count-fast-path] skip: mixed count(*) and count(col) calls");
+                    return Eligibility.NOT_ELIGIBLE;
+                }
+                haveCountStar = true;
+                continue;
             }
             if (call.getArgList().size() != 1) {
                 LOGGER.debug("[count-fast-path] skip: count with {} args", call.getArgList().size());
@@ -157,15 +170,29 @@ final class CountFastPathDetector {
                 );
                 return Eligibility.NOT_ELIGIBLE;
             }
-            existenceFields.add(fsi.getFieldName());
+            if (haveCountStar) {
+                LOGGER.debug("[count-fast-path] skip: mixed count(*) and count(col) calls");
+                return Eligibility.NOT_ELIGIBLE;
+            }
+            if (singleExistenceField != null && !singleExistenceField.equals(fsi.getFieldName())) {
+                LOGGER.debug(
+                    "[count-fast-path] skip: multiple distinct count(col): {} and {}",
+                    singleExistenceField,
+                    fsi.getFieldName()
+                );
+                return Eligibility.NOT_ELIGIBLE;
+            }
+            singleExistenceField = fsi.getFieldName();
         }
 
+        List<String> existenceFields = singleExistenceField == null ? List.of() : List.of(singleExistenceField);
         LOGGER.debug(
-            "[count-fast-path] ELIGIBLE: acceptingBackend={}, existenceFields={}",
+            "[count-fast-path] ELIGIBLE: acceptingBackend={}, existenceFields={}, partialCountColumnNames={}",
             acceptingBackend,
-            existenceFields
+            existenceFields,
+            callNames
         );
-        return new Eligibility(true, acceptingBackend, new ArrayList<>(existenceFields));
+        return new Eligibility(true, acceptingBackend, existenceFields, callNames);
     }
 
     /**

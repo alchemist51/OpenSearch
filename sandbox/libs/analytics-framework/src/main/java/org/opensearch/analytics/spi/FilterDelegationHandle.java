@@ -10,6 +10,8 @@ package org.opensearch.analytics.spi;
 
 import java.io.Closeable;
 import java.lang.foreign.MemorySegment;
+import java.util.List;
+import java.util.OptionalLong;
 
 /**
  * Callback surface for filter delegation between a driving backend and an accepting backend.
@@ -106,5 +108,25 @@ public interface FilterDelegationHandle extends Closeable {
      */
     default long countDocs(int collectorKey, int minDoc, int maxDoc) {
         return -1L;
+    }
+
+    /**
+     * Count fast path: answer the count for the surrounding {@code count(*)} or
+     * {@code count(col)} aggregate by ANDing all compiled delegated queries (plus
+     * a {@code FieldExistsQuery} for each entry in {@code existenceFields}) and
+     * delegating to the accepting backend's count primitive (e.g. Lucene's
+     * {@code IndexSearcher.count(BooleanQuery)}).
+     *
+     * <p>Returns {@link OptionalLong#empty()} when the implementation cannot answer
+     * (default), when the shard has any deleted docs, or when the count cannot be
+     * computed without materializing rows. Callers fall through to the indexed/DF
+     * slow path on empty.
+     *
+     * @param existenceFields columns whose {@code IS NOT NULL} must AND into the count;
+     *                        empty when the surrounding aggregate is {@code count(*)} only
+     * @return the count, or {@link OptionalLong#empty()} when the fast path declines
+     */
+    default OptionalLong tryCountQuery(List<String> existenceFields) {
+        return OptionalLong.empty();
     }
 }

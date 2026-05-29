@@ -304,9 +304,12 @@ public class LuceneAnalyticsBackendPluginTests extends OpenSearchTestCase {
                 public Optional<InstructionNode> createShardScanNode(
                     boolean requestsRowIds,
                     boolean countQuery,
-                    List<String> countExistenceFields
+                    List<String> countExistenceFields,
+                    List<String> partialCountColumnNames
                 ) {
-                    return Optional.of(new ShardScanInstructionNode(requestsRowIds, countQuery, countExistenceFields));
+                    return Optional.of(
+                        new ShardScanInstructionNode(requestsRowIds, countQuery, countExistenceFields, partialCountColumnNames)
+                    );
                 }
 
                 @Override
@@ -324,7 +327,8 @@ public class LuceneAnalyticsBackendPluginTests extends OpenSearchTestCase {
                     int delegatedPredicateCount,
                     boolean requestsRowIds,
                     boolean countQuery,
-                    List<String> countExistenceFields
+                    List<String> countExistenceFields,
+                    List<String> partialCountColumnNames
                 ) {
                     return Optional.of(
                         new ShardScanWithDelegationInstructionNode(
@@ -332,7 +336,8 @@ public class LuceneAnalyticsBackendPluginTests extends OpenSearchTestCase {
                             delegatedPredicateCount,
                             requestsRowIds,
                             countQuery,
-                            countExistenceFields
+                            countExistenceFields,
+                            partialCountColumnNames
                         )
                     );
                 }

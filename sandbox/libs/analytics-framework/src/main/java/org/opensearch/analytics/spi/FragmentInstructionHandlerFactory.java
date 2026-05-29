@@ -30,9 +30,16 @@ public interface FragmentInstructionHandlerFactory {
      * must emit shard-global {@code __row_id__} values (QTF query phase). {@code countQuery}
      * signals the surrounding plan is a count(*) / count(col) aggregate eligible for the
      * data-node count fast path; {@code countExistenceFields} carries the columns whose
-     * {@code IS NOT NULL} must be ANDed into the count (empty for count(*)).
+     * {@code IS NOT NULL} must be ANDed into the count (empty for count(*));
+     * {@code partialCountColumnNames} carries the partial-aggregate output column names so
+     * the fast path can build an Arrow batch matching the coordinator's expected schema.
      */
-    Optional<InstructionNode> createShardScanNode(boolean requestsRowIds, boolean countQuery, List<String> countExistenceFields);
+    Optional<InstructionNode> createShardScanNode(
+        boolean requestsRowIds,
+        boolean countQuery,
+        List<String> countExistenceFields,
+        List<String> partialCountColumnNames
+    );
 
     /** Creates a filter delegation instruction node with the given delegation metadata. */
     Optional<InstructionNode> createFilterDelegationNode(
@@ -45,15 +52,16 @@ public interface FragmentInstructionHandlerFactory {
      * Creates a shard scan with delegation instruction node — combines scan setup with
      * delegation config. {@code requestsRowIds} signals that the scan must emit shard-global
      * {@code __row_id__} values (QTF query phase). Backends that don't support QTF should
-     * return {@link Optional#empty()} when {@code requestsRowIds} is true. {@code countQuery}
-     * and {@code countExistenceFields} carry the count-fast-path hint (see {@link #createShardScanNode}).
+     * return {@link Optional#empty()} when {@code requestsRowIds} is true. The remaining
+     * arguments carry the count-fast-path hint (see {@link #createShardScanNode}).
      */
     Optional<InstructionNode> createShardScanWithDelegationNode(
         FilterTreeShape treeShape,
         int delegatedPredicateCount,
         boolean requestsRowIds,
         boolean countQuery,
-        List<String> countExistenceFields
+        List<String> countExistenceFields,
+        List<String> partialCountColumnNames
     );
 
     /** Creates a partial aggregate instruction node. */

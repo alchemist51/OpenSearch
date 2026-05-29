@@ -28,11 +28,11 @@ public class ShardScanWithDelegationInstructionNode extends ShardScanInstruction
     private final int delegatedPredicateCount;
 
     public ShardScanWithDelegationInstructionNode(FilterTreeShape treeShape, int delegatedPredicateCount) {
-        this(treeShape, delegatedPredicateCount, false, false, List.of());
+        this(treeShape, delegatedPredicateCount, false, false, List.of(), List.of());
     }
 
     public ShardScanWithDelegationInstructionNode(FilterTreeShape treeShape, int delegatedPredicateCount, boolean requestsRowIds) {
-        this(treeShape, delegatedPredicateCount, requestsRowIds, false, List.of());
+        this(treeShape, delegatedPredicateCount, requestsRowIds, false, List.of(), List.of());
     }
 
     public ShardScanWithDelegationInstructionNode(
@@ -40,9 +40,10 @@ public class ShardScanWithDelegationInstructionNode extends ShardScanInstruction
         int delegatedPredicateCount,
         boolean requestsRowIds,
         boolean countQuery,
-        List<String> countExistenceFields
+        List<String> countExistenceFields,
+        List<String> partialCountColumnNames
     ) {
-        super(requestsRowIds, countQuery, countExistenceFields);
+        super(requestsRowIds, countQuery, countExistenceFields, partialCountColumnNames);
         this.treeShape = treeShape;
         this.delegatedPredicateCount = delegatedPredicateCount;
     }
