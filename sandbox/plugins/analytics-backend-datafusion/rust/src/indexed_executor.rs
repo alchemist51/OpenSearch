@@ -448,15 +448,6 @@ pub async unsafe fn execute_indexed_with_context(
     //   0 = NO_DELEGATION              → FilterClass::None
     //   1 = CONJUNCTIVE                → FilterClass::SingleCollector  (bitmap path)
     //   2 = INTERLEAVED_BOOLEAN_EXPR.  → FilterClass::Tree             (bitmap path)
-    //   3 = COUNT_DELEGATION           → count_executor (no parquet decode, no bitset)
-    if handle.indexed_config.as_ref().map(|c| c.tree_shape) == Some(3) {
-        log::info!("[count-delegation] Rust: dispatch tree_shape=3 → count_executor");
-        return crate::count_executor::execute(handle, substrait_bytes, cpu_executor).await;
-    }
-    log::info!(
-        "[count-delegation] Rust: dispatch tree_shape={:?} → bitmap path (indexed_executor)",
-        handle.indexed_config.as_ref().map(|c| c.tree_shape)
-    );
     let classification_override = handle.indexed_config.map(|config| {
         match (config.tree_shape, config.delegated_predicate_count) {
             (1, _) => FilterClass::SingleCollector,

@@ -179,49 +179,6 @@ public final class FilterTreeCallbacks {
     }
 
     /**
-     * {@code countDocs(collectorKey, minDoc, maxDoc) -> count|-1}.
-     *
-     * <p>Used by the COUNT_DELEGATION fast path. Implementations that own a metadata-driven
-     * count (e.g. Lucene {@code Weight.count(LeafReaderContext)}) short-circuit; otherwise
-     * the SPI default returns {@code -1}.
-     */
-    public static long countDocs(int collectorKey, int minDoc, int maxDoc) {
-        long tid = trackStart();
-        try {
-            // FFM-boundary bounds check. Native side uses i32 ranges; defense in depth
-            // against a contract regression on the Rust caller (e.g. negative or
-            // inverted bounds). Cheap — no allocation, no Lucene dispatch on bad input.
-            if (minDoc < 0 || maxDoc < minDoc) {
-                LOGGER.error(
-                    "countDocs received invalid bounds collectorKey={}, [{}, {})",
-                    collectorKey,
-                    minDoc,
-                    maxDoc
-                );
-                return -1L;
-            }
-            FilterDelegationHandle handle = HANDLE.get();
-            if (handle == null) {
-                return -1L;
-            }
-            if (handle.isCancelled()) {
-                return -1L;
-            }
-            long n = handle.countDocs(collectorKey, minDoc, maxDoc);
-            LOGGER.info("[count-delegation] countDocs collectorKey={} [{}, {}) → {}", collectorKey, minDoc, maxDoc, n);
-            return n;
-        } catch (Throwable throwable) {
-            LOGGER.error(
-                new ParameterizedMessage("countDocs(collectorKey={}, [{}, {})) failed", collectorKey, minDoc, maxDoc),
-                throwable
-            );
-            return -1L;
-        } finally {
-            trackEnd(tid);
-        }
-    }
-
-    /**
      * {@code releaseCollector(collectorKey)}. Never throws.
      */
     public static void releaseCollector(int collectorKey) {

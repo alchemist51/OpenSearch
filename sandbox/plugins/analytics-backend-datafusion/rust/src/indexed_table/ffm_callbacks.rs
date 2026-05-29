@@ -8,13 +8,12 @@
 
 //! FFM upcall surface for index-filter providers and collectors.
 //!
-//! Six callback slots, populated once at startup by
+//! Five callback slots, populated once at startup by
 //! `df_register_filter_tree_callbacks` (see `ffm.rs`):
 //!
 //! - `createProvider(annotationId) -> providerKey|-1`
 //! - `createCollector(providerKey, writerGeneration, minDoc, maxDoc) -> collectorKey|-1`
 //! - `collectDocs(collectorKey, minDoc, maxDoc, outBuf, outWordCap) -> wordsWritten|-1`
-//! - `countDocs(collectorKey, minDoc, maxDoc) -> count|-1`
 //! - `releaseCollector(collectorKey)`
 //! - `releaseProvider(providerKey)`
 //!
@@ -34,17 +33,12 @@ type ReleaseProviderFn = unsafe extern "C" fn(i32);
 /// `writer_generation` is the stable per-segment identifier
 type CreateCollectorFn = unsafe extern "C" fn(i32, i64, i32, i32) -> i32;
 type CollectDocsFn = unsafe extern "C" fn(i32, i32, i32, *mut u64, i64) -> i64;
-/// `(collector_key, doc_min, doc_max) -> count | -1`. Used by the COUNT_DELEGATION
-/// fast path. Returns a non-negative count or `-1` when the backend cannot answer
-/// without materializing a bitset (caller falls back to `collect_docs`).
-type CountDocsFn = unsafe extern "C" fn(i32, i32, i32) -> i64;
 type ReleaseCollectorFn = unsafe extern "C" fn(i32);
 
 static CREATE_PROVIDER: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static RELEASE_PROVIDER: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static CREATE_COLLECTOR: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static COLLECT_DOCS: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
-static COUNT_DOCS: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static RELEASE_COLLECTOR: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Registered by Java at startup. Stores function pointers into atomic
@@ -59,7 +53,6 @@ pub unsafe extern "C" fn df_register_filter_tree_callbacks(
     release_provider: ReleaseProviderFn,
     create_collector: CreateCollectorFn,
     collect_docs: CollectDocsFn,
-    count_docs: CountDocsFn,
     release_collector: ReleaseCollectorFn,
 ) {
     // catch_unwind is defense-in-depth: atomic stores shouldn't panic,
@@ -72,7 +65,6 @@ pub unsafe extern "C" fn df_register_filter_tree_callbacks(
         RELEASE_PROVIDER.store(release_provider as *mut (), Ordering::Release);
         CREATE_COLLECTOR.store(create_collector as *mut (), Ordering::Release);
         COLLECT_DOCS.store(collect_docs as *mut (), Ordering::Release);
-        COUNT_DOCS.store(count_docs as *mut (), Ordering::Release);
         RELEASE_COLLECTOR.store(release_collector as *mut (), Ordering::Release);
     }));
 }
@@ -105,13 +97,6 @@ fn load_collect_docs() -> Result<CollectDocsFn, String> {
         return Err("FilterTree callbacks not registered".into());
     }
     Ok(unsafe { std::mem::transmute::<*mut (), CollectDocsFn>(p) })
-}
-fn load_count_docs() -> Result<CountDocsFn, String> {
-    let p = COUNT_DOCS.load(Ordering::Acquire);
-    if p.is_null() {
-        return Err("FilterTree callbacks not registered".into());
-    }
-    Ok(unsafe { std::mem::transmute::<*mut (), CountDocsFn>(p) })
 }
 fn load_release_collector() -> Option<ReleaseCollectorFn> {
     let p = RELEASE_COLLECTOR.load(Ordering::Acquire);
@@ -199,34 +184,6 @@ impl FfmSegmentCollector {
             ));
         }
         Ok(FfmSegmentCollector { key })
-    }
-
-    /// COUNT_DELEGATION fast path: ask the backend for a doc count over `[doc_min, doc_max)`
-    /// without materializing a bitset. Returns `Ok(n)` for a valid count, or `Err` if the
-    /// callback returned `-1` (cancellation, unsupported query type, or backend error).
-    /// Callers may treat `Err` as a signal to fall back to `collect_packed_u64_bitset`.
-    pub fn count_docs(&self, doc_min: i32, doc_max: i32) -> Result<i64, String> {
-        // Bounds invariant — symmetric with the Java-side createCollector contract.
-        // doc_min must be non-negative; doc_max <= doc_min returns 0 unambiguously.
-        // debug_assert (not assert) so release builds don't pay the check; the Java
-        // FFM target also bounds-checks before dispatching.
-        debug_assert!(
-            doc_min >= 0,
-            "FfmSegmentCollector::count_docs called with negative doc_min={}",
-            doc_min
-        );
-        if doc_max <= doc_min {
-            return Ok(0);
-        }
-        let count_fn = load_count_docs()?;
-        let n = unsafe { count_fn(self.key, doc_min, doc_max) };
-        if n < 0 {
-            return Err(format!(
-                "countDocs(key={}, [{},{})) returned {}",
-                self.key, doc_min, doc_max, n
-            ));
-        }
-        Ok(n)
     }
 }
 

@@ -16,33 +16,32 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * End-to-end test for the COUNT_DELEGATION fast path.
+ * End-to-end test for the count fast path.
  * <p>
  * Indexes data across multiple Lucene segments (force-flush between waves so each wave
  * becomes its own segment), then runs PPL {@code stats count()} queries with various
  * predicate shapes and asserts that the returned counts match the oracle the test
  * computed locally.
  * <p>
- * Multi-segment is critical: with one segment the
- * {@code FilterTreeCallbacks.countDocs} upcall fires once; with N segments the
- * {@code SegmentGrouped} partitioner distributes whole segments across DataFusion
- * partitions, so the test exercises the parallel summation behavior we actually care
- * about in production. The whole-segment chunk shape is what unlocks Lucene's
- * {@code Weight.count(LeafReaderContext)} metadata fast path on the data node.
+ * Result correctness is what's asserted here; multi-segment ingest exercises Lucene's
+ * per-leaf {@code Weight.count(LeafReaderContext)} metadata fast path through
+ * {@code IndexSearcher.count(BooleanQuery)} — the primitive the data-node short-circuit
+ * ({@code AnalyticsSearchService.tryCountFastPath} → {@code FilterDelegationHandle.tryCountQuery})
+ * delegates to. The fast path declines (returns empty) when the shard has any deleted
+ * docs; in that case the slow indexed path runs and must produce the same count.
  * <p>
  * Run with:
- * {@code ./gradlew :sandbox:qa:analytics-engine-rest:integTest --tests "*.CountDelegationIT" -Dsandbox.enabled=true}
+ * {@code ./gradlew :sandbox:qa:analytics-engine-rest:integTest --tests "*.CountFastPathIT" -Dsandbox.enabled=true}
  */
-public class CountDelegationIT extends AnalyticsRestTestCase {
+public class CountFastPathIT extends AnalyticsRestTestCase {
 
-    private static final String INDEX = "count_delegation_e2e";
+    private static final String INDEX = "count_fast_path_e2e";
 
     /**
      * Per-userID truth table. Total docs across all segments must equal sum(values).
-     * 'dave' is deliberately omitted from ingestion to assert the zero-match path;
-     * 'carol_only_3rd' appears only in the third segment to validate that
-     * SegmentGrouped doesn't drop or duplicate per-segment counts when most segments
-     * contribute zero matches.
+     * 'dave' is deliberately omitted from ingestion to assert the zero-match path.
+     * 'carol_only_3rd' appears only in the third segment, validating that per-leaf
+     * Weight.count summation handles segments where most leaves contribute zero.
      */
     private static final Map<String, Integer> USER_COUNTS = Map.of("arpit", 7, "bob", 4, "carol", 5, "carol_only_3rd", 3);
 
@@ -52,14 +51,14 @@ public class CountDelegationIT extends AnalyticsRestTestCase {
 
         long total = USER_COUNTS.values().stream().mapToLong(Integer::longValue).sum();
 
-        // Unfiltered count: no Lucene predicate, so the planner shouldn't pick
-        // COUNT_DELEGATION here. Validates the bitmap path's count answer matches
-        // the oracle.
+        // Unfiltered count: no Lucene predicate, so the planner doesn't set the count hint
+        // and the slow path runs. Validates the bitmap/DataFusion path's count answer
+        // matches the oracle.
         assertCount("stats count() as cnt", total);
 
-        // Canonical COUNT_DELEGATION shape: a single index_filter (TermQuery on a
-        // keyword field) with a count(*) aggregate, no projection. Each segment
-        // hits Weight.count(leaf) → docFreq from the term dictionary.
+        // Canonical count fast-path shape: a single index_filter (TermQuery on a
+        // keyword field) with a count(*) aggregate, no projection. IndexSearcher.count's
+        // per-leaf Weight.count(leaf) delivers docFreq from the term dictionary.
         // 'arpit' spans all three segments: 3 + 3 + 1 = 7.
         assertCount("where userID = 'arpit' | stats count() as cnt", USER_COUNTS.get("arpit"));
 
@@ -67,9 +66,8 @@ public class CountDelegationIT extends AnalyticsRestTestCase {
         // per leaf, total is 0.
         assertCount("where userID = 'dave' | stats count() as cnt", 0);
 
-        // Single-segment-only path: 'carol_only_3rd' appears only in segment 2
-        // (3 docs). Tests that SegmentGrouped doesn't drop or duplicate per-segment
-        // counts when most segments contribute zero matches.
+        // Single-segment-only path: 'carol_only_3rd' appears only in segment 2 (3 docs).
+        // Per-leaf Weight.count summation handles segments where most leaves contribute zero.
         assertCount("where userID = 'carol_only_3rd' | stats count() as cnt", USER_COUNTS.get("carol_only_3rd"));
 
         // Full-coverage predicates: every doc has exactly one of these event_type
@@ -129,9 +127,8 @@ public class CountDelegationIT extends AnalyticsRestTestCase {
      *   segment 2: arpit×1, carol_only_3rd×3        (4 docs)
      * </pre>
      *
-     * Total = 19 docs spread across 3 segments. Forces SegmentGrouped to bucket
-     * across multiple partitions and exercises the Weight.count fast path per
-     * segment when COUNT_DELEGATION fires.
+     * Total = 19 docs spread across 3 segments. Multi-segment ingest exercises the
+     * per-leaf Weight.count summation inside IndexSearcher.count.
      */
     private void ingestThreeSegments() throws Exception {
         bulkIndex(
