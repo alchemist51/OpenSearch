@@ -175,11 +175,7 @@ final class CountFastPathDetector {
                 return Eligibility.NOT_ELIGIBLE;
             }
             if (singleExistenceField != null && !singleExistenceField.equals(fsi.getFieldName())) {
-                LOGGER.debug(
-                    "[count-fast-path] skip: multiple distinct count(col): {} and {}",
-                    singleExistenceField,
-                    fsi.getFieldName()
-                );
+                LOGGER.debug("[count-fast-path] skip: multiple distinct count(col): {} and {}", singleExistenceField, fsi.getFieldName());
                 return Eligibility.NOT_ELIGIBLE;
             }
             singleExistenceField = fsi.getFieldName();

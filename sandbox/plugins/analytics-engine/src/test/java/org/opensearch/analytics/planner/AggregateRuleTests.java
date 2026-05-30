@@ -23,6 +23,7 @@ import org.opensearch.analytics.planner.rel.OpenSearchTableScan;
 import org.opensearch.analytics.spi.AggregateCapability;
 import org.opensearch.analytics.spi.AggregateFunction;
 import org.opensearch.analytics.spi.DelegationType;
+import org.opensearch.analytics.spi.FieldStorageInfo;
 import org.opensearch.analytics.spi.FieldType;
 import org.opensearch.analytics.spi.ScanCapability;
 
@@ -150,6 +151,77 @@ public class AggregateRuleTests extends BasePlannerRulesTests {
         OpenSearchAggregate agg = (OpenSearchAggregate) unwrapRootReducer(result);
         assertTrue(agg.getViableBackends().contains(MockLuceneBackend.NAME));
         assertCallAnnotation(agg, 0, MockDataFusionBackend.NAME, MockLuceneBackend.NAME);
+    }
+
+    /**
+     * Lucene-as-driver for count(*) over a keyword filter. Lucene declares
+     * {@link ScanCapability.InvertedIndex} (metadata-only scan, no row values) and
+     * {@link AggregateCapability} for COUNT on keyword. The chain
+     * Aggregate(count*) → Filter → Scan must mark Lucene viable end-to-end so
+     * PlanForker emits a Lucene-driver alternative — the precondition for the
+     * Lucene-driven count fast path.
+     */
+    public void testCountStarOverKeywordFilterMarksLuceneViable() {
+        MockLuceneBackend luceneWithCountSupport = new MockLuceneBackend() {
+            @Override
+            protected Set<ScanCapability> scanCapabilities() {
+                return Set.of(new ScanCapability.InvertedIndex(Set.of(MockLuceneBackend.LUCENE_DATA_FORMAT), Set.of(FieldType.KEYWORD)));
+            }
+
+            @Override
+            protected Set<AggregateCapability> aggregateCapabilities() {
+                return aggCaps(Set.of(MockLuceneBackend.LUCENE_DATA_FORMAT), Map.of(AggregateFunction.COUNT, Set.of(FieldType.KEYWORD)));
+            }
+        };
+        // Keyword field indexed by both backends — DF reads parquet doc values, Lucene
+        // walks its inverted index. indexFormats lists Lucene so metadataScanBackendsForField
+        // returns Lucene for this field.
+        Map<String, FieldStorageInfo> keywordStorage = Map.of(
+            "status",
+            new FieldStorageInfo(
+                "status",
+                "keyword",
+                FieldType.KEYWORD,
+                List.of(MockDataFusionBackend.PARQUET_DATA_FORMAT),
+                List.of(MockLuceneBackend.LUCENE_DATA_FORMAT, MockDataFusionBackend.PARQUET_DATA_FORMAT),
+                List.of(),
+                false
+            ),
+            "size",
+            new FieldStorageInfo(
+                "size",
+                "keyword",
+                FieldType.KEYWORD,
+                List.of(MockDataFusionBackend.PARQUET_DATA_FORMAT),
+                List.of(MockLuceneBackend.LUCENE_DATA_FORMAT, MockDataFusionBackend.PARQUET_DATA_FORMAT),
+                List.of(),
+                false
+            )
+        );
+        PlannerContext context = buildContextWithExplicitStorage(1, keywordStorage, List.of(DATAFUSION, luceneWithCountSupport));
+        SqlTypeName[] varcharTypes = new SqlTypeName[] { SqlTypeName.VARCHAR, SqlTypeName.VARCHAR };
+        RelNode result = runPlanner(
+            makeAggregate(
+                makeFilter(
+                    stubScan(mockTable("test_index", new String[] { "status", "size" }, varcharTypes)),
+                    makeEquals(0, SqlTypeName.VARCHAR, "GET")
+                ),
+                countStarCall()
+            ),
+            context
+        );
+        logger.info("Plan:\n{}", RelOptUtil.toString(result));
+        assertPipelineViableBackends(
+            result,
+            List.of(OpenSearchAggregate.class, OpenSearchFilter.class, OpenSearchTableScan.class),
+            Set.of(MockDataFusionBackend.NAME, MockLuceneBackend.NAME)
+        );
+        OpenSearchAggregate agg = (OpenSearchAggregate) unwrapRootReducer(result);
+        assertTrue(
+            "Lucene must be viable for count(*) over keyword filter — preconditions for the Lucene-driver fast path",
+            agg.getViableBackends().contains(MockLuceneBackend.NAME)
+        );
+        assertTrue("DataFusion stays viable as the existing driver", agg.getViableBackends().contains(MockDataFusionBackend.NAME));
     }
 
     // ---- Composed pipeline shapes ----

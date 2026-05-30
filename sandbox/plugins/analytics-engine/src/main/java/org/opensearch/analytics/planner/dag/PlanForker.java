@@ -9,6 +9,8 @@
 package org.opensearch.analytics.planner.dag;
 
 import org.apache.calcite.rel.RelNode;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.planner.CapabilityRegistry;
 import org.opensearch.analytics.planner.rel.OpenSearchRelNode;
 import org.opensearch.analytics.planner.rel.OperatorAnnotation;
@@ -34,6 +36,8 @@ import java.util.List;
  */
 public class PlanForker {
 
+    private static final Logger LOGGER = LogManager.getLogger(PlanForker.class);
+
     private PlanForker() {}
 
     public static void forkAll(QueryDAG dag, CapabilityRegistry registry) {
@@ -48,7 +52,14 @@ public class PlanForker {
             return;
         }
         List<Resolved> alternatives = resolve(stage.getFragment(), registry);
-        stage.setPlanAlternatives(alternatives.stream().map(resolved -> new StagePlan(resolved.node, resolved.chosenBackend)).toList());
+        List<StagePlan> plans = alternatives.stream().map(resolved -> new StagePlan(resolved.node, resolved.chosenBackend)).toList();
+        stage.setPlanAlternatives(plans);
+        LOGGER.debug(
+            "[plan-forker] stageId={} type={} alternatives={}",
+            stage.getStageId(),
+            stage.getExecutionType(),
+            plans.stream().map(StagePlan::backendId).toList()
+        );
     }
 
     /** Resolved node paired with the backend chosen at this operator level. */

@@ -131,13 +131,10 @@ public class FragmentConversionDriver {
             // Pre-conversion eligibility for the count fast path. When eligible, force
             // fuseDualViable for this plan so the combiner produces one DelegatedExpression
             // covering the entire filter (which is what tryCountQuery on the data node ANDs).
-            CountFastPathDetector.Eligibility countEligibility = CountFastPathDetector.preCheck(
-                plan.resolvedFragment(),
-                plan.backendId()
-            );
+            CountFastPathDetector.Eligibility countEligibility = CountFastPathDetector.preCheck(plan.resolvedFragment(), plan.backendId());
             boolean effectiveFuseDualViable = fuseDualViable || countEligibility.eligible();
 
-            LOGGER.info(
+            LOGGER.debug(
                 "[fragment-conversion] backend={} treeShape={} countEligible={} fuseDualViable={}",
                 plan.backendId(),
                 treeShape,

@@ -15,10 +15,7 @@ import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentReader;
-import org.apache.lucene.search.BooleanClause;
-import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreMode;
@@ -40,7 +37,6 @@ import java.lang.foreign.ValueLayout;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.OptionalLong;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
@@ -278,60 +274,6 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
     public void close() {
         weightsByProviderKey.clear();
         scorersByCollectorKey.clear();
-    }
-
-    @Override
-    public OptionalLong tryCountQuery(List<String> existenceFields) {
-        // Whole-shard deletes gate. IndexSearcher.count's per-leaf Weight.count(leaf) returns
-        // -1 on dirty leaves and self-heals via totalHitCount fallback (correct but slow); we
-        // promise the user "fast" so we decline rather than silently iterate. Conservative —
-        // a per-leaf gate would recover throughput but adds code; defer until measured.
-        if (directoryReader.numDeletedDocs() > 0) {
-            LOGGER.debug("[count-fast-path] decline: shard has {} deleted docs", directoryReader.numDeletedDocs());
-            return OptionalLong.empty();
-        }
-        if (queriesByAnnotationId.isEmpty() && existenceFields.isEmpty()) {
-            // No filter and no existence requirement → count(*) over MatchAllDocs would equal numDocs,
-            // but the no-delegation path (no DelegatedExpression) wouldn't reach this handle today. Defensive.
-            return OptionalLong.empty();
-        }
-        try {
-            Query combined = buildCombinedQuery(existenceFields);
-            long n = searcher.count(combined);
-            LOGGER.info(
-                "[count-fast-path] tryCountQuery returns {} (queries={}, existenceFields={})",
-                n,
-                queriesByAnnotationId.size(),
-                existenceFields
-            );
-            return OptionalLong.of(n);
-        } catch (IOException e) {
-            LOGGER.warn("[count-fast-path] IOException during searcher.count, declining fast path", e);
-            return OptionalLong.empty();
-        }
-    }
-
-    /**
-     * Builds the BooleanQuery the count fast path runs against. Single-clause shapes
-     * (one delegated query, no existence fields; OR a single existence field, no delegated
-     * queries) skip the BooleanQuery wrapper to keep the metadata fast path reachable.
-     */
-    private Query buildCombinedQuery(List<String> existenceFields) {
-        int totalClauses = queriesByAnnotationId.size() + existenceFields.size();
-        if (totalClauses == 1) {
-            if (queriesByAnnotationId.size() == 1) {
-                return queriesByAnnotationId.values().iterator().next();
-            }
-            return new FieldExistsQuery(existenceFields.get(0));
-        }
-        BooleanQuery.Builder b = new BooleanQuery.Builder();
-        for (Query q : queriesByAnnotationId.values()) {
-            b.add(q, BooleanClause.Occur.MUST);
-        }
-        for (String field : existenceFields) {
-            b.add(new FieldExistsQuery(field), BooleanClause.Occur.MUST);
-        }
-        return b.build();
     }
 
     private SegmentReader unwrapSegmentReader(LeafReader reader) {

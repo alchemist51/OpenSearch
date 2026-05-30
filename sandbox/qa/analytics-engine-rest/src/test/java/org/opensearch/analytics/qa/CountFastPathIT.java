@@ -16,21 +16,29 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * End-to-end test for the count fast path.
- * <p>
- * Indexes data across multiple Lucene segments (force-flush between waves so each wave
- * becomes its own segment), then runs PPL {@code stats count()} queries with various
- * predicate shapes and asserts that the returned counts match the oracle the test
- * computed locally.
- * <p>
- * Result correctness is what's asserted here; multi-segment ingest exercises Lucene's
- * per-leaf {@code Weight.count(LeafReaderContext)} metadata fast path through
- * {@code IndexSearcher.count(BooleanQuery)} — the primitive the data-node short-circuit
- * ({@code AnalyticsSearchService.tryCountFastPath} → {@code FilterDelegationHandle.tryCountQuery})
- * delegates to. The fast path declines (returns empty) when the shard has any deleted
- * docs; in that case the slow indexed path runs and must produce the same count.
- * <p>
- * Run with:
+ * End-to-end tests for the count fast path covering the four shape buckets the planner
+ * must navigate:
+ *
+ * <ol>
+ *   <li><b>Lucene-only viable</b> — predicate references a keyword/text field that lives in
+ *       Lucene's secondary inverted index and isn't reproducible by the parquet/DataFusion
+ *       column scan. Lucene drives end-to-end via {@code LuceneCountSearchExecEngine}.</li>
+ *   <li><b>DataFusion-only viable</b> — predicate references a numeric field which only
+ *       parquet has doc values for; Lucene is not viable for the operator and must NOT be
+ *       picked. The DataFusion engine path runs.</li>
+ *   <li><b>Mixed AND/OR</b> — leaves split between backends. {@code FilterTreeShape} drives
+ *       the conjunctive vs disjunctive delegation, and (when the count detector matches) the
+ *       combiner fuses both sides into one Lucene query.</li>
+ *   <li><b>Full-text on a text field</b> — {@code MATCH(message, ...)} resolves only on
+ *       Lucene; correctness delegation puts the predicate on Lucene's side and the count
+ *       fast path runs.</li>
+ * </ol>
+ *
+ * <p>Multi-segment ingest exercises Lucene's per-leaf {@code Weight.count(LeafReaderContext)}
+ * summation. Each test method computes its own oracle from {@link #DOCS} so adding rows in
+ * one place doesn't silently break a different assertion.
+ *
+ * <p>Run with:
  * {@code ./gradlew :sandbox:qa:analytics-engine-rest:integTest --tests "*.CountFastPathIT" -Dsandbox.enabled=true}
  */
 public class CountFastPathIT extends AnalyticsRestTestCase {
@@ -38,48 +46,229 @@ public class CountFastPathIT extends AnalyticsRestTestCase {
     private static final String INDEX = "count_fast_path_e2e";
 
     /**
-     * Per-userID truth table. Total docs across all segments must equal sum(values).
-     * 'dave' is deliberately omitted from ingestion to assert the zero-match path.
-     * 'carol_only_3rd' appears only in the third segment, validating that per-leaf
-     * Weight.count summation handles segments where most leaves contribute zero.
+     * Single source of truth — every assertion's oracle is computed from this list.
+     * Layout (segment splits in {@link #ingestThreeSegments}):
+     * <pre>
+     *   segment 0: arpit/click/10/us/"alpha beta", arpit/view/20/eu/"beta gamma",
+     *              arpit/click/30/us/"alpha", bob/view/40/eu/"gamma",
+     *              bob/click/50/us/"alpha beta gamma", carol/view/60/apac/"alpha gamma",
+     *              carol/click/70/apac/"beta"
+     *   segment 1: arpit/view/11/us/"alpha alpha", arpit/click/21/eu/"beta",
+     *              arpit/view/31/us/"gamma", bob/click/41/eu/"alpha",
+     *              bob/view/51/us/"alpha beta", carol/click/61/apac/"gamma alpha",
+     *              carol/view/71/apac/"beta beta", carol/click/81/us/"alpha"
+     *   segment 2: arpit/view/12/us/"alpha", carol_only_3rd/click/22/eu/"beta gamma",
+     *              carol_only_3rd/view/32/eu/"alpha", carol_only_3rd/click/42/apac/"gamma"
+     * </pre>
      */
-    private static final Map<String, Integer> USER_COUNTS = Map.of("arpit", 7, "bob", 4, "carol", 5, "carol_only_3rd", 3);
+    private static final List<Doc> DOCS = List.of(
+        // segment 0
+        new Doc("arpit", "click", 10, "us", "alpha beta"),
+        new Doc("arpit", "view", 20, "eu", "beta gamma"),
+        new Doc("arpit", "click", 30, "us", "alpha"),
+        new Doc("bob", "view", 40, "eu", "gamma"),
+        new Doc("bob", "click", 50, "us", "alpha beta gamma"),
+        new Doc("carol", "view", 60, "apac", "alpha gamma"),
+        new Doc("carol", "click", 70, "apac", "beta"),
+        // segment 1
+        new Doc("arpit", "view", 11, "us", "alpha alpha"),
+        new Doc("arpit", "click", 21, "eu", "beta"),
+        new Doc("arpit", "view", 31, "us", "gamma"),
+        new Doc("bob", "click", 41, "eu", "alpha"),
+        new Doc("bob", "view", 51, "us", "alpha beta"),
+        new Doc("carol", "click", 61, "apac", "gamma alpha"),
+        new Doc("carol", "view", 71, "apac", "beta beta"),
+        new Doc("carol", "click", 81, "us", "alpha"),
+        // segment 2
+        new Doc("arpit", "view", 12, "us", "alpha"),
+        new Doc("carol_only_3rd", "click", 22, "eu", "beta gamma"),
+        new Doc("carol_only_3rd", "view", 32, "eu", "alpha"),
+        new Doc("carol_only_3rd", "click", 42, "apac", "gamma")
+    );
+
+    /** Range of doc indices that go into each segment (start inclusive, end exclusive). */
+    private static final int[] SEGMENT_BOUNDS = { 0, 7, 15, DOCS.size() };
 
     public void testCountAcrossMultipleSegments() throws Exception {
         createIndex();
         ingestThreeSegments();
 
-        long total = USER_COUNTS.values().stream().mapToLong(Integer::longValue).sum();
+        long total = DOCS.size();
 
-        // Unfiltered count: no Lucene predicate, so the planner doesn't set the count hint
-        // and the slow path runs. Validates the bitmap/DataFusion path's count answer
-        // matches the oracle.
+        // Unfiltered count: no predicate, Lucene driver still picks up via metadata-only scan.
+        // Validates the count(*) fast path through Lucene's IndexReader.numDocs.
         assertCount("stats count() as cnt", total);
 
-        // Canonical count fast-path shape: a single index_filter (TermQuery on a
-        // keyword field) with a count(*) aggregate, no projection. IndexSearcher.count's
-        // per-leaf Weight.count(leaf) delivers docFreq from the term dictionary.
-        // 'arpit' spans all three segments: 3 + 3 + 1 = 7.
-        assertCount("where userID = 'arpit' | stats count() as cnt", USER_COUNTS.get("arpit"));
+        // Single keyword equality (Lucene-only viable: keyword has indexFormats=[lucene],
+        // operator EQ supported on Lucene). 'arpit' appears 7 times across all three segments.
+        assertCount("where userID = 'arpit' | stats count() as cnt", oracleWhere(d -> d.userID.equals("arpit")));
 
-        // Zero-match path: 'dave' isn't in any segment → Weight.count returns 0
-        // per leaf, total is 0.
+        // Zero-match: 'dave' isn't in any segment → Weight.count returns 0 per leaf.
         assertCount("where userID = 'dave' | stats count() as cnt", 0);
 
-        // Single-segment-only path: 'carol_only_3rd' appears only in segment 2 (3 docs).
-        // Per-leaf Weight.count summation handles segments where most leaves contribute zero.
-        assertCount("where userID = 'carol_only_3rd' | stats count() as cnt", USER_COUNTS.get("carol_only_3rd"));
+        // Single-segment-only term: 'carol_only_3rd' only in segment 2. Per-leaf summation
+        // covers segments where most leaves contribute zero.
+        assertCount(
+            "where userID = 'carol_only_3rd' | stats count() as cnt",
+            oracleWhere(d -> d.userID.equals("carol_only_3rd"))
+        );
 
-        // Full-coverage predicates: every doc has exactly one of these event_type
-        // values, so clicks + views must equal totalDocs. Exercises the path where
-        // Weight.count returns numDocs equivalent and per-segment sums add up.
+        // Coverage parity: every doc has exactly one event_type, so click_count + view_count = total.
         long clicks = countOf("where event_type = 'click' | stats count() as cnt");
         long views = countOf("where event_type = 'view' | stats count() as cnt");
-        assertEquals(
-            "clicks + views must equal total docs (every event has one type)",
-            total,
-            clicks + views
+        assertEquals("clicks + views must equal total docs (every event has one type)", total, clicks + views);
+    }
+
+    /**
+     * Predicates that only DataFusion can answer — numeric range on the parquet-backed
+     * {@code amount} field. Lucene has no doc values for it (long fields aren't in the
+     * STANDARD_TYPES set), so the planner must drop Lucene from the alternative list and
+     * the DataFusion engine path runs end-to-end. Asserted via correctness of the count.
+     */
+    public void testNumericFilter_dataFusionOnly() throws Exception {
+        createIndex();
+        ingestThreeSegments();
+
+        assertCount("where amount > 50 | stats count() as cnt", oracleWhere(d -> d.amount > 50));
+        assertCount("where amount >= 50 | stats count() as cnt", oracleWhere(d -> d.amount >= 50));
+        assertCount("where amount = 22 | stats count() as cnt", oracleWhere(d -> d.amount == 22));
+        // Empty range — every doc's amount > 0, so amount<0 is empty.
+        assertCount("where amount < 0 | stats count() as cnt", 0);
+    }
+
+    /**
+     * Mixed-backend AND: keyword-side leaf (Lucene viable) AND numeric-side leaf
+     * (DataFusion-only). With {@code fuseDualViable} on for count fast path, the planner
+     * delegates the keyword leaf to Lucene as a {@code DelegatedExpression} while DataFusion
+     * still owns the numeric leaf. With it off, both leaves stay native on the chosen backend.
+     * Either way, the count must match the oracle.
+     */
+    public void testMixedAndFilter_keywordPlusNumeric() throws Exception {
+        createIndex();
+        ingestThreeSegments();
+
+        assertCount(
+            "where userID = 'arpit' AND amount > 20 | stats count() as cnt",
+            oracleWhere(d -> d.userID.equals("arpit") && d.amount > 20)
         );
+
+        // OR across backends — the combiner declines to fuse under disjunction unless
+        // dual-viable is in effect (count fast path forces it on).
+        assertCount(
+            "where userID = 'bob' OR amount = 42 | stats count() as cnt",
+            oracleWhere(d -> d.userID.equals("bob") || d.amount == 42)
+        );
+    }
+
+    /**
+     * Pure Lucene-side AND/OR over keyword fields. Both leaves are correctness-delegated to
+     * Lucene; the combiner emits a single fused {@code BoolQueryBuilder} which Lucene's
+     * {@code IndexSearcher.count} resolves via the term dictionary.
+     */
+    public void testKeywordBooleanFilter_luceneFused() throws Exception {
+        createIndex();
+        ingestThreeSegments();
+
+        assertCount(
+            "where userID = 'arpit' AND event_type = 'click' | stats count() as cnt",
+            oracleWhere(d -> d.userID.equals("arpit") && d.eventType.equals("click"))
+        );
+
+        assertCount(
+            "where region = 'us' AND event_type = 'view' | stats count() as cnt",
+            oracleWhere(d -> d.region.equals("us") && d.eventType.equals("view"))
+        );
+
+        assertCount(
+            "where userID = 'bob' OR userID = 'carol_only_3rd' | stats count() as cnt",
+            oracleWhere(d -> d.userID.equals("bob") || d.userID.equals("carol_only_3rd"))
+        );
+
+        // Three-way AND across keyword fields exercises BoolQueryBuilder with multiple MUST clauses.
+        assertCount(
+            "where userID = 'arpit' AND event_type = 'view' AND region = 'us' | stats count() as cnt",
+            oracleWhere(d -> d.userID.equals("arpit") && d.eventType.equals("view") && d.region.equals("us"))
+        );
+    }
+
+    /**
+     * NOT and not-equals on keyword. Both lower to {@code BoolQueryBuilder.mustNot} —
+     * still Lucene-viable, still the fast path.
+     */
+    public void testNegationFilter() throws Exception {
+        createIndex();
+        ingestThreeSegments();
+
+        assertCount(
+            "where userID != 'arpit' | stats count() as cnt",
+            oracleWhere(d -> !d.userID.equals("arpit"))
+        );
+
+        assertCount(
+            "where NOT(event_type = 'click') | stats count() as cnt",
+            oracleWhere(d -> !d.eventType.equals("click"))
+        );
+    }
+
+    /**
+     * IN-list lowers to {@code BoolQueryBuilder.should} (term-set query) on Lucene.
+     */
+    public void testInListFilter() throws Exception {
+        createIndex();
+        ingestThreeSegments();
+
+        assertCount(
+            "where userID IN ('arpit', 'carol') | stats count() as cnt",
+            oracleWhere(d -> d.userID.equals("arpit") || d.userID.equals("carol"))
+        );
+
+        // Single-element IN reduces to equality.
+        assertCount(
+            "where region IN ('apac') | stats count() as cnt",
+            oracleWhere(d -> d.region.equals("apac"))
+        );
+    }
+
+    /**
+     * Full-text {@code MATCH} on a text field. Only Lucene supports MATCH for any field
+     * type, so the planner chooses Lucene and ships the predicate as a NamedWriteable
+     * {@code MatchQueryBuilder}.
+     */
+    public void testFullTextMatchFilter() throws Exception {
+        createIndex();
+        ingestThreeSegments();
+
+        // 'alpha' appears in many docs; oracle counts whitespace-tokenised occurrences.
+        assertCount(
+            "where match(message, 'alpha') | stats count() as cnt",
+            oracleWhere(d -> tokenizedContains(d.message, "alpha"))
+        );
+
+        // Term that's present in fewer docs.
+        assertCount(
+            "where match(message, 'gamma') | stats count() as cnt",
+            oracleWhere(d -> tokenizedContains(d.message, "gamma"))
+        );
+
+        // Combined with a keyword filter — both delegate to Lucene, fused into one BoolQueryBuilder.
+        assertCount(
+            "where userID = 'arpit' AND match(message, 'alpha') | stats count() as cnt",
+            oracleWhere(d -> d.userID.equals("arpit") && tokenizedContains(d.message, "alpha"))
+        );
+    }
+
+    // ── Oracle helpers ──────────────────────────────────────────────────────
+
+    private static long oracleWhere(java.util.function.Predicate<Doc> p) {
+        return DOCS.stream().filter(p).count();
+    }
+
+    /** Standard-analyzer-equivalent: token equality on whitespace splits. */
+    private static boolean tokenizedContains(String text, String token) {
+        for (String t : text.toLowerCase(java.util.Locale.ROOT).split("\\s+")) {
+            if (t.equals(token)) return true;
+        }
+        return false;
     }
 
     // ── Setup ───────────────────────────────────────────────────────────────
@@ -102,6 +291,8 @@ public class CountFastPathIT extends AnalyticsRestTestCase {
             + "  \"properties\": {"
             + "    \"userID\": { \"type\": \"keyword\" },"
             + "    \"event_type\": { \"type\": \"keyword\" },"
+            + "    \"region\": { \"type\": \"keyword\" },"
+            + "    \"message\": { \"type\": \"text\" },"
             + "    \"amount\": { \"type\": \"long\" }"
             + "  }"
             + "}"
@@ -118,61 +309,39 @@ public class CountFastPathIT extends AnalyticsRestTestCase {
     }
 
     /**
-     * Ingest in three waves with force-flush between each wave so each wave becomes
-     * its own Lucene segment. Per-userID totals match {@link #USER_COUNTS}.
-     *
-     * <pre>
-     *   segment 0: arpit×3, bob×2, carol×2          (7 docs)
-     *   segment 1: arpit×3, bob×2, carol×3          (8 docs)
-     *   segment 2: arpit×1, carol_only_3rd×3        (4 docs)
-     * </pre>
-     *
-     * Total = 19 docs spread across 3 segments. Multi-segment ingest exercises the
-     * per-leaf Weight.count summation inside IndexSearcher.count.
+     * Ingest in three waves (defined by {@link #SEGMENT_BOUNDS}) with force-flush between
+     * each so each wave becomes its own Lucene segment. Multi-segment ingest exercises the
+     * per-leaf {@code Weight.count} summation inside {@code IndexSearcher.count}.
      */
     private void ingestThreeSegments() throws Exception {
-        bulkIndex(
-            docs(
-                doc("arpit", "click", 10),
-                doc("arpit", "view", 20),
-                doc("arpit", "click", 30),
-                doc("bob", "view", 40),
-                doc("bob", "click", 50),
-                doc("carol", "view", 60),
-                doc("carol", "click", 70)
-            )
-        );
-        flush();
-
-        bulkIndex(
-            docs(
-                doc("arpit", "view", 11),
-                doc("arpit", "click", 21),
-                doc("arpit", "view", 31),
-                doc("bob", "click", 41),
-                doc("bob", "view", 51),
-                doc("carol", "click", 61),
-                doc("carol", "view", 71),
-                doc("carol", "click", 81)
-            )
-        );
-        flush();
-
-        bulkIndex(
-            docs(
-                doc("arpit", "view", 12),
-                doc("carol_only_3rd", "click", 22),
-                doc("carol_only_3rd", "view", 32),
-                doc("carol_only_3rd", "click", 42)
-            )
-        );
-        flush();
+        for (int seg = 0; seg < SEGMENT_BOUNDS.length - 1; seg++) {
+            int from = SEGMENT_BOUNDS[seg];
+            int to = SEGMENT_BOUNDS[seg + 1];
+            String[] batch = new String[to - from];
+            for (int i = from; i < to; i++) {
+                batch[i - from] = DOCS.get(i).toJson();
+            }
+            bulkIndex(docs(batch));
+            flush();
+        }
     }
 
-    // ── Document builders ───────────────────────────────────────────────────
+    // ── Document model ──────────────────────────────────────────────────────
 
-    private static String doc(String userID, String eventType, long amount) {
-        return "{\"userID\": \"" + userID + "\", \"event_type\": \"" + eventType + "\", \"amount\": " + amount + "}";
+    private record Doc(String userID, String eventType, long amount, String region, String message) {
+        String toJson() {
+            return "{\"userID\": \""
+                + userID
+                + "\", \"event_type\": \""
+                + eventType
+                + "\", \"region\": \""
+                + region
+                + "\", \"message\": \""
+                + message
+                + "\", \"amount\": "
+                + amount
+                + "}";
+        }
     }
 
     private static String docs(String... documents) {

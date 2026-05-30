@@ -126,8 +126,7 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(AnalyticsPlugin.COORDINATOR_BUFFER_LIMIT, v -> perQueryBufferLimit = v);
         this.fuseDualViable = AnalyticsPlugin.DELEGATION_FUSE_DUAL_VIABLE.get(clusterService.getSettings());
-        clusterService.getClusterSettings()
-            .addSettingsUpdateConsumer(AnalyticsPlugin.DELEGATION_FUSE_DUAL_VIABLE, v -> fuseDualViable = v);
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(AnalyticsPlugin.DELEGATION_FUSE_DUAL_VIABLE, v -> fuseDualViable = v);
         this.indexNameExpressionResolver = indexNameExpressionResolver;
     }
 

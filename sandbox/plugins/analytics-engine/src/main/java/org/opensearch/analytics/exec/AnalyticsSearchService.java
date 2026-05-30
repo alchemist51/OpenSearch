@@ -10,11 +10,6 @@ package org.opensearch.analytics.exec;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.BigIntVector;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.types.pojo.ArrowType;
-import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.FieldType;
-import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.backend.AnalyticsOperationListener;
@@ -33,7 +28,6 @@ import org.opensearch.analytics.spi.FilterDelegationHandle;
 import org.opensearch.analytics.spi.FragmentInstructionHandler;
 import org.opensearch.analytics.spi.FragmentInstructionHandlerFactory;
 import org.opensearch.analytics.spi.InstructionNode;
-import org.opensearch.analytics.spi.ShardScanInstructionNode;
 import org.opensearch.arrow.allocator.ArrowNativeAllocator;
 import org.opensearch.arrow.spi.NativeAllocatorPoolConfig;
 import org.opensearch.common.concurrent.GatedCloseable;
@@ -47,12 +41,9 @@ import org.opensearch.tasks.Task;
 import org.opensearch.tasks.TaskResourceTrackingService;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.OptionalLong;
 import java.util.concurrent.Executor;
 
 /**
@@ -318,19 +309,9 @@ public class AnalyticsSearchService implements AutoCloseable {
             ShardScanExecutionContext ctx = buildContext(request, readerContext.getReader(), resolved.plan, shard, task);
             AnalyticsSearchBackendPlugin backend = backends.get(resolved.plan.getBackendId());
 
-            // Acquire the delegation handle up front so the count fast path can attempt
-            // tryCountQuery before we pay for instruction-handler setup (FFM SessionContext
-            // creation, UDF registration). The same handle is wired into the backend context
-            // for the slow path via DelegationSetup.configureOn — single ownership chain.
-            delegationSetup = acquireDelegationSetup(resolved.plan.getDelegationDescriptor(), ctx);
-
-            FragmentResources fastPath = tryCountFastPath(resolved.plan.getInstructions(), delegationSetup, readerContext);
-            if (fastPath != null) {
-                delegationSetup = null;  // fast path consumed and closed the handle
-                return fastPath;
-            }
-
             backendContext = applyInstructionHandlers(backend, resolved.plan.getInstructions(), ctx);
+
+            delegationSetup = acquireDelegationSetup(resolved.plan.getDelegationDescriptor(), ctx);
 
             if (delegationSetup != null) {
                 delegationSetup.configureOn(backend, backendContext, task);
@@ -492,125 +473,12 @@ public class AnalyticsSearchService implements AutoCloseable {
         return () -> driving.setDelegationThreadTracker(null);
     }
 
-    /**
-     * Count fast path: when the plan carries a count-query hint and we have a delegation handle,
-     * ask the accepting backend to answer the count directly. On success returns a
-     * {@link FragmentResources} wrapping a precomputed one-row Arrow batch and consumes
-     * (closes) the delegation handle. On any check failure or empty {@code OptionalLong},
-     * returns {@code null} — caller continues down the slow path with the handle intact.
-     *
-     * <p>Bails out without an exception (returns {@code null}) when the instruction list isn't
-     * a single {@link ShardScanInstructionNode} (or subclass). Future multi-instruction plans
-     * just won't take this fast path; the slow path keeps working.
-     */
-    private FragmentResources tryCountFastPath(
-        List<InstructionNode> instructions,
-        DelegationSetup delegationSetup,
-        ReaderContext readerContext
-    ) {
-        if (delegationSetup == null) return null;
-        if (instructions.size() != 1) return null;
-        if (!(instructions.get(0) instanceof ShardScanInstructionNode scanNode)) return null;
-        if (!scanNode.countQuery()) return null;
-
-        OptionalLong fast = delegationSetup.handle().tryCountQuery(scanNode.countExistenceFields());
-        if (fast.isEmpty()) return null;
-
-        long count = fast.getAsLong();
-        try {
-            delegationSetup.close();
-        } catch (IOException e) {
-            // Closing the handle is best-effort here — the count itself succeeded. Surface
-            // close failures via the FragmentResources return path is awkward, so log + swallow.
-            LOGGER.warn("Failed to close delegation handle after count fast path", e);
-        }
-        EngineResultStream stream = buildOneRowCountStream(scanNode.partialCountColumnNames(), count);
-        LOGGER.info(
-            "[count-fast-path] short-circuit: count={} columns={} (skipping engine execution)",
-            count,
-            scanNode.partialCountColumnNames()
-        );
-        return new FragmentResources(readerContextStore, readerContext, null, stream, null);
-    }
-
-    /**
-     * Builds a one-row Arrow {@link VectorSchemaRoot} carrying {@code count} as the value of
-     * every column listed in {@code columnNames}. Schema: each column is a non-nullable Int64.
-     * Wraps the VSR in a single-batch {@link EngineResultStream}.
-     *
-     * <p>Multiple count calls in the same aggregate (e.g. {@code count() as a, count() as b})
-     * all map to the same long because the detector restricts the eligible shape to "all
-     * count(*) or all count(SAME_col)".
-     */
-    private EngineResultStream buildOneRowCountStream(List<String> columnNames, long count) {
-        FieldType int64NotNull = new FieldType(false, new ArrowType.Int(64, true), null);
-        List<Field> fields = new ArrayList<>(columnNames.size());
-        for (String name : columnNames) {
-            fields.add(new Field(name, int64NotNull, null));
-        }
-        VectorSchemaRoot vsr = VectorSchemaRoot.create(new Schema(fields), allocator);
-        vsr.allocateNew();
-        for (int i = 0; i < columnNames.size(); i++) {
-            BigIntVector v = (BigIntVector) vsr.getVector(i);
-            v.setSafe(0, count);
-        }
-        vsr.setRowCount(1);
-        return new SingleBatchStream(vsr);
-    }
-
-    /**
-     * One-batch {@link EngineResultStream} backed by a pre-built {@link VectorSchemaRoot}.
-     * The iterator yields the batch once; close releases the VSR's buffers.
-     */
-    private static final class SingleBatchStream implements EngineResultStream {
-        private final VectorSchemaRoot root;
-        private boolean consumed;
-
-        SingleBatchStream(VectorSchemaRoot root) {
-            this.root = root;
-        }
-
-        @Override
-        public Iterator<EngineResultBatch> iterator() {
-            if (consumed) {
-                return Collections.emptyIterator();
-            }
-            consumed = true;
-            EngineResultBatch batch = new EngineResultBatch() {
-                @Override
-                public VectorSchemaRoot getArrowRoot() {
-                    return root;
-                }
-
-                @Override
-                public List<String> getFieldNames() {
-                    List<String> names = new ArrayList<>(root.getFieldVectors().size());
-                    root.getFieldVectors().forEach(v -> names.add(v.getName()));
-                    return names;
-                }
-
-                @Override
-                public int getRowCount() {
-                    return root.getRowCount();
-                }
-
-                @Override
-                public Object getFieldValue(String fieldName, int rowIndex) {
-                    return root.getVector(fieldName).getObject(rowIndex);
-                }
-            };
-            return Collections.singletonList(batch).iterator();
-        }
-
-        @Override
-        public void close() {
-            root.close();
-        }
-    }
-
     private record ResolvedFragment(IndexReaderProvider readerProvider, FragmentExecutionRequest.PlanAlternative plan, String queryId,
         int stageId, String shardIdStr) {
     }
+
+    /** Prefer this backend among the registered alternatives when present — count fast path. */
+    private static final String PREFERRED_BACKEND_ID = "lucene";
 
     private ResolvedFragment resolveFragment(FragmentExecutionRequest request, IndexShard shard) {
         IndexReaderProvider readerProvider = shard.getReaderProvider();
@@ -618,14 +486,25 @@ public class AnalyticsSearchService implements AutoCloseable {
             throw new IllegalStateException("No ReaderProvider on " + shard.shardId());
         }
 
-        // Select the first available plan alternative whose backend is registered on this node.
-        // TODO: smarter selection based on data node capabilities/load
+        // Select among registered plan alternatives. Prefer Lucene when present — Lucene is
+        // only marked viable end-to-end when the fragment is fully metadata-soluble (count
+        // fast path today), so when it appears among alternatives it's strictly faster than
+        // the DataFusion alternative for the same fragment. Future Lucene-soluble shapes
+        // (group-by-count, top-K terms) plug in here naturally without a new selection rule.
         FragmentExecutionRequest.PlanAlternative selectedPlan = null;
+        FragmentExecutionRequest.PlanAlternative fallbackPlan = null;
         for (FragmentExecutionRequest.PlanAlternative alt : request.getPlanAlternatives()) {
-            if (backends.containsKey(alt.getBackendId())) {
+            if (!backends.containsKey(alt.getBackendId())) continue;
+            if (PREFERRED_BACKEND_ID.equals(alt.getBackendId())) {
                 selectedPlan = alt;
                 break;
             }
+            if (fallbackPlan == null) {
+                fallbackPlan = alt;
+            }
+        }
+        if (selectedPlan == null) {
+            selectedPlan = fallbackPlan;
         }
         if (selectedPlan == null) {
             throw new IllegalArgumentException(
