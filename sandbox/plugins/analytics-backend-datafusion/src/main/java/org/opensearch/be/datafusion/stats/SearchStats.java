@@ -33,6 +33,18 @@ public class SearchStats implements Writeable, ToXContentFragment {
     public final long listingTableScan;
     public final long singleCollectorScan;
     public final long bitmapTreeScan;
+    public final long maskSliceTimeMs;
+    public final long projectionFixupTimeMs;
+    public final long coalesceTimeMs;
+    public final long coalesceDrainTimeMs;
+    public final long rgSetupTimeMs;
+    public final long indexDispatchTimeMs;
+    public final long pollInnerTimeMs;
+    public final long indexTimeMs;
+    public final long partitionWallClockMs;
+    public final long outputRows;
+    public final long batchesProduced;
+    public final long parquetBatchesReceived;
 
     public SearchStats(
         long elapsedComputeMs,
@@ -48,7 +60,19 @@ public class SearchStats implements Writeable, ToXContentFragment {
         long parquetTimeMs,
         long listingTableScan,
         long singleCollectorScan,
-        long bitmapTreeScan
+        long bitmapTreeScan,
+        long maskSliceTimeMs,
+        long projectionFixupTimeMs,
+        long coalesceTimeMs,
+        long coalesceDrainTimeMs,
+        long rgSetupTimeMs,
+        long indexDispatchTimeMs,
+        long pollInnerTimeMs,
+        long indexTimeMs,
+        long partitionWallClockMs,
+        long outputRows,
+        long batchesProduced,
+        long parquetBatchesReceived
     ) {
         this.elapsedComputeMs = elapsedComputeMs;
         this.delegationCalls = delegationCalls;
@@ -64,6 +88,18 @@ public class SearchStats implements Writeable, ToXContentFragment {
         this.listingTableScan = listingTableScan;
         this.singleCollectorScan = singleCollectorScan;
         this.bitmapTreeScan = bitmapTreeScan;
+        this.maskSliceTimeMs = maskSliceTimeMs;
+        this.projectionFixupTimeMs = projectionFixupTimeMs;
+        this.coalesceTimeMs = coalesceTimeMs;
+        this.coalesceDrainTimeMs = coalesceDrainTimeMs;
+        this.rgSetupTimeMs = rgSetupTimeMs;
+        this.indexDispatchTimeMs = indexDispatchTimeMs;
+        this.pollInnerTimeMs = pollInnerTimeMs;
+        this.indexTimeMs = indexTimeMs;
+        this.partitionWallClockMs = partitionWallClockMs;
+        this.outputRows = outputRows;
+        this.batchesProduced = batchesProduced;
+        this.parquetBatchesReceived = parquetBatchesReceived;
     }
 
     public SearchStats(StreamInput in) throws IOException {
@@ -81,6 +117,18 @@ public class SearchStats implements Writeable, ToXContentFragment {
         this.listingTableScan = in.readVLong();
         this.singleCollectorScan = in.readVLong();
         this.bitmapTreeScan = in.readVLong();
+        this.maskSliceTimeMs = in.readVLong();
+        this.projectionFixupTimeMs = in.readVLong();
+        this.coalesceTimeMs = in.readVLong();
+        this.coalesceDrainTimeMs = in.readVLong();
+        this.rgSetupTimeMs = in.readVLong();
+        this.indexDispatchTimeMs = in.readVLong();
+        this.pollInnerTimeMs = in.readVLong();
+        this.indexTimeMs = in.readVLong();
+        this.partitionWallClockMs = in.readVLong();
+        this.outputRows = in.readVLong();
+        this.batchesProduced = in.readVLong();
+        this.parquetBatchesReceived = in.readVLong();
     }
 
     @Override
@@ -99,6 +147,47 @@ public class SearchStats implements Writeable, ToXContentFragment {
         out.writeVLong(listingTableScan);
         out.writeVLong(singleCollectorScan);
         out.writeVLong(bitmapTreeScan);
+        out.writeVLong(maskSliceTimeMs);
+        out.writeVLong(projectionFixupTimeMs);
+        out.writeVLong(coalesceTimeMs);
+        out.writeVLong(coalesceDrainTimeMs);
+        out.writeVLong(rgSetupTimeMs);
+        out.writeVLong(indexDispatchTimeMs);
+        out.writeVLong(pollInnerTimeMs);
+        out.writeVLong(indexTimeMs);
+        out.writeVLong(partitionWallClockMs);
+        out.writeVLong(outputRows);
+        out.writeVLong(batchesProduced);
+        out.writeVLong(parquetBatchesReceived);
+    }
+
+    /**
+     * Sum of all timed sub-phases that contribute to per-query wall-clock.
+     * Used to compute the residual = partition_wall_clock - timedSum.
+     */
+    public long timedPhasesSumMs() {
+        return parquetPollTimeMs
+            + onBatchMaskTimeMs
+            + buildMaskTimeMs
+            + filterRecordBatchTimeMs
+            + maskSliceTimeMs
+            + projectionFixupTimeMs
+            + coalesceTimeMs
+            + coalesceDrainTimeMs
+            + rgSetupTimeMs
+            + parquetTimeMs
+            + indexDispatchTimeMs
+            + indexTimeMs
+            + prefetchWaitTimeMs;
+    }
+
+    /**
+     * Wall-clock time NOT attributed to a named sub-phase. Computed as
+     * {@code partitionWallClockMs - timedPhasesSumMs()}, clamped at 0.
+     */
+    public long residualMs() {
+        long sum = timedPhasesSumMs();
+        return partitionWallClockMs > sum ? partitionWallClockMs - sum : 0;
     }
 
     @Override
@@ -118,6 +207,20 @@ public class SearchStats implements Writeable, ToXContentFragment {
         builder.field("listing_table_scan", listingTableScan);
         builder.field("single_collector_scan", singleCollectorScan);
         builder.field("bitmap_tree_scan", bitmapTreeScan);
+        builder.field("mask_slice_time_ms", maskSliceTimeMs);
+        builder.field("projection_fixup_time_ms", projectionFixupTimeMs);
+        builder.field("coalesce_time_ms", coalesceTimeMs);
+        builder.field("coalesce_drain_time_ms", coalesceDrainTimeMs);
+        builder.field("rg_setup_time_ms", rgSetupTimeMs);
+        builder.field("index_dispatch_time_ms", indexDispatchTimeMs);
+        builder.field("poll_inner_time_ms", pollInnerTimeMs);
+        builder.field("index_time_ms", indexTimeMs);
+        builder.field("partition_wall_clock_ms", partitionWallClockMs);
+        builder.field("output_rows", outputRows);
+        builder.field("batches_produced", batchesProduced);
+        builder.field("parquet_batches_received", parquetBatchesReceived);
+        builder.field("timed_phases_sum_ms", timedPhasesSumMs());
+        builder.field("residual_ms", residualMs());
         builder.endObject();
         return builder;
     }
@@ -140,12 +243,24 @@ public class SearchStats implements Writeable, ToXContentFragment {
             && parquetTimeMs == that.parquetTimeMs
             && listingTableScan == that.listingTableScan
             && singleCollectorScan == that.singleCollectorScan
-            && bitmapTreeScan == that.bitmapTreeScan;
+            && bitmapTreeScan == that.bitmapTreeScan
+            && maskSliceTimeMs == that.maskSliceTimeMs
+            && projectionFixupTimeMs == that.projectionFixupTimeMs
+            && coalesceTimeMs == that.coalesceTimeMs
+            && coalesceDrainTimeMs == that.coalesceDrainTimeMs
+            && rgSetupTimeMs == that.rgSetupTimeMs
+            && indexDispatchTimeMs == that.indexDispatchTimeMs
+            && pollInnerTimeMs == that.pollInnerTimeMs
+            && indexTimeMs == that.indexTimeMs
+            && partitionWallClockMs == that.partitionWallClockMs
+            && outputRows == that.outputRows
+            && batchesProduced == that.batchesProduced
+            && parquetBatchesReceived == that.parquetBatchesReceived;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(
+        int h = Objects.hash(
             elapsedComputeMs,
             delegationCalls,
             rgProcessed,
@@ -161,5 +276,20 @@ public class SearchStats implements Writeable, ToXContentFragment {
             singleCollectorScan,
             bitmapTreeScan
         );
+        return 31 * h
+            + Objects.hash(
+                maskSliceTimeMs,
+                projectionFixupTimeMs,
+                coalesceTimeMs,
+                coalesceDrainTimeMs,
+                rgSetupTimeMs,
+                indexDispatchTimeMs,
+                pollInnerTimeMs,
+                indexTimeMs,
+                partitionWallClockMs,
+                outputRows,
+                batchesProduced,
+                parquetBatchesReceived
+            );
     }
 }

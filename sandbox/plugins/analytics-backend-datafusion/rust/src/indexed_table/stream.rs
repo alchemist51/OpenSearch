@@ -110,6 +110,12 @@ struct IndexReader {
     /// polled (and returned Pending). Used to attribute wait time when
     /// the receiver eventually resolves.
     pending_since: Option<Instant>,
+    /// Wall-clock timestamp when `start_prefetch` was called for the
+    /// currently in-flight RG. Closed out when the result is consumed
+    /// in `poll_next_row_group`. Sums into `index_dispatch_time`.
+    fetch_started_at: Option<Instant>,
+    /// Total fetch latency (sum across all RGs); reported on Drop.
+    index_dispatch_time: Option<datafusion::physical_plan::metrics::Time>,
 }
 
 impl IndexReader {
@@ -120,6 +126,7 @@ impl IndexReader {
         rg_skipped: Option<datafusion::physical_plan::metrics::Count>,
         prefetch_wait_time: Option<datafusion::physical_plan::metrics::Time>,
         prefetch_wait_count: Option<datafusion::physical_plan::metrics::Count>,
+        index_dispatch_time: Option<datafusion::physical_plan::metrics::Time>,
     ) -> Self {
         Self {
             evaluator,
@@ -132,6 +139,8 @@ impl IndexReader {
             prefetch_wait_time,
             prefetch_wait_count,
             pending_since: None,
+            fetch_started_at: None,
+            index_dispatch_time,
         }
     }
 
@@ -171,6 +180,7 @@ impl IndexReader {
             Self::fetch_row_group(&evaluator, &row_groups, rg_idx, doc_range)
         });
         self.pending_prefetch = Some(handle);
+        self.fetch_started_at = Some(Instant::now());
     }
 
     fn poll_next_row_group(
@@ -182,6 +192,12 @@ impl IndexReader {
                 return Poll::Ready(Ok(None));
             }
             if let Some(result) = self.cached_result.take() {
+                // Close out the fetch timer for this RG.
+                if let Some(started) = self.fetch_started_at.take() {
+                    if let Some(ref t) = self.index_dispatch_time {
+                        t.add_duration(started.elapsed());
+                    }
+                }
                 self.current_rg_idx += 1;
                 self.start_prefetch(self.current_rg_idx);
                 match result {
@@ -216,6 +232,9 @@ impl IndexReader {
                         // JoinError distinguishes panic from cancellation.
                         self.pending_prefetch = None;
                         self.pending_since = None;
+                        // Discard any in-flight fetch timer; the retry
+                        // path will start a fresh one.
+                        self.fetch_started_at = None;
                         if join_error.is_panic() {
                             // Deterministic failure (e.g. subtree_cost invariant
                             // violation). Propagate immediately — retrying would
@@ -358,13 +377,20 @@ impl ExecutionPlan for IndexedExec {
                 .take()
                 .ok_or_else(|| DataFusionError::Internal("evaluator already consumed".into()))?
         };
+        // `IndexReader` and `IndexedStream` both observe the prefetch
+        // lifecycle, but only the stream-level mirror records timers
+        // now (so the values reflect the consumer's view including
+        // the runtime hop). Pass `None` to the reader for the timer
+        // handles to avoid double-counting; `rg_skipped` is unique
+        // to the reader path and stays.
         let index_reader = IndexReader::new(
             evaluator,
             self.row_groups.clone(),
             self.doc_range,
             self.stream_metrics.rg_skipped.clone(),
-            self.stream_metrics.prefetch_wait_time.clone(),
-            self.stream_metrics.prefetch_wait_count.clone(),
+            None,
+            None,
+            None,
         );
         Ok(Box::pin(IndexedStream::new(
             self.schema.clone(),
@@ -455,6 +481,17 @@ struct IndexedStream {
     emit_row_ids: bool,
     /// Index in the output schema where computed `___row_id` is inserted.
     row_id_output_index: Option<usize>,
+    /// Wall-clock timestamp at the first `Poll::Pending` returned by
+    /// `index_reader.poll_next_row_group(cx)` from this stream. Closed
+    /// out on the next `Poll::Ready` and added to
+    /// `metrics.prefetch_wait_time`. Mirrors `IndexReader.pending_since`
+    /// at the stream layer so park-time is observable from this scope.
+    pending_since: Option<Instant>,
+    /// Wall-clock stamped immediately before each call to
+    /// `index_reader.poll_next_row_group(cx)`. Closed out when the call
+    /// returns `Ready(Ok(Some))`/`Ready(Ok(None))` and added to
+    /// `metrics.index_dispatch_time`.
+    fetch_started_at: Option<Instant>,
 }
 
 impl IndexedStream {
@@ -518,6 +555,8 @@ impl IndexedStream {
             global_base,
             emit_row_ids,
             row_id_output_index,
+            pending_since: None,
+            fetch_started_at: None,
         }
     }
 
@@ -707,7 +746,12 @@ impl Stream for IndexedStream {
             self.initialized = true;
         }
 
+        let inner_start = Instant::now();
         let result = self.as_mut().poll_inner(cx);
+        let inner_elapsed = inner_start.elapsed();
+        if let Some(ref t) = self.metrics.poll_inner_time {
+            t.add_duration(inner_elapsed);
+        }
 
         if let Some(ref t) = self.metrics.elapsed_compute {
             t.add_duration(poll_start.elapsed());
@@ -723,14 +767,24 @@ impl IndexedStream {
     ) -> Poll<Option<Result<RecordBatch>>> {
         loop {
             // 1. Drain any completed batch from the coalescer first.
-            if let Some(batch) = self.batch_coalescer.next_completed_batch() {
+            let t_drain = Instant::now();
+            let drained = self.batch_coalescer.next_completed_batch();
+
+            if let Some(batch) = drained {
                 if let Some(ref counter) = self.metrics.output_rows {
                     counter.add(batch.num_rows());
                 }
                 if let Some(ref counter) = self.metrics.batches_produced {
                     counter.add(1);
                 }
+                if let Some(ref t) = self.metrics.coalesce_drain_time {
+                    t.add_duration(t_drain.elapsed());
+                }
                 return Poll::Ready(Some(Ok(batch)));
+            } else {
+                if let Some(ref t) = self.metrics.coalesce_drain_time {
+                    t.add_duration(t_drain.elapsed());
+                }
             }
 
             // 2. If upstream is done and coalescer has drained, we're done.
@@ -832,9 +886,30 @@ impl IndexedStream {
                 continue;
             }
 
-            // Poll for next row group
+            // Poll for next row group. Stamp the fetch start before
+            // calling so `metrics.index_dispatch_time` measures the
+            // full wall-clock of one fetch (spawn dispatch + Lucene
+            // compute on the blocking thread + wake-up to here),
+            // spanning any number of `Poll::Pending` returns. The
+            // `pending_since` mirror tracks the park-only subset.
+            if self.fetch_started_at.is_none() {
+                self.fetch_started_at = Some(Instant::now());
+            }
+
             match self.index_reader.poll_next_row_group(cx) {
                 Poll::Ready(Ok(Some(prefetched))) => {
+                    // Close out the fetch + park timers for this RG.
+                    if let Some(started) = self.fetch_started_at.take() {
+                        if let Some(ref t) = self.metrics.index_dispatch_time {
+                            t.add_duration(started.elapsed());
+                        }
+                    }
+                    if let Some(started) = self.pending_since.take() {
+                        if let Some(ref t) = self.metrics.prefetch_wait_time {
+                            t.add_duration(started.elapsed());
+                        }
+                    }
+
                     let rg = prefetched.rg;
                     let candidates = prefetched.prefetched.candidates;
                     let prefetch_mask_buffer = prefetched.prefetched.mask_buffer;
@@ -863,6 +938,7 @@ impl IndexedStream {
                     // per-RG state.
                     self.current_rg_context = Some(prefetched.prefetched.context);
                     self.batch_offset = 0;
+                    let t_rg_setup = Instant::now();
 
                     // Decide min_skip_run for this RG.
                     //
@@ -934,6 +1010,9 @@ impl IndexedStream {
                         }
                     }
 
+                    if let Some(ref t) = self.metrics.rg_setup_time {
+                        t.add_duration(t_rg_setup.elapsed());
+                    }
                     let t_plan = Instant::now();
                     // Pushdown decision:
                     //
@@ -1017,12 +1096,34 @@ impl IndexedStream {
                     }
                 }
                 Poll::Ready(Ok(None)) => {
+                    // No more RGs — close any open fetch/park timers.
+                    if let Some(started) = self.fetch_started_at.take() {
+                        if let Some(ref t) = self.metrics.index_dispatch_time {
+                            t.add_duration(started.elapsed());
+                        }
+                    }
+                    if let Some(started) = self.pending_since.take() {
+                        if let Some(ref t) = self.metrics.prefetch_wait_time {
+                            t.add_duration(started.elapsed());
+                        }
+                    }
                     self.finished = true;
                     self.upstream_done = true;
                     continue;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // First time we see Pending for this fetch from
+                    // this stream → start the park-clock. Counted once
+                    // per stream-park to mirror IndexReader's view.
+                    if self.pending_since.is_none() {
+                        self.pending_since = Some(Instant::now());
+                        if let Some(ref c) = self.metrics.prefetch_wait_count {
+                            c.add(1);
+                        }
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -1095,6 +1196,7 @@ mod tests {
         let mut reader = IndexReader::new(
             evaluator.clone(),
             vec![rg_info],
+            None,
             None,
             None,
             None,

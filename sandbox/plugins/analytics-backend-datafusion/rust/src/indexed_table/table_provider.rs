@@ -461,12 +461,12 @@ impl ExecutionPlan for QueryShardExec {
             let empty =
                 datafusion::physical_plan::empty::EmptyExec::new(self.projected_schema.clone());
             let inner = empty.execute(0, context)?;
-            return Ok(Box::pin(AccumulatingStream { inner, stream_metrics: stream_metrics_for_drop }));
+            return Ok(Box::pin(AccumulatingStream { inner, stream_metrics: stream_metrics_for_drop, started_at: None, partition }));
         }
 
         if execs.len() == 1 {
             let inner = execs.remove(0).execute(0, context)?;
-            return Ok(Box::pin(AccumulatingStream { inner, stream_metrics: stream_metrics_for_drop }));
+            return Ok(Box::pin(AccumulatingStream { inner, stream_metrics: stream_metrics_for_drop, started_at: None, partition }));
         }
 
         // Multiple chunks in one partition — concatenate via UnionExec
@@ -477,19 +477,26 @@ impl ExecutionPlan for QueryShardExec {
         let coalesced =
             datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(union);
         let inner = coalesced.execute(0, context)?;
-        Ok(Box::pin(AccumulatingStream { inner, stream_metrics: stream_metrics_for_drop }))
+        Ok(Box::pin(AccumulatingStream { inner, stream_metrics: stream_metrics_for_drop, started_at: None, partition }))
     }
 }
 
 struct AccumulatingStream {
     inner: SendableRecordBatchStream,
     stream_metrics: StreamMetrics,
+    /// Stamped at the first `poll_next`; used to attribute total wall-clock
+    /// for this partition stream into `partition_wall_clock` on Drop.
+    started_at: Option<std::time::Instant>,
+    partition: usize,
 }
 
 impl Stream for AccumulatingStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.started_at.is_none() {
+            self.started_at = Some(std::time::Instant::now());
+        }
         Pin::new(&mut self.inner).poll_next(cx)
     }
 }
@@ -502,8 +509,132 @@ impl RecordBatchStream for AccumulatingStream {
 
 impl Drop for AccumulatingStream {
     fn drop(&mut self) {
+        if let Some(started) = self.started_at {
+            let total = started.elapsed();
+            if let Some(ref t) = self.stream_metrics.partition_wall_clock {
+                t.add_duration(total);
+            }
+            log_partition_summary(&self.stream_metrics, self.partition, total);
+        }
         crate::search_stats::accumulate(&self.stream_metrics);
     }
+}
+
+/// Emit a one-shot per-partition summary of the indexed-search timings.
+///
+/// Two separate budgets are reported:
+///
+/// - **Foreground (on the poll thread, sequential):** parquet_poll,
+///   on_batch_mask, build_mask, filter_rb, mask_slice, projection_fixup,
+///   coalesce_push/drain, rg_setup, parquet_setup, prefetch_wait.
+///   Residual = `elapsed_compute - foreground_sum` — unaccounted on-CPU
+///   time spent in `poll_inner` outside the named timers.
+///
+/// - **Background (parallel, off-thread):** index_eval (Lucene
+///   `prefetch_rg` on `spawn_blocking`). This overlaps with foreground
+///   work and is NOT subtracted from the foreground pie. Use
+///   `prefetch_wait_time` to see how much of the background work the
+///   foreground had to wait on (i.e. couldn't hide behind decode).
+///
+/// `wall_clock` is informational — the time from the consumer's first
+/// `poll_next` to Drop. Under `CoalescePartitionsExec` / `CrossRtStream`
+/// the real work runs on a spawned task in parallel, so `wall_clock`
+/// can be much smaller than the cumulative timer sums.
+fn log_partition_summary(
+    m: &StreamMetrics,
+    partition: usize,
+    total: std::time::Duration,
+) {
+    fn ms(t: &Option<datafusion::physical_plan::metrics::Time>) -> u128 {
+        t.as_ref().map(|x| x.value() / 1_000_000).unwrap_or(0) as u128
+    }
+    fn ct(c: &Option<datafusion::physical_plan::metrics::Count>) -> usize {
+        c.as_ref().map(|x| x.value()).unwrap_or(0)
+    }
+    let wall_clock_ms = total.as_millis();
+    let elapsed_compute = ms(&m.elapsed_compute);
+    let parquet_poll = ms(&m.parquet_poll_time);
+    let on_batch_mask = ms(&m.on_batch_mask_time);
+    let build_mask = ms(&m.build_mask_time);
+    let filter_rb = ms(&m.filter_record_batch_time);
+    let mask_slice = ms(&m.mask_slice_time);
+    let projection_fixup = ms(&m.projection_fixup_time);
+    let coalesce_push = ms(&m.coalesce_time);
+    let coalesce_drain = ms(&m.coalesce_drain_time);
+    let rg_setup = ms(&m.rg_setup_time);
+    let parquet_setup = ms(&m.parquet_time);
+    let prefetch_wait = ms(&m.prefetch_wait_time);
+    let index_eval = ms(&m.index_time);
+    let index_dispatch = ms(&m.index_dispatch_time);
+    let poll_inner = ms(&m.poll_inner_time);
+
+    // Foreground (sequential on poll thread) — sums to <= elapsed_compute.
+    // `prefetch_wait` and `index_dispatch` are wall-clock (overlap with
+    // foreground decode) and don't consume foreground CPU; excluded here.
+    let foreground_sum = parquet_poll
+        + on_batch_mask
+        + build_mask
+        + filter_rb
+        + mask_slice
+        + projection_fixup
+        + coalesce_push
+        + coalesce_drain
+        + rg_setup
+        + parquet_setup;
+    let residual = elapsed_compute.saturating_sub(foreground_sum);
+    let coverage_pct = if elapsed_compute == 0 {
+        0
+    } else {
+        (foreground_sum * 100) / elapsed_compute
+    };
+    // Split the residual: time inside `poll_inner` (untimed loop body)
+    // vs. time outside it (Tokio waker / future state-machine plumbing).
+    let runtime_overhead = elapsed_compute.saturating_sub(poll_inner);
+    let inner_residual = residual.saturating_sub(runtime_overhead);
+
+    native_bridge_common::log_info!(
+        "[indexed-search-stats] partition={} wall_clock={}ms elapsed_compute={}ms \
+         | fg: parquet_poll={}ms on_batch_mask={}ms build_mask={}ms filter_rb={}ms \
+         mask_slice={}ms projection_fixup={}ms coalesce_push={}ms coalesce_drain={}ms \
+         rg_setup={}ms parquet_setup={}ms (sum={}ms residual={}ms covered={}%) \
+         | split: poll_inner={}ms runtime_overhead={}ms inner_residual={}ms \
+         | bg: index_eval={}ms index_dispatch={}ms \
+         pending_since_total={}ms pending_since_count={} \
+         (overlap_achieved={}ms) \
+         | counts: rg_proc={} rg_skip={} ffm={} batches={}->{} rows_out={} matched={} pruned={}",
+        partition,
+        wall_clock_ms,
+        elapsed_compute,
+        parquet_poll,
+        on_batch_mask,
+        build_mask,
+        filter_rb,
+        mask_slice,
+        projection_fixup,
+        coalesce_push,
+        coalesce_drain,
+        rg_setup,
+        parquet_setup,
+        foreground_sum,
+        residual,
+        coverage_pct,
+        poll_inner,
+        runtime_overhead,
+        inner_residual,
+        index_eval,
+        index_dispatch,
+        prefetch_wait,
+        ct(&m.prefetch_wait_count),
+        index_dispatch.saturating_sub(prefetch_wait),
+        ct(&m.rg_processed),
+        ct(&m.rg_skipped),
+        ct(&m.ffm_collector_calls),
+        ct(&m.parquet_batches_received),
+        ct(&m.batches_produced),
+        ct(&m.output_rows),
+        ct(&m.rows_matched),
+        ct(&m.rows_pruned),
+    );
 }
 
 #[cfg(test)]

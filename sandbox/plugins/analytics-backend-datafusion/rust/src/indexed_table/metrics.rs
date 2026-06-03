@@ -96,6 +96,35 @@ pub struct StreamMetrics {
     /// Time spent polling the inner parquet stream (pull decoded
     /// batch), isolating decode from our own processing.
     pub parquet_poll_time: Option<Time>,
+    /// Time spent setting up per-RG state outside parquet construction:
+    /// `build_row_selection_with_min_skip_run` +
+    /// `PositionMap::from_candidates_with_selection`. Excludes
+    /// `parquet_time` (covered by its own timer) and `index_time`
+    /// (eval_nanos already attributed). Lets us attribute the per-RG
+    /// pre-decode CPU cost separately from the candidate eval.
+    pub rg_setup_time: Option<Time>,
+    /// Total wall-clock per-RG prefetch latency, summed across all RGs:
+    /// from `start_prefetch` (spawn_blocking dispatched) to the moment
+    /// the result is consumed in `poll_next_row_group`. Spans dispatch
+    /// lag, Lucene compute on the blocking thread, and wake-up
+    /// latency back to the foreground. Foreground may have been
+    /// parallel-busy with parquet decode for some of this; use
+    /// `prefetch_wait_time` for the foreground-blocking subset.
+    pub index_dispatch_time: Option<Time>,
+    /// Total time inside `poll_inner` (the loop body that drives RGs +
+    /// batches). The gap `elapsed_compute - poll_inner_total` is
+    /// Tokio waker / future state-machine / scheduler overhead — work
+    /// done outside the loop but still inside the operator's
+    /// `poll_next`. Useful to see whether residual lives in untimed
+    /// loop code or in the runtime plumbing.
+    pub poll_inner_time: Option<Time>,
+    /// Time spent in `LimitedBatchCoalescer::next_completed_batch`
+    /// (drain side; the push side is already covered by `coalesce_time`).
+    pub coalesce_drain_time: Option<Time>,
+    /// Total wall-clock for the partition stream's lifetime. Captured
+    /// once on first poll and accumulated on Drop. Lets the per-query
+    /// Drop summary compute residual = total - sum(timed sub-phases).
+    pub partition_wall_clock: Option<Time>,
     /// Accumulated inner `DataSourceExec` parquet metrics (shared across partitions).
     pub inner_parquet_metrics: Option<Arc<std::sync::Mutex<Vec<MetricsSet>>>>,
 }
@@ -133,6 +162,11 @@ impl StreamMetrics {
             mask_slice_time: None,
             projection_fixup_time: None,
             parquet_poll_time: None,
+            rg_setup_time: None,
+            index_dispatch_time: None,
+            poll_inner_time: None,
+            coalesce_drain_time: None,
+            partition_wall_clock: None,
             inner_parquet_metrics: None,
         }
     }
@@ -169,6 +203,11 @@ pub struct PartitionMetrics {
     pub mask_slice_time: Time,
     pub projection_fixup_time: Time,
     pub parquet_poll_time: Time,
+    pub rg_setup_time: Time,
+    pub index_dispatch_time: Time,
+    pub poll_inner_time: Time,
+    pub coalesce_drain_time: Time,
+    pub partition_wall_clock: Time,
 }
 
 impl PartitionMetrics {
@@ -209,6 +248,15 @@ impl PartitionMetrics {
                 .subset_time("projection_fixup_time", partition),
             parquet_poll_time: MetricBuilder::new(metrics)
                 .subset_time("parquet_poll_time", partition),
+            rg_setup_time: MetricBuilder::new(metrics).subset_time("rg_setup_time", partition),
+            index_dispatch_time: MetricBuilder::new(metrics)
+                .subset_time("index_dispatch_time", partition),
+            poll_inner_time: MetricBuilder::new(metrics)
+                .subset_time("poll_inner_time", partition),
+            coalesce_drain_time: MetricBuilder::new(metrics)
+                .subset_time("coalesce_drain_time", partition),
+            partition_wall_clock: MetricBuilder::new(metrics)
+                .subset_time("partition_wall_clock", partition),
         }
     }
 
@@ -247,6 +295,11 @@ impl PartitionMetrics {
             mask_slice_time: Some(self.mask_slice_time),
             projection_fixup_time: Some(self.projection_fixup_time),
             parquet_poll_time: Some(self.parquet_poll_time),
+            rg_setup_time: Some(self.rg_setup_time),
+            index_dispatch_time: Some(self.index_dispatch_time),
+            poll_inner_time: Some(self.poll_inner_time),
+            coalesce_drain_time: Some(self.coalesce_drain_time),
+            partition_wall_clock: Some(self.partition_wall_clock),
             inner_parquet_metrics,
         }
     }

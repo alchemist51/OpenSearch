@@ -5,7 +5,7 @@
 //! Stats packing helpers for the FFM `df_stats()` function.
 //!
 //! Packs Tokio runtime metrics and per-operation task monitor metrics
-//! into a `#[repr(C)]` `DfStatsBuffer` struct (496 bytes) for efficient
+//! into a `#[repr(C)]` `DfStatsBuffer` struct (592 bytes) for efficient
 //! transfer across the FFM boundary.
 //!
 //! ## Struct layout
@@ -21,7 +21,7 @@
 //! | `datanode_gate`      | `PartitionGateRepr`  | 4 × i64 |
 //! | `coordinator_gate`   | `PartitionGateRepr`  | 4 × i64 |
 //! | `cache_stats`        | `CacheStatsRepr`     | 10 × i64 (2 × 5: metadata + statistics caches) |
-//! | `search_stats`       | `SearchStatsRepr`    | 14 × i64 |
+//! | `search_stats`       | `SearchStatsRepr`    | 26 × i64 |
 
 use tokio::runtime::Handle;
 use tokio_metrics::{RuntimeMonitor, TaskMonitor};
@@ -125,6 +125,18 @@ pub struct SearchStatsRepr {
     pub listing_table_scan: i64,
     pub single_collector_scan: i64,
     pub bitmap_tree_scan: i64,
+    pub mask_slice_time_ms: i64,
+    pub projection_fixup_time_ms: i64,
+    pub coalesce_time_ms: i64,
+    pub coalesce_drain_time_ms: i64,
+    pub rg_setup_time_ms: i64,
+    pub index_dispatch_time_ms: i64,
+    pub poll_inner_time_ms: i64,
+    pub index_time_ms: i64,
+    pub partition_wall_clock_ms: i64,
+    pub output_rows: i64,
+    pub batches_produced: i64,
+    pub parquet_batches_received: i64,
 }
 
 #[repr(C)]
@@ -146,13 +158,13 @@ const _: () = assert!(std::mem::size_of::<TaskMonitorRepr>() == 3 * 8);
 const _: () = assert!(std::mem::size_of::<PartitionGateRepr>() == 4 * 8);
 const _: () = assert!(std::mem::size_of::<CacheGroupRepr>() == 5 * 8);
 const _: () = assert!(std::mem::size_of::<CacheStatsRepr>() == 10 * 8);
-const _: () = assert!(std::mem::size_of::<SearchStatsRepr>() == 14 * 8);
-const _: () = assert!(std::mem::size_of::<DfStatsBuffer>() == 62 * 8);
+const _: () = assert!(std::mem::size_of::<SearchStatsRepr>() == 26 * 8);
+const _: () = assert!(std::mem::size_of::<DfStatsBuffer>() == 74 * 8);
 
 pub mod layout {
     use super::*;
     pub const BUFFER_BYTE_SIZE: usize = std::mem::size_of::<DfStatsBuffer>();
-    const _: () = assert!(BUFFER_BYTE_SIZE == 496);
+    const _: () = assert!(BUFFER_BYTE_SIZE == 592);
 }
 
 /// Snapshot a `RuntimeMonitor` and return a populated `RuntimeMetricsRepr`.

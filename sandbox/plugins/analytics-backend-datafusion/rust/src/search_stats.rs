@@ -27,6 +27,18 @@ static PARQUET_TIME_MS: AtomicI64 = AtomicI64::new(0);
 static LISTING_TABLE_SCAN: AtomicI64 = AtomicI64::new(0);
 static SINGLE_COLLECTOR_SCAN: AtomicI64 = AtomicI64::new(0);
 static BITMAP_TREE_SCAN: AtomicI64 = AtomicI64::new(0);
+static MASK_SLICE_TIME_MS: AtomicI64 = AtomicI64::new(0);
+static PROJECTION_FIXUP_TIME_MS: AtomicI64 = AtomicI64::new(0);
+static COALESCE_TIME_MS: AtomicI64 = AtomicI64::new(0);
+static COALESCE_DRAIN_TIME_MS: AtomicI64 = AtomicI64::new(0);
+static RG_SETUP_TIME_MS: AtomicI64 = AtomicI64::new(0);
+static INDEX_DISPATCH_TIME_MS: AtomicI64 = AtomicI64::new(0);
+static POLL_INNER_TIME_MS: AtomicI64 = AtomicI64::new(0);
+static INDEX_TIME_MS: AtomicI64 = AtomicI64::new(0);
+static PARTITION_WALL_CLOCK_MS: AtomicI64 = AtomicI64::new(0);
+static OUTPUT_ROWS: AtomicI64 = AtomicI64::new(0);
+static BATCHES_PRODUCED: AtomicI64 = AtomicI64::new(0);
+static PARQUET_BATCHES_RECEIVED: AtomicI64 = AtomicI64::new(0);
 
 pub fn inc_listing_table_scan() {
     LISTING_TABLE_SCAN.fetch_add(1, Ordering::Relaxed);
@@ -74,6 +86,42 @@ pub fn accumulate(m: &StreamMetrics) {
     if let Some(ref t) = m.parquet_time {
         PARQUET_TIME_MS.fetch_add((t.value() / 1_000_000) as i64, Ordering::Relaxed);
     }
+    if let Some(ref t) = m.mask_slice_time {
+        MASK_SLICE_TIME_MS.fetch_add((t.value() / 1_000_000) as i64, Ordering::Relaxed);
+    }
+    if let Some(ref t) = m.projection_fixup_time {
+        PROJECTION_FIXUP_TIME_MS.fetch_add((t.value() / 1_000_000) as i64, Ordering::Relaxed);
+    }
+    if let Some(ref t) = m.coalesce_time {
+        COALESCE_TIME_MS.fetch_add((t.value() / 1_000_000) as i64, Ordering::Relaxed);
+    }
+    if let Some(ref t) = m.coalesce_drain_time {
+        COALESCE_DRAIN_TIME_MS.fetch_add((t.value() / 1_000_000) as i64, Ordering::Relaxed);
+    }
+    if let Some(ref t) = m.rg_setup_time {
+        RG_SETUP_TIME_MS.fetch_add((t.value() / 1_000_000) as i64, Ordering::Relaxed);
+    }
+    if let Some(ref t) = m.index_dispatch_time {
+        INDEX_DISPATCH_TIME_MS.fetch_add((t.value() / 1_000_000) as i64, Ordering::Relaxed);
+    }
+    if let Some(ref t) = m.poll_inner_time {
+        POLL_INNER_TIME_MS.fetch_add((t.value() / 1_000_000) as i64, Ordering::Relaxed);
+    }
+    if let Some(ref t) = m.index_time {
+        INDEX_TIME_MS.fetch_add((t.value() / 1_000_000) as i64, Ordering::Relaxed);
+    }
+    if let Some(ref t) = m.partition_wall_clock {
+        PARTITION_WALL_CLOCK_MS.fetch_add((t.value() / 1_000_000) as i64, Ordering::Relaxed);
+    }
+    if let Some(ref c) = m.output_rows {
+        OUTPUT_ROWS.fetch_add(c.value() as i64, Ordering::Relaxed);
+    }
+    if let Some(ref c) = m.batches_produced {
+        BATCHES_PRODUCED.fetch_add(c.value() as i64, Ordering::Relaxed);
+    }
+    if let Some(ref c) = m.parquet_batches_received {
+        PARQUET_BATCHES_RECEIVED.fetch_add(c.value() as i64, Ordering::Relaxed);
+    }
 }
 
 pub fn snapshot() -> SearchStatsRepr {
@@ -92,6 +140,18 @@ pub fn snapshot() -> SearchStatsRepr {
         listing_table_scan: LISTING_TABLE_SCAN.load(Ordering::Relaxed),
         single_collector_scan: SINGLE_COLLECTOR_SCAN.load(Ordering::Relaxed),
         bitmap_tree_scan: BITMAP_TREE_SCAN.load(Ordering::Relaxed),
+        mask_slice_time_ms: MASK_SLICE_TIME_MS.load(Ordering::Relaxed),
+        projection_fixup_time_ms: PROJECTION_FIXUP_TIME_MS.load(Ordering::Relaxed),
+        coalesce_time_ms: COALESCE_TIME_MS.load(Ordering::Relaxed),
+        coalesce_drain_time_ms: COALESCE_DRAIN_TIME_MS.load(Ordering::Relaxed),
+        rg_setup_time_ms: RG_SETUP_TIME_MS.load(Ordering::Relaxed),
+        index_dispatch_time_ms: INDEX_DISPATCH_TIME_MS.load(Ordering::Relaxed),
+        poll_inner_time_ms: POLL_INNER_TIME_MS.load(Ordering::Relaxed),
+        index_time_ms: INDEX_TIME_MS.load(Ordering::Relaxed),
+        partition_wall_clock_ms: PARTITION_WALL_CLOCK_MS.load(Ordering::Relaxed),
+        output_rows: OUTPUT_ROWS.load(Ordering::Relaxed),
+        batches_produced: BATCHES_PRODUCED.load(Ordering::Relaxed),
+        parquet_batches_received: PARQUET_BATCHES_RECEIVED.load(Ordering::Relaxed),
     }
 }
 

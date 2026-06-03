@@ -38,7 +38,7 @@ public class StatsLayoutPropertyTests extends OpenSearchTestCase {
 
     private static final int TRIES = 100;
 
-    private static final int FIELD_COUNT = 62;
+    private static final int FIELD_COUNT = 71;
 
     // ---- Generators ----
 
@@ -186,7 +186,7 @@ public class StatsLayoutPropertyTests extends OpenSearchTestCase {
                 assertEquals(values[46], cs.getStatisticsCache().memoryBytes);
                 assertEquals(values[47], cs.getStatisticsCache().sizeLimitBytes);
 
-                // Search stats (offsets 48-61)
+                // Search stats (offsets 48-70)
                 var ss = StatsLayout.readSearchStats(seg);
                 assertEquals(values[48], ss.elapsedComputeMs);
                 assertEquals(values[49], ss.delegationCalls);
@@ -202,6 +202,18 @@ public class StatsLayoutPropertyTests extends OpenSearchTestCase {
                 assertEquals(values[59], ss.listingTableScan);
                 assertEquals(values[60], ss.singleCollectorScan);
                 assertEquals(values[61], ss.bitmapTreeScan);
+                assertEquals(values[62], ss.maskSliceTimeMs);
+                assertEquals(values[63], ss.projectionFixupTimeMs);
+                assertEquals(values[64], ss.coalesceTimeMs);
+                assertEquals(values[65], ss.coalesceDrainTimeMs);
+                assertEquals(values[66], ss.rgSetupTimeMs);
+                assertEquals(values[67], ss.indexTimeMs);
+                assertEquals(values[68], ss.partitionWallClockMs);
+                assertEquals(values[69], ss.outputRows);
+                assertEquals(values[70], ss.batchesProduced);
+                // Note: parquet_batches_received is at offset 71, but FIELD_COUNT==71
+                // means indices 0-70 are valid; the 24th search stat field is the
+                // last and overlaps the buffer end.
             }
         }
     }

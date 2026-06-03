@@ -27,8 +27,8 @@ import java.lang.invoke.VarHandle;
  * and provides {@link VarHandle} accessors for each field via layout path navigation.
  *
  * <p>The layout contains 10 named groups (2 runtime × 9 fields + 4 task monitor × 3 fields
- * + 2 partition gate × 4 fields + 1 cache stats × 10 fields + 1 search stats × 14 fields
- * = 62 longs = 496 bytes).
+ * + 2 partition gate × 4 fields + 1 cache stats × 10 fields + 1 search stats × 26 fields
+ * = 74 longs = 592 bytes).
  */
 public final class StatsLayout {
 
@@ -75,7 +75,19 @@ public final class StatsLayout {
         "parquet_time_ms",
         "listing_table_scan",
         "single_collector_scan",
-        "bitmap_tree_scan" };
+        "bitmap_tree_scan",
+        "mask_slice_time_ms",
+        "projection_fixup_time_ms",
+        "coalesce_time_ms",
+        "coalesce_drain_time_ms",
+        "rg_setup_time_ms",
+        "index_dispatch_time_ms",
+        "poll_inner_time_ms",
+        "index_time_ms",
+        "partition_wall_clock_ms",
+        "output_rows",
+        "batches_produced",
+        "parquet_batches_received" };
 
     /** The struct layout mirroring Rust's {@code DfStatsBuffer}. */
     public static final StructLayout LAYOUT = MemoryLayout.structLayout(
@@ -92,8 +104,8 @@ public final class StatsLayout {
     );
 
     static {
-        if (LAYOUT.byteSize() != 62 * Long.BYTES) {
-            throw new AssertionError("StatsLayout size mismatch: expected " + (62 * Long.BYTES) + " but got " + LAYOUT.byteSize());
+        if (LAYOUT.byteSize() != 74 * Long.BYTES) {
+            throw new AssertionError("StatsLayout size mismatch: expected " + (74 * Long.BYTES) + " but got " + LAYOUT.byteSize());
         }
     }
 
@@ -180,6 +192,18 @@ public final class StatsLayout {
     private static final VarHandle SS_LISTING_TABLE_SCAN = handle("search_stats", "listing_table_scan");
     private static final VarHandle SS_SINGLE_COLLECTOR_SCAN = handle("search_stats", "single_collector_scan");
     private static final VarHandle SS_BITMAP_TREE_SCAN = handle("search_stats", "bitmap_tree_scan");
+    private static final VarHandle SS_MASK_SLICE_TIME_MS = handle("search_stats", "mask_slice_time_ms");
+    private static final VarHandle SS_PROJECTION_FIXUP_TIME_MS = handle("search_stats", "projection_fixup_time_ms");
+    private static final VarHandle SS_COALESCE_TIME_MS = handle("search_stats", "coalesce_time_ms");
+    private static final VarHandle SS_COALESCE_DRAIN_TIME_MS = handle("search_stats", "coalesce_drain_time_ms");
+    private static final VarHandle SS_RG_SETUP_TIME_MS = handle("search_stats", "rg_setup_time_ms");
+    private static final VarHandle SS_INDEX_DISPATCH_TIME_MS = handle("search_stats", "index_dispatch_time_ms");
+    private static final VarHandle SS_POLL_INNER_TIME_MS = handle("search_stats", "poll_inner_time_ms");
+    private static final VarHandle SS_INDEX_TIME_MS = handle("search_stats", "index_time_ms");
+    private static final VarHandle SS_PARTITION_WALL_CLOCK_MS = handle("search_stats", "partition_wall_clock_ms");
+    private static final VarHandle SS_OUTPUT_ROWS = handle("search_stats", "output_rows");
+    private static final VarHandle SS_BATCHES_PRODUCED = handle("search_stats", "batches_produced");
+    private static final VarHandle SS_PARQUET_BATCHES_RECEIVED = handle("search_stats", "parquet_batches_received");
 
     private StatsLayout() {}
 
@@ -292,7 +316,19 @@ public final class StatsLayout {
             (long) SS_PARQUET_TIME_MS.get(seg, 0L),
             (long) SS_LISTING_TABLE_SCAN.get(seg, 0L),
             (long) SS_SINGLE_COLLECTOR_SCAN.get(seg, 0L),
-            (long) SS_BITMAP_TREE_SCAN.get(seg, 0L)
+            (long) SS_BITMAP_TREE_SCAN.get(seg, 0L),
+            (long) SS_MASK_SLICE_TIME_MS.get(seg, 0L),
+            (long) SS_PROJECTION_FIXUP_TIME_MS.get(seg, 0L),
+            (long) SS_COALESCE_TIME_MS.get(seg, 0L),
+            (long) SS_COALESCE_DRAIN_TIME_MS.get(seg, 0L),
+            (long) SS_RG_SETUP_TIME_MS.get(seg, 0L),
+            (long) SS_INDEX_DISPATCH_TIME_MS.get(seg, 0L),
+            (long) SS_POLL_INNER_TIME_MS.get(seg, 0L),
+            (long) SS_INDEX_TIME_MS.get(seg, 0L),
+            (long) SS_PARTITION_WALL_CLOCK_MS.get(seg, 0L),
+            (long) SS_OUTPUT_ROWS.get(seg, 0L),
+            (long) SS_BATCHES_PRODUCED.get(seg, 0L),
+            (long) SS_PARQUET_BATCHES_RECEIVED.get(seg, 0L)
         );
     }
 
@@ -361,7 +397,19 @@ public final class StatsLayout {
             ValueLayout.JAVA_LONG.withName("parquet_time_ms"),
             ValueLayout.JAVA_LONG.withName("listing_table_scan"),
             ValueLayout.JAVA_LONG.withName("single_collector_scan"),
-            ValueLayout.JAVA_LONG.withName("bitmap_tree_scan")
+            ValueLayout.JAVA_LONG.withName("bitmap_tree_scan"),
+            ValueLayout.JAVA_LONG.withName("mask_slice_time_ms"),
+            ValueLayout.JAVA_LONG.withName("projection_fixup_time_ms"),
+            ValueLayout.JAVA_LONG.withName("coalesce_time_ms"),
+            ValueLayout.JAVA_LONG.withName("coalesce_drain_time_ms"),
+            ValueLayout.JAVA_LONG.withName("rg_setup_time_ms"),
+            ValueLayout.JAVA_LONG.withName("index_dispatch_time_ms"),
+            ValueLayout.JAVA_LONG.withName("poll_inner_time_ms"),
+            ValueLayout.JAVA_LONG.withName("index_time_ms"),
+            ValueLayout.JAVA_LONG.withName("partition_wall_clock_ms"),
+            ValueLayout.JAVA_LONG.withName("output_rows"),
+            ValueLayout.JAVA_LONG.withName("batches_produced"),
+            ValueLayout.JAVA_LONG.withName("parquet_batches_received")
         ).withName(name);
     }
 
