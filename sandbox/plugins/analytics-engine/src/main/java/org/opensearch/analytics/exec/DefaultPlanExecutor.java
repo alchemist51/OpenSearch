@@ -37,6 +37,7 @@ import org.opensearch.analytics.planner.dag.BackendPlanAdapter;
 import org.opensearch.analytics.planner.dag.DAGBuilder;
 import org.opensearch.analytics.planner.dag.FragmentConversionDriver;
 import org.opensearch.analytics.planner.dag.PlanAlternativeSelector;
+import org.opensearch.analytics.planner.dag.PerfPeerNarrowing;
 import org.opensearch.analytics.planner.dag.PlanForker;
 import org.opensearch.analytics.planner.dag.QueryDAG;
 import org.opensearch.analytics.settings.AnalyticsApproximationSettings;
@@ -241,6 +242,11 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
         final String fullPlan = profile ? org.apache.calcite.plan.RelOptUtil.toString(plan) : null;
         QueryDAG dag = DAGBuilder.build(plan, capabilityRegistry, clusterService, indexNameExpressionResolver);
         PlanForker.forkAll(dag, capabilityRegistry);
+        // Narrow performance-delegation peers per StagePlan based on registered rules. The pass
+        // doesn't touch viableBackends — backend-driver alternatives produced by PlanForker
+        // (e.g. Lucene-as-driver count fast-path) are unaffected. Only the DataFusion-driver
+        // alternative's perf-peer attachments are filtered. See PerfPeerNarrowing javadoc.
+        PerfPeerNarrowing.narrowAll(dag);
         BackendPlanAdapter.adaptAll(dag, capabilityRegistry);
         // Collapse multi-backend stages to a single chosen alternative before conversion
         // so the convertor runs once per stage and the wire request carries one PlanAlternative.
