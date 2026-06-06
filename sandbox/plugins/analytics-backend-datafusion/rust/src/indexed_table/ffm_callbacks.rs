@@ -8,7 +8,7 @@
 
 //! FFM upcall surface for index-filter providers and collectors.
 //!
-//! Five callback slots, populated once at startup by
+//! Six callback slots, populated once at startup by
 //! `df_register_filter_tree_callbacks` (see `ffm.rs`):
 //!
 //! - `createProvider(contextId, annotationId) -> providerKey|-1`
@@ -16,6 +16,9 @@
 //! - `collectDocs(contextId, collectorKey, minDoc, maxDoc, outBuf, outWordCap) -> wordsWritten|-1`
 //! - `releaseCollector(contextId, collectorKey)`
 //! - `releaseProvider(contextId, providerKey)`
+//! - `estimateSelectivityPpm(contextId, providerKey, writerGeneration) -> ppm|-1` —
+//!   cheap per-segment selectivity (count / segment-doc-count) in parts-per-million
+//!   ([0, 1_000_000]) consumed by the driver-side peer-consultation gate.
 //!
 //! `ProviderHandle` and `FfmSegmentCollector` are the lifetime wrappers —
 //! they call the release callbacks on drop.
@@ -39,12 +42,18 @@ type ReleaseProviderFn = unsafe extern "C" fn(i64, i32);
 type CreateCollectorFn = unsafe extern "C" fn(i64, i32, i64, i32, i32) -> i32;
 type CollectDocsFn = unsafe extern "C" fn(i64, i32, i32, i32, *mut u64, i64) -> i64;
 type ReleaseCollectorFn = unsafe extern "C" fn(i64, i32);
+/// `(context_id, provider_key, writer_generation) -> ppm | -1`. Cheap per-segment
+/// selectivity (count / segment-doc-count) in parts-per-million in `[0, 1_000_000]`,
+/// used by the driver-side peer-consultation gate. `-1` means "I can't tell
+/// quickly" — driver will fall back to consulting.
+type EstimateSelectivityPpmFn = unsafe extern "C" fn(i64, i32, i64) -> i64;
 
 static CREATE_PROVIDER: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static RELEASE_PROVIDER: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static CREATE_COLLECTOR: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static COLLECT_DOCS: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static RELEASE_COLLECTOR: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+static ESTIMATE_SELECTIVITY_PPM: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Registered by Java at startup. Stores function pointers into atomic
 /// slots. Each call to this entry replaces the slots wholesale.
@@ -59,6 +68,7 @@ pub unsafe extern "C" fn df_register_filter_tree_callbacks(
     create_collector: CreateCollectorFn,
     collect_docs: CollectDocsFn,
     release_collector: ReleaseCollectorFn,
+    estimate_selectivity_ppm: EstimateSelectivityPpmFn,
 ) {
     // catch_unwind is defense-in-depth: atomic stores shouldn't panic,
     // but if they ever did (e.g. allocator OOM if we grew the atomics),
@@ -71,6 +81,7 @@ pub unsafe extern "C" fn df_register_filter_tree_callbacks(
         CREATE_COLLECTOR.store(create_collector as *mut (), Ordering::Release);
         COLLECT_DOCS.store(collect_docs as *mut (), Ordering::Release);
         RELEASE_COLLECTOR.store(release_collector as *mut (), Ordering::Release);
+        ESTIMATE_SELECTIVITY_PPM.store(estimate_selectivity_ppm as *mut (), Ordering::Release);
     }));
 }
 
@@ -109,6 +120,29 @@ fn load_release_collector() -> Option<ReleaseCollectorFn> {
         None
     } else {
         Some(unsafe { std::mem::transmute::<*mut (), ReleaseCollectorFn>(p) })
+    }
+}
+fn load_estimate_selectivity_ppm() -> Option<EstimateSelectivityPpmFn> {
+    let p = ESTIMATE_SELECTIVITY_PPM.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<*mut (), EstimateSelectivityPpmFn>(p) })
+    }
+}
+
+/// Cheap per-segment selectivity (count / segment-doc-count) in parts-per-million
+/// in `[0, 1_000_000]`, used by the driver-side peer-consultation gate. Returns
+/// `Some(ppm)` on a non-negative result; `None` when the Java side returns `-1`
+/// (couldn't cheaply derive) or the callback slot wasn't registered. The caller
+/// treats `None` as "I don't know — be conservative and consult".
+pub fn estimate_selectivity_ppm(context_id: i64, provider_key: i32, writer_generation: i64) -> Option<i64> {
+    let f = load_estimate_selectivity_ppm()?;
+    let n = unsafe { f(context_id, provider_key, writer_generation) };
+    if n < 0 {
+        None
+    } else {
+        Some(n)
     }
 }
 

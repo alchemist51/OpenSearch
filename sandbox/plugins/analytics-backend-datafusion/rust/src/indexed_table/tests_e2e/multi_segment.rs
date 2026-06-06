@@ -161,6 +161,7 @@ async fn run_two_segment_query(
                     std::sync::Arc::new(crate::indexed_table::eval::single_collector::FfmDelegatedBackendCollectorFactory),
                     0,
                     None,
+                    0.10,
                 ),
             );
                 Ok(eval)
@@ -571,6 +572,7 @@ async fn run_segments(specs: Vec<SegSpec>, num_partitions: usize) -> Vec<(i32, S
                     std::sync::Arc::new(crate::indexed_table::eval::single_collector::FfmDelegatedBackendCollectorFactory),
                     0,
                     None,
+                    0.10,
                 ),
             );
                 Ok(eval)

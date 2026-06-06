@@ -423,6 +423,7 @@ pub(in crate::indexed_table::tests_e2e) async fn execute_delegation_tree(
                 Arc::clone(&factory),
                 0,
                 None,
+                0.10,
             ));
             Ok(eval)
         })

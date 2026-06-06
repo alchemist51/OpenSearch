@@ -403,6 +403,7 @@ pub(in crate::indexed_table::tests_e2e) async fn execute_tree_single_collector(
                 std::sync::Arc::new(crate::indexed_table::eval::single_collector::FfmDelegatedBackendCollectorFactory),
                 0,
                 None,
+                0.10,
             ));
             let _ = segment;
             Ok(eval)

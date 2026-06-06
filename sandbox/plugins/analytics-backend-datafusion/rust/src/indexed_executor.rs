@@ -692,6 +692,7 @@ async unsafe fn execute_indexed_with_context_inner(
             let bloom_store = Arc::clone(&store);
             let bloom_schema = schema.clone();
             let bloom_on_read = query_config.bloom_filter_on_read;
+            let lucene_peer_consultation_threshold = query_config.lucene_peer_consultation_threshold;
             Arc::new(
                 move |segment: &SegmentFileInfo, chunk, stream_metrics: &StreamMetrics| {
                     let collector_opt: Option<Arc<dyn RowGroupDocsCollector>> = match &correctness_provider {
@@ -749,6 +750,7 @@ async unsafe fn execute_indexed_with_context_inner(
                             Arc::new(crate::indexed_table::eval::single_collector::FfmDelegatedBackendCollectorFactory),
                             context_id,
                             bloom_config,
+                            lucene_peer_consultation_threshold,
                         ));
                     Ok(eval)
                 },

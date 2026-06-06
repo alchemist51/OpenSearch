@@ -261,6 +261,39 @@ public final class FilterTreeCallbacks {
     }
 
     /**
+     * {@code estimateSelectivityPpm(contextId, providerKey, writerGeneration) -> ppm|-1}.
+     * Returns selectivity (count / segment-doc-count) in parts-per-million in
+     * {@code [0, 1_000_000]}, or {@code -1} when unknown. Used by the driver's
+     * peer-consultation gate.
+     */
+    public static long estimateSelectivityPpm(long contextId, int providerKey, long writerGeneration) {
+        long tid = trackStart(contextId);
+        try {
+            QueryBinding binding = BINDINGS.get(contextId);
+            assertBindingExists(binding, "estimateSelectivityPpm", contextId);
+            if (binding == null || binding.handle() == null) {
+                return -1L;
+            }
+            return binding.handle().estimateSelectivityPpm(providerKey, writerGeneration);
+        } catch (AssertionError e) {
+            throw e;
+        } catch (Throwable throwable) {
+            LOGGER.error(
+                new ParameterizedMessage(
+                    "estimateSelectivityPpm(contextId={}, providerKey={}, writerGeneration={}) failed",
+                    contextId,
+                    providerKey,
+                    writerGeneration
+                ),
+                throwable
+            );
+            return -1L;
+        } finally {
+            trackEnd(contextId, tid);
+        }
+    }
+
+    /**
      * {@code releaseCollector(contextId, collectorKey)}. Never throws.
      */
     public static void releaseCollector(long contextId, int collectorKey) {

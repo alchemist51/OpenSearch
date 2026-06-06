@@ -71,6 +71,14 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
     private final Map<Long, String> generationToSegmentName;
 
     private final ConcurrentHashMap<Integer, Weight> weightsByProviderKey = new ConcurrentHashMap<>();
+    /**
+     * Per-provider list of {@link LeafCountEstimator}s, populated when
+     * {@link #createProvider(int)} compiles the Weight. Read by
+     * {@link #estimateSelectivityPpm(int, long)} to derive a cheap estimate for the
+     * driver-side peer-consultation gate. Same lifecycle as
+     * {@link #weightsByProviderKey}.
+     */
+    private final ConcurrentHashMap<Integer, List<LeafCountEstimator>> estimatorsByProviderKey = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, ScorerHandle> scorersByCollectorKey = new ConcurrentHashMap<>();
     private final AtomicInteger nextProviderKey = new AtomicInteger(1);
     private final AtomicInteger nextCollectorKey = new AtomicInteger(1);
@@ -123,9 +131,15 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
             return -1;
         }
         try {
-            Weight weight = searcher.createWeight(searcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+            Query rewritten = searcher.rewrite(query);
+            Weight weight = searcher.createWeight(rewritten, ScoreMode.COMPLETE_NO_SCORES, 1.0f);
             int providerKey = nextProviderKey.getAndIncrement();
             weightsByProviderKey.put(providerKey, weight);
+            // Build per-leaf estimators once per provider so the runtime estimate path is
+            // allocation-free. The list is per-conjunction-clause for top-level all-MUST
+            // BooleanQueries; one entry otherwise. Empty list shouldn't be possible — empty
+            // BooleanQueries are rewritten to MatchNoDocsQuery.
+            estimatorsByProviderKey.put(providerKey, LeafCountEstimators.buildList(weight, rewritten));
             LOGGER.debug("[scf] createProvider annotationId={} → providerKey={}", annotationId, providerKey);
             return providerKey;
         } catch (IOException exception) {
@@ -209,6 +223,61 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
     }
 
     @Override
+    public long estimateSelectivityPpm(int providerKey, long writerGeneration) {
+        List<LeafCountEstimator> estimators = estimatorsByProviderKey.get(providerKey);
+        if (estimators == null || estimators.isEmpty()) {
+            return -1L;
+        }
+        String segName = generationToSegmentName.get(writerGeneration);
+        if (segName == null) {
+            return -1L;
+        }
+        LeafReaderContext leaf = null;
+        for (LeafReaderContext lrc : leaves) {
+            if (unwrapSegmentReader(lrc.reader()).getSegmentInfo().info.name.equals(segName)) {
+                leaf = lrc;
+                break;
+            }
+        }
+        if (leaf == null) {
+            return -1L;
+        }
+        int total = leaf.reader().numDocs();
+        if (total <= 0) {
+            // Empty / fully-deleted segment — every fraction is trivially 0; return that
+            // so the gate treats this segment as maximally selective and consults.
+            return 0L;
+        }
+        try {
+            // Conjunction count is bounded by the smallest leaf; any leaf returning -1
+            // ("can't tell cheaply") poisons the result so the driver consults to be safe.
+            long min = Long.MAX_VALUE;
+            for (LeafCountEstimator estimator : estimators) {
+                long c = estimator.estimate(leaf);
+                if (c < 0) {
+                    return -1L;
+                }
+                if (c < min) {
+                    min = c;
+                }
+            }
+            if (min == Long.MAX_VALUE) {
+                return -1L;
+            }
+            // selectivity = min / total, encoded in parts-per-million for FFM transport.
+            // Capped at 1_000_000 in case rounding ever pushes a count above total.
+            long ppm = (min * 1_000_000L) / total;
+            return Math.min(ppm, 1_000_000L);
+        } catch (IOException exception) {
+            LOGGER.warn(
+                "estimateSelectivityPpm IOException for providerKey=" + providerKey + " writerGeneration=" + writerGeneration,
+                exception
+            );
+            return -1L;
+        }
+    }
+
+    @Override
     public int collectDocs(int collectorKey, int minDoc, int maxDoc, MemorySegment out) {
         ScorerHandle handle = scorersByCollectorKey.get(collectorKey);
         if (handle == null) {
@@ -268,11 +337,13 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
     @Override
     public void releaseProvider(int providerKey) {
         weightsByProviderKey.remove(providerKey);
+        estimatorsByProviderKey.remove(providerKey);
     }
 
     @Override
     public void close() {
         weightsByProviderKey.clear();
+        estimatorsByProviderKey.clear();
         scorersByCollectorKey.clear();
     }
 

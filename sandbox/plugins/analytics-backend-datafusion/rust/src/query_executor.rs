@@ -305,7 +305,7 @@ pub async fn execute_with_context(
         // and fall through to the standard decode + execute below.
         if let Some(prepared) = handle.prepared_plan.as_ref() {
             let physical_plan = std::sync::Arc::clone(prepared);
-            let df_stream = execute_stream(physical_plan, handle.ctx.task_ctx()).map_err(|e| {
+            let df_stream = execute_stream(Arc::clone(&physical_plan), handle.ctx.task_ctx()).map_err(|e| {
                 error!("execute_with_context: failed to execute prepared plan: {}", e);
                 e
             })?;
