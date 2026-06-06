@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use native_bridge_common::log_debug;
 use datafusion::{
     common::DataFusionError,
     datasource::file_format::parquet::ParquetFormat,
@@ -204,6 +205,11 @@ pub async unsafe fn create_session_context(
     config.options_mut().execution.parquet.pushdown_filters = query_config.parquet_pushdown_filters;
     config.options_mut().execution.target_partitions = effective_partitions;
     config.options_mut().execution.batch_size = effective_batch_size;
+    // When the index has `index.sort.field`, ask DataFusion to use the sort-aware
+    // file-group partitioner so `output_ordering` can propagate from the scan.
+    if !shard_view.sort_fields.is_empty() {
+        config.options_mut().execution.split_file_groups_by_statistics = true;
+    }
 
     let mut state_builder = SessionStateBuilder::new()
         .with_config(config)
@@ -237,9 +243,40 @@ pub async unsafe fn create_session_context(
     crate::udwf::register_all(&ctx);
 
     // Register default ListingTable for parquet scans.
-    let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+    //
+    // `target_partitions` on the listing options drives the sort-aware bin-packer in
+    // `split_groups_by_statistics_with_target_partitions`. We set it to the session's
+    // effective partition count so the bin-packer produces up to N groups (one file per
+    // group when min/max ranges can't chain). The session-state's `target_partitions`
+    // controls EnforceDistribution; this one is independent.
+    let mut listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
         .with_file_extension(".parquet")
-        .with_collect_stat(true);
+        .with_collect_stat(true)
+        .with_target_partitions(effective_partitions);
+
+    // When the index has `index.sort.field`, declare the per-file sort order so
+    // DataFusion can advertise `output_ordering` through the scan and enable the
+    // `sort_prefix` TopK optimization. The OpenSearch writer enforces this sort
+    // within each segment, so the per-file claim is verifiable-by-construction.
+    //
+    // `Column::from_name` (instead of `col(name)`) preserves the column-name case.
+    // `col("EventTime")` lowercases via SQL identifier normalization to "eventtime",
+    // which fails the lookup against Arrow schemas that store the case-sensitive name.
+    if !shard_view.sort_fields.is_empty() {
+        use datafusion::common::Column;
+        use datafusion::logical_expr::{Expr, SortExpr};
+        let sort_exprs: Vec<SortExpr> = shard_view
+            .sort_fields
+            .iter()
+            .zip(shard_view.sort_orders.iter())
+            .map(|(name, order)| {
+                let asc = order.eq_ignore_ascii_case("asc");
+                // Match Lucene default NULLS placement: ASC → NULLS FIRST, DESC → NULLS LAST.
+                Expr::Column(Column::from_name(name.clone())).sort(asc, asc)
+            })
+            .collect();
+        listing_options = listing_options.with_file_sort_order(vec![sort_exprs]);
+    }
 
     // For multi-index queries, the plan's NamedTable carries the logical name (alias/pattern)
     // which differs from table_name (the concrete shard index). Extract it from the plan and
@@ -314,6 +351,11 @@ pub async unsafe fn create_session_context(
         );
         e
     })?;
+    log_debug!(
+        "create_session_context: registered table '{}' with file_sort_order_keys={}",
+        register_name,
+        shard_view.sort_fields.len()
+    );
 
     error!(
         "create_session_context: successfully registered table '{}', table_name_len={}",

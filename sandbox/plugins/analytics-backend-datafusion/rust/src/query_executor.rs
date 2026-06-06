@@ -53,6 +53,8 @@ pub async fn execute_query(
     context_id: i64,
     shard_store: Arc<dyn ObjectStore>,
     phantom_corrector: Option<Arc<crate::phantom_corrector::PhantomCorrector>>,
+    sort_fields: &[String],
+    sort_orders: &[String],
 ) -> Result<i64, DataFusionError> {
     // Build per-query RuntimeEnv with list-files cache pre-populated.
     let runtime_env = build_query_runtime_env(runtime, &table_path, object_metas.as_ref())?;
@@ -135,9 +137,32 @@ pub async fn execute_query(
         _ => {
             // Baseline: use standard ListingTable
             let file_format = ParquetFormat::new();
-            let listing_options = ListingOptions::new(Arc::new(file_format))
+            let mut listing_options = ListingOptions::new(Arc::new(file_format))
                 .with_file_extension(".parquet")
                 .with_collect_stat(true);
+            // Declare per-file sort order to DataFusion if the index has `index.sort.field`.
+            // OpenSearch's parquet writer enforces this sort within each segment, so the claim
+            // is verifiable-by-construction. With `output_ordering` advertised on
+            // `DataSourceExec`, the optimizer can elide redundant SortExec, enable
+            // `repartition_preserving_order` (one whole file per partition), and fire the
+            // `sort_prefix` TopK optimization when the query's ORDER BY matches a prefix.
+            if !sort_fields.is_empty() {
+                use datafusion::common::Column;
+                use datafusion::logical_expr::{Expr, SortExpr};
+                let sort_exprs: Vec<SortExpr> = sort_fields
+                    .iter()
+                    .zip(sort_orders.iter())
+                    .map(|(name, order)| {
+                        let asc = order.eq_ignore_ascii_case("asc");
+                        // Match Lucene default NULLS placement: ASC → first, DESC → last.
+                        // Use `Column::from_name` (NOT `col(name)`) to preserve the column-name
+                        // case. `col("EventTime")` lowercases via SQL identifier normalization,
+                        // breaking lookups against Arrow schemas with PascalCase names.
+                        Expr::Column(Column::from_name(name.clone())).sort(asc, asc)
+                    })
+                    .collect();
+                listing_options = listing_options.with_file_sort_order(vec![sort_exprs]);
+            }
             let resolved_schema = listing_options
                 .infer_schema(&ctx.state(), &table_path)
                 .await
