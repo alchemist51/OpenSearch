@@ -26,7 +26,7 @@ import java.lang.foreign.ValueLayout;
 public final class WireConfigSnapshot {
 
     /** Total byte size of the wire struct ({@code WireDatafusionQueryConfig}). */
-    public static final long BYTE_SIZE = 76;
+    public static final long BYTE_SIZE = 88;
 
     private final int batchSize;
     private final int targetPartitions;
@@ -38,6 +38,7 @@ public final class WireConfigSnapshot {
     private final int singleCollectorStrategy;
     private final int treeCollectorStrategy;
     private final int queryStrategy;
+    private final double lucenePeerConsultationThreshold;
 
     private WireConfigSnapshot(Builder builder) {
         this.batchSize = builder.batchSize;
@@ -50,6 +51,7 @@ public final class WireConfigSnapshot {
         this.singleCollectorStrategy = builder.singleCollectorStrategy;
         this.treeCollectorStrategy = builder.treeCollectorStrategy;
         this.queryStrategy = builder.queryStrategy;
+        this.lucenePeerConsultationThreshold = builder.lucenePeerConsultationThreshold;
     }
 
     public static Builder builder() {
@@ -70,7 +72,8 @@ public final class WireConfigSnapshot {
             .maxCollectorParallelism(current.maxCollectorParallelism)
             .singleCollectorStrategy(current.singleCollectorStrategy)
             .treeCollectorStrategy(current.treeCollectorStrategy)
-            .queryStrategy(current.queryStrategy);
+            .queryStrategy(current.queryStrategy)
+            .lucenePeerConsultationThreshold(current.lucenePeerConsultationThreshold);
     }
 
     public int batchSize() {
@@ -113,6 +116,10 @@ public final class WireConfigSnapshot {
         return queryStrategy;
     }
 
+    public double lucenePeerConsultationThreshold() {
+        return lucenePeerConsultationThreshold;
+    }
+
     /**
      * Writes this snapshot into a {@code MemorySegment} matching the
      * {@code WireDatafusionQueryConfig} {@code #[repr(C)]} layout.
@@ -138,8 +145,10 @@ public final class WireConfigSnapshot {
      * 64      4     tree_collector_strategy              i32      from snapshot
      * 68      4     query_strategy                       i32      from snapshot (0/1/2)
      * 72      4     bloom_filter_on_read                 i32      from snapshot (0/1)
+     * 76      4     (padding for 8-byte alignment of next f64)
+     * 80      8     lucene_peer_consultation_threshold   f64      from snapshot ([0.0, 1.0])
      * ──────  ────
-     * Total: 76 bytes
+     * Total: 88 bytes
      * </pre>
      *
      * @param segment the target memory segment (at least {@link #BYTE_SIZE} bytes)
@@ -175,6 +184,11 @@ public final class WireConfigSnapshot {
         segment.set(ValueLayout.JAVA_INT, 68, queryStrategy);
         // Offset 72: bloom_filter_on_read (i32) — 0 = false, 1 = true
         segment.set(ValueLayout.JAVA_INT, 72, bloomFilterOnRead ? 1 : 0);
+        // Offset 76-79: 4 bytes of padding so the next f64 starts on an 8-byte boundary.
+        // Rust's `#[repr(C)]` would insert this padding automatically; we mirror it explicitly
+        // here so MemorySegment aligned-writes don't fault.
+        // Offset 80: lucene_peer_consultation_threshold (f64) — [0.0, 1.0]
+        segment.set(ValueLayout.JAVA_DOUBLE, 80, lucenePeerConsultationThreshold);
     }
 
     /**
@@ -192,6 +206,7 @@ public final class WireConfigSnapshot {
         private int singleCollectorStrategy = 2; // PageRangeSplit
         private int treeCollectorStrategy = 1;   // TightenOuterBounds
         private int queryStrategy = 2;           // IndexedPredicateOnly (matches DatafusionSettings default "indexed")
+        private double lucenePeerConsultationThreshold = 0.10;
 
         private Builder() {}
 
@@ -242,6 +257,11 @@ public final class WireConfigSnapshot {
 
         public Builder queryStrategy(int queryStrategy) {
             this.queryStrategy = queryStrategy;
+            return this;
+        }
+
+        public Builder lucenePeerConsultationThreshold(double lucenePeerConsultationThreshold) {
+            this.lucenePeerConsultationThreshold = lucenePeerConsultationThreshold;
             return this;
         }
 

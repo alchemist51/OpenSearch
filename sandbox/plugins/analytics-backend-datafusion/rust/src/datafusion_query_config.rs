@@ -72,6 +72,14 @@ pub struct DatafusionQueryConfig {
     pub query_strategy: QueryStrategy,
     /// Whether to use bloom filters for row group pruning on the indexed read path.
     pub bloom_filter_on_read: bool,
+    /// Threshold for the driver-side Lucene peer-consultation gate. When DF page
+    /// pruning kept >5% of an RG (existing first gate), the driver asks Lucene
+    /// for a cheap document-count estimate; if the estimate over the segment's
+    /// total docs is at most this fraction, the peer is consulted (its bitset
+    /// is selective enough to narrow further). Otherwise the peer call is
+    /// skipped. `0.0` = never consult; `1.0` = always consult on this gate.
+    /// Set via `analytics.lucene.peer_consultation_threshold` (default `0.10`).
+    pub lucene_peer_consultation_threshold: f64,
 }
 
 /// FFM wire format. Must stay in lockstep with the Java `MemoryLayout`.
@@ -105,6 +113,9 @@ pub struct WireDatafusionQueryConfig {
     pub query_strategy: i32,
     /// 0 = false, 1 = true
     pub bloom_filter_on_read: i32,
+    /// Threshold (0..1) for the Lucene peer-consultation second gate. See
+    /// `DatafusionQueryConfig::lucene_peer_consultation_threshold`.
+    pub lucene_peer_consultation_threshold: f64,
 }
 
 impl DatafusionQueryConfig {
@@ -129,6 +140,7 @@ impl DatafusionQueryConfig {
             tree_collector_strategy: CollectorCallStrategy::TightenOuterBounds,
             query_strategy: QueryStrategy::None,
             bloom_filter_on_read: true,
+            lucene_peer_consultation_threshold: 0.10,
         }
     }
 
@@ -200,6 +212,9 @@ impl DatafusionQueryConfig {
                 _ => QueryStrategy::None,
             },
             bloom_filter_on_read: w.bloom_filter_on_read != 0,
+            // Clamp to [0.0, 1.0]. Java validates the cluster setting in the same range, so
+            // out-of-range values shouldn't cross the wire — clamp defensively for ABI hygiene.
+            lucene_peer_consultation_threshold: w.lucene_peer_consultation_threshold.clamp(0.0, 1.0),
         }
     }
 }
@@ -316,6 +331,7 @@ mod tests {
             tree_collector_strategy: 1,
             query_strategy: 1,
             bloom_filter_on_read: 1,
+            lucene_peer_consultation_threshold: 0.25,
         };
         let ptr = &wire as *const _ as i64;
         let c = unsafe { DatafusionQueryConfig::from_ffm_ptr(ptr) };
@@ -330,6 +346,7 @@ mod tests {
         assert_eq!(c.cost_predicate, 3);
         assert_eq!(c.cost_collector, 17);
         assert_eq!(c.query_strategy, QueryStrategy::ListingTable);
+        assert!((c.lucene_peer_consultation_threshold - 0.25).abs() < 1e-9);
     }
 
     #[test]
@@ -350,11 +367,13 @@ mod tests {
             tree_collector_strategy: 1,
             query_strategy: 0,
             bloom_filter_on_read: 0,
+            lucene_peer_consultation_threshold: 0.10,
         };
         let ptr = &wire as *const _ as i64;
         let c = unsafe { DatafusionQueryConfig::from_ffm_ptr(ptr) };
         assert_eq!(c.force_strategy, None);
         assert_eq!(c.force_pushdown, None);
         assert_eq!(c.query_strategy, QueryStrategy::None);
+        assert!((c.lucene_peer_consultation_threshold - 0.10).abs() < 1e-9);
     }
 }

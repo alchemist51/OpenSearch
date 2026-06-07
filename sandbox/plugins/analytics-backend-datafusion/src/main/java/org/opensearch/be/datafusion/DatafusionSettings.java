@@ -236,6 +236,27 @@ public final class DatafusionSettings {
         Setting.Property.Dynamic
     );
 
+    /**
+     * Threshold [0.0, 1.0] for the Lucene peer-consultation second gate. The driver-side
+     * {@code SingleCollectorEvaluator} runs DataFusion's page-pruning first; if page
+     * pruning kept more than the existing 5% of an RG, it asks Lucene for a cheap
+     * per-segment doc-count estimate (via {@code Weight.count} + a per-leaf min over the
+     * conjunction). The peer is consulted only when the estimate over the segment's
+     * total docs is at most this fraction; otherwise the peer call is skipped because
+     * its bitset wouldn't narrow further.
+     * <p>
+     * {@code 0.0} = never consult on this gate. {@code 1.0} = always consult.
+     * Default: {@code 0.10}.
+     */
+    public static final Setting<Double> LUCENE_PEER_CONSULTATION_THRESHOLD = Setting.doubleSetting(
+        "analytics.lucene.peer_consultation_threshold",
+        0.10,
+        0.0,
+        1.0,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     // ── All settings registered by the plugin ──
 
     public static final List<Setting<?>> ALL_SETTINGS = List.of(
@@ -273,7 +294,8 @@ public final class DatafusionSettings {
         INDEXED_SINGLE_COLLECTOR_STRATEGY,
         INDEXED_TREE_COLLECTOR_STRATEGY,
         INDEXED_MAX_COLLECTOR_PARALLELISM,
-        INDEXED_QUERY_STRATEGY
+        INDEXED_QUERY_STRATEGY,
+        LUCENE_PEER_CONSULTATION_THRESHOLD
     );
 
     // ── Snapshot management ──
@@ -316,6 +338,7 @@ public final class DatafusionSettings {
             .treeCollectorStrategy(strategyToWireValue(INDEXED_TREE_COLLECTOR_STRATEGY.get(settings)))
             .maxCollectorParallelism(INDEXED_MAX_COLLECTOR_PARALLELISM.get(settings))
             .queryStrategy(queryStrategyToWireValue(INDEXED_QUERY_STRATEGY.get(settings)))
+            .lucenePeerConsultationThreshold(LUCENE_PEER_CONSULTATION_THRESHOLD.get(settings))
             .build();
 
         registerListeners(clusterSettings);
@@ -340,6 +363,7 @@ public final class DatafusionSettings {
             .treeCollectorStrategy(strategyToWireValue(INDEXED_TREE_COLLECTOR_STRATEGY.get(settings)))
             .maxCollectorParallelism(INDEXED_MAX_COLLECTOR_PARALLELISM.get(settings))
             .queryStrategy(queryStrategyToWireValue(INDEXED_QUERY_STRATEGY.get(settings)))
+            .lucenePeerConsultationThreshold(LUCENE_PEER_CONSULTATION_THRESHOLD.get(settings))
             .build();
     }
 
@@ -378,6 +402,10 @@ public final class DatafusionSettings {
 
         clusterSettings.addSettingsUpdateConsumer(INDEXED_QUERY_STRATEGY, newValue -> {
             snapshot = WireConfigSnapshot.builder(snapshot).queryStrategy(queryStrategyToWireValue(newValue)).build();
+        });
+
+        clusterSettings.addSettingsUpdateConsumer(LUCENE_PEER_CONSULTATION_THRESHOLD, newValue -> {
+            snapshot = WireConfigSnapshot.builder(snapshot).lucenePeerConsultationThreshold(newValue).build();
         });
 
         clusterSettings.addSettingsUpdateConsumer(SearchService.CONCURRENT_SEGMENT_SEARCH_TARGET_MAX_SLICE_COUNT_SETTING, newValue -> {

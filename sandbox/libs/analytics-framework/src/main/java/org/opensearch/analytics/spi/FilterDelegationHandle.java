@@ -88,4 +88,29 @@ public interface FilterDelegationHandle extends Closeable {
     default boolean isCancelled() {
         return false;
     }
+
+    /**
+     * Cheap, approximate selectivity for the provider on one segment, returned in
+     * parts-per-million ({@code [0, 1_000_000]}) so a single i64 carries it across
+     * the FFM boundary without floating-point. Drives the driver-side
+     * peer-consultation gate: when the selectivity exceeds the configured
+     * threshold, the driver skips the peer call (the bitset would approximate
+     * match-all and AND-intersection wouldn't prune anything).
+     *
+     * <p>The implementation derives the count via per-leaf minimum over the
+     * conjunction the provider represents — a conjunction's count is bounded by
+     * the smallest leaf's count. If any leaf can't be estimated, returns
+     * {@code -1} ("unknown") so the driver consults to be safe.
+     *
+     * <p>Default returns {@code -1} so backends without an estimate path don't
+     * change driver behaviour.
+     *
+     * @param providerKey the key returned from {@link #createProvider(int)}
+     * @param writerGeneration the writer generation identifying the segment
+     * @return selectivity in parts-per-million in {@code [0, 1_000_000]},
+     *         or {@code -1} if unknown
+     */
+    default long estimateSelectivityPpm(int providerKey, long writerGeneration) {
+        return -1L;
+    }
 }

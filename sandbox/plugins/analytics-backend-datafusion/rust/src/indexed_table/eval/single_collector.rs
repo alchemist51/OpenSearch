@@ -31,7 +31,7 @@ use native_bridge_common::log_debug;
 use roaring::RoaringBitmap;
 
 use super::{PrefetchedRg, RowGroupBitsetSource};
-use crate::indexed_table::ffm_callbacks::{create_provider, FfmSegmentCollector, ProviderHandle};
+use crate::indexed_table::ffm_callbacks::{create_provider, estimate_selectivity_ppm, FfmSegmentCollector, ProviderHandle};
 use crate::indexed_table::index::RowGroupDocsCollector;
 use crate::indexed_table::page_pruner::{PagePruneMetrics, PagePruner};
 use crate::indexed_table::row_selection::{
@@ -45,12 +45,10 @@ use std::time::Instant;
 pub use super::CollectorCallStrategy;
 use crate::indexed_table::stream::RowGroupInfo;
 
-/// TODO(phase-99): hardcoded selectivity threshold for opportunistic peer consultation.
-/// Replaced by a cluster setting plumbed through `WireConfigSnapshot` and
-/// `DatafusionQueryConfig` in the very last phase, after Phase 7 OR/NOT support and
-/// everything else. Until then, performance-delegated leaves consult the peer when DF
-/// page-pruning kept more than 5% of an RG.
-const HARDCODED_SELECTIVITY_THRESHOLD: f64 = 0.05;
+/// First gate threshold: when DF page pruning keeps MORE than this fraction of an RG,
+/// page pruning wasn't selective enough and we proceed to gate 2 (Lucene estimate).
+/// When DF already squeezed below this, the peer call is skipped.
+const PAGE_PRUNE_SELECTIVITY_THRESHOLD: f64 = 0.05;
 
 /// Builds delegated-backend collectors for performance-delegated leaves. Production impl
 /// wraps `FfmSegmentCollector::create` (Java/Lucene round-trip); fuzz tests inject a
@@ -177,6 +175,11 @@ pub struct SingleCollectorEvaluator {
     context_id: i64,
     /// Bloom filter pruning config. None = disabled.
     bloom_config: Option<BloomConfig>,
+    /// Lucene peer-consultation second gate. After page pruning kept >5% of an RG, ask
+    /// Lucene for a cheap doc-count estimate; consult only when the estimate over the
+    /// segment's total docs is at most this fraction. `0.0` = never consult on this
+    /// gate. `1.0` = always consult. Plumbed through `DatafusionQueryConfig`.
+    lucene_peer_consultation_threshold: f64,
 }
 
 /// Resources needed for per-RG bloom filter pruning.
@@ -191,6 +194,7 @@ pub struct BloomConfig {
 }
 
 impl SingleCollectorEvaluator {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         collector: Option<Arc<dyn RowGroupDocsCollector>>,
         page_pruner: Arc<PagePruner>,
@@ -204,6 +208,7 @@ impl SingleCollectorEvaluator {
         delegated_backend_collector_factory: Arc<dyn DelegatedBackendCollectorFactory>,
         context_id: i64,
         bloom_config: Option<BloomConfig>,
+        lucene_peer_consultation_threshold: f64,
     ) -> Self {
         Self {
             collector,
@@ -218,6 +223,7 @@ impl SingleCollectorEvaluator {
             delegated_backend_collector_factory,
             context_id,
             bloom_config,
+            lucene_peer_consultation_threshold,
         }
     }
 }
@@ -394,15 +400,22 @@ impl RowGroupBitsetSource for SingleCollectorEvaluator {
             }
         };
 
-        // Opportunistic peer consultation for performance-delegated leaves. Only fires
-        // when DF page-pruning kept more than the configured fraction of the RG —
-        // skipping the FFM round-trip when DF was already selective. Lazy: lock the
-        // map only if the gate fires; create the provider only once per query × leaf.
+        // Opportunistic peer consultation for performance-delegated leaves. Two gates:
+        //  1. DF page-pruning selectivity — if DF already pruned ≤ 5% of the RG, the
+        //     peer call is skipped (DF is selective enough on its own).
+        //  2. Lucene cheap doc-count estimate — when (1) didn't help, ask Lucene for an
+        //     estimate via Weight.count + per-leaf min over the conjunction. Consult
+        //     only when the estimate over the segment's total docs is at most the
+        //     configured threshold; otherwise the bitset would approximate match-all
+        //     and AND-intersection wouldn't prune anything. Threshold sourced from
+        //     `analytics.lucene.peer_consultation_threshold` (default 0.10).
+        // Lazy throughout — provider is created only once per query × leaf, and only
+        // when the gates fire.
         // TODO(d3): consult ALL performance leaves whose gate fires and AND their
         // bitsets. Today we consult the first leaf only — sufficient for AND-only
         // single-call demo. Multi-leaf intersection is part of D3 follow-up.
         if !self.performance_provider_locks.is_empty()
-            && should_consult_lucene(&page_ranges, rg, HARDCODED_SELECTIVITY_THRESHOLD)
+            && should_consult_lucene(&page_ranges, rg, PAGE_PRUNE_SELECTIVITY_THRESHOLD)
         {
             // Pick the smallest annotation_id deterministically so logs/tests are stable.
             // Avoids the Vec/sort allocation in the common single-leaf case.
@@ -433,6 +446,37 @@ impl RowGroupBitsetSource for SingleCollectorEvaluator {
                     "[scf-rust] lazy provider initialized context_id={} annotation_id={} provider_key={}",
                     context_id, annotation_id, provider.key()
                 );
+            }
+
+            // Second gate: ask Lucene for a cheap per-segment selectivity estimate via
+            // Weight.count + per-leaf min over the conjunction. Skip the FFM round-trip
+            // when the peer's bitset would approximate match-all (estimated selectivity
+            // exceeds the configured threshold). `None` means "Java couldn't cheaply
+            // derive it" → consult anyway (safe default).
+            let threshold_ppm = (self.lucene_peer_consultation_threshold * 1_000_000.0) as i64;
+            let consult = match estimate_selectivity_ppm(context_id, provider.key(), self.writer_generation) {
+                Some(ppm) => ppm <= threshold_ppm,
+                None => true,
+            };
+            if !consult {
+                // Drop this AND-leaf's contribution: candidates already reflect DF page-pruning.
+                // Skip ahead to the post-peer materialization without intersecting a peer bitset.
+                let mask_len = rg.num_rows as usize;
+                let packed_bits = bitmap_to_packed_bits(&candidates, mask_len as u32);
+                let mask_buffer = datafusion::arrow::buffer::Buffer::from_vec(packed_bits);
+                if candidates.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(PrefetchedRg {
+                    candidates: candidates.clone(),
+                    eval_nanos: t.elapsed().as_nanos() as u64,
+                    context: Box::new(SingleCollectorState {
+                        candidates,
+                        mask_buffer: mask_buffer.clone(),
+                        mask_len,
+                    }),
+                    mask_buffer: Some(mask_buffer),
+                }));
             }
 
             let collector = self
@@ -691,6 +735,7 @@ mod tests {
         }) as Arc<dyn RowGroupDocsCollector>;
         let pruner = minimal_page_pruner();
         let eval = SingleCollectorEvaluator::new(Some(collector), pruner, None, None, None, None, CollectorCallStrategy::FullRange, Arc::new(HashMap::new()), 0, Arc::new(FfmDelegatedBackendCollectorFactory), 0, None);
+        let eval = SingleCollectorEvaluator::new(Some(collector), pruner, None, None, None, None, CollectorCallStrategy::FullRange, Arc::new(HashMap::new()), 0, Arc::new(FfmDelegatedBackendCollectorFactory), 0, 0.10);
 
         let rg = RowGroupInfo {
             index: 0,
@@ -707,6 +752,7 @@ mod tests {
         let collector = Arc::new(StubCollector { docs: vec![0] }) as Arc<dyn RowGroupDocsCollector>;
         let pruner = minimal_page_pruner();
         let eval = SingleCollectorEvaluator::new(Some(collector), pruner, None, None, None, None, CollectorCallStrategy::FullRange, Arc::new(HashMap::new()), 0, Arc::new(FfmDelegatedBackendCollectorFactory), 0, None);
+        let eval = SingleCollectorEvaluator::new(Some(collector), pruner, None, None, None, None, CollectorCallStrategy::FullRange, Arc::new(HashMap::new()), 0, Arc::new(FfmDelegatedBackendCollectorFactory), 0, 0.10);
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
             schema,
@@ -735,6 +781,7 @@ mod tests {
         let collector = Arc::new(StubCollector { docs: vec![0] }) as Arc<dyn RowGroupDocsCollector>;
         let pruner = minimal_page_pruner();
         let eval = SingleCollectorEvaluator::new(Some(collector), pruner, None, None, None, None, CollectorCallStrategy::FullRange, Arc::new(HashMap::new()), 0, Arc::new(FfmDelegatedBackendCollectorFactory), 0, None);
+        let eval = SingleCollectorEvaluator::new(Some(collector), pruner, None, None, None, None, CollectorCallStrategy::FullRange, Arc::new(HashMap::new()), 0, Arc::new(FfmDelegatedBackendCollectorFactory), 0, 0.10);
         assert!(eval.needs_row_mask());
     }
 
@@ -743,6 +790,7 @@ mod tests {
         let collector = Arc::new(StubCollector { docs: vec![] }) as Arc<dyn RowGroupDocsCollector>;
         let pruner = minimal_page_pruner();
         let eval = SingleCollectorEvaluator::new(Some(collector), pruner, None, None, None, None, CollectorCallStrategy::FullRange, Arc::new(HashMap::new()), 0, Arc::new(FfmDelegatedBackendCollectorFactory), 0, None);
+        let eval = SingleCollectorEvaluator::new(Some(collector), pruner, None, None, None, None, CollectorCallStrategy::FullRange, Arc::new(HashMap::new()), 0, Arc::new(FfmDelegatedBackendCollectorFactory), 0, 0.10);
         let rg = RowGroupInfo {
             index: 0,
             first_row: 0,
@@ -763,6 +811,7 @@ mod tests {
         }) as Arc<dyn RowGroupDocsCollector>;
         let pruner = minimal_page_pruner();
         let eval = SingleCollectorEvaluator::new(Some(collector), pruner, None, None, None, None, CollectorCallStrategy::FullRange, Arc::new(HashMap::new()), 0, Arc::new(FfmDelegatedBackendCollectorFactory), 0, None);
+        let eval = SingleCollectorEvaluator::new(Some(collector), pruner, None, None, None, None, CollectorCallStrategy::FullRange, Arc::new(HashMap::new()), 0, Arc::new(FfmDelegatedBackendCollectorFactory), 0, 0.10);
 
         let rg = RowGroupInfo {
             index: 0,

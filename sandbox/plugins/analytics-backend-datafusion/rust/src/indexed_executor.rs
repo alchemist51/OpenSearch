@@ -692,6 +692,7 @@ async unsafe fn execute_indexed_with_context_inner(
             let bloom_store = Arc::clone(&store);
             let bloom_schema = schema.clone();
             let bloom_on_read = query_config.bloom_filter_on_read;
+            let lucene_peer_consultation_threshold = query_config.lucene_peer_consultation_threshold;
             Arc::new(
                 move |segment: &SegmentFileInfo, chunk, stream_metrics: &StreamMetrics| {
                     let collector_opt: Option<Arc<dyn RowGroupDocsCollector>> = match &correctness_provider {
@@ -749,6 +750,7 @@ async unsafe fn execute_indexed_with_context_inner(
                             Arc::new(crate::indexed_table::eval::single_collector::FfmDelegatedBackendCollectorFactory),
                             context_id,
                             bloom_config,
+                            lucene_peer_consultation_threshold,
                         ));
                     Ok(eval)
                 },
@@ -886,7 +888,7 @@ async unsafe fn execute_indexed_with_context_inner(
     let target_schema = crate::schema_coerce::coerce_inferred_schema(physical_plan.schema());
     let physical_plan = crate::relabel_exec::wrap_if_relabel_needed(physical_plan, target_schema)?;
     log_debug!("DataFusion physical plan:\n{}", displayable(physical_plan.as_ref()).indent(true));
-    let df_stream = execute_stream(physical_plan, ctx.task_ctx())
+    let df_stream = execute_stream(physical_plan.clone(), ctx.task_ctx())
         .map_err(|e| DataFusionError::Execution(format!("execute_stream: {}", e)))?;
 
     let (cross_rt_stream, abort_handle) =
@@ -898,6 +900,6 @@ async unsafe fn execute_indexed_with_context_inner(
 
     let schema = cross_rt_stream.schema();
     let wrapped = RecordBatchStreamAdapter::new(schema, cross_rt_stream);
-    let stream_handle = crate::api::QueryStreamHandle::with_session_context(wrapped, query_context, ctx, Some(permit));
+    let stream_handle = crate::api::QueryStreamHandle::with_physical_plan(wrapped, query_context, ctx, Some(permit), physical_plan);
     Ok(Box::into_raw(Box::new(stream_handle)) as i64)
 }

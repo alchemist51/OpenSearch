@@ -184,8 +184,13 @@ impl LocalSession {
             DataFusionError::Execution(format!("Failed to decode Substrait plan: {}", e))
         })?;
         let logical_plan = from_substrait_plan(&self.ctx.state(), &plan).await?;
+        log_debug!("DataFusion logical plan:\n{}", logical_plan.display_indent());
         let dataframe = self.ctx.execute_logical_plan(logical_plan).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
+        log_debug!(
+            "DataFusion physical plan:\n{}",
+            displayable(physical_plan.as_ref()).indent(true)
+        );
 
         let target_schema = crate::schema_coerce::coerce_inferred_schema(physical_plan.schema());
         let physical_plan = crate::relabel_exec::wrap_if_relabel_needed(physical_plan, target_schema)?;
@@ -218,8 +223,13 @@ impl LocalSession {
             ))
         })?;
         let logical_plan = from_substrait_plan(&self.ctx.state(), &plan).await?;
+        log_debug!("DataFusion logical plan:\n{}", logical_plan.display_indent());
         let dataframe = self.ctx.execute_logical_plan(logical_plan).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
+        log_debug!(
+            "DataFusion physical plan:\n{}",
+            displayable(physical_plan.as_ref()).indent(true)
+        );
         // Strip first so `force_aggregate_mode(Final)` can find the Final/Partial pair
         // through the raw plan; then derive `target_schema` and wrap with RelabelExec from
         // the stripped output (otherwise the relabel target would carry the pre-strip Final

@@ -63,13 +63,13 @@ public class LuceneAnalyticsBackendPlugin implements AnalyticsSearchBackendPlugi
     // registered in QuerySerializerRegistry — declaring a capability without a matching
     // DelegatedPredicateSerializer makes the marking layer pick Lucene as viable for
     // operators it can't actually translate, and the failure surfaces at convert time as
-    // an IllegalStateException ("No Lucene serializer for [..]"). Today only EQUALS has
-    // a serializer; range ops, NOT_EQUALS, IS_NULL, IS_NOT_NULL, IN, LIKE are deferred
+    // an IllegalStateException ("No Lucene serializer for [..]"). Today EQUALS and
+    // NOT_EQUALS have serializers; range ops, IS_NULL, IS_NOT_NULL, IN, LIKE are deferred
     // until their serializers land.
     // TODO: have CapabilityRegistry intersect declared FilterCapability against the
     // backend's serializer keyset at startup so this list can't drift again. The TODO in
     // OpenSearchFilterRule.resolveViableBackends references the same constraint.
-    private static final Set<ScalarFunction> STANDARD_OPS = Set.of(ScalarFunction.EQUALS);
+    private static final Set<ScalarFunction> STANDARD_OPS = Set.of(ScalarFunction.EQUALS, ScalarFunction.NOT_EQUALS);
 
     private static final Set<ScalarFunction> FULL_TEXT_OPS = Set.of(
         ScalarFunction.MATCH,
@@ -98,6 +98,15 @@ public class LuceneAnalyticsBackendPlugin implements AnalyticsSearchBackendPlugi
         STANDARD_TYPES.add(FieldType.MATCH_ONLY_TEXT);
     }
 
+    // NOT_EQUALS-eligible field types — strictly narrower than {@link #STANDARD_TYPES}.
+    // The serializer emits {@code bool { mustNot: term { field: value } }}. On a text /
+    // match_only_text field with the standard analyzer, {@code term: ""} matches nothing
+    // (analyzer produces zero tokens from the empty string), which makes
+    // {@code mustNot match-nothing} degenerate to "match all" — wrong results for the
+    // canonical {@code SearchPhrase != ''} ClickBench shape. Keyword fields are not
+    // analyzed, so the term lookup is exact and the inversion is correct.
+    private static final Set<FieldType> NOT_EQUALS_TYPES = Set.of(FieldType.KEYWORD);
+
     private static final Set<FieldType> FULL_TEXT_TYPES = new HashSet<>();
     static {
         FULL_TEXT_TYPES.addAll(FieldType.keyword());
@@ -108,7 +117,11 @@ public class LuceneAnalyticsBackendPlugin implements AnalyticsSearchBackendPlugi
     static {
         Set<FilterCapability> caps = new HashSet<>();
         for (ScalarFunction op : STANDARD_OPS) {
-            caps.add(new FilterCapability.Standard(op, STANDARD_TYPES, LUCENE_FORMATS));
+            // Per-op type restrictions: NOT_EQUALS is keyword-only because the
+            // mustNot-term DSL form misbehaves on analyzed (text) fields. See
+            // {@link #NOT_EQUALS_TYPES} above.
+            Set<FieldType> typesForOp = op == ScalarFunction.NOT_EQUALS ? NOT_EQUALS_TYPES : STANDARD_TYPES;
+            caps.add(new FilterCapability.Standard(op, typesForOp, LUCENE_FORMATS));
         }
         for (ScalarFunction op : FULL_TEXT_OPS) {
             for (FieldType type : FULL_TEXT_TYPES) {

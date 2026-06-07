@@ -29,6 +29,7 @@ import org.opensearch.common.unit.Fuzziness;
 import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.MatchBoolPrefixQueryBuilder;
 import org.opensearch.index.query.MatchPhrasePrefixQueryBuilder;
@@ -40,6 +41,7 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryStringQueryBuilder;
 import org.opensearch.index.query.SimpleQueryStringBuilder;
 import org.opensearch.index.query.SimpleQueryStringFlag;
+import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.WildcardQueryBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -64,7 +66,9 @@ public class QuerySerializerRegistryTests extends OpenSearchTestCase {
             new NamedWriteableRegistry.Entry(QueryBuilder.class, QueryStringQueryBuilder.NAME, QueryStringQueryBuilder::new),
             new NamedWriteableRegistry.Entry(QueryBuilder.class, SimpleQueryStringBuilder.NAME, SimpleQueryStringBuilder::new),
             new NamedWriteableRegistry.Entry(QueryBuilder.class, WildcardQueryBuilder.NAME, WildcardQueryBuilder::new),
-            new NamedWriteableRegistry.Entry(QueryBuilder.class, MatchAllQueryBuilder.NAME, MatchAllQueryBuilder::new)
+            new NamedWriteableRegistry.Entry(QueryBuilder.class, MatchAllQueryBuilder.NAME, MatchAllQueryBuilder::new),
+            new NamedWriteableRegistry.Entry(QueryBuilder.class, TermQueryBuilder.NAME, TermQueryBuilder::new),
+            new NamedWriteableRegistry.Entry(QueryBuilder.class, BoolQueryBuilder.NAME, BoolQueryBuilder::new)
         )
     );
 
@@ -966,6 +970,128 @@ public class QuerySerializerRegistryTests extends OpenSearchTestCase {
         }
     }
 
+    // --- NotEqualsSerializer tests ---
+
+    /**
+     * NOT_EQUALS must be registered alongside EQUALS so the marking layer can
+     * advertise Lucene as a viable peer for {@code <>} predicates.
+     */
+    public void testNotEqualsSerializerIsRegistered() {
+        DelegatedPredicateSerializer serializer = serializers.get(ScalarFunction.NOT_EQUALS);
+        assertNotNull("NOT_EQUALS serializer must be registered", serializer);
+    }
+
+    /**
+     * {@code col <> 'literal'} round-trips into a {@code bool { mustNot: term { col: literal } }}.
+     * The bool wrapper is the canonical OpenSearch DSL shape for negated equality.
+     */
+    public void testNotEqualsSerializerRoundTripColumnLeft() throws IOException {
+        DelegatedPredicateSerializer serializer = serializers.get(ScalarFunction.NOT_EQUALS);
+        assertNotNull("NOT_EQUALS serializer must be registered", serializer);
+
+        RexCall call = buildNotEqualsCall(/* columnFirst */ true, "tag", "hello");
+        List<FieldStorageInfo> fieldStorage = List.of(
+            new FieldStorageInfo("tag", "keyword", FieldType.KEYWORD, List.of(), List.of("lucene"), List.of(), false)
+        );
+
+        byte[] serialized = serializer.serialize(call, fieldStorage);
+
+        try (StreamInput input = new NamedWriteableAwareStreamInput(StreamInput.wrap(serialized), WRITEABLE_REGISTRY)) {
+            QueryBuilder deserialized = input.readNamedWriteable(QueryBuilder.class);
+            assertTrue("Deserialized must be BoolQueryBuilder", deserialized instanceof BoolQueryBuilder);
+            BoolQueryBuilder bool = (BoolQueryBuilder) deserialized;
+            assertTrue("must clauses must be empty", bool.must().isEmpty());
+            assertEquals("exactly one mustNot clause expected", 1, bool.mustNot().size());
+            QueryBuilder mustNotChild = bool.mustNot().get(0);
+            assertTrue("mustNot child must be a TermQueryBuilder", mustNotChild instanceof TermQueryBuilder);
+            TermQueryBuilder term = (TermQueryBuilder) mustNotChild;
+            assertEquals("tag", term.fieldName());
+            assertEquals("hello", term.value());
+        }
+    }
+
+    /**
+     * Operand order shouldn't matter — {@code 'literal' <> col} is the same
+     * predicate as {@code col <> 'literal'}, so the serializer must accept both.
+     */
+    public void testNotEqualsSerializerAcceptsLiteralLeft() throws IOException {
+        DelegatedPredicateSerializer serializer = serializers.get(ScalarFunction.NOT_EQUALS);
+        assertNotNull("NOT_EQUALS serializer must be registered", serializer);
+
+        RexCall call = buildNotEqualsCall(/* columnFirst */ false, "tag", "hello");
+        List<FieldStorageInfo> fieldStorage = List.of(
+            new FieldStorageInfo("tag", "keyword", FieldType.KEYWORD, List.of(), List.of("lucene"), List.of(), false)
+        );
+
+        byte[] serialized = serializer.serialize(call, fieldStorage);
+
+        try (StreamInput input = new NamedWriteableAwareStreamInput(StreamInput.wrap(serialized), WRITEABLE_REGISTRY)) {
+            QueryBuilder deserialized = input.readNamedWriteable(QueryBuilder.class);
+            assertTrue("Deserialized must be BoolQueryBuilder", deserialized instanceof BoolQueryBuilder);
+            BoolQueryBuilder bool = (BoolQueryBuilder) deserialized;
+            assertEquals("exactly one mustNot clause expected", 1, bool.mustNot().size());
+            TermQueryBuilder term = (TermQueryBuilder) bool.mustNot().get(0);
+            assertEquals("tag", term.fieldName());
+            assertEquals("hello", term.value());
+        }
+    }
+
+    /**
+     * The {@code field <> ''} shape — ClickBench q11/q13/q25/q27/q28 all use this against
+     * keyword/text fields. {@code STANDARD_TYPES} on the Lucene plugin restricts NOT_EQUALS
+     * delegation to KEYWORD / TEXT / MATCH_ONLY_TEXT, so this is the realistic round-trip
+     * shape the marking layer will produce in production.
+     */
+    public void testNotEqualsSerializerRoundTripTextField() throws IOException {
+        DelegatedPredicateSerializer serializer = serializers.get(ScalarFunction.NOT_EQUALS);
+        assertNotNull("NOT_EQUALS serializer must be registered", serializer);
+
+        RexCall call = buildNotEqualsCall(/* columnFirst */ true, "SearchPhrase", "");
+        List<FieldStorageInfo> fieldStorage = List.of(
+            new FieldStorageInfo("SearchPhrase", "text", FieldType.TEXT, List.of(), List.of("lucene"), List.of(), false)
+        );
+
+        byte[] serialized = serializer.serialize(call, fieldStorage);
+
+        try (StreamInput input = new NamedWriteableAwareStreamInput(StreamInput.wrap(serialized), WRITEABLE_REGISTRY)) {
+            QueryBuilder deserialized = input.readNamedWriteable(QueryBuilder.class);
+            assertTrue("Deserialized must be BoolQueryBuilder", deserialized instanceof BoolQueryBuilder);
+            BoolQueryBuilder bool = (BoolQueryBuilder) deserialized;
+            assertEquals("exactly one mustNot clause expected", 1, bool.mustNot().size());
+            TermQueryBuilder term = (TermQueryBuilder) bool.mustNot().get(0);
+            assertEquals("SearchPhrase", term.fieldName());
+            assertEquals("", term.value());
+        }
+    }
+
+    /**
+     * Wrong operand shapes (column-column or literal-literal) must throw, not
+     * silently emit a malformed query.
+     */
+    public void testNotEqualsSerializerRejectsTwoColumns() {
+        DelegatedPredicateSerializer serializer = serializers.get(ScalarFunction.NOT_EQUALS);
+        assertNotNull("NOT_EQUALS serializer must be registered", serializer);
+
+        RelDataType varcharType = typeFactory.createSqlType(SqlTypeName.VARCHAR);
+        RexNode left = rexBuilder.makeInputRef(varcharType, 0);
+        RexNode right = rexBuilder.makeInputRef(varcharType, 1);
+        RexCall call = (RexCall) rexBuilder.makeCall(SqlStdOperatorTable.NOT_EQUALS, left, right);
+
+        List<FieldStorageInfo> fieldStorage = List.of(
+            new FieldStorageInfo("a", "keyword", FieldType.KEYWORD, List.of(), List.of("lucene"), List.of(), false),
+            new FieldStorageInfo("b", "keyword", FieldType.KEYWORD, List.of(), List.of("lucene"), List.of(), false)
+        );
+
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> serializer.serialize(call, fieldStorage)
+        );
+        assertTrue(
+            "Exception message must mention NOT_EQUALS, got: " + exception.getMessage(),
+            exception.getMessage().contains("NOT_EQUALS")
+        );
+    }
+
     // --- Helper methods ---
 
     /**
@@ -1074,5 +1200,24 @@ public class QuerySerializerRegistryTests extends OpenSearchTestCase {
         );
 
         return (RexCall) rexBuilder.makeCall(sqlFunction, operands);
+    }
+
+    /**
+     * Builds a {@code NOT_EQUALS($colIdx, literal)} {@link RexCall} for serializer
+     * tests. {@code columnFirst} controls operand order: {@code true} produces
+     * {@code col <> literal}, {@code false} produces {@code literal <> col}.
+     * Both shapes are accepted by {@code NotEqualsSerializer} per its javadoc.
+     */
+    private RexCall buildNotEqualsCall(boolean columnFirst, String fieldName, String literalValue) {
+        // Field name is unused in the RexCall itself — only the column index matters.
+        // The caller passes a matching FieldStorageInfo at index 0 so resolve(...) finds the name.
+        assert fieldName != null;
+        RelDataType varcharType = typeFactory.createSqlType(SqlTypeName.VARCHAR);
+        RexNode columnRef = rexBuilder.makeInputRef(varcharType, 0);
+        RexNode literal = rexBuilder.makeLiteral(literalValue);
+        if (columnFirst) {
+            return (RexCall) rexBuilder.makeCall(SqlStdOperatorTable.NOT_EQUALS, columnRef, literal);
+        }
+        return (RexCall) rexBuilder.makeCall(SqlStdOperatorTable.NOT_EQUALS, literal, columnRef);
     }
 }

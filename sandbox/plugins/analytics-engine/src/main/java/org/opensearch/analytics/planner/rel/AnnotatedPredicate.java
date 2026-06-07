@@ -84,6 +84,24 @@ public class AnnotatedPredicate extends RexCall implements OperatorAnnotation {
         this.performanceDelegationBackends = performanceDelegationBackends;
     }
 
+    /**
+     * Rebuilds an {@link AnnotatedPredicate} with an explicit performance-delegation peer
+     * list (including the empty list). Used by post-PlanForker passes that drop a peer
+     * for a specific predicate shape without touching {@code viableBackends} —
+     * {@link #narrowTo(String)} alone can't express "narrowed AND zero peers" since it
+     * derives peers from {@code viableBackends}. Constructor stays private; callers must
+     * route through this factory so the construction surface remains explicit.
+     */
+    public static AnnotatedPredicate rebuildWithPeers(
+        RelDataType type,
+        RexNode original,
+        List<String> viableBackends,
+        int annotationId,
+        List<String> performanceDelegationBackends
+    ) {
+        return new AnnotatedPredicate(type, original, viableBackends, annotationId, performanceDelegationBackends);
+    }
+
     public RexNode getOriginal() {
         return original;
     }

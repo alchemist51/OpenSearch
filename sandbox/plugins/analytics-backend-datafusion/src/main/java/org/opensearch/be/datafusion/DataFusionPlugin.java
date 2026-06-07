@@ -33,9 +33,12 @@ import org.opensearch.core.indices.breaker.CircuitBreakerStats;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
+import org.opensearch.index.IndexSettings;
+import org.opensearch.index.IndexSortConfig;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
 import org.opensearch.index.engine.dataformat.ReaderManagerConfig;
 import org.opensearch.index.engine.exec.EngineReaderManager;
+import org.opensearch.search.sort.SortOrder;
 import org.opensearch.indices.breaker.BreakerSettings;
 import org.opensearch.monitor.os.OsProbe;
 import org.opensearch.nativebridge.spi.NativeMemoryFetcher;
@@ -615,7 +618,32 @@ public class DataFusionPlugin extends Plugin
     @Override
     public EngineReaderManager<DatafusionReader> createReaderManager(ReaderManagerConfig settings) throws IOException {
         NativeStoreHandle dataformatAwareStoreHandle = settings.dataformatAwareStoreHandles().get(settings.format());
-        return new DatafusionReaderManager(settings.format(), settings.shardPath(), dataFusionService, dataformatAwareStoreHandle);
+        // Pull index.sort.field / index.sort.order off IndexSettings so the native reader can declare
+        // file sort order to DataFusion. Empty lists when the index has no index sort configured.
+        List<String> sortFields = List.of();
+        List<String> sortOrders = List.of();
+        IndexSettings indexSettings = settings.indexSettings();
+        if (indexSettings != null) {
+            List<String> fields = IndexSortConfig.INDEX_SORT_FIELD_SETTING.get(indexSettings.getSettings());
+            List<SortOrder> orders = IndexSortConfig.INDEX_SORT_ORDER_SETTING.get(indexSettings.getSettings());
+            if (fields != null && !fields.isEmpty()) {
+                sortFields = List.copyOf(fields);
+                if (orders != null && orders.size() == fields.size()) {
+                    sortOrders = orders.stream().map(o -> o == SortOrder.DESC ? "desc" : "asc").toList();
+                } else {
+                    // index.sort.order defaults to asc per field when omitted
+                    sortOrders = fields.stream().map(f -> "asc").toList();
+                }
+            }
+        }
+        return new DatafusionReaderManager(
+            settings.format(),
+            settings.shardPath(),
+            dataFusionService,
+            dataformatAwareStoreHandle,
+            sortFields,
+            sortOrders
+        );
     }
 
     @Override

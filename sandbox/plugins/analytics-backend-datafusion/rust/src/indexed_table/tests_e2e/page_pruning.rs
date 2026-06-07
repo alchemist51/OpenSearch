@@ -363,6 +363,7 @@ async fn run_single_collector(
                 std::sync::Arc::new(crate::indexed_table::eval::single_collector::FfmDelegatedBackendCollectorFactory),
                 0,
                 None,
+                0.10,
             ));
             Ok(eval)
         })

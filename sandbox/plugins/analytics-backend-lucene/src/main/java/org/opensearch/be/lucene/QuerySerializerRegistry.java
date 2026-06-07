@@ -17,6 +17,7 @@ import org.opensearch.be.lucene.serializers.MatchPhrasePrefixSerializer;
 import org.opensearch.be.lucene.serializers.MatchPhraseSerializer;
 import org.opensearch.be.lucene.serializers.MatchSerializer;
 import org.opensearch.be.lucene.serializers.MultiMatchSerializer;
+import org.opensearch.be.lucene.serializers.NotEqualsSerializer;
 import org.opensearch.be.lucene.serializers.QuerySerializer;
 import org.opensearch.be.lucene.serializers.QueryStringSerializer;
 import org.opensearch.be.lucene.serializers.SimpleQueryStringSerializer;
@@ -42,7 +43,8 @@ final class QuerySerializerRegistry {
         Map.entry(ScalarFunction.WILDCARD_QUERY, new WildcardQuerySerializer()),
         Map.entry(ScalarFunction.QUERY, new QuerySerializer()),
         Map.entry(ScalarFunction.MATCHALL, new MatchAllSerializer()),
-        Map.entry(ScalarFunction.EQUALS, new EqualsSerializer())
+        Map.entry(ScalarFunction.EQUALS, new EqualsSerializer()),
+        Map.entry(ScalarFunction.NOT_EQUALS, new NotEqualsSerializer())
     );
 
     private QuerySerializerRegistry() {}
