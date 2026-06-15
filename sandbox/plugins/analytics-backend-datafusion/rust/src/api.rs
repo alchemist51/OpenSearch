@@ -1361,6 +1361,11 @@ pub unsafe fn sql_to_substrait(
                     )
                     .with_file_statistics_cache(
                         runtime.runtime_env.cache_manager.get_file_statistic_cache(),
+                    )
+                    // Preserve the statistics cache's configured byte limit; otherwise
+                    // CacheManager::try_new resets it to the 20MiB default at rebuild.
+                    .with_file_statistics_cache_limit(
+                        runtime.runtime_env.cache_manager.get_file_statistic_cache_limit(),
                     ),
             )
             .build()?;

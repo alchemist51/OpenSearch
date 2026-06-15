@@ -175,6 +175,14 @@ pub async unsafe fn create_session_context(
                 )
                 .with_file_statistics_cache(
                     runtime.runtime_env.cache_manager.get_file_statistic_cache(),
+                )
+                // Preserve the statistics cache's configured byte limit. Without this,
+                // CacheManager::try_new resets it to the 20MiB default
+                // (config.file_statistics_cache_limit) at every rebuild, silently
+                // shrinking datafusion.statistics.cache.size.limit at query time.
+                // Mirrors with_metadata_cache_limit above.
+                .with_file_statistics_cache_limit(
+                    runtime.runtime_env.cache_manager.get_file_statistic_cache_limit(),
                 ),
         );
 

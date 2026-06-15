@@ -410,8 +410,18 @@ pub fn build_query_runtime_env(
                 .with_file_metadata_cache(Some(
                     runtime.runtime_env.cache_manager.get_file_metadata_cache(),
                 ))
+                // Preserve the metadata cache's configured byte limit; otherwise
+                // CacheManager::try_new resets it to the 50MiB default at rebuild.
+                .with_metadata_cache_limit(
+                    runtime.runtime_env.cache_manager.get_metadata_cache_limit(),
+                )
                 .with_file_statistics_cache(
                     runtime.runtime_env.cache_manager.get_file_statistic_cache(),
+                )
+                // Preserve the statistics cache's configured byte limit; otherwise
+                // CacheManager::try_new resets it to the 20MiB default at rebuild.
+                .with_file_statistics_cache_limit(
+                    runtime.runtime_env.cache_manager.get_file_statistic_cache_limit(),
                 ),
         )
         .build()?;
