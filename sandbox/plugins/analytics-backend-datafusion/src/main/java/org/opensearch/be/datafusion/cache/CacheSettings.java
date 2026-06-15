@@ -55,6 +55,43 @@ public class CacheSettings {
         Setting.Property.Dynamic
     );
 
+    // S3-FIFO probationary-queue share (fraction of capacity for the `small` queue).
+    // Paper default 0.10. Only used when eviction.type=S3FIFO. Read once at startup
+    // (restart-required, like eviction.type — no live rebuild path for the policy).
+    public static final Setting<Double> METADATA_CACHE_S3FIFO_SMALL_RATIO = Setting.doubleSetting(
+        "datafusion.metadata.cache.s3fifo.small_ratio",
+        0.10,
+        0.01,
+        0.99,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<Double> STATISTICS_CACHE_S3FIFO_SMALL_RATIO = Setting.doubleSetting(
+        "datafusion.statistics.cache.s3fifo.small_ratio",
+        0.10,
+        0.01,
+        0.99,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    // S3-FIFO ghost-queue toggle: fast-readmit of recently-evicted keys straight to `main`.
+    // Default true (paper behavior). Only used when eviction.type=S3FIFO. Restart-required.
+    public static final Setting<Boolean> METADATA_CACHE_S3FIFO_GHOST_ENABLED = Setting.boolSetting(
+        "datafusion.metadata.cache.s3fifo.ghost_enabled",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<Boolean> STATISTICS_CACHE_S3FIFO_GHOST_ENABLED = Setting.boolSetting(
+        "datafusion.statistics.cache.s3fifo.ghost_enabled",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     public static final String METADATA_CACHE_ENABLED_KEY = "datafusion.metadata.cache.enabled";
     public static final Setting<Boolean> METADATA_CACHE_ENABLED = Setting.boolSetting(
         METADATA_CACHE_ENABLED_KEY,
@@ -75,9 +112,13 @@ public class CacheSettings {
         METADATA_CACHE_ENABLED,
         METADATA_CACHE_SIZE_LIMIT,
         METADATA_CACHE_EVICTION_TYPE,
+        METADATA_CACHE_S3FIFO_SMALL_RATIO,
+        METADATA_CACHE_S3FIFO_GHOST_ENABLED,
         STATISTICS_CACHE_ENABLED,
         STATISTICS_CACHE_SIZE_LIMIT,
-        STATISTICS_CACHE_EVICTION_TYPE
+        STATISTICS_CACHE_EVICTION_TYPE,
+        STATISTICS_CACHE_S3FIFO_SMALL_RATIO,
+        STATISTICS_CACHE_S3FIFO_GHOST_ENABLED
     );
 
     private static String validateEvictionType(String value) {

@@ -380,7 +380,7 @@ mod tests {
     fn test_e2e_metadata_s3fifo_hot_set_survives_scan() {
         // The headline property, end-to-end through the metadata cache's CacheAccessor
         // path with S3-FIFO: a hot footer set survives a wide one-off scan.
-        let cache = MutexFileMetadataCache::new(PolicyType::S3Fifo, ENTRY_BYTES * 10);
+        let cache = MutexFileMetadataCache::new(PolicyType::s3fifo_default(), ENTRY_BYTES * 10);
 
         let hot: Vec<Path> = (0..3).map(|i| path(&format!("hot{i}"))).collect();
         for p in &hot {
@@ -414,7 +414,7 @@ mod tests {
     fn test_e2e_metadata_update_limit_shrinks() {
         // Lowering the limit at runtime evicts down to the new budget (mirrors the
         // dynamic datafusion.metadata.cache.size.limit path).
-        let cache = MutexFileMetadataCache::new(PolicyType::S3Fifo, ENTRY_BYTES * 20);
+        let cache = MutexFileMetadataCache::new(PolicyType::s3fifo_default(), ENTRY_BYTES * 20);
         for i in 0..15 {
             let p = path(&format!("f{i}"));
             cache.put(&p, entry(&p));

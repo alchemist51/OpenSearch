@@ -54,7 +54,17 @@ pub enum PolicyType {
     /// small probationary queue; only keys re-accessed there are promoted to the main
     /// queue, so a one-off scan of cold keys is evicted out of the small queue without
     /// displacing the hot working set in main.
-    S3Fifo,
+    ///
+    /// Carries the tunable parameters: `small_ratio` (probationary-queue share, paper
+    /// default 0.10) and `ghost_enabled` (fast-readmit of recently-evicted keys).
+    S3Fifo { small_ratio: f64, ghost_enabled: bool },
+}
+
+impl PolicyType {
+    /// S3-FIFO with the paper-default parameters (small_ratio 0.10, ghost on).
+    pub fn s3fifo_default() -> Self {
+        PolicyType::S3Fifo { small_ratio: 0.10, ghost_enabled: true }
+    }
 }
 
 /// Simple cache entry metadata
@@ -313,8 +323,13 @@ impl CachePolicy for LfuPolicy {
 pub struct S3FifoPolicy {
     state: std::sync::Mutex<S3FifoState>,
     /// Fraction of total capacity assigned to the small/probationary queue. Defaults to
-    /// 0.50 (SLRU-like 50/50 split); see `S3FifoPolicy::new`.
+    /// 0.10 (the S3-FIFO paper's value); see `S3FifoPolicy::new`. Tunable at runtime via
+    /// `datafusion.*.cache.s3fifo.small_ratio`.
     small_ratio: f64,
+    /// When false, the ghost queue is disabled: small-evictions are not remembered and a
+    /// re-inserted key never gets fast-readmitted to `main` (it re-enters `small`). Tunable
+    /// via `datafusion.*.cache.s3fifo.ghost_enabled`. Lets us A/B the ghost mechanism.
+    ghost_enabled: bool,
 }
 
 struct S3FifoEntry {
@@ -346,16 +361,21 @@ struct S3FifoState {
 const S3FIFO_MAX_FREQ: u8 = 3;
 
 impl S3FifoPolicy {
-    /// Default small/probationary share. Set to 0.50 (rather than the S3-FIFO paper's
-    /// ~10%) so the probationary vs. protected split mirrors a 50/50 SLRU — matching
-    /// ClickHouse's default `*_cache_size_ratio` for its scan-resistant caches. A larger
-    /// probationary segment tolerates more one-off churn before promoting to the
-    /// protected `main` set.
+    /// Default small/probationary share = **0.10**, the value from the S3-FIFO paper
+    /// (Yang et al., SOSP'23). A small probationary segment is the paper's design: most
+    /// one-hit-wonders are filtered out of `small` before they can reach the protected
+    /// `main` set. Tunable via `datafusion.*.cache.s3fifo.small_ratio`; ghost on by default.
     pub fn new() -> Self {
-        Self::with_small_ratio(0.50)
+        Self::with_params(0.10, true)
     }
 
+    /// Construct with an explicit small-queue ratio (ghost enabled).
     pub fn with_small_ratio(small_ratio: f64) -> Self {
+        Self::with_params(small_ratio, true)
+    }
+
+    /// Construct with explicit small-queue ratio and ghost-queue toggle.
+    pub fn with_params(small_ratio: f64, ghost_enabled: bool) -> Self {
         Self {
             state: std::sync::Mutex::new(S3FifoState {
                 small: std::collections::HashMap::new(),
@@ -369,6 +389,7 @@ impl S3FifoPolicy {
                 total_bytes: 0,
             }),
             small_ratio: small_ratio.clamp(0.01, 0.99),
+            ghost_enabled,
         }
     }
 }
@@ -457,7 +478,8 @@ impl CachePolicy for S3FifoPolicy {
             return;
         }
         // A key seen recently (in ghost) was popular enough to come back → main.
-        if s.ghost.remove(key) {
+        // Skipped entirely when the ghost queue is disabled (ghost is always empty then).
+        if self.ghost_enabled && s.ghost.remove(key) {
             if let Some(pos) = s.ghost_order.iter().position(|k| k == key) {
                 s.ghost_order.remove(pos);
             }
@@ -536,7 +558,9 @@ impl CachePolicy for S3FifoPolicy {
                         s.small_bytes -= entry.size;
                         s.total_bytes -= entry.size;
                         freed += entry.size;
-                        s.remember_ghost(key.clone());
+                        if self.ghost_enabled {
+                            s.remember_ghost(key.clone());
+                        }
                         victims.push(key);
                         break;
                     }
@@ -593,7 +617,9 @@ pub fn create_policy(policy_type: PolicyType) -> Box<dyn CachePolicy> {
     match policy_type {
         PolicyType::Lru => Box::new(LruPolicy::new()),
         PolicyType::Lfu => Box::new(LfuPolicy::new()),
-        PolicyType::S3Fifo => Box::new(S3FifoPolicy::new()),
+        PolicyType::S3Fifo { small_ratio, ghost_enabled } => {
+            Box::new(S3FifoPolicy::with_params(small_ratio, ghost_enabled))
+        }
     }
 }
 
@@ -662,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_s3fifo_policy_name_and_create() {
-        let p = create_policy(PolicyType::S3Fifo);
+        let p = create_policy(PolicyType::s3fifo_default());
         assert_eq!(p.policy_name(), "s3fifo");
     }
 
@@ -732,6 +758,33 @@ mod tests {
             assert!(s.main.contains_key("k"), "ghost-readmitted key must be in main");
             assert!(s.small.contains_key("fresh"), "brand-new key must be in small (probation)");
         }
+    }
+
+    #[test]
+    fn test_s3fifo_ghost_disabled_reinsert_goes_to_small() {
+        // With the ghost queue OFF, an evicted key is NOT remembered, so re-inserting it
+        // sends it back to `small` (probation) like any fresh key — no fast-readmit to main.
+        let mut p = S3FifoPolicy::with_params(0.10, false);
+        p.on_insert("k", 100);
+        let victims = p.select_for_eviction(100);
+        assert_eq!(victims, vec!["k".to_string()]);
+
+        p.on_insert("k", 100); // ghost off → re-enters small, NOT main
+        {
+            let s = p.state.lock().unwrap();
+            assert!(s.small.contains_key("k"), "with ghost off, re-inserted key must be in small");
+            assert!(!s.main.contains_key("k"), "with ghost off, key must NOT be fast-readmitted to main");
+            assert!(s.ghost.is_empty(), "ghost set must stay empty when disabled");
+        }
+    }
+
+    #[test]
+    fn test_s3fifo_small_ratio_param_respected() {
+        // with_params clamps and stores small_ratio; 0.10 is the new default.
+        let p = S3FifoPolicy::new();
+        assert!((p.small_ratio - 0.10).abs() < 1e-9, "default small_ratio must be 0.10");
+        let p2 = S3FifoPolicy::with_params(0.25, true);
+        assert!((p2.small_ratio - 0.25).abs() < 1e-9);
     }
 
     #[test]

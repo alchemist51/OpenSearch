@@ -396,7 +396,8 @@ public final class NativeBridge {
             FunctionDescriptor.ofVoid(ValueLayout.JAVA_LONG)
         );
 
-        // i64 df_create_cache(mgr_ptr, type_ptr, type_len, size_limit, eviction_ptr, eviction_len, enabled)
+        // i64 df_create_cache(mgr_ptr, type_ptr, type_len, size_limit, eviction_ptr, eviction_len,
+        //                     enabled, s3fifo_small_ratio (f64), s3fifo_ghost_enabled)
         CREATE_CACHE = linker.downcallHandle(
             lib.find("df_create_cache").orElseThrow(),
             FunctionDescriptor.of(
@@ -407,6 +408,8 @@ public final class NativeBridge {
                 ValueLayout.JAVA_LONG,
                 ValueLayout.ADDRESS,
                 ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_DOUBLE,
                 ValueLayout.JAVA_LONG
             )
         );
@@ -1551,6 +1554,19 @@ public final class NativeBridge {
     }
 
     public static void createCache(long cacheManagerPtr, String cacheType, long sizeLimit, String evictionType, boolean enabled) {
+        // Default S3-FIFO params (paper default small_ratio 0.10, ghost on). LRU/LFU ignore them.
+        createCache(cacheManagerPtr, cacheType, sizeLimit, evictionType, enabled, 0.10d, true);
+    }
+
+    public static void createCache(
+        long cacheManagerPtr,
+        String cacheType,
+        long sizeLimit,
+        String evictionType,
+        boolean enabled,
+        double s3fifoSmallRatio,
+        boolean s3fifoGhostEnabled
+    ) {
         try (var call = new NativeCall()) {
             var type = call.str(cacheType);
             var eviction = call.str(evictionType);
@@ -1562,7 +1578,9 @@ public final class NativeBridge {
                 sizeLimit,
                 eviction.segment(),
                 eviction.len(),
-                enabled ? 1L : 0L
+                enabled ? 1L : 0L,
+                s3fifoSmallRatio,
+                s3fifoGhostEnabled ? 1L : 0L
             );
         }
     }

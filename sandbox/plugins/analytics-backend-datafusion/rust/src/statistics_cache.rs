@@ -953,7 +953,7 @@ mod tests {
 
     // ── End-to-end: S3-FIFO scan resistance through the real cache ──
     //
-    // These drive CustomStatisticsCache configured with PolicyType::S3Fifo via its
+    // These drive CustomStatisticsCache configured with PolicyType::s3fifo_default() via its
     // public put/get path (not the policy in isolation), exercising the same flow a
     // query takes, and assert the headline property: a one-off wide scan does not
     // evict the repeatedly-queried hot working set.
@@ -968,7 +968,7 @@ mod tests {
         // Size the cache so the hot set comfortably fits but a scan would, under LRU,
         // churn the whole thing: ~10 entries' worth of bytes.
         let per = stat_entry_bytes();
-        let cache = CustomStatisticsCache::new(PolicyType::S3Fifo, per * 10, 0.8);
+        let cache = CustomStatisticsCache::new(PolicyType::s3fifo_default(), per * 10, 0.8);
 
         // Warm a small hot set and query each entry repeatedly (earns frequency).
         let hot: Vec<Path> = (0..3).map(|i| create_test_path(&format!("hot{i}"))).collect();
@@ -1035,7 +1035,7 @@ mod tests {
             cache.get(&hot);
         }
 
-        cache.set_policy(PolicyType::S3Fifo).unwrap();
+        cache.set_policy(PolicyType::s3fifo_default()).unwrap();
         assert_eq!(cache.policy_name().unwrap(), "s3fifo");
         assert!(cache.get(&hot).is_some(), "switching policy must not drop existing entries");
 

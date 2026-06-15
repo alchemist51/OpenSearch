@@ -298,6 +298,10 @@ public final class DatafusionSettings {
         CacheSettings.STATISTICS_CACHE_EVICTION_TYPE,
         CacheSettings.METADATA_CACHE_ENABLED,
         CacheSettings.STATISTICS_CACHE_ENABLED,
+        CacheSettings.METADATA_CACHE_S3FIFO_SMALL_RATIO,
+        CacheSettings.STATISTICS_CACHE_S3FIFO_SMALL_RATIO,
+        CacheSettings.METADATA_CACHE_S3FIFO_GHOST_ENABLED,
+        CacheSettings.STATISTICS_CACHE_S3FIFO_GHOST_ENABLED,
 
         // Concurrency gate settings
         CONCURRENCY_DATANODE_MULTIPLIER,

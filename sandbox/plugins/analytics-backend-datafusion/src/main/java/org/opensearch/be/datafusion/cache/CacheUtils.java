@@ -17,9 +17,13 @@ import org.opensearch.core.common.unit.ByteSizeValue;
 
 import static org.opensearch.be.datafusion.cache.CacheSettings.METADATA_CACHE_ENABLED;
 import static org.opensearch.be.datafusion.cache.CacheSettings.METADATA_CACHE_EVICTION_TYPE;
+import static org.opensearch.be.datafusion.cache.CacheSettings.METADATA_CACHE_S3FIFO_GHOST_ENABLED;
+import static org.opensearch.be.datafusion.cache.CacheSettings.METADATA_CACHE_S3FIFO_SMALL_RATIO;
 import static org.opensearch.be.datafusion.cache.CacheSettings.METADATA_CACHE_SIZE_LIMIT;
 import static org.opensearch.be.datafusion.cache.CacheSettings.STATISTICS_CACHE_ENABLED;
 import static org.opensearch.be.datafusion.cache.CacheSettings.STATISTICS_CACHE_EVICTION_TYPE;
+import static org.opensearch.be.datafusion.cache.CacheSettings.STATISTICS_CACHE_S3FIFO_GHOST_ENABLED;
+import static org.opensearch.be.datafusion.cache.CacheSettings.STATISTICS_CACHE_S3FIFO_SMALL_RATIO;
 import static org.opensearch.be.datafusion.cache.CacheSettings.STATISTICS_CACHE_SIZE_LIMIT;
 
 /**
@@ -36,25 +40,53 @@ public final class CacheUtils {
      * Cache type enumeration with associated settings.
      */
     public enum CacheType {
-        METADATA("METADATA", METADATA_CACHE_ENABLED, METADATA_CACHE_SIZE_LIMIT, METADATA_CACHE_EVICTION_TYPE),
+        METADATA(
+            "METADATA",
+            METADATA_CACHE_ENABLED,
+            METADATA_CACHE_SIZE_LIMIT,
+            METADATA_CACHE_EVICTION_TYPE,
+            METADATA_CACHE_S3FIFO_SMALL_RATIO,
+            METADATA_CACHE_S3FIFO_GHOST_ENABLED
+        ),
 
-        STATISTICS("STATISTICS", STATISTICS_CACHE_ENABLED, STATISTICS_CACHE_SIZE_LIMIT, STATISTICS_CACHE_EVICTION_TYPE);
+        STATISTICS(
+            "STATISTICS",
+            STATISTICS_CACHE_ENABLED,
+            STATISTICS_CACHE_SIZE_LIMIT,
+            STATISTICS_CACHE_EVICTION_TYPE,
+            STATISTICS_CACHE_S3FIFO_SMALL_RATIO,
+            STATISTICS_CACHE_S3FIFO_GHOST_ENABLED
+        );
 
         private final String cacheTypeName;
         private final Setting<Boolean> enabledSetting;
         private final Setting<ByteSizeValue> sizeLimitSetting;
         private final Setting<String> evictionTypeSetting;
+        private final Setting<Double> s3fifoSmallRatioSetting;
+        private final Setting<Boolean> s3fifoGhostEnabledSetting;
 
         CacheType(
             String cacheTypeName,
             Setting<Boolean> enabledSetting,
             Setting<ByteSizeValue> sizeLimitSetting,
-            Setting<String> evictionTypeSetting
+            Setting<String> evictionTypeSetting,
+            Setting<Double> s3fifoSmallRatioSetting,
+            Setting<Boolean> s3fifoGhostEnabledSetting
         ) {
             this.cacheTypeName = cacheTypeName;
             this.enabledSetting = enabledSetting;
             this.sizeLimitSetting = sizeLimitSetting;
             this.evictionTypeSetting = evictionTypeSetting;
+            this.s3fifoSmallRatioSetting = s3fifoSmallRatioSetting;
+            this.s3fifoGhostEnabledSetting = s3fifoGhostEnabledSetting;
+        }
+
+        public double getS3fifoSmallRatio(ClusterSettings clusterSettings) {
+            return clusterSettings.get(s3fifoSmallRatioSetting);
+        }
+
+        public boolean getS3fifoGhostEnabled(ClusterSettings clusterSettings) {
+            return clusterSettings.get(s3fifoGhostEnabledSetting);
         }
 
         public boolean isEnabled(ClusterSettings clusterSettings) {
@@ -102,12 +134,16 @@ public final class CacheUtils {
         // state (a disabled cache serves misses and drops writes, holding no memory).
         for (CacheType type : CacheType.values()) {
             boolean enabled = type.isEnabled(clusterSettings);
+            double smallRatio = type.getS3fifoSmallRatio(clusterSettings);
+            boolean ghostEnabled = type.getS3fifoGhostEnabled(clusterSettings);
             logger.info(
-                "Configuring {} cache: enabled={}, size={} bytes, eviction={}",
+                "Configuring {} cache: enabled={}, size={} bytes, eviction={}, s3fifo.small_ratio={}, s3fifo.ghost_enabled={}",
                 type.getCacheTypeName(),
                 enabled,
                 type.getSizeLimit(clusterSettings).getBytes(),
-                type.getEvictionType(clusterSettings)
+                type.getEvictionType(clusterSettings),
+                smallRatio,
+                ghostEnabled
             );
 
             NativeBridge.createCache(
@@ -115,7 +151,9 @@ public final class CacheUtils {
                 type.cacheTypeName,
                 type.getSizeLimit(clusterSettings).getBytes(),
                 type.getEvictionType(clusterSettings),
-                enabled
+                enabled,
+                smallRatio,
+                ghostEnabled
             );
         }
         logger.info("Cache configuration completed");

@@ -757,6 +757,10 @@ pub unsafe extern "C" fn df_create_cache(
     eviction_type_ptr: *const u8,
     eviction_type_len: i64,
     enabled: i64,
+    // S3-FIFO tunables (ignored by LRU/LFU): probationary-queue share and ghost toggle.
+    // small_ratio <= 0 falls back to the paper default (0.10); ghost_enabled != 0 = on.
+    s3fifo_small_ratio: f64,
+    s3fifo_ghost_enabled: i64,
 ) -> i64 {
     if cache_manager_ptr == 0 {
         return Err("df_create_cache: null cache manager pointer".to_string());
@@ -769,7 +773,10 @@ pub unsafe extern "C" fn df_create_cache(
     let policy_type = match eviction_type.to_uppercase().as_str() {
         "LRU" => PolicyType::Lru,
         "LFU" => PolicyType::Lfu,
-        "S3FIFO" => PolicyType::S3Fifo,
+        "S3FIFO" => {
+            let small_ratio = if s3fifo_small_ratio > 0.0 { s3fifo_small_ratio } else { 0.10 };
+            PolicyType::S3Fifo { small_ratio, ghost_enabled: s3fifo_ghost_enabled != 0 }
+        }
         _ => {
             return Err(format!(
                 "df_create_cache: unsupported eviction type: {}",
@@ -1508,7 +1515,7 @@ mod tests {
         let mgr_ptr = df_create_custom_cache_manager();
         let lru = "LRU";
         for (ty, limit) in [(cache::CACHE_TYPE_METADATA, metadata_limit), (cache::CACHE_TYPE_STATS, stats_limit)] {
-            let rc = df_create_cache(mgr_ptr, ty.as_ptr(), ty.len() as i64, limit, lru.as_ptr(), lru.len() as i64, 1);
+            let rc = df_create_cache(mgr_ptr, ty.as_ptr(), ty.len() as i64, limit, lru.as_ptr(), lru.len() as i64, 1, 0.0, 1);
             assert!(rc >= 0, "df_create_cache({}) failed: {}", ty, rc);
         }
         // create_global_runtime consumes mgr_ptr (Box::from_raw). Empty (non-null)
