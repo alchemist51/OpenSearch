@@ -126,6 +126,7 @@ import org.opensearch.index.engine.NoOpEngine;
 import org.opensearch.index.engine.ReadOnlyEngine;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
 import org.opensearch.index.engine.exec.DataFormatAwareIndexerFactory;
+import org.opensearch.index.engine.exec.DocumentMetadataResolver;
 import org.opensearch.index.engine.exec.EngineBackedIndexerFactory;
 import org.opensearch.index.engine.exec.IndexerFactory;
 import org.opensearch.index.fielddata.IndexFieldDataCache;
@@ -172,6 +173,7 @@ import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.ingest.IngestService;
 import org.opensearch.node.Node;
 import org.opensearch.node.remotestore.RemoteStoreNodeAttribute;
+import org.opensearch.plugins.DocumentLookupProvider;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.plugins.PluginsService;
 import org.opensearch.plugins.SearchStatsContributor;
@@ -1234,7 +1236,7 @@ public class IndicesService extends AbstractLifecycleComponent
     }
 
     private EngineConfigFactory getEngineConfigFactory(final IndexSettings idxSettings) {
-        return new EngineConfigFactory(this.pluginsService, idxSettings);
+        return new EngineConfigFactory(this.pluginsService, idxSettings, resolveGetByIdPlugin(), resolveDocumentResolver());
     }
 
     private IngestionConsumerFactory getIngestionConsumerFactory(final IndexSettings idxSettings) {
@@ -1258,6 +1260,28 @@ public class IndicesService extends AbstractLifecycleComponent
         } else {
             return new EngineBackedIndexerFactory(getEngineFactory(idxSettings));
         }
+    }
+
+    private DocumentLookupProvider resolveGetByIdPlugin() {
+        List<DocumentLookupProvider> plugins = pluginsService.filterPlugins(DocumentLookupProvider.class);
+        if (plugins.isEmpty()) {
+            return null;
+        }
+        if (plugins.size() > 1) {
+            throw new IllegalStateException("multiple DocumentLookupProvider implementations registered: " + plugins);
+        }
+        return plugins.getFirst();
+    }
+
+    private DocumentMetadataResolver resolveDocumentResolver() {
+        List<DocumentMetadataResolver> resolvers = pluginsService.filterPlugins(DocumentMetadataResolver.class);
+        if (resolvers.isEmpty()) {
+            return DocumentMetadataResolver.NOOP;
+        }
+        if (resolvers.size() > 1) {
+            throw new IllegalStateException("multiple DocumentMetadataResolver implementations registered: " + resolvers);
+        }
+        return resolvers.getFirst();
     }
 
     private EngineFactory getEngineFactory(final IndexSettings idxSettings) {
