@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use native_bridge_common::log_debug;
+use native_bridge_common::log_info;
 use datafusion::{
     common::DataFusionError,
     datasource::file_format::parquet::ParquetFormat,
@@ -161,6 +162,10 @@ pub async unsafe fn create_session_context(
         },
         CachedFileList::new(shard_view.object_metas.as_ref().clone()),
     );
+    log_info!("[LIST-CACHE] table_prefix={} files={}", shard_view.table_path.prefix(), shard_view.object_metas.len());
+    for m in shard_view.object_metas.iter() {
+        log_info!("[LIST-CACHE]   object_meta path={} size={}", m.location, m.size);
+    }
 
     let mut runtime_env_builder = RuntimeEnvBuilder::from_runtime_env(&runtime.runtime_env)
         .with_cache_manager(

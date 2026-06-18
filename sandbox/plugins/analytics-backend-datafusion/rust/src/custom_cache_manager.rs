@@ -17,6 +17,7 @@ use object_store::path::Path;
 use object_store::ObjectMeta;
 use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
 use log::{debug, error};
+use native_bridge_common::log_info;
 
 /// Create ObjectMeta from a local file path.
 fn create_object_meta_from_file(file_path: &str) -> Result<Vec<ObjectMeta>, datafusion::common::DataFusionError> {
@@ -88,8 +89,11 @@ impl CustomCacheManager {
 
         // Add file metadata cache if available
         if let Some(cache) = self.get_file_metadata_cache_for_datafusion() {
+            log_info!("[CACHE-MGR] build_cache_manager_config: ATTACHING metadata cache (limit={} bytes)", cache.cache_limit());
             config = config.with_file_metadata_cache(Some(cache.clone()))
                 .with_metadata_cache_limit(cache.cache_limit());
+        } else {
+            log_info!("[CACHE-MGR] build_cache_manager_config: NO metadata cache attached (query will not use shared metadata cache)");
         }
 
         // Add statistics cache if available - use CustomStatisticsCache directly
@@ -107,8 +111,10 @@ impl CustomCacheManager {
     /// Add multiple files to all applicable caches
     pub fn add_files(&self, file_paths: &[String], rt_handle: &tokio::runtime::Handle) -> Result<Vec<(String, bool)>, String> {
         let mut results = Vec::new();
+        log_info!("[CACHE-MGR] add_files: warming {} file(s)", file_paths.len());
 
         for file_path in file_paths {
+            log_info!("[CACHE-MGR] add_files: file={}", file_path);
             let mut any_success = false;
             let mut errors = Vec::new();
 

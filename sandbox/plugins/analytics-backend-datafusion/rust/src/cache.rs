@@ -15,6 +15,7 @@ use datafusion::execution::cache::cache_manager::{
 use datafusion::execution::cache::DefaultFilesMetadataCache;
 use datafusion::execution::cache::CacheAccessor;
 use log::error;
+use native_bridge_common::log_info;
 use object_store::path::Path;
 
 // Cache type constants
@@ -83,8 +84,10 @@ impl CacheAccessor<Path, CachedFileMetadataEntry> for MutexFileMetadataCache {
                 let result = cache.get(k);
                 if result.is_some() {
                     self.hit_count.fetch_add(1, Ordering::Relaxed);
+                    log_info!("[META-CACHE] GET HIT  key={}", k);
                 } else {
                     self.miss_count.fetch_add(1, Ordering::Relaxed);
+                    log_info!("[META-CACHE] GET MISS key={}", k);
                 }
                 result
             }
@@ -96,6 +99,7 @@ impl CacheAccessor<Path, CachedFileMetadataEntry> for MutexFileMetadataCache {
     }
 
     fn put(&self, k: &Path, v: CachedFileMetadataEntry) -> Option<CachedFileMetadataEntry> {
+        log_info!("[META-CACHE] PUT     key={}", k);
         match self.inner.lock() {
             Ok(cache) => cache.put(k, v),
             Err(e) => {
@@ -106,6 +110,7 @@ impl CacheAccessor<Path, CachedFileMetadataEntry> for MutexFileMetadataCache {
     }
 
     fn remove(&self, k: &Path) -> Option<CachedFileMetadataEntry> {
+        log_info!("[META-CACHE] REMOVE  key={}", k);
         match self.inner.lock() {
             Ok(cache) => cache.remove(k),
             Err(e) => {
