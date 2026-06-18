@@ -189,7 +189,8 @@ public class DatafusionReaderManagerTests extends OpenSearchTestCase {
 
         String expectedDir = shardPath.getDataPath().resolve("parquet").toString();
         Collection<String> expectedPaths = List.of(expectedDir + "/seg_0.parquet");
-        verify(mockService).onFilesAdded(expectedPaths);
+        // Manager built with a null store handle, so it delegates with a null handle.
+        verify(mockService).onFilesAdded(expectedPaths, (org.opensearch.plugins.NativeStoreHandle) null);
         manager.close();
     }
 

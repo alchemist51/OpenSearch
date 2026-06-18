@@ -15,32 +15,23 @@ use crate::cache::MutexFileMetadataCache;
 use crate::statistics_cache::CustomStatisticsCache;
 use object_store::path::Path;
 use object_store::ObjectMeta;
+use object_store::ObjectStore;
 use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
 use log::{debug, error};
 
-/// Create ObjectMeta from a local file path.
-fn create_object_meta_from_file(file_path: &str) -> Result<Vec<ObjectMeta>, datafusion::common::DataFusionError> {
-    use chrono::{DateTime, Utc};
-    use datafusion::common::DataFusionError;
-
-    let metadata = std::fs::metadata(file_path)
-        .map_err(|e| DataFusionError::Execution(format!("Failed to get file metadata for {}: {}", file_path, e)))?;
-
-    let file_size = metadata.len();
-
-    let modified = metadata.modified()
-        .map(|t| DateTime::<Utc>::from(t))
-        .unwrap_or_else(|_| Utc::now());
-
-    let object_meta = ObjectMeta {
-        location: Path::from(file_path),
-        last_modified: modified,
-        size: file_size,
-        e_tag: None,
-        version: None,
-    };
-
-    Ok(vec![object_meta])
+/// Fetch `ObjectMeta` for a file **through the object store** (`store.head`), so size /
+/// last_modified / e_tag come from the same store the query path uses. This is what the
+/// metadata/statistics caches key on via `is_valid_for`; deriving it from `std::fs` (or
+/// worse, `Utc::now()`) instead would make cached entries fail validation on the next query.
+async fn object_meta_via_store(
+    store: &Arc<dyn object_store::ObjectStore>,
+    file_path: &str,
+) -> Result<ObjectMeta, String> {
+    // Delegate to the shared resolver used by the query/reader path so both paths derive
+    // ObjectMeta identically (see api::object_meta_for_file).
+    crate::api::object_meta_for_file(store.as_ref(), file_path)
+        .await
+        .map_err(|e| format!("store.head failed for {}: {}", file_path, e))
 }
 
 /// Custom CacheManager that holds cache references directly
@@ -104,8 +95,16 @@ impl CustomCacheManager {
         config
     }
 
-    /// Add multiple files to all applicable caches
-    pub fn add_files(&self, file_paths: &[String], rt_handle: &tokio::runtime::Handle) -> Result<Vec<(String, bool)>, String> {
+    /// Add multiple files to all applicable caches, reading footers through `store` — the
+    /// shard's object store (TieredObjectStore for local+remote), so cache-warm matches the
+    /// query path. `store` comes from the per-index `dataformatAwareStoreHandle`; when absent
+    /// the FFM layer passes a default LocalFileSystem.
+    pub fn add_files(
+        &self,
+        file_paths: &[String],
+        store: &Arc<dyn object_store::ObjectStore>,
+        rt_handle: &tokio::runtime::Handle,
+    ) -> Result<Vec<(String, bool)>, String> {
         let mut results = Vec::new();
 
         for file_path in file_paths {
@@ -113,7 +112,7 @@ impl CustomCacheManager {
             let mut errors = Vec::new();
 
             // Add to metadata cache
-            match self.metadata_cache_put(file_path, rt_handle) {
+            match self.metadata_cache_put(file_path, store, rt_handle) {
                 Ok(true) => {
                     any_success = true;
                 }
@@ -127,7 +126,7 @@ impl CustomCacheManager {
 
             // Add to statistics cache
             if let Some(_) = &self.statistics_cache {
-                match self.statistics_cache_compute_and_put(file_path) {
+                match self.statistics_cache_compute_and_put(file_path, store, rt_handle) {
                     Ok(true) => {
                         any_success = true;
                     }
@@ -340,18 +339,15 @@ impl CustomCacheManager {
     }
 
     /// Internal method to put metadata into cache
-    fn metadata_cache_put(&self, file_path: &str, rt_handle: &tokio::runtime::Handle) -> Result<bool, String> {
+    fn metadata_cache_put(
+        &self,
+        file_path: &str,
+        store: &Arc<dyn object_store::ObjectStore>,
+        rt_handle: &tokio::runtime::Handle,
+    ) -> Result<bool, String> {
         if !file_path.to_lowercase().ends_with(".parquet") {
             return Ok(false); // Skip unsupported formats
         }
-
-        let object_metas = create_object_meta_from_file(file_path)
-            .map_err(|e| format!("Failed to get object metadata: {}", e))?;
-
-        let object_meta = object_metas.first()
-            .ok_or_else(|| "No object metadata returned".to_string())?;
-
-        let store = Arc::new(object_store::local::LocalFileSystem::new());
 
         // Get cache reference for DataFusion metadata loading
         let cache_ref = self.file_metadata_cache.as_ref()
@@ -364,9 +360,13 @@ impl CustomCacheManager {
         // 1. Enable page index loading (with_page_indexes(true))
         // 2. Load the complete metadata including column and offset indexes
         // 3. Automatically put the metadata into the cache (lines 155-160 in datafusion's metadata.rs)
-        // This ensures we cache exactly what DataFusion would cache during query execution
+        // This ensures we cache exactly what DataFusion would cache during query execution.
+        // The footer is read through the shard `store` (not a fabricated LocalFileSystem) and
+        // the ObjectMeta is fetched via `store.head`, so the cached entry matches the query
+        // path and passes `is_valid_for`.
         let _parquet_metadata = rt_handle.block_on(async {
-            let df_metadata = DFParquetMetadata::new(store.as_ref(), object_meta)
+            let object_meta = object_meta_via_store(store, file_path).await?;
+            let df_metadata = DFParquetMetadata::new(store.as_ref(), &object_meta)
                 .with_file_metadata_cache(Some(metadata_cache));
 
             // fetch_metadata() performs the cache put operation internally
@@ -389,8 +389,14 @@ impl CustomCacheManager {
         }
     }
 
-    /// Compute and put statistics into cache
-    pub fn statistics_cache_compute_and_put(&self, file_path: &str) -> Result<bool, String> {
+    /// Compute and put statistics into cache, reading the parquet footer through the shard
+    /// `store` (matching the query path) and keying on the store-derived `ObjectMeta`.
+    pub fn statistics_cache_compute_and_put(
+        &self,
+        file_path: &str,
+        store: &Arc<dyn object_store::ObjectStore>,
+        rt_handle: &tokio::runtime::Handle,
+    ) -> Result<bool, String> {
         let cache = self.statistics_cache.as_ref()
             .ok_or_else(|| "No statistics cache configured".to_string())?;
 
@@ -401,19 +407,17 @@ impl CustomCacheManager {
             return Ok(true);
         }
 
-        // Compute statistics
-        match compute_parquet_statistics(file_path) {
-            Ok(stats) => {
-                let meta = ObjectMeta {
-                    location: path.clone(),
-                    last_modified: chrono::Utc::now(),
-                    size: std::fs::metadata(file_path)
-                        .map(|m| m.len())
-                        .unwrap_or(0),
-                    e_tag: None,
-                    version: None,
-                };
+        // Fetch ObjectMeta + compute statistics through the shard store (async).
+        let computed = rt_handle.block_on(async {
+            let meta = object_meta_via_store(store, file_path).await?;
+            let stats = compute_parquet_statistics(store, &meta)
+                .await
+                .map_err(|e| format!("Failed to compute statistics for {}: {}", file_path, e))?;
+            Ok::<_, String>((meta, stats))
+        });
 
+        match computed {
+            Ok((meta, stats)) => {
                 cache.put_statistics(&path, Arc::new(stats), &meta);
                 Ok(true)
             }
@@ -423,8 +427,14 @@ impl CustomCacheManager {
         }
     }
 
-    /// Batch compute and cache statistics for multiple files
-    pub fn statistics_cache_batch_compute_and_put(&self, file_paths: &[String]) -> Result<usize, String> {
+    /// Batch compute and cache statistics for multiple files, reading footers through the
+    /// shard `store`.
+    pub fn statistics_cache_batch_compute_and_put(
+        &self,
+        file_paths: &[String],
+        store: &Arc<dyn object_store::ObjectStore>,
+        rt_handle: &tokio::runtime::Handle,
+    ) -> Result<usize, String> {
         let cache = self.statistics_cache.as_ref()
             .ok_or_else(|| "No statistics cache configured".to_string())?;
 
@@ -439,18 +449,16 @@ impl CustomCacheManager {
                 continue;
             }
 
-            match compute_parquet_statistics(file_path) {
-                Ok(stats) => {
-                    let meta = ObjectMeta {
-                        location: path.clone(),
-                        last_modified: chrono::Utc::now(),
-                        size: std::fs::metadata(file_path)
-                            .map(|m| m.len())
-                            .unwrap_or(0),
-                        e_tag: None,
-                        version: None,
-                    };
+            let computed = rt_handle.block_on(async {
+                let meta = object_meta_via_store(store, file_path).await?;
+                let stats = compute_parquet_statistics(store, &meta)
+                    .await
+                    .map_err(|e| format!("{}", e))?;
+                Ok::<_, String>((meta, stats))
+            });
 
+            match computed {
+                Ok((meta, stats)) => {
                     cache.put_statistics(&path, Arc::new(stats), &meta);
                     success_count += 1;
                 }
@@ -470,7 +478,12 @@ impl CustomCacheManager {
     }
 
     /// Get or compute statistics
-    pub fn statistics_cache_get_or_compute(&self, file_path: &str) -> Result<bool, String> {
+    pub fn statistics_cache_get_or_compute(
+        &self,
+        file_path: &str,
+        store: &Arc<dyn object_store::ObjectStore>,
+        rt_handle: &tokio::runtime::Handle,
+    ) -> Result<bool, String> {
         let cache = self.statistics_cache.as_ref()
             .ok_or_else(|| "No statistics cache configured".to_string())?;
 
@@ -480,7 +493,7 @@ impl CustomCacheManager {
             return Ok(true);
         }
 
-        self.statistics_cache_compute_and_put(file_path)
+        self.statistics_cache_compute_and_put(file_path, store, rt_handle)
     }
 
     /// Get statistics cache hit count

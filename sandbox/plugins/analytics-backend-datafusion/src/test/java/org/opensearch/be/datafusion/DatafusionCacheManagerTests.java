@@ -30,9 +30,19 @@ import static org.opensearch.common.settings.ClusterSettings.BUILT_IN_CLUSTER_SE
 public class DatafusionCacheManagerTests extends OpenSearchTestCase {
     private DataFusionService service;
     private CacheManager cacheManager;
+    // Real native object-store pointers for the cache-warm path (no local-filesystem fallback
+    // exists; the store must come from a pointer). `tieredStorePtr` is the raw
+    // Arc<TieredObjectStore> from createTieredObjectStore (0 local + 0 remote → local-backed);
+    // `storePtr` is the Box<Arc<dyn ObjectStore>> the warm path actually consumes, obtained via
+    // getObjectStoreBoxPtr. This mirrors production, where ParquetDataFormatStoreHandler hands
+    // df_create_reader / onFilesAdded the boxed form from getFormatStoreHandle (NOT the raw ptr).
+    private long tieredStorePtr;
+    private long storePtr;
 
     private void setup() {
         NativeBridge.initTokioRuntimeManager(2);
+        tieredStorePtr = NativeStoreTestHelper.createTieredObjectStore(0L, 0L);
+        storePtr = NativeStoreTestHelper.getObjectStoreBoxPtr(tieredStorePtr);
 
         Set<Setting<?>> clusterSettingsToAdd = new HashSet<>(BUILT_IN_CLUSTER_SETTINGS);
         clusterSettingsToAdd.add(CacheSettings.METADATA_CACHE_ENABLED);
@@ -63,13 +73,23 @@ public class DatafusionCacheManagerTests extends OpenSearchTestCase {
         if (service != null) {
             service.stop();
         }
+        // Free the box first (decrements the Arc refcount), then the underlying TieredObjectStore
+        // — same order as ParquetDataFormatStoreHandler.close().
+        if (storePtr != 0L) {
+            NativeStoreTestHelper.destroyObjectStoreBoxPtr(storePtr);
+            storePtr = 0L;
+        }
+        if (tieredStorePtr != 0L) {
+            NativeStoreTestHelper.destroyTieredObjectStore(tieredStorePtr);
+            tieredStorePtr = 0L;
+        }
     }
 
     public void testAddFileToCache() {
         setup();
         try {
             String fileName = getResourceFile("hits1.parquet");
-            cacheManager.addFilesToCacheManager(List.of(fileName));
+            cacheManager.addFilesToCacheManager(List.of(fileName), storePtr);
             assertTrue(cacheManager.getEntryFromCacheType(CacheUtils.CacheType.METADATA, fileName));
             assertTrue(cacheManager.getMemoryConsumed(CacheUtils.CacheType.METADATA) > 0);
         } finally {
@@ -81,7 +101,7 @@ public class DatafusionCacheManagerTests extends OpenSearchTestCase {
         setup();
         try {
             String fileName = getResourceFile("hits1.parquet");
-            cacheManager.addFilesToCacheManager(List.of(fileName));
+            cacheManager.addFilesToCacheManager(List.of(fileName), storePtr);
             assertTrue(cacheManager.getEntryFromCacheType(CacheUtils.CacheType.METADATA, fileName));
 
             cacheManager.removeFilesFromCacheManager(List.of(fileName));
@@ -95,7 +115,7 @@ public class DatafusionCacheManagerTests extends OpenSearchTestCase {
         setup();
         try {
             String fileName = getResourceFile("hits1.parquet");
-            cacheManager.addFilesToCacheManager(List.of(fileName));
+            cacheManager.addFilesToCacheManager(List.of(fileName), storePtr);
             assertTrue(cacheManager.getEntryFromCacheType(CacheUtils.CacheType.METADATA, fileName));
 
             cacheManager.clearCacheForCacheType(CacheUtils.CacheType.METADATA);
@@ -109,7 +129,7 @@ public class DatafusionCacheManagerTests extends OpenSearchTestCase {
         setup();
         try {
             List<String> fileNames = List.of(getResourceFile("hits1.parquet"), getResourceFile("hits2.parquet"));
-            cacheManager.addFilesToCacheManager(fileNames);
+            cacheManager.addFilesToCacheManager(fileNames, storePtr);
             assertTrue(cacheManager.getEntryFromCacheType(CacheUtils.CacheType.METADATA, fileNames.getFirst()));
             assertTrue(cacheManager.getEntryFromCacheType(CacheUtils.CacheType.METADATA, fileNames.getLast()));
         } finally {
@@ -131,7 +151,7 @@ public class DatafusionCacheManagerTests extends OpenSearchTestCase {
         try {
             String fileName = getResourceFile("hits1.parquet");
             long initialMemory = cacheManager.getTotalMemoryConsumed();
-            cacheManager.addFilesToCacheManager(List.of(fileName));
+            cacheManager.addFilesToCacheManager(List.of(fileName), storePtr);
             long afterAddMemory = cacheManager.getTotalMemoryConsumed();
             assertTrue(afterAddMemory > initialMemory);
 
@@ -146,7 +166,7 @@ public class DatafusionCacheManagerTests extends OpenSearchTestCase {
     public void testAddFilesWithNullList() {
         setup();
         try {
-            cacheManager.addFilesToCacheManager(null);
+            cacheManager.addFilesToCacheManager(null, storePtr);
         } finally {
             cleanup();
         }
@@ -155,7 +175,7 @@ public class DatafusionCacheManagerTests extends OpenSearchTestCase {
     public void testAddFilesWithEmptyList() {
         setup();
         try {
-            cacheManager.addFilesToCacheManager(Collections.emptyList());
+            cacheManager.addFilesToCacheManager(Collections.emptyList(), storePtr);
         } finally {
             cleanup();
         }
@@ -182,7 +202,7 @@ public class DatafusionCacheManagerTests extends OpenSearchTestCase {
     public void testExceptionHandlingWithInvalidFile() {
         setup();
         try {
-            cacheManager.addFilesToCacheManager(List.of("/invalid/path/to/file.parquet"));
+            cacheManager.addFilesToCacheManager(List.of("/invalid/path/to/file.parquet"), storePtr);
         } finally {
             cleanup();
         }

@@ -28,13 +28,20 @@ public class CacheManager {
         this.runtimeHandle = runtimeHandle;
     }
 
-    public void addFilesToCacheManager(List<String> files) {
+    /**
+     * Warm the caches for {@code files}, reading footers through the object store at
+     * {@code storePtr} (a native {@code Box<Arc<dyn ObjectStore>>} pointer, e.g. from the
+     * shard's {@code NativeStoreHandle}). A {@code storePtr} of 0 makes native fall back to a
+     * default local filesystem store — identical to the reader path. The production warm path
+     * supplies the per-index store via {@link org.opensearch.be.datafusion.DataFusionService#onFilesAdded}.
+     */
+    public void addFilesToCacheManager(List<String> files, long storePtr) {
         try {
             if (files == null || files.isEmpty()) {
                 return;
             }
             String[] filesArray = files.toArray(new String[0]);
-            NativeBridge.cacheManagerAddFiles(runtimeHandle.get(), filesArray);
+            NativeBridge.cacheManagerAddFiles(runtimeHandle.get(), filesArray, storePtr);
         } catch (Exception e) {
             logger.error("Error adding files to cache manager", e);
         }

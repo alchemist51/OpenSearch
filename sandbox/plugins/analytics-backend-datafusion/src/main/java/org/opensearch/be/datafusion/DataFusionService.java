@@ -15,6 +15,7 @@ import org.opensearch.be.datafusion.cache.CacheUtils;
 import org.opensearch.be.datafusion.cache.NativeCacheManagerHandle;
 import org.opensearch.be.datafusion.nativelib.NativeBridge;
 import org.opensearch.be.datafusion.stats.DataFusionStats;
+import org.opensearch.plugins.NativeStoreHandle;
 import org.opensearch.be.datafusion.stats.SpillStats;
 import org.opensearch.be.datafusion.stats.SpillStatsCollector;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
@@ -256,11 +257,21 @@ public class DataFusionService extends AbstractLifecycleComponent {
     /**
      * Notifies the native cache that new files are available for caching.
      * @param filePaths absolute paths of the new files
+     * @param storeHandle the per-index native object store handle (TieredObjectStore) the
+     *                    cache-warm path reads footers through, so cached metadata and
+     *                    statistics match the query path. Null / closed → storePtr 0, and
+     *                    native falls back to a default local filesystem store — identical to
+     *                    the reader path ({@link NativeBridge#createDatafusionReader}).
      */
-    public void onFilesAdded(Collection<String> filePaths) {
+    public void onFilesAdded(Collection<String> filePaths, NativeStoreHandle storeHandle) {
         if (filePaths == null || filePaths.isEmpty()) return;
+        // Resolve the store pointer the same way the reader path does (shared helper): a usable
+        // handle gives the shard's TieredObjectStore; null / closed → storePtr 0 (native uses a
+        // default LocalFileSystem). Warming through the same store the reader uses keeps cached
+        // ObjectMeta valid against the query path.
+        long storePtr = NativeBridge.storePointerOrDefault(storeHandle);
         try {
-            NativeBridge.cacheManagerAddFiles(runtimeHandle.get(), filePaths.toArray(new String[0]));
+            NativeBridge.cacheManagerAddFiles(runtimeHandle.get(), filePaths.toArray(new String[0]), storePtr);
         } catch (Exception e) {
             logger.warn("Failed to register new files with native cache", e);
         }

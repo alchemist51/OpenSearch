@@ -110,7 +110,10 @@ public class DatafusionReaderManager implements EngineReaderManager<DatafusionRe
     @Override
     public void onFilesAdded(Collection<String> files) throws IOException {
         if (files == null || files.isEmpty()) return;
-        dataFusionService.onFilesAdded(toAbsolutePaths(files));
+        // Warm the caches through THIS index's store (same handle the readers use), so cached
+        // footer metadata/statistics match the query path instead of being read off a fabricated
+        // local filesystem store.
+        dataFusionService.onFilesAdded(toAbsolutePaths(files), dataformatAwareStoreHandle);
     }
 
     @Override

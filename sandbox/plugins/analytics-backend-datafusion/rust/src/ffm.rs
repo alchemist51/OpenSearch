@@ -810,6 +810,12 @@ pub unsafe extern "C" fn df_cache_manager_add_files(
     files_ptr: *const *const u8,
     files_len_ptr: *const i64,
     files_count: i64,
+    // Per-index object store from the Java `dataformatAwareStoreHandle`: a
+    // Box<Arc<dyn ObjectStore>> pointer routing through TieredObjectStore (same convention as
+    // df_create_global_runtime / create_reader). Cache-warm reads footers through THIS store
+    // so entries match the query path's `is_valid_for`. `store_ptr == 0` (no handle / hot path)
+    // falls back to a default LocalFileSystem, identical to create_reader.
+    store_ptr: i64,
 ) -> i64 {
     if runtime_ptr == 0 {
         return Err("df_cache_manager_add_files: null runtime pointer".to_string());
@@ -832,11 +838,17 @@ pub unsafe extern "C" fn df_cache_manager_add_files(
         );
     }
 
+    // Resolve the shard object store via the shared resolver used by create_reader:
+    // store_ptr > 0 → the shard's TieredObjectStore (boxed fat pointer); 0 → default
+    // LocalFileSystem. Safety: store_ptr is 0 or a valid Box<Arc<dyn ObjectStore>> from the
+    // Java NativeStoreHandle.
+    let store: Arc<dyn object_store::ObjectStore> = api::resolve_object_store(store_ptr);
+
     let rt_manager = get_rt_manager()
         .map_err(|e| format!("df_cache_manager_add_files: {}", e))?;
     let rt_handle = rt_manager.io_runtime.handle();
 
-    manager.add_files(&file_paths, rt_handle)
+    manager.add_files(&file_paths, &store, rt_handle)
         .map_err(|e| format!("df_cache_manager_add_files: {}", e))?;
     Ok(0)
 }

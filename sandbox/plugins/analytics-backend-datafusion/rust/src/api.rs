@@ -57,6 +57,7 @@ use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::TryStreamExt;
+use object_store::local::LocalFileSystem;
 use object_store::{ObjectStore, ObjectStoreExt};
 use roaring::RoaringBitmap;
 
@@ -233,6 +234,21 @@ impl QueryStreamHandle {
     }
 }
 
+/// Fetch `ObjectMeta` for a single file **through the object store** (`store.head`).
+///
+/// Shared by the query/reader path (`create_object_metas`) and the cache-warm path
+/// (`custom_cache_manager::object_meta_via_store`): both derive size / last_modified / e_tag
+/// from the same store call, so the `ObjectMeta` cached at warm time is byte-identical to what
+/// the query path computes and passes `is_valid_for`. `full_path` is taken as-is (already
+/// absolute / store-relative); callers that need base-path joining do it before calling.
+pub async fn object_meta_for_file(
+    store: &dyn object_store::ObjectStore,
+    full_path: &str,
+) -> object_store::Result<object_store::ObjectMeta> {
+    let path = object_store::path::Path::from(full_path);
+    store.head(&path).await
+}
+
 /// Build ObjectMeta for each file using the given object store.
 pub async fn create_object_metas(
     store: &dyn object_store::ObjectStore,
@@ -246,8 +262,7 @@ pub async fn create_object_metas(
         } else {
             format!("{}/{}", base_path.trim_end_matches('/'), filename)
         };
-        let path = object_store::path::Path::from(full_path.as_str());
-        let meta = store.head(&path).await.map_err(|e| {
+        let meta = object_meta_for_file(store, &full_path).await.map_err(|e| {
             DataFusionError::Execution(format!(
                 "Failed to get object meta for {}: {}",
                 full_path, e
@@ -741,6 +756,33 @@ pub fn get_reduce_target_partitions() -> usize {
     REDUCE_TARGET_PARTITIONS.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Resolve the per-shard object store used to read parquet footers.
+///
+/// This is the single source of truth shared by the query/reader path (`create_reader`)
+/// and the cache-warm path (`df_cache_manager_add_files`), so both read footers through the
+/// **same** store and the warmed `ObjectMeta` validates (`is_valid_for`) against what the
+/// query path computes.
+///
+/// `store_ptr`:
+/// - `> 0`: a `Box<Arc<dyn ObjectStore>>` pointer from the Java `NativeStoreHandle`
+///   (TieredObjectStore: local + remote + optional block cache). The Arc is cloned out
+///   without consuming the box.
+/// - `0`: no native store supplied (hot path, or store handle null/closed) — fall back to a
+///   default `LocalFileSystem`, identical for both paths.
+///
+/// # Safety
+/// When `store_ptr > 0` it must be a valid `Box<Arc<dyn ObjectStore>>` pointer (the boxed
+/// fat trait-object form produced by `ts_get_object_store_box_ptr`), still live for the
+/// duration of this call.
+pub unsafe fn resolve_object_store(store_ptr: i64) -> Arc<dyn ObjectStore> {
+    if store_ptr > 0 {
+        let boxed = &*(store_ptr as *const Arc<dyn ObjectStore>);
+        Arc::clone(boxed)
+    } else {
+        Arc::new(LocalFileSystem::new())
+    }
+}
+
 /// Creates a native reader (ShardView) for the given path and files.
 ///
 /// Returns a heap-allocated pointer (as i64) to `ShardView`.
@@ -785,15 +827,11 @@ pub fn create_reader(
     let table_url = ListingTableUrl::parse(table_path)
         .map_err(|e| DataFusionError::Execution(format!("Invalid table path: {}", e)))?;
 
-    // Resolve the object store: if store_ptr > 0, clone the Arc from the boxed pointer.
-    // Otherwise use default LocalFileSystem.
-    let store: Arc<dyn ObjectStore> = if store_ptr > 0 {
-        let boxed = unsafe { &*(store_ptr as *const Arc<dyn ObjectStore>) };
-        Arc::clone(boxed)
-    } else {
-        let default_rt = RuntimeEnvBuilder::new().build()?;
-        default_rt.object_store(&table_url)?
-    };
+    // Resolve the object store via the shared resolver: store_ptr > 0 → the shard's
+    // TieredObjectStore (boxed fat pointer); 0 → default LocalFileSystem. The cache-warm
+    // path (df_cache_manager_add_files) uses the same resolver so warmed ObjectMeta matches.
+    // Safety: store_ptr is 0 or a valid Box<Arc<dyn ObjectStore>> from the Java NativeStoreHandle.
+    let store: Arc<dyn ObjectStore> = unsafe { resolve_object_store(store_ptr) };
 
     let object_metas = tokio_rt_manager.io_runtime.block_on(create_object_metas(
         store.as_ref(),

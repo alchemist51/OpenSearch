@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use std::fs::File;
 
 /// Trait to calculate heap memory size for statistics objects
 trait HeapSize {
@@ -505,33 +504,23 @@ impl Default for CustomStatisticsCache {
     }
 }
 
-/// Compute statistics from a parquet file using DataFusion's built-in functionality
-pub fn compute_parquet_statistics(file_path: &str) -> Result<Statistics, Box<dyn std::error::Error>> {
-    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+/// Compute statistics for a parquet file, reading its footer **through the supplied object
+/// store** (the shard's store, which routes through TieredObjectStore for local+remote data)
+/// and the store-derived `ObjectMeta`. This mirrors the query execution path, so the read
+/// works for non-local shards and the footer bytes match what queries see.
+///
+/// Async because object-store reads are async; callers on the cache-warm path drive it via
+/// `rt_handle.block_on`.
+pub async fn compute_parquet_statistics(
+    store: &Arc<dyn object_store::ObjectStore>,
+    object_meta: &ObjectMeta,
+) -> Result<Statistics, Box<dyn std::error::Error>> {
     use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
-    use object_store::local::LocalFileSystem;
-    use object_store::path::Path;
 
-    let file = File::open(file_path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let metadata = builder.metadata();
-    let schema = builder.schema().clone();
-
-    // Create ObjectStore and ObjectMeta for the file
-    let _store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
-    let path = Path::from(file_path);
-    let file_metadata = std::fs::metadata(file_path)?;
-    let _object_meta = ObjectMeta {
-        location: path,
-        last_modified: chrono::DateTime::from(file_metadata.modified()?),
-        size: file_metadata.len(),
-        e_tag: None,
-        version: None,
-    };
-
-    // Use DataFusion's method to extract statistics from parquet metadata
-    // statistics_from_parquet_metadata is an associated function that takes metadata and schema
-    let statistics = DFParquetMetadata::statistics_from_parquet_metadata(metadata, &schema)?;
+    let df_metadata = DFParquetMetadata::new(store.as_ref(), object_meta);
+    // Schema then statistics, both decoded from the store-fetched footer.
+    let schema = df_metadata.fetch_schema().await?;
+    let statistics = df_metadata.fetch_statistics(&std::sync::Arc::new(schema)).await?;
     Ok(statistics)
 }
 

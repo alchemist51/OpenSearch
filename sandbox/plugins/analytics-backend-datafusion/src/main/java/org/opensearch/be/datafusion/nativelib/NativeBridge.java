@@ -444,7 +444,7 @@ public final class NativeBridge {
             )
         );
 
-        // i64 df_cache_manager_add_files(runtime_ptr, files_ptr, files_len_ptr, files_count)
+        // i64 df_cache_manager_add_files(runtime_ptr, files_ptr, files_len_ptr, files_count, store_ptr)
         CACHE_MANAGER_ADD_FILES = linker.downcallHandle(
             lib.find("df_cache_manager_add_files").orElseThrow(),
             FunctionDescriptor.of(
@@ -452,6 +452,7 @@ public final class NativeBridge {
                 ValueLayout.JAVA_LONG,
                 ValueLayout.ADDRESS,
                 ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
                 ValueLayout.JAVA_LONG
             )
         );
@@ -842,6 +843,30 @@ public final class NativeBridge {
      *                   reversal when the query's leading ORDER BY runs counter to catalog direction.
      * @param sortOrders index.sort.order values ("asc" or "desc"), parallel to {@code sortFields}.
      */
+    /**
+     * Resolve the native object-store pointer to pass across FFM for a per-index store handle.
+     * Returns the handle's live pointer, or {@code 0} when the handle is null or was closed
+     * between the null-check and extraction. A {@code 0} pointer makes the native side fall back
+     * to a default {@code LocalFileSystem}. Shared by the reader path
+     * ({@link #createDatafusionReader}) and the cache-warm path
+     * ({@link org.opensearch.be.datafusion.DataFusionService#onFilesAdded}) so both resolve the
+     * store the same way.
+     */
+    public static long storePointerOrDefault(NativeStoreHandle storeHandle) {
+        if (storeHandle == null) {
+            return 0L;
+        }
+        try {
+            long ptr = storeHandle.getPointer();
+            // EMPTY.getPointer() returns -1; normalize any non-positive value to 0 so the
+            // native side takes the LocalFileSystem fallback (store_ptr > 0 == real store).
+            return ptr > 0L ? ptr : 0L;
+        } catch (IllegalStateException e) {
+            // Handle closed between check and extraction — use default (local).
+            return 0L;
+        }
+    }
+
     public static long createDatafusionReader(
         String path,
         List<org.opensearch.index.engine.exec.MonoFileWriterSet> segments,
@@ -849,15 +874,7 @@ public final class NativeBridge {
         List<String> sortFields,
         List<String> sortOrders
     ) {
-        long storePtr = 0L;
-        if (dataformatAwareStoreHandle != null) {
-            try {
-                storePtr = dataformatAwareStoreHandle.getPointer();
-            } catch (IllegalStateException e) {
-                // Handle closed between check and extraction — use default (local)
-                storePtr = 0L;
-            }
-        }
+        long storePtr = storePointerOrDefault(dataformatAwareStoreHandle);
         if (sortFields == null) sortFields = List.of();
         if (sortOrders == null) sortOrders = List.of();
         if (sortFields.size() != sortOrders.size()) {
@@ -1541,10 +1558,10 @@ public final class NativeBridge {
         }
     }
 
-    public static void cacheManagerAddFiles(long runtimePtr, String[] filePaths) {
+    public static void cacheManagerAddFiles(long runtimePtr, String[] filePaths, long storePtr) {
         try (var call = new NativeCall()) {
             var f = call.strArray(filePaths);
-            call.invoke(CACHE_MANAGER_ADD_FILES, runtimePtr, f.ptrs(), f.lens(), f.count());
+            call.invoke(CACHE_MANAGER_ADD_FILES, runtimePtr, f.ptrs(), f.lens(), f.count(), storePtr);
         }
     }
 

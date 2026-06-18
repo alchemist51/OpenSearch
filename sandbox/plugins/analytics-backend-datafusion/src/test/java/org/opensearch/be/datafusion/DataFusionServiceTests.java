@@ -117,10 +117,11 @@ public class DataFusionServiceTests extends OpenSearchTestCase {
             .build();
         service.start();
 
-        // These are no-ops in the current Rust impl but should not throw
-        service.onFilesAdded(java.util.List.of("/tmp/test1.parquet", "/tmp/test2.parquet"));
+        // These are no-ops in the current Rust impl but should not throw. null store handle →
+        // native uses the default local store (storePtr 0).
+        service.onFilesAdded(java.util.List.of("/tmp/test1.parquet", "/tmp/test2.parquet"), null);
         service.onFilesDeleted(java.util.List.of("/tmp/test1.parquet"));
-        service.onFilesAdded(null);
+        service.onFilesAdded(null, null);
         service.onFilesDeleted(java.util.List.of());
 
         service.stop();
