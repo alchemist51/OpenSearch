@@ -68,6 +68,18 @@ impl CustomCacheManager {
         self.statistics_cache.clone()
     }
 
+    /// Attach the on-disk footer tier (POC) to the metadata cache, if one exists. No-op when no
+    /// metadata cache is configured. Idempotent (the metadata cache's `set_disk_cache` only takes
+    /// the first value). See [`crate::metadata_disk_cache`].
+    pub fn attach_metadata_disk_cache(
+        &self,
+        disk: Option<crate::metadata_disk_cache::MetadataDiskCache>,
+    ) {
+        if let Some(cache) = &self.file_metadata_cache {
+            cache.set_disk_cache(disk);
+        }
+    }
+
     /// Get the file metadata cache as Arc<dyn FileMetadataCache> for DataFusion
     pub fn get_file_metadata_cache_for_datafusion(&self) -> Option<Arc<dyn FileMetadataCache>> {
         self.file_metadata_cache.as_ref().map(|cache| cache.clone() as Arc<dyn FileMetadataCache>)
@@ -99,11 +111,16 @@ impl CustomCacheManager {
     /// shard's object store (TieredObjectStore for local+remote), so cache-warm matches the
     /// query path. `store` comes from the per-index `dataformatAwareStoreHandle`; when absent
     /// the FFM layer passes a default LocalFileSystem.
+    ///
+    /// `persist_to_disk` enables the on-disk footer tier (POC). The caller sets it only when the
+    /// store is remote (`store_ptr > 0`), where re-reading a footer means remote IO; for a local
+    /// store the footer read is already cheap, so the disk tier is skipped.
     pub fn add_files(
         &self,
         file_paths: &[String],
         store: &Arc<dyn object_store::ObjectStore>,
         rt_handle: &tokio::runtime::Handle,
+        persist_to_disk: bool,
     ) -> Result<Vec<(String, bool)>, String> {
         let mut results = Vec::new();
 
@@ -112,7 +129,7 @@ impl CustomCacheManager {
             let mut errors = Vec::new();
 
             // Add to metadata cache
-            match self.metadata_cache_put(file_path, store, rt_handle) {
+            match self.metadata_cache_put(file_path, store, rt_handle, persist_to_disk) {
                 Ok(true) => {
                     any_success = true;
                 }
@@ -338,12 +355,14 @@ impl CustomCacheManager {
         }
     }
 
-    /// Internal method to put metadata into cache
+    /// Internal method to put metadata into cache. `persist_to_disk` mirrors the footer to the
+    /// on-disk tier (only set for remote stores; see [`Self::add_files`]).
     fn metadata_cache_put(
         &self,
         file_path: &str,
         store: &Arc<dyn object_store::ObjectStore>,
         rt_handle: &tokio::runtime::Handle,
+        persist_to_disk: bool,
     ) -> Result<bool, String> {
         if !file_path.to_lowercase().ends_with(".parquet") {
             return Ok(false); // Skip unsupported formats
@@ -364,15 +383,26 @@ impl CustomCacheManager {
         // The footer is read through the shard `store` (not a fabricated LocalFileSystem) and
         // the ObjectMeta is fetched via `store.head`, so the cached entry matches the query
         // path and passes `is_valid_for`.
-        let _parquet_metadata = rt_handle.block_on(async {
+        let (object_meta, parquet_metadata) = rt_handle.block_on(async {
             let object_meta = object_meta_via_store(store, file_path).await?;
             let df_metadata = DFParquetMetadata::new(store.as_ref(), &object_meta)
                 .with_file_metadata_cache(Some(metadata_cache));
 
             // fetch_metadata() performs the cache put operation internally
-            df_metadata.fetch_metadata().await
-                .map_err(|e| format!("Failed to fetch metadata: {}", e))
+            let parquet_metadata = df_metadata.fetch_metadata().await
+                .map_err(|e| format!("Failed to fetch metadata: {}", e))?;
+            Ok::<_, String>((object_meta, parquet_metadata))
         })?;
+
+        // POC: persist the decoded footer to the on-disk tier so a future in-memory miss reloads
+        // it from local disk instead of re-reading the (possibly remote) store. Best-effort; the
+        // store remains the source of truth on a disk miss. We pay the remote read once, here.
+        // Only for remote stores — see `persist_to_disk` in `add_files`.
+        if persist_to_disk {
+            if let Some(disk) = cache_ref.disk_cache() {
+                disk.put(file_path, &object_meta, parquet_metadata.as_ref());
+            }
+        }
 
         // Verify the metadata was cached properly
         match cache_ref.inner.lock() {

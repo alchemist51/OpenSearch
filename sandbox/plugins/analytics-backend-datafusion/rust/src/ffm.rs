@@ -848,7 +848,12 @@ pub unsafe extern "C" fn df_cache_manager_add_files(
         .map_err(|e| format!("df_cache_manager_add_files: {}", e))?;
     let rt_handle = rt_manager.io_runtime.handle();
 
-    manager.add_files(&file_paths, &store, rt_handle)
+    // Persist footers to the on-disk tier only for a real (remote) store: store_ptr > 0 means the
+    // footer read is remote IO worth caching on local disk; store_ptr == 0 (LocalFileSystem) is
+    // already cheap, so skip the disk tier there.
+    let persist_to_disk = store_ptr > 0;
+
+    manager.add_files(&file_paths, &store, rt_handle, persist_to_disk)
         .map_err(|e| format!("df_cache_manager_add_files: {}", e))?;
     Ok(0)
 }

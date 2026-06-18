@@ -556,6 +556,13 @@ pub fn create_global_runtime(
                     continue;
                 }
 
+                // Skip the persistent on-disk metadata-footer cache: it must survive restarts so
+                // the first post-restart query reloads footers from local disk instead of the
+                // remote store. It is NOT leaked spill data. See `metadata_disk_cache`.
+                if name_str == crate::metadata_disk_cache::SUBDIR {
+                    continue;
+                }
+
                 // Rename to <name>.stale within the same parent. Metadata-only;
                 // contents not touched. Same parent (spill_path), so requires
                 // only write on spill_path itself. Works uniformly for files,
@@ -665,6 +672,11 @@ pub fn create_global_runtime(
 
     let (cache_manager_config, custom_cache_manager) = if cache_manager_ptr != 0 {
         let mgr = unsafe { *Box::from_raw(cache_manager_ptr as *mut CustomCacheManager) };
+        // POC: attach the on-disk footer tier rooted under the spill directory (node-local).
+        // Disabled (None) when spill is off. The metadata cache was created earlier in
+        // df_create_cache, before spill_dir was known, so we set it here via interior mutability.
+        let disk_cache = crate::metadata_disk_cache::MetadataDiskCache::new(spill_dir);
+        mgr.attach_metadata_disk_cache(disk_cache);
         (mgr.build_cache_manager_config(), Some(mgr))
     } else {
         (CacheManagerConfig::default(), None)
