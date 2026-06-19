@@ -31,8 +31,6 @@ import org.opensearch.index.mapper.Uid;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -81,6 +79,8 @@ public class GetService implements Closeable {
 
         private static final String GET_BY_ID_TABLE_ALIAS = "_t";
         private static final String PARQUET_FORMAT = "parquet";
+        /** Empty Substrait plan — the internal-search path builds its plan natively and ignores it. */
+        private static final byte[] EMPTY_PLAN = new byte[0];
 
         private final DataFusionPlugin dfPlugin;
         private final BufferAllocator sharedAllocator = new RootAllocator(64 * 1024 * 1024);
@@ -112,18 +112,18 @@ public class GetService implements Closeable {
             MonoFileWriterSet segment = MonoFileWriterSet.of(parquetDir, parquetSet.writerGeneration(), parquetFile, 0L);
             try (ReaderHandle readerHandle = new ReaderHandle(parquetDir, List.of(segment), null, List.of(), List.of())) {
                 long readerPtr = readerHandle.getPointer();
-                // TODO: only the OFFSET (rowId) varies between calls — cache the Substrait plan
-                // per reader and rebind the offset to avoid re-planning on every get-by-id.
-                String sql = "SELECT * FROM \"" + GET_BY_ID_TABLE_ALIAS + "\" LIMIT 1 OFFSET " + Long.toUnsignedString(rowId);
-                byte[] substraitPlan = NativeBridge.sqlToSubstrait(readerPtr, GET_BY_ID_TABLE_ALIAS, sql, runtimePtr);
-                WireConfigSnapshot configSnapshot = WireConfigSnapshot.builder(dfPlugin.getDatafusionSettings().getSnapshot())
-                    .queryStrategy(1) // ListingTable — bypass indexed executor routing
-                    .build();
-                long streamPtr = executeNativeQuery(
+                // Internal-search get-by-row-id: the native side ignores Substrait and builds a
+                // DataFrame plan filtering `__row_id__ = rowId` with pushdown enabled. __row_id__ is
+                // the physical row position the parquet writer stamps at flush (sequential 0..N after
+                // any index sort) and remaps into the Lucene secondary index, so the resolver's rowId
+                // equals the row's __row_id__. An equality predicate returns exactly that row
+                // independent of scan order and lets DataFusion prune row-groups/pages via the
+                // column's min/max statistics.
+                long streamPtr = executeInternalSearch(
                     readerPtr,
-                    substraitPlan,
                     runtimePtr,
-                    configSnapshot,
+                    NativeBridge.INTERNAL_SEARCH_BY_ROW_ID,
+                    rowId,
                     "DataFusion get-by-id query failed"
                 );
                 return readSingleRow(streamPtr);
@@ -140,21 +140,14 @@ public class GetService implements Closeable {
                 MonoFileWriterSet writerSet = MonoFileWriterSet.of(parquetDir, parquetSet.writerGeneration(), parquetFile, 0L);
                 try (ReaderHandle readerHandle = new ReaderHandle(parquetDir, List.of(writerSet), null, List.of(), List.of())) {
                     long readerPtr = readerHandle.getPointer();
-                    // TODO: only the _seq_no floor varies between calls -- cache the Substrait plan
-                    // per reader and rebind the bound to avoid re-planning on every restore scan.
-                    String sql = "SELECT \"_id\", \"_seq_no\", \"_primary_term\", \"_version\" FROM \""
-                        + GET_BY_ID_TABLE_ALIAS
-                        + "\" WHERE \"_seq_no\" > "
-                        + seqNoFloor;
-                    byte[] substraitPlan = NativeBridge.sqlToSubstrait(readerPtr, GET_BY_ID_TABLE_ALIAS, sql, runtimePtr);
-                    WireConfigSnapshot configSnapshot = WireConfigSnapshot.builder(dfPlugin.getDatafusionSettings().getSnapshot())
-                        .queryStrategy(1) // ListingTable — bypass indexed executor routing
-                        .build();
-                    long streamPtr = executeNativeQuery(
+                    // Internal-search seq-no scan: the native side ignores Substrait and builds a
+                    // DataFrame plan filtering `_seq_no > seqNoFloor`, projecting only the version
+                    // metadata columns, with pushdown enabled.
+                    long streamPtr = executeInternalSearch(
                         readerPtr,
-                        substraitPlan,
                         runtimePtr,
-                        configSnapshot,
+                        NativeBridge.INTERNAL_SEARCH_SEQ_NO_ABOVE,
+                        seqNoFloor,
                         "DataFusion range query failed"
                     );
                     all.addAll(readAllRows(streamPtr));
@@ -202,41 +195,40 @@ public class GetService implements Closeable {
             }
         }
 
-        private long executeNativeQuery(
-            long readerPtr,
-            byte[] substraitPlan,
-            long runtimePtr,
-            WireConfigSnapshot configSnapshot,
-            String errorMessage
-        ) throws IOException {
+        /**
+         * Runs an engine-internal point lookup through {@link NativeBridge#executeQueryAsync} and
+         * returns the result stream pointer. No Substrait is generated: the native side builds the
+         * filter plan from {@code mode} + {@code bound} via the DataFrame API. {@code queryConfigPtr}
+         * is 0 — the internal-search path uses its own session config (pushdown on, single partition),
+         * so no {@link WireConfigSnapshot} is needed.
+         */
+        private long executeInternalSearch(long readerPtr, long runtimePtr, long mode, long bound, String errorMessage) throws IOException {
             CompletableFuture<Long> future = new CompletableFuture<>();
-            try (Arena arena = Arena.ofConfined()) {
-                MemorySegment configSegment = arena.allocate(WireConfigSnapshot.BYTE_SIZE);
-                configSnapshot.writeTo(configSegment);
-                NativeBridge.executeQueryAsync(
-                    readerPtr,
-                    GET_BY_ID_TABLE_ALIAS,
-                    substraitPlan,
-                    runtimePtr,
-                    0L,
-                    configSegment.address(),
-                    new ActionListener<>() {
-                        @Override
-                        public void onResponse(Long v) {
-                            future.complete(v);
-                        }
-
-                        @Override
-                        public void onFailure(Exception e) {
-                            future.completeExceptionally(e);
-                        }
+            NativeBridge.executeQueryAsync(
+                readerPtr,
+                GET_BY_ID_TABLE_ALIAS,
+                EMPTY_PLAN,
+                runtimePtr,
+                0L,
+                0L,
+                mode,
+                bound,
+                new ActionListener<>() {
+                    @Override
+                    public void onResponse(Long v) {
+                        future.complete(v);
                     }
-                );
-                try {
-                    return future.join();
-                } catch (Exception e) {
-                    throw new IOException(errorMessage, e);
+
+                    @Override
+                    public void onFailure(Exception e) {
+                        future.completeExceptionally(e);
+                    }
                 }
+            );
+            try {
+                return future.join();
+            } catch (Exception e) {
+                throw new IOException(errorMessage, e);
             }
         }
 
