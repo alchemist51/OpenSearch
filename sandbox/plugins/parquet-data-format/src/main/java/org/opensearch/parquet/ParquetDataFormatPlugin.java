@@ -137,6 +137,14 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
         long mergeMax = ParquetSettings.MERGE_POOL_MAX.get(this.settings);
         RustBridge.initMemoryPools(writeMax, mergeMax);
 
+        // Enable the codec-owned cross-query decoded-page cache (liquid-cache core) when configured.
+        // Off by default → the DocValues decode path is unchanged.
+        boolean liquidCacheEnabled = ParquetSettings.LIQUID_CACHE_ENABLED.get(this.settings);
+        if (liquidCacheEnabled) {
+            long liquidCacheMaxBytes = ParquetSettings.LIQUID_CACHE_MAX_BYTES.get(this.settings).getBytes();
+            RustBridge.liquidCacheSetEnabled(true, liquidCacheMaxBytes);
+        }
+
         // Register virtual pools if allocator is available (arrow-base loaded)
         if (nativeAllocator != null) {
             NativeAllocator.VirtualPoolHandle writePool = nativeAllocator.registerVirtualPool(

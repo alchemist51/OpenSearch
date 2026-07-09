@@ -210,6 +210,8 @@ pub async unsafe fn create_session_context(
     if !shard_view.sort_fields.is_empty() {
         config.options_mut().execution.split_file_groups_by_statistics = true;
     }
+    // LC session config is applied only when LC is actually engaged (inside
+    // parquet_bridge.rs), not globally.
 
     let mut state_builder = SessionStateBuilder::new()
         .with_config(config)
@@ -230,6 +232,16 @@ pub async unsafe fn create_session_context(
                 runtime.runtime_env.cache_manager.get_file_metadata_cache(),
             ),
         ));
+    }
+    // Only the physical optimizer (LocalModeLiquidCacheOptimizer) is applied.
+    // It wraps ParquetSource with LiquidParquetSource for decoded-batch caching.
+    // The LineageOptimizer (logical) is excluded — it adds O(nodes*exprs)
+    // planning overhead that causes 2x regression on string-heavy queries.
+    #[cfg(target_os = "linux")]
+    if crate::liquid_cache::LiquidOnlyRuntime::is_enabled_globally() {
+        if let Some(ref optimizer) = runtime.liquid_cache_optimizer {
+            state_builder = state_builder.with_physical_optimizer_rule(optimizer.clone());
+        }
     }
 
     let state = state_builder.build();
@@ -359,7 +371,7 @@ pub async unsafe fn create_session_context(
         shard_view.sort_fields.len()
     );
 
-    error!(
+    log_debug!(
         "create_session_context: successfully registered table '{}', table_name_len={}",
         table_name,
         table_name.len()

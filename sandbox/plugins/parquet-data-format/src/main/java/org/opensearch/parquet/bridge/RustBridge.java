@@ -55,6 +55,7 @@ public class RustBridge {
     private static final MethodHandle OPEN_COLUMN_READER;
     private static final MethodHandle CLOSE_COLUMN_READER;
     private static final MethodHandle OPEN_COLUMN_READER_COUNT;
+    private static final MethodHandle LIQUID_CACHE_SET_ENABLED;
     private static final MethodHandle READ_VALUE_AT_ROW;
     private static final MethodHandle READ_REPEATED_AT_ROW;
     private static final MethodHandle GET_COLUMN_NUM_PAGES;
@@ -317,6 +318,10 @@ public class RustBridge {
         OPEN_COLUMN_READER_COUNT = linker.downcallHandle(
             lib.find("parquet_open_column_reader_count").orElseThrow(),
             FunctionDescriptor.of(ValueLayout.JAVA_LONG)
+        );
+        LIQUID_CACHE_SET_ENABLED = linker.downcallHandle(
+            lib.find("parquet_liquid_cache_set_enabled").orElseThrow(),
+            FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG)
         );
         READ_VALUE_AT_ROW = linker.downcallHandle(
             lib.find("parquet_read_value_at_row").orElseThrow(),
@@ -849,6 +854,17 @@ public class RustBridge {
      */
     public static long openColumnReaderCount() {
         return NativeCall.invokeStatic(OPEN_COLUMN_READER_COUNT);
+    }
+
+    /**
+     * Enables or disables the cross-query decoded-page cache (codec-owned liquid instance) and sets
+     * its memory budget in bytes. Called once at plugin init when the {@code parquet_liquid_cache}
+     * feature flag is on. When disabled (the default), {@code parquet_decode_page_at_row} never
+     * consults the cache and the decode path is unchanged. A {@code maxMemoryBytes} of 0 leaves the
+     * native default budget.
+     */
+    public static void liquidCacheSetEnabled(boolean enabled, long maxMemoryBytes) {
+        NativeCall.invokeVoid(LIQUID_CACHE_SET_ENABLED, enabled ? 1 : 0, maxMemoryBytes);
     }
 
     /**

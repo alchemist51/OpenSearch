@@ -859,6 +859,9 @@ struct ColumnReaderState {
     /// `global_first_row`. Built once at `open()` from the Parquet OffsetIndex +
     /// ColumnIndex when present, else one entry per row group as a fallback.
     pages: Vec<PageEntry>,
+    /// Codec-local file id (path→id) for the cross-query decoded-page cache key. See
+    /// `crate::liquid_page_cache`.
+    liquid_file_id: u32,
 }
 
 /// One row-aligned page in the column (or one row group, in the no-page-index
@@ -939,6 +942,8 @@ impl ColumnReaderState {
             (leaf_idx, phys, max_rep > 0, max_def, row_count, rg_first_row, rg_num_rows, pages)
         };
 
+        let liquid_file_id = crate::liquid_page_cache::file_id(filename);
+
         Ok(ColumnReaderState {
             reader,
             leaf_idx,
@@ -949,6 +954,7 @@ impl ColumnReaderState {
             rg_first_row,
             rg_num_rows,
             pages,
+            liquid_file_id,
         })
     }
 
@@ -1204,6 +1210,16 @@ pub unsafe extern "C" fn parquet_open_column_reader_count() -> i64 {
         Ok(guard) => guard.len() as i64,
         Err(poisoned) => poisoned.into_inner().len() as i64,
     }
+}
+
+/// Enable/disable the cross-query decoded-page cache and set its memory budget (bytes).
+/// Called by Java at plugin init when the `parquet_liquid_cache` feature flag is on. When
+/// disabled (the default), `parquet_decode_page_at_row` never consults the cache and the decode
+/// path is unchanged. A `max_memory_bytes` of 0 leaves the liquid-cache default budget.
+#[no_mangle]
+pub unsafe extern "C" fn parquet_liquid_cache_set_enabled(enabled: i32, max_memory_bytes: i64) {
+    let bytes = if max_memory_bytes > 0 { max_memory_bytes as usize } else { 0 };
+    crate::liquid_page_cache::set_enabled(enabled != 0, bytes);
 }
 
 /// Slow-path single-value read at `row`.
@@ -1728,6 +1744,28 @@ pub unsafe extern "C" fn parquet_decode_page_at_row(
         *out_last_row = first_global + num_rows - 1;
     }
 
+    // Cross-query decoded-page cache (codec-owned liquid instance). When enabled, a hit serves the
+    // decoded page from the node-level cache and skips the Parquet decode below entirely; a miss
+    // decodes as usual and backfills the cache (see the primitive arms). Keyed by
+    // (file, column, page); primitives only. No-op when the feature flag is off.
+    let lc_eid = if crate::liquid_page_cache::enabled() {
+        Some(crate::liquid_page_cache::entry_id(
+            state.liquid_file_id,
+            state.leaf_idx as u32,
+            page_idx as u32,
+        ))
+    } else {
+        None
+    };
+    if let Some(eid) = lc_eid {
+        if let Some((longs, presence)) = crate::liquid_page_cache::get_page(eid) {
+            return write_primitive_page(
+                &longs, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
+                out_presence_bitset, out_presence_bits_cap,
+            );
+        }
+    }
+
     let rg = state.reader.get_row_group(rg_idx).map_err(|e| e.to_string())?;
     let col = rg.get_column_reader(state.leaf_idx).map_err(|e| e.to_string())?;
     let skip = local_first as usize;
@@ -1739,6 +1777,9 @@ pub unsafe extern "C" fn parquet_decode_page_at_row(
         ColumnReader::Int32ColumnReader(mut r) => {
             let (presence, values) = decode_page_records(&mut r, skip, num_rows_usize, max_def_level)?;
             let longs = expand_primitive(&presence, &values, |v| v as i64);
+            if let Some(eid) = lc_eid {
+                crate::liquid_page_cache::put_page(eid, &longs, &presence);
+            }
             return write_primitive_page(
                 &longs, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
                 out_presence_bitset, out_presence_bits_cap,
@@ -1747,6 +1788,9 @@ pub unsafe extern "C" fn parquet_decode_page_at_row(
         ColumnReader::Int64ColumnReader(mut r) => {
             let (presence, values) = decode_page_records(&mut r, skip, num_rows_usize, max_def_level)?;
             let longs = expand_primitive(&presence, &values, |v| v);
+            if let Some(eid) = lc_eid {
+                crate::liquid_page_cache::put_page(eid, &longs, &presence);
+            }
             return write_primitive_page(
                 &longs, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
                 out_presence_bitset, out_presence_bits_cap,
@@ -1755,6 +1799,9 @@ pub unsafe extern "C" fn parquet_decode_page_at_row(
         ColumnReader::FloatColumnReader(mut r) => {
             let (presence, values) = decode_page_records(&mut r, skip, num_rows_usize, max_def_level)?;
             let longs = expand_primitive(&presence, &values, |v| v.to_bits() as i64);
+            if let Some(eid) = lc_eid {
+                crate::liquid_page_cache::put_page(eid, &longs, &presence);
+            }
             return write_primitive_page(
                 &longs, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
                 out_presence_bitset, out_presence_bits_cap,
@@ -1763,6 +1810,9 @@ pub unsafe extern "C" fn parquet_decode_page_at_row(
         ColumnReader::DoubleColumnReader(mut r) => {
             let (presence, values) = decode_page_records(&mut r, skip, num_rows_usize, max_def_level)?;
             let longs = expand_primitive(&presence, &values, |v| v.to_bits() as i64);
+            if let Some(eid) = lc_eid {
+                crate::liquid_page_cache::put_page(eid, &longs, &presence);
+            }
             return write_primitive_page(
                 &longs, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
                 out_presence_bitset, out_presence_bits_cap,
@@ -1771,6 +1821,9 @@ pub unsafe extern "C" fn parquet_decode_page_at_row(
         ColumnReader::BoolColumnReader(mut r) => {
             let (presence, values) = decode_page_records(&mut r, skip, num_rows_usize, max_def_level)?;
             let longs = expand_primitive(&presence, &values, |v| if v { 1i64 } else { 0i64 });
+            if let Some(eid) = lc_eid {
+                crate::liquid_page_cache::put_page(eid, &longs, &presence);
+            }
             return write_primitive_page(
                 &longs, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
                 out_presence_bitset, out_presence_bits_cap,

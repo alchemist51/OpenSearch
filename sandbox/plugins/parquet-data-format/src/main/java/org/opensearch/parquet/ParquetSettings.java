@@ -218,6 +218,27 @@ public final class ParquetSettings {
     );
 
     /**
+     * Enables the codec-owned cross-query decoded-page cache (backed by liquid-cache core). When off
+     * (the default), the DocValues codec decode path is unchanged and the native cache is never
+     * consulted. Node-scoped: set in {@code opensearch.yml} or via {@code -E} at launch.
+     */
+    public static final Setting<Boolean> LIQUID_CACHE_ENABLED = Setting.boolSetting(
+        "parquet.liquid_cache.enabled",
+        false,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Memory budget for the codec-owned decoded-page cache. A value of 0 leaves the native liquid
+     * default budget. Only consulted when {@link #LIQUID_CACHE_ENABLED} is true.
+     */
+    public static final Setting<ByteSizeValue> LIQUID_CACHE_MAX_BYTES = Setting.byteSizeSetting(
+        "parquet.liquid_cache.max_bytes",
+        new ByteSizeValue(0, ByteSizeUnit.BYTES),
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Minimum number of variable-width (string/binary) non-sort columns required to activate
      * deferred data loading during merge. Below this threshold, all columns are decoded eagerly
      * (original behavior). Set to 0 to always defer; set very high to disable deferral.
@@ -849,6 +870,8 @@ public final class ParquetSettings {
             MERGE_BATCH_SIZE,
             MERGE_RAYON_THREADS,
             MERGE_IO_THREADS,
+            LIQUID_CACHE_ENABLED,
+            LIQUID_CACHE_MAX_BYTES,
             MERGE_DEFERRED_COLUMN_THRESHOLD,
             WRITE_POOL_MIN,
             WRITE_POOL_MAX,
