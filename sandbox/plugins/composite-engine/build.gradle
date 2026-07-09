@@ -51,6 +51,8 @@ dependencies {
   api project(':libs:opensearch-concurrent-queue')
   implementation project(':sandbox:libs:plugin-stats-spi')
   compileOnly project(':server')
+  // Parquet DocValues codec (ParquetDocValuesFormat) for per-field routing at the segment level.
+  compileOnly project(':sandbox:plugins:parquet-data-format')
   testImplementation project(':test:framework')
   testImplementation project(':sandbox:plugins:parquet-data-format')
   testImplementation project(':sandbox:plugins:analytics-backend-lucene')
