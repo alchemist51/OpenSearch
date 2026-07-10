@@ -15,14 +15,14 @@ use std::collections::HashMap;
 use std::slice;
 use std::str;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use lazy_static::lazy_static;
 use native_bridge_common::{ffm_safe, log_debug};
 
-use crate::native_settings::NativeSettings;
 use crate::field_config::FieldConfig;
 use crate::merge;
+use crate::native_settings::NativeSettings;
 use crate::writer::{NativeParquetWriter, SETTINGS_STORE};
 
 unsafe fn str_from_raw<'a>(ptr: *const u8, len: i64) -> Result<&'a str, String> {
@@ -59,10 +59,7 @@ unsafe fn str_array_from_raw(
 }
 
 /// Decode a parallel (pointers, count) array of i64 values interpreted as booleans (0 = false).
-unsafe fn bool_array_from_raw(
-    vals: *const i64,
-    count: i64,
-) -> Vec<bool> {
+unsafe fn bool_array_from_raw(vals: *const i64, count: i64) -> Vec<bool> {
     if count == 0 || vals.is_null() {
         return vec![];
     }
@@ -92,17 +89,27 @@ pub unsafe extern "C" fn parquet_create_writer(
     writer_generation: i64,
 ) -> i64 {
     let filename = str_from_raw(file_ptr, file_len)
-        .map_err(|e| format!("parquet_create_writer file: {}", e))?.to_string();
+        .map_err(|e| format!("parquet_create_writer file: {}", e))?
+        .to_string();
     let index_name = str_from_raw(index_name_ptr, index_name_len)
-        .map_err(|e| format!("parquet_create_writer index_name: {}", e))?.to_string();
+        .map_err(|e| format!("parquet_create_writer index_name: {}", e))?
+        .to_string();
     let sort_columns = str_array_from_raw(sort_ptrs, sort_lens, sort_count)
         .map_err(|e| format!("parquet_create_writer sort_columns: {}", e))?;
     let reverse_sorts = bool_array_from_raw(reverse_vals, reverse_count);
     let nulls_first = bool_array_from_raw(nulls_first_vals, nulls_first_count);
 
-    NativeParquetWriter::create_writer(filename, index_name, schema_address, sort_columns, reverse_sorts, nulls_first, writer_generation)
-        .map(|_| 0)
-        .map_err(|e| e.to_string())
+    NativeParquetWriter::create_writer(
+        filename,
+        index_name,
+        schema_address,
+        sort_columns,
+        reverse_sorts,
+        nulls_first,
+        writer_generation,
+    )
+    .map(|_| 0)
+    .map_err(|e| e.to_string())
 }
 
 #[ffm_safe]
@@ -113,7 +120,9 @@ pub unsafe extern "C" fn parquet_write(
     array_address: i64,
     schema_address: i64,
 ) -> i64 {
-    let filename = str_from_raw(file_ptr, file_len).map_err(|e| format!("parquet_write: {}", e))?.to_string();
+    let filename = str_from_raw(file_ptr, file_len)
+        .map_err(|e| format!("parquet_write: {}", e))?
+        .to_string();
     NativeParquetWriter::write_data(filename, array_address, schema_address)
         .map(|_| 0)
         .map_err(|e| e.to_string())
@@ -135,24 +144,36 @@ pub unsafe extern "C" fn parquet_finalize_writer(
     sort_perm_ptr_out: *mut i64,
     sort_perm_len_out: *mut i64,
 ) -> i64 {
-    let filename = str_from_raw(file_ptr, file_len).map_err(|e| format!("parquet_finalize_writer: {}", e))?.to_string();
+    let filename = str_from_raw(file_ptr, file_len)
+        .map_err(|e| format!("parquet_finalize_writer: {}", e))?
+        .to_string();
     match NativeParquetWriter::finalize_writer(filename) {
         Ok(Some(result)) => {
             let fm = result.metadata.file_metadata();
-            if !version_out.is_null() { *version_out = fm.version(); }
-            if !num_rows_out.is_null() { *num_rows_out = fm.num_rows(); }
+            if !version_out.is_null() {
+                *version_out = fm.version();
+            }
+            if !num_rows_out.is_null() {
+                *num_rows_out = fm.num_rows();
+            }
             if let Some(cb) = fm.created_by() {
                 if !created_by_buf.is_null() && created_by_buf_len > 0 {
                     let bytes = cb.as_bytes();
                     let n = bytes.len().min(created_by_buf_len as usize);
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), created_by_buf, n);
-                    if !created_by_len_out.is_null() { *created_by_len_out = n as i64; }
+                    if !created_by_len_out.is_null() {
+                        *created_by_len_out = n as i64;
+                    }
                 }
             } else if !created_by_len_out.is_null() {
                 *created_by_len_out = -1;
             }
-            if !crc32_out.is_null() { *crc32_out = result.crc32 as i64; }
-            if !num_row_groups_out.is_null() { *num_row_groups_out = result.metadata.num_row_groups() as i64; }
+            if !crc32_out.is_null() {
+                *crc32_out = result.crc32 as i64;
+            }
+            if !num_row_groups_out.is_null() {
+                *num_row_groups_out = result.metadata.num_row_groups() as i64;
+            }
 
             // Return sort permutation if present
             if !sort_perm_ptr_out.is_null() && !sort_perm_len_out.is_null() {
@@ -176,7 +197,6 @@ pub unsafe extern "C" fn parquet_finalize_writer(
     }
 }
 
-
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn parquet_get_file_metadata(
@@ -189,18 +209,28 @@ pub unsafe extern "C" fn parquet_get_file_metadata(
     created_by_len_out: *mut i64,
     num_row_groups_out: *mut i64,
 ) -> i64 {
-    let filename = str_from_raw(file_ptr, file_len).map_err(|e| format!("parquet_get_file_metadata: {}", e))?.to_string();
+    let filename = str_from_raw(file_ptr, file_len)
+        .map_err(|e| format!("parquet_get_file_metadata: {}", e))?
+        .to_string();
     let metadata = NativeParquetWriter::get_file_metadata(filename).map_err(|e| e.to_string())?;
     let fm = metadata.file_metadata();
-    if !version_out.is_null() { *version_out = fm.version(); }
-    if !num_rows_out.is_null() { *num_rows_out = fm.num_rows(); }
-    if !num_row_groups_out.is_null() { *num_row_groups_out = metadata.num_row_groups() as i64; }
+    if !version_out.is_null() {
+        *version_out = fm.version();
+    }
+    if !num_rows_out.is_null() {
+        *num_rows_out = fm.num_rows();
+    }
+    if !num_row_groups_out.is_null() {
+        *num_row_groups_out = metadata.num_row_groups() as i64;
+    }
     if let Some(cb) = fm.created_by() {
         if !created_by_buf.is_null() && created_by_buf_len > 0 {
             let bytes = cb.as_bytes();
             let n = bytes.len().min(created_by_buf_len as usize);
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), created_by_buf, n);
-            if !created_by_len_out.is_null() { *created_by_len_out = n as i64; }
+            if !created_by_len_out.is_null() {
+                *created_by_len_out = n as i64;
+            }
         }
     } else if !created_by_len_out.is_null() {
         *created_by_len_out = -1;
@@ -223,9 +253,12 @@ pub unsafe extern "C" fn parquet_get_column_metadata(
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::fs::File;
 
-    let filename = str_from_raw(file_ptr, file_len).map_err(|e| format!("parquet_get_column_metadata: {}", e))?.to_string();
+    let filename = str_from_raw(file_ptr, file_len)
+        .map_err(|e| format!("parquet_get_column_metadata: {}", e))?
+        .to_string();
     let file = File::open(&filename).map_err(|e| format!("Failed to open file: {}", e))?;
-    let reader = SerializedFileReader::new(file).map_err(|e| format!("Failed to read parquet: {}", e))?;
+    let reader =
+        SerializedFileReader::new(file).map_err(|e| format!("Failed to read parquet: {}", e))?;
     let metadata = reader.metadata();
 
     if metadata.num_row_groups() == 0 {
@@ -233,7 +266,9 @@ pub unsafe extern "C" fn parquet_get_column_metadata(
         let bytes = json.as_bytes();
         let n = bytes.len().min(out_buf_len as usize);
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, n);
-        if !out_len.is_null() { *out_len = n as i64; }
+        if !out_len.is_null() {
+            *out_len = n as i64;
+        }
         return Ok(0);
     }
 
@@ -245,11 +280,17 @@ pub unsafe extern "C" fn parquet_get_column_metadata(
         let encodings: Vec<String> = col.encodings().map(|e| format!("{:?}", e)).collect();
         let compression = format!("{:?}", col.compression());
         let has_bloom_filter = col.bloom_filter_offset().is_some();
-        if i > 0 { json.push(','); }
+        if i > 0 {
+            json.push(',');
+        }
         json.push_str(&format!(
             "\"{}\":{{\"encodings\":[{}],\"compression\":\"{}\",\"bloom_filter\":{}}}",
             col_name,
-            encodings.iter().map(|e| format!("\"{}\"" , e)).collect::<Vec<_>>().join(","),
+            encodings
+                .iter()
+                .map(|e| format!("\"{}\"", e))
+                .collect::<Vec<_>>()
+                .join(","),
             compression,
             has_bloom_filter
         ));
@@ -259,7 +300,9 @@ pub unsafe extern "C" fn parquet_get_column_metadata(
     let bytes = json.as_bytes();
     let n = bytes.len().min(out_buf_len as usize);
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, n);
-    if !out_len.is_null() { *out_len = n as i64; }
+    if !out_len.is_null() {
+        *out_len = n as i64;
+    }
     Ok(0)
 }
 
@@ -268,7 +311,9 @@ pub unsafe extern "C" fn parquet_get_filtered_native_bytes_used(
     prefix_ptr: *const u8,
     prefix_len: i64,
 ) -> i64 {
-    let prefix = str_from_raw(prefix_ptr, prefix_len).unwrap_or("").to_string();
+    let prefix = str_from_raw(prefix_ptr, prefix_len)
+        .unwrap_or("")
+        .to_string();
     NativeParquetWriter::get_filtered_writer_memory_usage(prefix).unwrap_or(0) as i64
 }
 
@@ -335,93 +380,218 @@ pub unsafe extern "C" fn parquet_on_settings_update(
     type_bf_ndv_count: i64,
 ) -> i64 {
     let index_name = str_from_raw(index_name_ptr, index_name_len)
-        .map_err(|e| format!("parquet_on_settings_update index_name: {}", e))?.to_string();
+        .map_err(|e| format!("parquet_on_settings_update index_name: {}", e))?
+        .to_string();
 
     let compression_type = if compression_type_ptr.is_null() || compression_type_len < 0 {
         None
     } else {
-        Some(str_from_raw(compression_type_ptr, compression_type_len)
-            .map_err(|e| format!("parquet_on_settings_update compression_type: {}", e))?.to_string())
+        Some(
+            str_from_raw(compression_type_ptr, compression_type_len)
+                .map_err(|e| format!("parquet_on_settings_update compression_type: {}", e))?
+                .to_string(),
+        )
     };
 
-    fn opt_i32(v: i64) -> Option<i32> { if v < 0 { None } else { Some(v as i32) } }
-    fn opt_usize(v: i64) -> Option<usize> { if v < 0 { None } else { Some(v as usize) } }
-    fn opt_bool(v: i64) -> Option<bool> { if v < 0 { None } else { Some(v != 0) } }
-    fn opt_f64(v: f64) -> Option<f64> { if v < 0.0 { None } else { Some(v) } }
-    fn opt_u64(v: i64) -> Option<u64> { if v < 0 { None } else { Some(v as u64) } }
+    fn opt_i32(v: i64) -> Option<i32> {
+        if v < 0 {
+            None
+        } else {
+            Some(v as i32)
+        }
+    }
+    fn opt_usize(v: i64) -> Option<usize> {
+        if v < 0 {
+            None
+        } else {
+            Some(v as usize)
+        }
+    }
+    fn opt_bool(v: i64) -> Option<bool> {
+        if v < 0 {
+            None
+        } else {
+            Some(v != 0)
+        }
+    }
+    fn opt_f64(v: f64) -> Option<f64> {
+        if v < 0.0 {
+            None
+        } else {
+            Some(v)
+        }
+    }
+    fn opt_u64(v: i64) -> Option<u64> {
+        if v < 0 {
+            None
+        } else {
+            Some(v as u64)
+        }
+    }
 
     let field_names = str_array_from_raw(field_name_ptrs, field_name_lens, field_count)
         .map_err(|e| format!("parquet_on_settings_update field_names: {}", e))?;
     let field_encodings = str_array_from_raw(field_encoding_ptrs, field_encoding_lens, field_count)
         .map_err(|e| format!("parquet_on_settings_update field_encodings: {}", e))?;
-    let field_compression_names = str_array_from_raw(field_compression_name_ptrs, field_compression_name_lens, field_compression_count)
-        .map_err(|e| format!("parquet_on_settings_update field_compression_names: {}", e))?;
-    let field_compressions = str_array_from_raw(field_compression_value_ptrs, field_compression_value_lens, field_compression_count)
-        .map_err(|e| format!("parquet_on_settings_update field_compressions: {}", e))?;
+    let field_compression_names = str_array_from_raw(
+        field_compression_name_ptrs,
+        field_compression_name_lens,
+        field_compression_count,
+    )
+    .map_err(|e| format!("parquet_on_settings_update field_compression_names: {}", e))?;
+    let field_compressions = str_array_from_raw(
+        field_compression_value_ptrs,
+        field_compression_value_lens,
+        field_compression_count,
+    )
+    .map_err(|e| format!("parquet_on_settings_update field_compressions: {}", e))?;
 
-    let type_encoding_names = str_array_from_raw(type_encoding_name_ptrs, type_encoding_name_lens, type_encoding_count)
-        .map_err(|e| format!("parquet_on_settings_update type_encoding_names: {}", e))?;
-    let type_encodings = str_array_from_raw(type_encoding_value_ptrs, type_encoding_value_lens, type_encoding_count)
-        .map_err(|e| format!("parquet_on_settings_update type_encodings: {}", e))?;
-    let type_compression_names = str_array_from_raw(type_compression_name_ptrs, type_compression_name_lens, type_compression_count)
-        .map_err(|e| format!("parquet_on_settings_update type_compression_names: {}", e))?;
-    let type_compressions = str_array_from_raw(type_compression_value_ptrs, type_compression_value_lens, type_compression_count)
-        .map_err(|e| format!("parquet_on_settings_update type_compressions: {}", e))?;
+    let type_encoding_names = str_array_from_raw(
+        type_encoding_name_ptrs,
+        type_encoding_name_lens,
+        type_encoding_count,
+    )
+    .map_err(|e| format!("parquet_on_settings_update type_encoding_names: {}", e))?;
+    let type_encodings = str_array_from_raw(
+        type_encoding_value_ptrs,
+        type_encoding_value_lens,
+        type_encoding_count,
+    )
+    .map_err(|e| format!("parquet_on_settings_update type_encodings: {}", e))?;
+    let type_compression_names = str_array_from_raw(
+        type_compression_name_ptrs,
+        type_compression_name_lens,
+        type_compression_count,
+    )
+    .map_err(|e| format!("parquet_on_settings_update type_compression_names: {}", e))?;
+    let type_compressions = str_array_from_raw(
+        type_compression_value_ptrs,
+        type_compression_value_lens,
+        type_compression_count,
+    )
+    .map_err(|e| format!("parquet_on_settings_update type_compressions: {}", e))?;
 
     // Parse per-field bloom filter arrays
-    let bf_enabled_names = str_array_from_raw(bf_enabled_name_ptrs, bf_enabled_name_lens, bf_enabled_count)
-        .map_err(|e| format!("parquet_on_settings_update bf_enabled_names: {}", e))?;
+    let bf_enabled_names =
+        str_array_from_raw(bf_enabled_name_ptrs, bf_enabled_name_lens, bf_enabled_count)
+            .map_err(|e| format!("parquet_on_settings_update bf_enabled_names: {}", e))?;
 
     let field_configs = {
         let mut map = std::collections::HashMap::new();
         for (name, encoding) in field_names.into_iter().zip(field_encodings.into_iter()) {
-            map.insert(name, FieldConfig { encoding_type: Some(encoding), ..Default::default() });
+            map.insert(
+                name,
+                FieldConfig {
+                    encoding_type: Some(encoding),
+                    ..Default::default()
+                },
+            );
         }
-        for (name, compression) in field_compression_names.into_iter().zip(field_compressions.into_iter()) {
+        for (name, compression) in field_compression_names
+            .into_iter()
+            .zip(field_compressions.into_iter())
+        {
             map.entry(name)
-               .and_modify(|fc| fc.compression_type = Some(compression.clone()))
-               .or_insert(FieldConfig { compression_type: Some(compression), ..Default::default() });
+                .and_modify(|fc| fc.compression_type = Some(compression.clone()))
+                .or_insert(FieldConfig {
+                    compression_type: Some(compression),
+                    ..Default::default()
+                });
         }
         for (i, name) in bf_enabled_names.into_iter().enumerate() {
             let val = *bf_enabled_vals.add(i) != 0;
             map.entry(name)
-               .and_modify(|fc| fc.bloom_filter_enabled = Some(val))
-               .or_insert(FieldConfig { bloom_filter_enabled: Some(val), ..Default::default() });
+                .and_modify(|fc| fc.bloom_filter_enabled = Some(val))
+                .or_insert(FieldConfig {
+                    bloom_filter_enabled: Some(val),
+                    ..Default::default()
+                });
         }
-        if map.is_empty() { None } else { Some(map) }
+        if map.is_empty() {
+            None
+        } else {
+            Some(map)
+        }
     };
 
     let type_encoding_configs: Option<std::collections::HashMap<String, String>> = {
-        let map: std::collections::HashMap<_, _> = type_encoding_names.into_iter().zip(type_encodings.into_iter()).collect();
-        if map.is_empty() { None } else { Some(map) }
+        let map: std::collections::HashMap<_, _> = type_encoding_names
+            .into_iter()
+            .zip(type_encodings.into_iter())
+            .collect();
+        if map.is_empty() {
+            None
+        } else {
+            Some(map)
+        }
     };
     let type_compression_configs: Option<std::collections::HashMap<String, String>> = {
-        let map: std::collections::HashMap<_, _> = type_compression_names.into_iter().zip(type_compressions.into_iter()).collect();
-        if map.is_empty() { None } else { Some(map) }
+        let map: std::collections::HashMap<_, _> = type_compression_names
+            .into_iter()
+            .zip(type_compressions.into_iter())
+            .collect();
+        if map.is_empty() {
+            None
+        } else {
+            Some(map)
+        }
     };
 
     // Parse type-level bloom filter arrays
-    let type_bf_enabled_names = str_array_from_raw(type_bf_enabled_name_ptrs, type_bf_enabled_name_lens, type_bf_enabled_count)
-        .map_err(|e| format!("parquet_on_settings_update type_bf_enabled_names: {}", e))?;
-    let type_bf_fpp_names = str_array_from_raw(type_bf_fpp_name_ptrs, type_bf_fpp_name_lens, type_bf_fpp_count)
-        .map_err(|e| format!("parquet_on_settings_update type_bf_fpp_names: {}", e))?;
-    let type_bf_ndv_names = str_array_from_raw(type_bf_ndv_name_ptrs, type_bf_ndv_name_lens, type_bf_ndv_count)
-        .map_err(|e| format!("parquet_on_settings_update type_bf_ndv_names: {}", e))?;
+    let type_bf_enabled_names = str_array_from_raw(
+        type_bf_enabled_name_ptrs,
+        type_bf_enabled_name_lens,
+        type_bf_enabled_count,
+    )
+    .map_err(|e| format!("parquet_on_settings_update type_bf_enabled_names: {}", e))?;
+    let type_bf_fpp_names = str_array_from_raw(
+        type_bf_fpp_name_ptrs,
+        type_bf_fpp_name_lens,
+        type_bf_fpp_count,
+    )
+    .map_err(|e| format!("parquet_on_settings_update type_bf_fpp_names: {}", e))?;
+    let type_bf_ndv_names = str_array_from_raw(
+        type_bf_ndv_name_ptrs,
+        type_bf_ndv_name_lens,
+        type_bf_ndv_count,
+    )
+    .map_err(|e| format!("parquet_on_settings_update type_bf_ndv_names: {}", e))?;
 
     let type_bloom_filter_enabled: Option<std::collections::HashMap<String, bool>> = {
-        let map: std::collections::HashMap<_, _> = type_bf_enabled_names.into_iter().enumerate()
-            .map(|(i, name)| (name, *type_bf_enabled_vals.add(i) != 0)).collect();
-        if map.is_empty() { None } else { Some(map) }
+        let map: std::collections::HashMap<_, _> = type_bf_enabled_names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| (name, *type_bf_enabled_vals.add(i) != 0))
+            .collect();
+        if map.is_empty() {
+            None
+        } else {
+            Some(map)
+        }
     };
     let type_bloom_filter_fpp: Option<std::collections::HashMap<String, f64>> = {
-        let map: std::collections::HashMap<_, _> = type_bf_fpp_names.into_iter().enumerate()
-            .map(|(i, name)| (name, *type_bf_fpp_vals.add(i))).collect();
-        if map.is_empty() { None } else { Some(map) }
+        let map: std::collections::HashMap<_, _> = type_bf_fpp_names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| (name, *type_bf_fpp_vals.add(i)))
+            .collect();
+        if map.is_empty() {
+            None
+        } else {
+            Some(map)
+        }
     };
     let type_bloom_filter_ndv: Option<std::collections::HashMap<String, u64>> = {
-        let map: std::collections::HashMap<_, _> = type_bf_ndv_names.into_iter().enumerate()
-            .map(|(i, name)| (name, *type_bf_ndv_vals.add(i) as u64)).collect();
-        if map.is_empty() { None } else { Some(map) }
+        let map: std::collections::HashMap<_, _> = type_bf_ndv_names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| (name, *type_bf_ndv_vals.add(i) as u64))
+            .collect();
+        if map.is_empty() {
+            None
+        } else {
+            Some(map)
+        }
     };
 
     let config = NativeSettings {
@@ -460,7 +630,8 @@ pub unsafe extern "C" fn parquet_remove_settings(
     index_name_len: i64,
 ) -> i64 {
     let index_name = str_from_raw(index_name_ptr, index_name_len)
-        .map_err(|e| format!("parquet_remove_settings: {}", e))?.to_string();
+        .map_err(|e| format!("parquet_remove_settings: {}", e))?
+        .to_string();
     SETTINGS_STORE.remove(&index_name);
     Ok(0)
 }
@@ -524,7 +695,12 @@ pub unsafe extern "C" fn parquet_merge_files(
     };
 
     let result = if sort_cols.is_empty() {
-        merge::merge_unsorted(&input_files, output_path, index_name, output_writer_generation)
+        merge::merge_unsorted(
+            &input_files,
+            output_path,
+            index_name,
+            output_writer_generation,
+        )
     } else {
         merge::merge_sorted(
             &input_files,
@@ -540,19 +716,27 @@ pub unsafe extern "C" fn parquet_merge_files(
 
     // Write Parquet file metadata to out-pointers.
     let fm = result.metadata.file_metadata();
-    if !version_out.is_null() { *version_out = fm.version(); }
-    if !num_rows_out.is_null() { *num_rows_out = fm.num_rows(); }
+    if !version_out.is_null() {
+        *version_out = fm.version();
+    }
+    if !num_rows_out.is_null() {
+        *num_rows_out = fm.num_rows();
+    }
     if let Some(cb) = fm.created_by() {
         if !created_by_buf.is_null() && created_by_buf_len > 0 {
             let bytes = cb.as_bytes();
             let n = bytes.len().min(created_by_buf_len as usize);
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), created_by_buf, n);
-            if !created_by_len_out.is_null() { *created_by_len_out = n as i64; }
+            if !created_by_len_out.is_null() {
+                *created_by_len_out = n as i64;
+            }
         }
     } else if !created_by_len_out.is_null() {
         *created_by_len_out = -1;
     }
-    if !crc32_out.is_null() { *crc32_out = result.crc32 as i64; }
+    if !crc32_out.is_null() {
+        *crc32_out = result.crc32 as i64;
+    }
 
     // Write row-ID mapping into out-pointers as heap-allocated arrays.
     // Java reads them and then calls parquet_free_merge_result to deallocate.
@@ -594,7 +778,10 @@ pub unsafe extern "C" fn parquet_free_merge_result(
         let mapping_bytes = mapping_len as usize * std::mem::size_of::<i64>();
         // Java released merge mapping — free from pool
         crate::memory::merge_pool().shrink(mapping_bytes);
-        let _ = Box::from_raw(slice::from_raw_parts_mut(mapping_ptr as *mut i64, mapping_len as usize));
+        let _ = Box::from_raw(slice::from_raw_parts_mut(
+            mapping_ptr as *mut i64,
+            mapping_len as usize,
+        ));
     }
     let n = gen_count as usize;
     if gen_keys_ptr != 0 && n > 0 {
@@ -628,13 +815,16 @@ pub unsafe extern "C" fn parquet_read_as_json(
     use arrow::array::Array;
 
     let filename = str_from_raw(file_ptr, file_len)
-        .map_err(|e| format!("parquet_read_as_json: {}", e))?.to_string();
+        .map_err(|e| format!("parquet_read_as_json: {}", e))?
+        .to_string();
 
     let file = std::fs::File::open(&filename)
         .map_err(|e| format!("Failed to open {}: {}", filename, e))?;
     let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| format!("Failed to read parquet: {}", e))?;
-    let reader = builder.with_batch_size(8192).build()
+    let reader = builder
+        .with_batch_size(8192)
+        .build()
         .map_err(|e| format!("Failed to build reader: {}", e))?;
 
     let mut rows: Vec<serde_json::Value> = Vec::new();
@@ -650,26 +840,43 @@ pub unsafe extern "C" fn parquet_read_as_json(
                 } else {
                     match col.data_type() {
                         arrow::datatypes::DataType::Int32 => {
-                            let arr = col.as_any().downcast_ref::<arrow::array::Int32Array>().unwrap();
+                            let arr = col
+                                .as_any()
+                                .downcast_ref::<arrow::array::Int32Array>()
+                                .unwrap();
                             serde_json::Value::Number(arr.value(row_idx).into())
                         }
                         arrow::datatypes::DataType::Int64 => {
-                            let arr = col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+                            let arr = col
+                                .as_any()
+                                .downcast_ref::<arrow::array::Int64Array>()
+                                .unwrap();
                             serde_json::Value::Number(arr.value(row_idx).into())
                         }
                         arrow::datatypes::DataType::Utf8 => {
-                            let arr = col.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+                            let arr = col
+                                .as_any()
+                                .downcast_ref::<arrow::array::StringArray>()
+                                .unwrap();
                             serde_json::Value::String(arr.value(row_idx).to_string())
                         }
                         arrow::datatypes::DataType::Boolean => {
-                            let arr = col.as_any().downcast_ref::<arrow::array::BooleanArray>().unwrap();
+                            let arr = col
+                                .as_any()
+                                .downcast_ref::<arrow::array::BooleanArray>()
+                                .unwrap();
                             serde_json::Value::Bool(arr.value(row_idx))
                         }
                         arrow::datatypes::DataType::Float64 => {
-                            let arr = col.as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+                            let arr = col
+                                .as_any()
+                                .downcast_ref::<arrow::array::Float64Array>()
+                                .unwrap();
                             serde_json::json!(arr.value(row_idx))
                         }
-                        _ => serde_json::Value::String(format!("<unsupported:{}>", col.data_type())),
+                        _ => {
+                            serde_json::Value::String(format!("<unsupported:{}>", col.data_type()))
+                        }
                     }
                 };
                 obj.insert(field.name().clone(), val);
@@ -678,11 +885,15 @@ pub unsafe extern "C" fn parquet_read_as_json(
         }
     }
 
-    let json_str = serde_json::to_string(&rows)
-        .map_err(|e| format!("JSON serialization failed: {}", e))?;
+    let json_str =
+        serde_json::to_string(&rows).map_err(|e| format!("JSON serialization failed: {}", e))?;
     let bytes = json_str.as_bytes();
     if bytes.len() > buf_capacity as usize {
-        return Err(format!("JSON output ({} bytes) exceeds buffer capacity ({})", bytes.len(), buf_capacity));
+        return Err(format!(
+            "JSON output ({} bytes) exceeds buffer capacity ({})",
+            bytes.len(),
+            buf_capacity
+        ));
     }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
     *out_len = bytes.len() as i64;
@@ -695,15 +906,15 @@ pub unsafe extern "C" fn parquet_read_as_json(
 
 /// Frees the heap-allocated row ID mapping array returned as part of `parquet_finalize_writer`.
 #[no_mangle]
-pub unsafe extern "C" fn parquet_free_row_id_mapping(
-    mapping_ptr: i64,
-    mapping_len: i64,
-) {
+pub unsafe extern "C" fn parquet_free_row_id_mapping(mapping_ptr: i64, mapping_len: i64) {
     if mapping_ptr != 0 && mapping_len > 0 {
         let mapping_bytes = mapping_len as usize * std::mem::size_of::<i64>();
         // Java released write mapping — free from pool
         crate::memory::write_pool().shrink(mapping_bytes);
-        let _ = Box::from_raw(slice::from_raw_parts_mut(mapping_ptr as *mut i64, mapping_len as usize));
+        let _ = Box::from_raw(slice::from_raw_parts_mut(
+            mapping_ptr as *mut i64,
+            mapping_len as usize,
+        ));
     }
 }
 
@@ -719,10 +930,7 @@ pub unsafe extern "C" fn parquet_free_row_id_mapping(
 /// Returns 0 on success, negative error pointer on failure (per FFM convention).
 #[ffm_safe]
 #[no_mangle]
-pub unsafe extern "C" fn parquet_collect_runtime_metrics(
-    out_buf: *mut i64,
-    out_len: i64,
-) -> i64 {
+pub unsafe extern "C" fn parquet_collect_runtime_metrics(out_buf: *mut i64, out_len: i64) -> i64 {
     if out_buf.is_null() {
         return Err("parquet_collect_runtime_metrics: null out_buf".to_string());
     }
@@ -812,6 +1020,13 @@ pub unsafe extern "C" fn parquet_get_pool_stats(out_buf: *mut i64) {
 use std::fs::File;
 use std::sync::MutexGuard;
 
+use arrow::array::{Array, ArrayRef};
+use arrow::datatypes::DataType as ArrowDataType;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+    RowSelector,
+};
+use parquet::arrow::ProjectionMask;
 use parquet::basic::Type as PhysicalType;
 use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
 use parquet::data_type::DataType as ParquetDataType;
@@ -838,17 +1053,28 @@ const TYPE_BYTE_ARRAY: i32 = 5;
 /// and the row-group layout needed to translate a global row position into a
 /// `(row_group, local_offset)` pair. Random access reopens the relevant row
 /// group per call — this is the documented *slow path*; the hot path goes
-/// through `parquet_decode_page_at_row` (page-resident caching on the Java side).
+/// through `parquet_decode_page_at_row` (page-resident caching on the Java side),
+/// which decodes via the arrow-rs record-batch reader built from the
+/// once-parsed `arrow_metadata` (no footer re-read per decode).
 struct ColumnReaderState {
+    /// Low-level reader kept for the slow paths (`parquet_read_value_at_row`,
+    /// `parquet_read_repeated_at_row`); the page-decode hot path uses
+    /// `arrow_metadata` + `file` instead.
     reader: SerializedFileReader<File>,
+    /// Parsed footer + arrow schema, constructed ONCE at `open()` (including the
+    /// page index) and reused for every `parquet_decode_page_at_row` via
+    /// `ParquetRecordBatchReaderBuilder::new_with_metadata` — cloning it is
+    /// cheap (`Arc`s all the way down).
+    arrow_metadata: ArrowReaderMetadata,
+    /// File handle for the arrow decode path; `try_clone()`d per decode (cheaper
+    /// than reopening by path).
+    file: File,
     /// Leaf column index within the Parquet schema descriptor.
     leaf_idx: usize,
     /// Physical type of the column (validated against the caller's expectation).
     physical_type: PhysicalType,
     /// True when the column has a repetition level > 0 (multi-valued).
     repeated: bool,
-    /// Max definition level of the column (0 = required; >0 = optional/nested).
-    max_def_level: i16,
     /// Total number of rows (records) in the file.
     row_count: i64,
     /// Global row index of the first row in each row group.
@@ -891,7 +1117,13 @@ struct PageEntry {
 
 impl ColumnReaderState {
     fn open(filename: &str, column: &str, expected_type: i32) -> Result<ColumnReaderState, String> {
-        let file = File::open(filename).map_err(|e| format!("Failed to open '{}': {}", filename, e))?;
+        let file =
+            File::open(filename).map_err(|e| format!("Failed to open '{}': {}", filename, e))?;
+        // Keep a second handle to the same file for the arrow decode path
+        // (the first is consumed by `SerializedFileReader`).
+        let arrow_file = file
+            .try_clone()
+            .map_err(|e| format!("Failed to clone file handle for '{}': {}", filename, e))?;
         // Load the Parquet page index (OffsetIndex + ColumnIndex) so we can build
         // the Layer 3/4 page layout. Falls back gracefully to row-group
         // granularity if the file was written without a page index.
@@ -901,20 +1133,32 @@ impl ColumnReaderState {
 
         // Extract everything we need from the (borrowed) metadata inside a block so
         // the borrow ends before we move `reader` into the returned struct.
-        let (leaf_idx, physical_type, repeated, max_def_level, row_count, rg_first_row, rg_num_rows, pages) = {
+        let (
+            leaf_idx,
+            physical_type,
+            repeated,
+            row_count,
+            rg_first_row,
+            rg_num_rows,
+            pages,
+            arrow_metadata,
+        ) = {
             let metadata = reader.metadata();
             let schema = metadata.file_metadata().schema_descr();
 
-            let mut found: Option<(usize, PhysicalType, i16, i16)> = None;
+            let mut found: Option<(usize, PhysicalType, i16)> = None;
             for i in 0..schema.num_columns() {
                 let descr = schema.column(i);
                 if descr.name() == column || descr.path().string() == column {
-                    found = Some((i, descr.physical_type(), descr.max_rep_level(), descr.max_def_level()));
+                    found = Some((i, descr.physical_type(), descr.max_rep_level()));
                     break;
                 }
             }
-            let (leaf_idx, phys, max_rep, max_def) = found.ok_or_else(|| {
-                format!("Column '{}' not found in parquet file '{}'", column, filename)
+            let (leaf_idx, phys, max_rep) = found.ok_or_else(|| {
+                format!(
+                    "Column '{}' not found in parquet file '{}'",
+                    column, filename
+                )
             })?;
 
             let actual = physical_type_code(phys);
@@ -939,17 +1183,41 @@ impl ColumnReaderState {
 
             let pages = build_page_layout(metadata, leaf_idx, phys, &rg_first_row, &rg_num_rows);
 
-            (leaf_idx, phys, max_rep > 0, max_def, row_count, rg_first_row, rg_num_rows, pages)
+            // Parse the footer into arrow-reader form ONCE. `try_new` reuses the
+            // already-parsed `ParquetMetaData` (page index included, loaded above),
+            // so per-decode builders never re-read the footer from disk.
+            let arrow_metadata = ArrowReaderMetadata::try_new(
+                std::sync::Arc::new(metadata.clone()),
+                ArrowReaderOptions::new(),
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to build arrow reader metadata for '{}': {}",
+                    filename, e
+                )
+            })?;
+
+            (
+                leaf_idx,
+                phys,
+                max_rep > 0,
+                row_count,
+                rg_first_row,
+                rg_num_rows,
+                pages,
+                arrow_metadata,
+            )
         };
 
         let liquid_file_id = crate::liquid_page_cache::file_id(filename);
 
         Ok(ColumnReaderState {
             reader,
+            arrow_metadata,
+            file: arrow_file,
             leaf_idx,
             physical_type,
             repeated,
-            max_def_level,
             row_count,
             rg_first_row,
             rg_num_rows,
@@ -967,7 +1235,10 @@ impl ColumnReaderState {
                 return Ok((i, row - start));
             }
         }
-        Err(format!("Row {} not found in any row group (row count {})", row, self.row_count))
+        Err(format!(
+            "Row {} not found in any row group (row count {})",
+            row, self.row_count
+        ))
     }
 
     /// Find the index of the page containing global row `row` (binary search over
@@ -977,14 +1248,20 @@ impl ColumnReaderState {
         // page we want is the one immediately before it.
         let p = self.pages.partition_point(|e| e.global_first_row <= row);
         if p == 0 {
-            return Err(format!("Row {} precedes the first page (row count {})", row, self.row_count));
+            return Err(format!(
+                "Row {} precedes the first page (row count {})",
+                row, self.row_count
+            ));
         }
         let idx = p - 1;
         let entry = &self.pages[idx];
         if row >= entry.global_first_row && row < entry.global_first_row + entry.num_rows {
             Ok(idx)
         } else {
-            Err(format!("Row {} not found in any page (row count {})", row, self.row_count))
+            Err(format!(
+                "Row {} not found in any page (row count {})",
+                row, self.row_count
+            ))
         }
     }
 }
@@ -1026,9 +1303,8 @@ fn build_page_layout(
                     };
                     let num_rows = next_local - local_first;
                     let null_count = ci.and_then(|c| c.null_count(p)).unwrap_or(-1);
-                    let (min_long, max_long) = ci
-                        .map(|c| page_min_max(c, p, phys))
-                        .unwrap_or((0, 0));
+                    let (min_long, max_long) =
+                        ci.map(|c| page_min_max(c, p, phys)).unwrap_or((0, 0));
                     pages.push(PageEntry {
                         global_first_row: rg_first_row[rg] + local_first,
                         num_rows,
@@ -1091,8 +1367,12 @@ fn page_min_max(ci: &ColumnIndexMetaData, idx: usize, _phys: PhysicalType) -> (i
             p.max_value(idx).map(|v| v.to_bits() as i64).unwrap_or(0),
         ),
         ColumnIndexMetaData::BOOLEAN(p) => (
-            p.min_value(idx).map(|v| if *v { 1 } else { 0 }).unwrap_or(0),
-            p.max_value(idx).map(|v| if *v { 1 } else { 0 }).unwrap_or(0),
+            p.min_value(idx)
+                .map(|v| if *v { 1 } else { 0 })
+                .unwrap_or(0),
+            p.max_value(idx)
+                .map(|v| if *v { 1 } else { 0 })
+                .unwrap_or(0),
         ),
         _ => (0, 0),
     }
@@ -1125,7 +1405,10 @@ fn read_record_values<T: ParquetDataType>(
     if skip > 0 {
         let skipped = r.skip_records(skip).map_err(|e| e.to_string())?;
         if skipped < skip {
-            return Err(format!("requested skip of {} records but only {} available", skip, skipped));
+            return Err(format!(
+                "requested skip of {} records but only {} available",
+                skip, skipped
+            ));
         }
     }
     let mut def_levels: Vec<i16> = Vec::new();
@@ -1138,21 +1421,50 @@ fn read_record_values<T: ParquetDataType>(
 
 lazy_static! {
     /// Per-handle registry of open column readers, keyed by an opaque i64 handle.
-    /// Mirrors the writer-side handle pattern; serialised behind a single mutex
-    /// since column readers are not shared across threads.
-    static ref COLUMN_READERS: Mutex<HashMap<i64, ColumnReaderState>> = Mutex::new(HashMap::new());
+    ///
+    /// Two-level locking: the outer mutex guards only the handle → state *map*
+    /// (insert/remove/lookup, all O(1) and IO-free); each `ColumnReaderState`
+    /// sits behind its own `Arc<Mutex<..>>`. Entry points lock the registry just
+    /// long enough to clone the state's `Arc`, then release it and lock the
+    /// individual state for the actual work — so decodes on different handles
+    /// (different columns/queries, or a future prefetch thread) run concurrently
+    /// instead of serialising process-wide. No entry point may hold the registry
+    /// lock across file IO or a page decode.
+    static ref COLUMN_READERS: Mutex<ColumnReaderRegistry> = Mutex::new(HashMap::new());
 }
+
+/// The outer registry map: handle → per-handle state cell.
+type ColumnReaderRegistry = HashMap<i64, Arc<Mutex<ColumnReaderState>>>;
 
 /// Monotonic handle allocator. Always `>= 0`, so a returned handle is never
 /// confused with the `< 0` error-pointer convention.
 static NEXT_COLUMN_READER_HANDLE: AtomicI64 = AtomicI64::new(0);
 
-/// Locks the column-reader registry, converting a poisoned mutex into a normal
-/// FFM error instead of propagating the panic.
-fn lock_readers<'a>() -> Result<MutexGuard<'a, HashMap<i64, ColumnReaderState>>, String> {
+/// Locks the column-reader registry (the outer map lock — hold only for handle
+/// lookup/insert/remove, never across IO or decode), converting a poisoned
+/// mutex into a normal FFM error instead of propagating the panic.
+fn lock_registry<'a>() -> Result<MutexGuard<'a, ColumnReaderRegistry>, String> {
     COLUMN_READERS
         .lock()
         .map_err(|_| "column reader registry mutex poisoned".to_string())
+}
+
+/// Resolves `handle` to its state cell, holding the registry lock only for the
+/// `Arc` clone. `ctx` names the calling entry point for the error message.
+fn state_for_handle(handle: i64, ctx: &str) -> Result<Arc<Mutex<ColumnReaderState>>, String> {
+    lock_registry()?
+        .get(&handle)
+        .cloned()
+        .ok_or_else(|| format!("{}: unknown handle {}", ctx, handle))
+}
+
+/// Locks one column reader's state for the duration of a call, converting a
+/// poisoned mutex into a normal FFM error.
+fn lock_state(
+    cell: &Arc<Mutex<ColumnReaderState>>,
+) -> Result<MutexGuard<'_, ColumnReaderState>, String> {
+    cell.lock()
+        .map_err(|_| "column reader state mutex poisoned".to_string())
 }
 
 /// Opens a per-column reader over `file` for `col`, validating that the column
@@ -1179,31 +1491,44 @@ pub unsafe extern "C" fn parquet_open_column_reader(
     let state = ColumnReaderState::open(&filename, &column, expected_type)?;
 
     let handle = NEXT_COLUMN_READER_HANDLE.fetch_add(1, Ordering::SeqCst);
-    lock_readers()?.insert(handle, state);
+    lock_registry()?.insert(handle, Arc::new(Mutex::new(state)));
     log_debug!(
         "parquet_open_column_reader: file={}, column={}, handle={}",
-        filename, column, handle
+        filename,
+        column,
+        handle
     );
     Ok(handle)
 }
 
 /// Closes a column reader handle and releases its file handle and buffers.
 /// Returns `0` on success, a `< 0` error pointer if the handle is unknown.
+///
+/// Close-vs-in-flight-decode semantics: this only removes the handle's `Arc`
+/// from the registry. If another thread is mid-decode on the same handle it
+/// still owns a clone of the `Arc`, so the state (and its file handle) stays
+/// alive until that decode finishes and drops the last clone — close never
+/// frees state out from under an in-flight call. New calls made after the
+/// remove fail with "unknown handle".
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn parquet_close_column_reader(handle: i64) -> i64 {
-    match lock_readers()?.remove(&handle) {
+    match lock_registry()?.remove(&handle) {
         Some(_) => {
             log_debug!("parquet_close_column_reader: handle={}", handle);
             Ok(RC_OK)
         }
-        None => Err(format!("parquet_close_column_reader: unknown handle {}", handle)),
+        None => Err(format!(
+            "parquet_close_column_reader: unknown handle {}",
+            handle
+        )),
     }
 }
 
 /// Debug-only symbol: returns the number of currently open column-reader
-/// handles. Used by Property 7 (native handle non-leakage). Never errors;
-/// recovers from a poisoned mutex rather than panicking.
+/// handles (registry map size only; individual state locks are not taken).
+/// Used by Property 7 (native handle non-leakage). Never errors; recovers
+/// from a poisoned mutex rather than panicking.
 #[no_mangle]
 pub unsafe extern "C" fn parquet_open_column_reader_count() -> i64 {
     match COLUMN_READERS.lock() {
@@ -1218,7 +1543,11 @@ pub unsafe extern "C" fn parquet_open_column_reader_count() -> i64 {
 /// path is unchanged. A `max_memory_bytes` of 0 leaves the liquid-cache default budget.
 #[no_mangle]
 pub unsafe extern "C" fn parquet_liquid_cache_set_enabled(enabled: i32, max_memory_bytes: i64) {
-    let bytes = if max_memory_bytes > 0 { max_memory_bytes as usize } else { 0 };
+    let bytes = if max_memory_bytes > 0 {
+        max_memory_bytes as usize
+    } else {
+        0
+    };
     crate::liquid_page_cache::set_enabled(enabled != 0, bytes);
 }
 
@@ -1248,10 +1577,8 @@ pub unsafe extern "C" fn parquet_read_value_at_row(
     out_buf_cap: i64,
     out_len: *mut i64,
 ) -> i64 {
-    let mut guard = lock_readers()?;
-    let state = guard
-        .get_mut(&handle)
-        .ok_or_else(|| format!("parquet_read_value_at_row: unknown handle {}", handle))?;
+    let cell = state_for_handle(handle, "parquet_read_value_at_row")?;
+    let state = lock_state(&cell)?;
 
     if row < 0 {
         return Err(format!("parquet_read_value_at_row: negative row {}", row));
@@ -1275,8 +1602,13 @@ pub unsafe extern "C" fn parquet_read_value_at_row(
     }
 
     let (rg_idx, local) = state.locate(row)?;
-    let rg = state.reader.get_row_group(rg_idx).map_err(|e| e.to_string())?;
-    let col = rg.get_column_reader(state.leaf_idx).map_err(|e| e.to_string())?;
+    let rg = state
+        .reader
+        .get_row_group(rg_idx)
+        .map_err(|e| e.to_string())?;
+    let col = rg
+        .get_column_reader(state.leaf_idx)
+        .map_err(|e| e.to_string())?;
     let local = local as usize;
 
     match col {
@@ -1389,13 +1721,14 @@ pub unsafe extern "C" fn parquet_read_repeated_at_row(
     out_byte_offsets: *mut i64,
     out_byte_buf_cap: i64,
 ) -> i64 {
-    let mut guard = lock_readers()?;
-    let state = guard
-        .get_mut(&handle)
-        .ok_or_else(|| format!("parquet_read_repeated_at_row: unknown handle {}", handle))?;
+    let cell = state_for_handle(handle, "parquet_read_repeated_at_row")?;
+    let state = lock_state(&cell)?;
 
     if row < 0 {
-        return Err(format!("parquet_read_repeated_at_row: negative row {}", row));
+        return Err(format!(
+            "parquet_read_repeated_at_row: negative row {}",
+            row
+        ));
     }
     if row >= state.row_count {
         return Err(format!(
@@ -1409,40 +1742,89 @@ pub unsafe extern "C" fn parquet_read_repeated_at_row(
     }
 
     let (rg_idx, local) = state.locate(row)?;
-    let rg = state.reader.get_row_group(rg_idx).map_err(|e| e.to_string())?;
-    let col = rg.get_column_reader(state.leaf_idx).map_err(|e| e.to_string())?;
+    let rg = state
+        .reader
+        .get_row_group(rg_idx)
+        .map_err(|e| e.to_string())?;
+    let col = rg
+        .get_column_reader(state.leaf_idx)
+        .map_err(|e| e.to_string())?;
     let local = local as usize;
 
     match col {
         ColumnReader::Int32ColumnReader(mut r) => {
             let vals = read_record_values(&mut r, local)?;
-            write_primitive_repeated(vals.iter().map(|v| *v as i64), vals.len(), out_count, out_longs, out_long_cap)
+            write_primitive_repeated(
+                vals.iter().map(|v| *v as i64),
+                vals.len(),
+                out_count,
+                out_longs,
+                out_long_cap,
+            )
         }
         ColumnReader::Int64ColumnReader(mut r) => {
             let vals = read_record_values(&mut r, local)?;
-            write_primitive_repeated(vals.iter().copied(), vals.len(), out_count, out_longs, out_long_cap)
+            write_primitive_repeated(
+                vals.iter().copied(),
+                vals.len(),
+                out_count,
+                out_longs,
+                out_long_cap,
+            )
         }
         ColumnReader::FloatColumnReader(mut r) => {
             let vals = read_record_values(&mut r, local)?;
-            write_primitive_repeated(vals.iter().map(|v| v.to_bits() as i64), vals.len(), out_count, out_longs, out_long_cap)
+            write_primitive_repeated(
+                vals.iter().map(|v| v.to_bits() as i64),
+                vals.len(),
+                out_count,
+                out_longs,
+                out_long_cap,
+            )
         }
         ColumnReader::DoubleColumnReader(mut r) => {
             let vals = read_record_values(&mut r, local)?;
-            write_primitive_repeated(vals.iter().map(|v| v.to_bits() as i64), vals.len(), out_count, out_longs, out_long_cap)
+            write_primitive_repeated(
+                vals.iter().map(|v| v.to_bits() as i64),
+                vals.len(),
+                out_count,
+                out_longs,
+                out_long_cap,
+            )
         }
         ColumnReader::BoolColumnReader(mut r) => {
             let vals = read_record_values(&mut r, local)?;
-            write_primitive_repeated(vals.iter().map(|v| if *v { 1i64 } else { 0i64 }), vals.len(), out_count, out_longs, out_long_cap)
+            write_primitive_repeated(
+                vals.iter().map(|v| if *v { 1i64 } else { 0i64 }),
+                vals.len(),
+                out_count,
+                out_longs,
+                out_long_cap,
+            )
         }
         ColumnReader::ByteArrayColumnReader(mut r) => {
             let vals = read_record_values(&mut r, local)?;
             let slices: Vec<&[u8]> = vals.iter().map(|v| v.data()).collect();
-            write_bytes_repeated(&slices, out_count, out_long_cap, out_byte_buf, out_byte_offsets, out_byte_buf_cap)
+            write_bytes_repeated(
+                &slices,
+                out_count,
+                out_long_cap,
+                out_byte_buf,
+                out_byte_offsets,
+                out_byte_buf_cap,
+            )
         }
         ColumnReader::FixedLenByteArrayColumnReader(mut r) => {
             let vals = read_record_values(&mut r, local)?;
             let slices: Vec<&[u8]> = vals.iter().map(|v| v.data()).collect();
-            write_bytes_repeated(&slices, out_count, out_long_cap, out_byte_buf, out_byte_offsets, out_byte_buf_cap)
+            write_bytes_repeated(
+                &slices,
+                out_count,
+                out_long_cap,
+                out_byte_buf,
+                out_byte_offsets,
+                out_byte_buf_cap,
+            )
         }
         ColumnReader::Int96ColumnReader(_) => {
             Err("parquet_read_repeated_at_row: INT96 columns are not supported".to_string())
@@ -1534,10 +1916,8 @@ unsafe fn write_bytes_repeated(
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn parquet_get_column_num_pages(handle: i64) -> i64 {
-    let guard = lock_readers()?;
-    let state = guard
-        .get(&handle)
-        .ok_or_else(|| format!("parquet_get_column_num_pages: unknown handle {}", handle))?;
+    let cell = state_for_handle(handle, "parquet_get_column_num_pages")?;
+    let state = lock_state(&cell)?;
     Ok(state.pages.len() as i64)
 }
 
@@ -1570,10 +1950,8 @@ pub unsafe extern "C" fn parquet_get_column_page_index(
     out_buf_capacity: i64,
     out_actual_pages: *mut i64,
 ) -> i64 {
-    let guard = lock_readers()?;
-    let state = guard
-        .get(&handle)
-        .ok_or_else(|| format!("parquet_get_column_page_index: unknown handle {}", handle))?;
+    let cell = state_for_handle(handle, "parquet_get_column_page_index")?;
+    let state = lock_state(&cell)?;
 
     let n = state.pages.len();
     if !out_actual_pages.is_null() {
@@ -1606,49 +1984,6 @@ pub unsafe extern "C" fn parquet_get_column_page_index(
     Ok(RC_OK)
 }
 
-/// Decodes one page's worth of single-valued records, returning a per-row
-/// presence flag (`true` = value present) and the dense list of non-null values
-/// in row order. `skip` records are skipped first, then `num_rows` records are
-/// read. Works for required columns (`max_def_level == 0`, all present) and
-/// optional non-repeated columns.
-fn decode_page_records<T: ParquetDataType>(
-    r: &mut ColumnReaderImpl<T>,
-    skip: usize,
-    num_rows: usize,
-    max_def_level: i16,
-) -> Result<(Vec<bool>, Vec<T::T>), String> {
-    if skip > 0 {
-        let skipped = r.skip_records(skip).map_err(|e| e.to_string())?;
-        if skipped < skip {
-            return Err(format!(
-                "page decode: requested skip of {} records but only {} available",
-                skip, skipped
-            ));
-        }
-    }
-
-    let mut def_levels: Vec<i16> = Vec::with_capacity(num_rows);
-    let mut values: Vec<T::T> = Vec::with_capacity(num_rows);
-    let (records_read, _values_read, _levels_read) = r
-        .read_records(num_rows, Some(&mut def_levels), None, &mut values)
-        .map_err(|e| e.to_string())?;
-    if records_read < num_rows {
-        return Err(format!(
-            "page decode: expected {} records but read {}",
-            num_rows, records_read
-        ));
-    }
-
-    // Build the per-row presence vector. For required columns `read_records`
-    // ignores the def-level buffer and every row is present.
-    let presence = if max_def_level == 0 {
-        vec![true; num_rows]
-    } else {
-        def_levels.iter().take(num_rows).map(|d| *d == max_def_level).collect()
-    };
-    Ok((presence, values))
-}
-
 /// Packs a per-row presence slice into a little-endian `long[]` bitset (bit i set
 /// when row i is present), writing into `out` (capacity `out_words`). Returns the
 /// number of words required; on capacity shortfall writes nothing and the caller
@@ -1676,6 +2011,12 @@ unsafe fn write_presence_bitset(presence: &[bool], out: *mut i64, out_words: i64
 }
 
 /// Layer 1 + 2: decode the page containing global row `row` into caller buffers.
+///
+/// Decode goes through the arrow-rs record-batch reader: a trivial
+/// `RowSelection` of `[skip(local_first), select(page_rows), skip(rest of RG)]`
+/// over the page's single row group, projected to the one leaf column. The
+/// builder is constructed from the `ArrowReaderMetadata` parsed once at
+/// `open()` (`new_with_metadata`), so no footer bytes are re-read per decode.
 ///
 /// On success (`RC_OK`):
 ///   - `out_first_row` / `out_last_row` = inclusive global row range of the page
@@ -1707,10 +2048,8 @@ pub unsafe extern "C" fn parquet_decode_page_at_row(
     out_presence_bitset: *mut i64,
     out_presence_bits_cap: i64,
 ) -> i64 {
-    let mut guard = lock_readers()?;
-    let state = guard
-        .get_mut(&handle)
-        .ok_or_else(|| format!("parquet_decode_page_at_row: unknown handle {}", handle))?;
+    let cell = state_for_handle(handle, "parquet_decode_page_at_row")?;
+    let state = lock_state(&cell)?;
 
     if row < 0 || row >= state.row_count {
         return Err(format!(
@@ -1726,14 +2065,11 @@ pub unsafe extern "C" fn parquet_decode_page_at_row(
     }
 
     let page_idx = state.page_for_row(row)?;
-    // Copy out the page's coordinates before borrowing the reader mutably.
     let (rg_idx, local_first, num_rows, first_global) = {
         let e = &state.pages[page_idx];
         (e.rg_idx, e.local_first_row, e.num_rows, e.global_first_row)
     };
     let num_rows_usize = num_rows as usize;
-    let max_def_level = state.max_def_level;
-    let physical_type = state.physical_type;
 
     // Always report the page row range so the caller can bound its cache and
     // size buffers even on the overflow path.
@@ -1746,7 +2082,7 @@ pub unsafe extern "C" fn parquet_decode_page_at_row(
 
     // Cross-query decoded-page cache (codec-owned liquid instance). When enabled, a hit serves the
     // decoded page from the node-level cache and skips the Parquet decode below entirely; a miss
-    // decodes as usual and backfills the cache (see the primitive arms). Keyed by
+    // decodes as usual and backfills the cache (see the primitive arm below). Keyed by
     // (file, column, page); primitives only. No-op when the feature flag is off.
     let lc_eid = if crate::liquid_page_cache::enabled() {
         Some(crate::liquid_page_cache::entry_id(
@@ -1760,146 +2096,310 @@ pub unsafe extern "C" fn parquet_decode_page_at_row(
     if let Some(eid) = lc_eid {
         if let Some((longs, presence)) = crate::liquid_page_cache::get_page(eid) {
             return write_primitive_page(
-                &longs, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
-                out_presence_bitset, out_presence_bits_cap,
+                &longs,
+                &presence,
+                out_value_buf,
+                out_value_buf_cap,
+                out_value_actual_len,
+                out_presence_bitset,
+                out_presence_bits_cap,
             );
         }
     }
 
-    let rg = state.reader.get_row_group(rg_idx).map_err(|e| e.to_string())?;
-    let col = rg.get_column_reader(state.leaf_idx).map_err(|e| e.to_string())?;
-    let skip = local_first as usize;
+    // Liquid miss: decode the whole page via the arrow record-batch reader.
+    let array = decode_page_arrow(&state, rg_idx, local_first, num_rows_usize)?;
 
-    // Decode the page into per-row presence + raw-bit values (primitives) or a
-    // backing byte buffer + CSR offsets (BYTE_ARRAY), then validate caller
-    // capacities and either copy out or signal overflow.
-    match col {
-        ColumnReader::Int32ColumnReader(mut r) => {
-            let (presence, values) = decode_page_records(&mut r, skip, num_rows_usize, max_def_level)?;
-            let longs = expand_primitive(&presence, &values, |v| v as i64);
+    match state.physical_type {
+        PhysicalType::BOOLEAN
+        | PhysicalType::INT32
+        | PhysicalType::INT64
+        | PhysicalType::FLOAT
+        | PhysicalType::DOUBLE => {
+            let (longs, presence) = arrow_primitive_to_page(&array)?;
             if let Some(eid) = lc_eid {
                 crate::liquid_page_cache::put_page(eid, &longs, &presence);
             }
-            return write_primitive_page(
-                &longs, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
-                out_presence_bitset, out_presence_bits_cap,
-            );
+            write_primitive_page(
+                &longs,
+                &presence,
+                out_value_buf,
+                out_value_buf_cap,
+                out_value_actual_len,
+                out_presence_bitset,
+                out_presence_bits_cap,
+            )
         }
-        ColumnReader::Int64ColumnReader(mut r) => {
-            let (presence, values) = decode_page_records(&mut r, skip, num_rows_usize, max_def_level)?;
-            let longs = expand_primitive(&presence, &values, |v| v);
-            if let Some(eid) = lc_eid {
-                crate::liquid_page_cache::put_page(eid, &longs, &presence);
-            }
-            return write_primitive_page(
-                &longs, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
-                out_presence_bitset, out_presence_bits_cap,
-            );
+        PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+            let (slices, presence) = arrow_bytes_to_page(&array)?;
+            write_bytes_page(
+                &slices,
+                &presence,
+                out_value_buf,
+                out_value_buf_cap,
+                out_value_actual_len,
+                out_byte_offsets,
+                out_byte_offsets_cap,
+                out_presence_bitset,
+                out_presence_bits_cap,
+            )
         }
-        ColumnReader::FloatColumnReader(mut r) => {
-            let (presence, values) = decode_page_records(&mut r, skip, num_rows_usize, max_def_level)?;
-            let longs = expand_primitive(&presence, &values, |v| v.to_bits() as i64);
-            if let Some(eid) = lc_eid {
-                crate::liquid_page_cache::put_page(eid, &longs, &presence);
-            }
-            return write_primitive_page(
-                &longs, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
-                out_presence_bitset, out_presence_bits_cap,
-            );
-        }
-        ColumnReader::DoubleColumnReader(mut r) => {
-            let (presence, values) = decode_page_records(&mut r, skip, num_rows_usize, max_def_level)?;
-            let longs = expand_primitive(&presence, &values, |v| v.to_bits() as i64);
-            if let Some(eid) = lc_eid {
-                crate::liquid_page_cache::put_page(eid, &longs, &presence);
-            }
-            return write_primitive_page(
-                &longs, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
-                out_presence_bitset, out_presence_bits_cap,
-            );
-        }
-        ColumnReader::BoolColumnReader(mut r) => {
-            let (presence, values) = decode_page_records(&mut r, skip, num_rows_usize, max_def_level)?;
-            let longs = expand_primitive(&presence, &values, |v| if v { 1i64 } else { 0i64 });
-            if let Some(eid) = lc_eid {
-                crate::liquid_page_cache::put_page(eid, &longs, &presence);
-            }
-            return write_primitive_page(
-                &longs, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
-                out_presence_bitset, out_presence_bits_cap,
-            );
-        }
-        ColumnReader::ByteArrayColumnReader(mut r) => {
-            let (presence, values) = decode_page_records(&mut r, skip, num_rows_usize, max_def_level)?;
-            let slices = expand_bytes(&presence, &values);
-            return write_bytes_page(
-                &slices, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
-                out_byte_offsets, out_byte_offsets_cap, out_presence_bitset, out_presence_bits_cap,
-            );
-        }
-        ColumnReader::FixedLenByteArrayColumnReader(mut r) => {
-            let (presence, values) = decode_page_records(&mut r, skip, num_rows_usize, max_def_level)?;
-            let slices = expand_flba(&presence, &values);
-            return write_bytes_page(
-                &slices, &presence, out_value_buf, out_value_buf_cap, out_value_actual_len,
-                out_byte_offsets, out_byte_offsets_cap, out_presence_bitset, out_presence_bits_cap,
-            );
-        }
-        ColumnReader::Int96ColumnReader(_) => {
-            let _ = physical_type; // silence unused in this arm
+        PhysicalType::INT96 => {
             Err("parquet_decode_page_at_row: INT96 columns are not supported".to_string())
         }
     }
 }
 
-/// Expands dense non-null primitive values into a per-row `i64` slot vector
-/// (null rows hold 0), applying `to_bits` to each present value.
-fn expand_primitive<T: Copy>(presence: &[bool], dense: &[T], to_bits: impl Fn(T) -> i64) -> Vec<i64> {
-    let mut out = Vec::with_capacity(presence.len());
-    let mut di = 0usize;
-    for &present in presence {
-        if present {
-            out.push(to_bits(dense[di]));
-            di += 1;
-        } else {
-            out.push(0);
-        }
+/// Decodes one whole page (`num_rows` records starting `local_first` into row
+/// group `rg_idx`) of the state's leaf column into a single arrow array.
+///
+/// Selection shape: `[skip(local_first), select(num_rows), skip(rest of RG)]`
+/// over just `rg_idx`; batch size = page rows so the reader usually yields one
+/// batch (multiple batches are concatenated). The builder reuses the state's
+/// once-parsed `ArrowReaderMetadata` and a `try_clone()` of its file handle —
+/// no footer re-read, no path re-open.
+///
+/// Dictionary-encoded columns: the writer does not embed a `Dictionary` arrow
+/// type hint, so parquet-rs hydrates dictionary pages to plain arrays. As a
+/// belt-and-braces guard the result is cast to the dictionary's value type if
+/// a `DictionaryArray` ever surfaces, keeping the conversion helpers simple.
+fn decode_page_arrow(
+    state: &ColumnReaderState,
+    rg_idx: usize,
+    local_first: i64,
+    num_rows: usize,
+) -> Result<ArrayRef, String> {
+    let rg_rows = state.rg_num_rows[rg_idx];
+    let trailing = rg_rows - local_first - num_rows as i64;
+    let mut selectors = Vec::with_capacity(3);
+    if local_first > 0 {
+        selectors.push(RowSelector::skip(local_first as usize));
     }
-    out
+    selectors.push(RowSelector::select(num_rows));
+    if trailing > 0 {
+        selectors.push(RowSelector::skip(trailing as usize));
+    }
+
+    let file = state
+        .file
+        .try_clone()
+        .map_err(|e| format!("page decode: failed to clone file handle: {}", e))?;
+    let mask = ProjectionMask::leaves(state.arrow_metadata.parquet_schema(), [state.leaf_idx]);
+    let reader =
+        ParquetRecordBatchReaderBuilder::new_with_metadata(file, state.arrow_metadata.clone())
+            .with_row_groups(vec![rg_idx])
+            .with_projection(mask)
+            .with_batch_size(num_rows)
+            .with_row_selection(RowSelection::from(selectors))
+            .build()
+            .map_err(|e| format!("page decode: failed to build arrow reader: {}", e))?;
+
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(1);
+    for batch in reader {
+        let batch = batch.map_err(|e| format!("page decode: batch read failed: {}", e))?;
+        if batch.num_columns() != 1 {
+            return Err(format!(
+                "page decode: expected 1 projected column, got {}",
+                batch.num_columns()
+            ));
+        }
+        arrays.push(batch.column(0).clone());
+    }
+    let array = match arrays.len() {
+        0 => return Err("page decode: reader returned no batches".to_string()),
+        1 => arrays.pop().expect("len checked"),
+        _ => {
+            let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+            arrow::compute::concat(&refs)
+                .map_err(|e| format!("page decode: failed to concat batches: {}", e))?
+        }
+    };
+    if array.len() != num_rows {
+        return Err(format!(
+            "page decode: expected {} rows but decoded {}",
+            num_rows,
+            array.len()
+        ));
+    }
+    // Hydrate a DictionaryArray to its value type (see doc comment).
+    if let ArrowDataType::Dictionary(_, value_type) = array.data_type() {
+        let value_type = value_type.as_ref().clone();
+        return arrow::compute::cast(&array, &value_type)
+            .map_err(|e| format!("page decode: failed to hydrate dictionary column: {}", e));
+    }
+    Ok(array)
 }
 
-/// Expands dense non-null BYTE_ARRAY values into a per-row slice vector (null
-/// rows map to an empty slice).
-fn expand_bytes<'a>(presence: &[bool], dense: &'a [parquet::data_type::ByteArray]) -> Vec<&'a [u8]> {
-    let mut out: Vec<&[u8]> = Vec::with_capacity(presence.len());
-    let mut di = 0usize;
-    for &present in presence {
-        if present {
-            out.push(dense[di].data());
-            di += 1;
-        } else {
-            out.push(&[]);
+/// Converts a decoded primitive arrow array into the codec's wire form: per-row
+/// raw `i64` bits (null slots hold 0) + per-row presence flags from the array's
+/// null buffer. Bit conventions match the old def-level decode path exactly:
+/// INT32-backed values sign-extend, FLOAT is `f32::to_bits` zero-extended,
+/// DOUBLE is `f64::to_bits`, BOOL is 0/1, and date/time/timestamp logical
+/// types pass through as their raw INT32/INT64 physical values.
+fn arrow_primitive_to_page(array: &ArrayRef) -> Result<(Vec<i64>, Vec<bool>), String> {
+    use arrow::array::AsArray;
+    use arrow::datatypes as adt;
+    use arrow::datatypes::ArrowPrimitiveType;
+
+    fn conv<T: ArrowPrimitiveType>(
+        array: &ArrayRef,
+        to_bits: impl Fn(T::Native) -> i64,
+    ) -> (Vec<i64>, Vec<bool>) {
+        let a = array.as_primitive::<T>();
+        let mut longs = Vec::with_capacity(a.len());
+        let mut presence = Vec::with_capacity(a.len());
+        for i in 0..a.len() {
+            if a.is_valid(i) {
+                longs.push(to_bits(a.value(i)));
+                presence.push(true);
+            } else {
+                longs.push(0);
+                presence.push(false);
+            }
         }
+        (longs, presence)
     }
-    out
+
+    let out = match array.data_type() {
+        ArrowDataType::Boolean => {
+            let a = array.as_boolean();
+            let mut longs = Vec::with_capacity(a.len());
+            let mut presence = Vec::with_capacity(a.len());
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    longs.push(if a.value(i) { 1 } else { 0 });
+                    presence.push(true);
+                } else {
+                    longs.push(0);
+                    presence.push(false);
+                }
+            }
+            (longs, presence)
+        }
+        ArrowDataType::Int8 => conv::<adt::Int8Type>(array, |v| v as i64),
+        ArrowDataType::Int16 => conv::<adt::Int16Type>(array, |v| v as i64),
+        ArrowDataType::Int32 => conv::<adt::Int32Type>(array, |v| v as i64),
+        ArrowDataType::Int64 => conv::<adt::Int64Type>(array, |v| v),
+        // Unsigned types are stored as their signed physical INT32/INT64
+        // counterparts; reinterpret through the signed type so the raw bits
+        // match what the old physical-value path produced.
+        ArrowDataType::UInt8 => conv::<adt::UInt8Type>(array, |v| v as i64),
+        ArrowDataType::UInt16 => conv::<adt::UInt16Type>(array, |v| v as i64),
+        ArrowDataType::UInt32 => conv::<adt::UInt32Type>(array, |v| (v as i32) as i64),
+        ArrowDataType::UInt64 => conv::<adt::UInt64Type>(array, |v| v as i64),
+        ArrowDataType::Float32 => conv::<adt::Float32Type>(array, |v| v.to_bits() as i64),
+        ArrowDataType::Float64 => conv::<adt::Float64Type>(array, |v| v.to_bits() as i64),
+        // Date/time/timestamp logical types: raw physical INT32/INT64 passthrough.
+        ArrowDataType::Date32 => conv::<adt::Date32Type>(array, |v| v as i64),
+        ArrowDataType::Date64 => conv::<adt::Date64Type>(array, |v| v),
+        ArrowDataType::Time32(adt::TimeUnit::Second) => {
+            conv::<adt::Time32SecondType>(array, |v| v as i64)
+        }
+        ArrowDataType::Time32(adt::TimeUnit::Millisecond) => {
+            conv::<adt::Time32MillisecondType>(array, |v| v as i64)
+        }
+        ArrowDataType::Time64(adt::TimeUnit::Microsecond) => {
+            conv::<adt::Time64MicrosecondType>(array, |v| v)
+        }
+        ArrowDataType::Time64(adt::TimeUnit::Nanosecond) => {
+            conv::<adt::Time64NanosecondType>(array, |v| v)
+        }
+        ArrowDataType::Timestamp(adt::TimeUnit::Second, _) => {
+            conv::<adt::TimestampSecondType>(array, |v| v)
+        }
+        ArrowDataType::Timestamp(adt::TimeUnit::Millisecond, _) => {
+            conv::<adt::TimestampMillisecondType>(array, |v| v)
+        }
+        ArrowDataType::Timestamp(adt::TimeUnit::Microsecond, _) => {
+            conv::<adt::TimestampMicrosecondType>(array, |v| v)
+        }
+        ArrowDataType::Timestamp(adt::TimeUnit::Nanosecond, _) => {
+            conv::<adt::TimestampNanosecondType>(array, |v| v)
+        }
+        ArrowDataType::Duration(adt::TimeUnit::Second) => {
+            conv::<adt::DurationSecondType>(array, |v| v)
+        }
+        ArrowDataType::Duration(adt::TimeUnit::Millisecond) => {
+            conv::<adt::DurationMillisecondType>(array, |v| v)
+        }
+        ArrowDataType::Duration(adt::TimeUnit::Microsecond) => {
+            conv::<adt::DurationMicrosecondType>(array, |v| v)
+        }
+        ArrowDataType::Duration(adt::TimeUnit::Nanosecond) => {
+            conv::<adt::DurationNanosecondType>(array, |v| v)
+        }
+        other => {
+            return Err(format!(
+                "page decode: unsupported arrow type {:?} for primitive column",
+                other
+            ))
+        }
+    };
+    Ok(out)
 }
 
-/// Expands dense non-null FIXED_LEN_BYTE_ARRAY values into a per-row slice vector.
-fn expand_flba<'a>(
-    presence: &[bool],
-    dense: &'a [parquet::data_type::FixedLenByteArray],
-) -> Vec<&'a [u8]> {
-    let mut out: Vec<&[u8]> = Vec::with_capacity(presence.len());
-    let mut di = 0usize;
-    for &present in presence {
-        if present {
-            out.push(dense[di].data());
-            di += 1;
-        } else {
-            out.push(&[]);
+/// Converts a decoded BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY arrow array into per-row
+/// byte slices (null rows map to an empty slice, matching the old expand path)
+/// + per-row presence flags from the array's null buffer.
+fn arrow_bytes_to_page(array: &ArrayRef) -> Result<(Vec<&[u8]>, Vec<bool>), String> {
+    use arrow::array::AsArray;
+
+    fn conv<'a>(
+        len: usize,
+        is_valid: impl Fn(usize) -> bool,
+        value: impl Fn(usize) -> &'a [u8],
+    ) -> (Vec<&'a [u8]>, Vec<bool>) {
+        let mut slices: Vec<&[u8]> = Vec::with_capacity(len);
+        let mut presence = Vec::with_capacity(len);
+        for i in 0..len {
+            if is_valid(i) {
+                slices.push(value(i));
+                presence.push(true);
+            } else {
+                slices.push(&[]);
+                presence.push(false);
+            }
         }
+        (slices, presence)
     }
-    out
+
+    let out = match array.data_type() {
+        ArrowDataType::Utf8 => {
+            let a = array.as_string::<i32>();
+            conv(a.len(), |i| a.is_valid(i), |i| a.value(i).as_bytes())
+        }
+        ArrowDataType::LargeUtf8 => {
+            let a = array.as_string::<i64>();
+            conv(a.len(), |i| a.is_valid(i), |i| a.value(i).as_bytes())
+        }
+        ArrowDataType::Utf8View => {
+            let a = array.as_string_view();
+            conv(a.len(), |i| a.is_valid(i), |i| a.value(i).as_bytes())
+        }
+        ArrowDataType::Binary => {
+            let a = array.as_binary::<i32>();
+            conv(a.len(), |i| a.is_valid(i), |i| a.value(i))
+        }
+        ArrowDataType::LargeBinary => {
+            let a = array.as_binary::<i64>();
+            conv(a.len(), |i| a.is_valid(i), |i| a.value(i))
+        }
+        ArrowDataType::BinaryView => {
+            let a = array.as_binary_view();
+            conv(a.len(), |i| a.is_valid(i), |i| a.value(i))
+        }
+        ArrowDataType::FixedSizeBinary(_) => {
+            let a = array.as_fixed_size_binary();
+            conv(a.len(), |i| a.is_valid(i), |i| a.value(i))
+        }
+        other => {
+            return Err(format!(
+                "page decode: unsupported arrow type {:?} for byte-array column",
+                other
+            ))
+        }
+    };
+    Ok(out)
 }
 
 /// Writes a decoded primitive page (per-row raw bits + presence bitset) to the
@@ -1933,11 +2433,7 @@ unsafe fn write_primitive_page(
     // storing through a *mut i64 — out_value_buf is a u8 buffer with no
     // guaranteed 8-byte alignment, so an aligned i64 store would be UB.
     if !longs.is_empty() {
-        std::ptr::copy_nonoverlapping(
-            longs.as_ptr() as *const u8,
-            out_value_buf,
-            longs.len() * 8,
-        );
+        std::ptr::copy_nonoverlapping(longs.as_ptr() as *const u8, out_value_buf, longs.len() * 8);
     }
     write_presence_bitset(presence, out_presence_bitset, out_presence_bits_cap);
     Ok(RC_OK)
@@ -1986,4 +2482,587 @@ unsafe fn write_bytes_page(
 
     write_presence_bitset(presence, out_presence_bitset, out_presence_bits_cap);
     Ok(RC_OK)
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use arrow::array::{
+        ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array,
+        Int32Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+    };
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    // -------------------------------------------------------------------
+    // Conversion helpers: arrow array -> (longs, presence) / (slices, presence)
+    // -------------------------------------------------------------------
+
+    fn int64_array(vals: Vec<Option<i64>>) -> ArrayRef {
+        Arc::new(Int64Array::from(vals))
+    }
+
+    #[test]
+    fn primitive_conversion_no_nulls() {
+        let (longs, presence) =
+            arrow_primitive_to_page(&int64_array(vec![Some(1), Some(-2), Some(i64::MAX)])).unwrap();
+        assert_eq!(longs, vec![1, -2, i64::MAX]);
+        assert_eq!(presence, vec![true, true, true]);
+    }
+
+    #[test]
+    fn primitive_conversion_null_at_start() {
+        let (longs, presence) =
+            arrow_primitive_to_page(&int64_array(vec![None, Some(7), Some(8)])).unwrap();
+        assert_eq!(longs, vec![0, 7, 8]);
+        assert_eq!(presence, vec![false, true, true]);
+    }
+
+    #[test]
+    fn primitive_conversion_null_in_middle() {
+        let (longs, presence) =
+            arrow_primitive_to_page(&int64_array(vec![Some(7), None, Some(8)])).unwrap();
+        assert_eq!(longs, vec![7, 0, 8]);
+        assert_eq!(presence, vec![true, false, true]);
+    }
+
+    #[test]
+    fn primitive_conversion_null_at_end() {
+        let (longs, presence) =
+            arrow_primitive_to_page(&int64_array(vec![Some(7), Some(8), None])).unwrap();
+        assert_eq!(longs, vec![7, 8, 0]);
+        assert_eq!(presence, vec![true, true, false]);
+    }
+
+    #[test]
+    fn primitive_conversion_all_null() {
+        let (longs, presence) =
+            arrow_primitive_to_page(&int64_array(vec![None, None, None])).unwrap();
+        assert_eq!(longs, vec![0, 0, 0]);
+        assert_eq!(presence, vec![false, false, false]);
+    }
+
+    #[test]
+    fn primitive_conversion_all_null_slice() {
+        // A sliced array exercises offset-carrying null buffers.
+        let base = int64_array(vec![Some(1), None, None, None, Some(5)]);
+        let sliced = base.slice(1, 3);
+        let (longs, presence) = arrow_primitive_to_page(&sliced).unwrap();
+        assert_eq!(longs, vec![0, 0, 0]);
+        assert_eq!(presence, vec![false, false, false]);
+    }
+
+    #[test]
+    fn primitive_conversion_raw_bits_per_type() {
+        // INT32 sign-extends.
+        let (longs, _) = arrow_primitive_to_page(
+            &(Arc::new(Int32Array::from(vec![Some(-1), Some(42)])) as ArrayRef),
+        )
+        .unwrap();
+        assert_eq!(longs, vec![-1i64, 42]);
+
+        // FLOAT = f32::to_bits zero-extended.
+        let (longs, _) = arrow_primitive_to_page(
+            &(Arc::new(Float32Array::from(vec![Some(-1.5f32)])) as ArrayRef),
+        )
+        .unwrap();
+        assert_eq!(longs, vec![(-1.5f32).to_bits() as i64]);
+
+        // DOUBLE = f64::to_bits.
+        let (longs, _) = arrow_primitive_to_page(
+            &(Arc::new(Float64Array::from(vec![Some(2.25f64)])) as ArrayRef),
+        )
+        .unwrap();
+        assert_eq!(longs, vec![2.25f64.to_bits() as i64]);
+
+        // BOOL = 0/1 with nulls as 0.
+        let (longs, presence) = arrow_primitive_to_page(
+            &(Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])) as ArrayRef),
+        )
+        .unwrap();
+        assert_eq!(longs, vec![1, 0, 0]);
+        assert_eq!(presence, vec![true, false, true]);
+
+        // Date32 / TimestampMillis pass raw physical values through.
+        let (longs, _) =
+            arrow_primitive_to_page(&(Arc::new(Date32Array::from(vec![Some(19000)])) as ArrayRef))
+                .unwrap();
+        assert_eq!(longs, vec![19000]);
+        let (longs, _) = arrow_primitive_to_page(
+            &(Arc::new(TimestampMillisecondArray::from(vec![Some(
+                1_700_000_000_000i64,
+            )])) as ArrayRef),
+        )
+        .unwrap();
+        assert_eq!(longs, vec![1_700_000_000_000]);
+    }
+
+    #[test]
+    fn bytes_conversion_nulls() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![
+            None,
+            Some("ab"),
+            None,
+            Some(""),
+            Some("xyz"),
+            None,
+        ]));
+        let (slices, presence) = arrow_bytes_to_page(&arr).unwrap();
+        assert_eq!(
+            slices,
+            vec![
+                b"".as_ref(),
+                b"ab".as_ref(),
+                b"".as_ref(),
+                b"".as_ref(),
+                b"xyz".as_ref(),
+                b"".as_ref()
+            ]
+        );
+        assert_eq!(presence, vec![false, true, false, true, true, false]);
+    }
+
+    #[test]
+    fn bytes_conversion_fixed_size_binary() {
+        let arr: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                vec![Some(vec![1u8, 2]), None, Some(vec![3u8, 4])].into_iter(),
+                2,
+            )
+            .unwrap(),
+        );
+        let (slices, presence) = arrow_bytes_to_page(&arr).unwrap();
+        assert_eq!(
+            slices,
+            vec![[1u8, 2].as_ref(), b"".as_ref(), [3u8, 4].as_ref()]
+        );
+        assert_eq!(presence, vec![true, false, true]);
+    }
+
+    // -------------------------------------------------------------------
+    // End-to-end FFM decode over real files (written with ArrowWriter)
+    // -------------------------------------------------------------------
+
+    fn write_file(path: &str, batch: &RecordBatch, page_row_limit: usize) {
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(page_row_limit)
+            .set_write_batch_size(page_row_limit)
+            .build();
+        let file = File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+        w.write(batch).unwrap();
+        w.close().unwrap();
+    }
+
+    fn open_handle(path: &str, col: &str, expected_type: i32) -> i64 {
+        let h = unsafe {
+            parquet_open_column_reader(
+                path.as_ptr(),
+                path.len() as i64,
+                col.as_ptr(),
+                col.len() as i64,
+                expected_type,
+            )
+        };
+        assert!(h >= 0, "open_column_reader failed: {}", h);
+        h
+    }
+
+    fn close_handle(handle: i64) {
+        let rc = unsafe { parquet_close_column_reader(handle) };
+        assert_eq!(rc, RC_OK);
+    }
+
+    struct Decoded {
+        first_row: i64,
+        last_row: i64,
+        longs: Vec<i64>,
+        bytes: Vec<u8>,
+        offsets: Vec<i32>,
+        presence_words: Vec<i64>,
+    }
+
+    impl Decoded {
+        fn present(&self, i: usize) -> bool {
+            (self.presence_words[i / 64] >> (i % 64)) & 1 == 1
+        }
+        fn rows(&self) -> usize {
+            (self.last_row - self.first_row + 1) as usize
+        }
+    }
+
+    /// Calls `parquet_decode_page_at_row` with generously sized buffers.
+    fn decode_at(handle: i64, row: i64, max_rows: usize, max_bytes: usize) -> Decoded {
+        let mut first = 0i64;
+        let mut last = 0i64;
+        let mut value_buf = vec![0u8; max_bytes.max(max_rows * 8)];
+        let mut actual_len = 0i64;
+        let mut offsets = vec![0i32; max_rows + 1];
+        let words = max_rows.div_ceil(64);
+        let mut presence = vec![0i64; words];
+        let rc = unsafe {
+            parquet_decode_page_at_row(
+                handle,
+                row,
+                &mut first,
+                &mut last,
+                value_buf.as_mut_ptr(),
+                value_buf.len() as i64,
+                &mut actual_len,
+                offsets.as_mut_ptr(),
+                offsets.len() as i64,
+                presence.as_mut_ptr(),
+                words as i64,
+            )
+        };
+        assert_eq!(rc, RC_OK, "decode_page_at_row returned {}", rc);
+        let rows = (last - first + 1) as usize;
+        let longs: Vec<i64> = (0..rows)
+            .map(|i| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&value_buf[i * 8..i * 8 + 8]);
+                i64::from_ne_bytes(b)
+            })
+            .collect();
+        value_buf.truncate(actual_len.max(0) as usize);
+        Decoded {
+            first_row: first,
+            last_row: last,
+            longs,
+            bytes: value_buf,
+            offsets,
+            presence_words: presence,
+        }
+    }
+
+    #[test]
+    fn decode_page_int64_multi_page_with_nulls() {
+        let (_dir, path) = crate::test_utils::get_temp_file_path("int64_pages.parquet");
+        let total = 2500usize;
+        let vals: Vec<Option<i64>> = (0..total)
+            .map(|i| if i % 7 == 0 { None } else { Some(i as i64 * 3) })
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vals.clone()))]).unwrap();
+        write_file(&path, &batch, 1000);
+
+        let h = open_handle(&path, "v", TYPE_INT64);
+        // A late row lands in a later page: the decode must cover exactly the
+        // page's rows and reproduce values + nulls.
+        let d = decode_at(h, 2200, total, 0);
+        assert!(d.first_row <= 2200 && 2200 <= d.last_row);
+        assert!(d.first_row > 0, "row 2200 should not be in the first page");
+        for i in 0..d.rows() {
+            let global = d.first_row as usize + i;
+            match vals[global] {
+                Some(v) => {
+                    assert!(d.present(i), "row {} should be present", global);
+                    assert_eq!(d.longs[i], v, "row {}", global);
+                }
+                None => {
+                    assert!(!d.present(i), "row {} should be null", global);
+                    assert_eq!(d.longs[i], 0);
+                }
+            }
+        }
+        close_handle(h);
+    }
+
+    #[test]
+    fn decode_page_utf8_dictionary_encoded() {
+        let (_dir, path) = crate::test_utils::get_temp_file_path("utf8_dict.parquet");
+        let total = 500usize;
+        // Heavily repeated strings → the default writer produces dictionary pages.
+        let vals: Vec<Option<&str>> = (0..total)
+            .map(|i| match i % 4 {
+                0 => Some("alpha"),
+                1 => Some("beta"),
+                2 => None,
+                _ => Some("gamma"),
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vals.clone()))]).unwrap();
+        write_file(&path, &batch, 200);
+
+        let h = open_handle(&path, "s", TYPE_BYTE_ARRAY);
+        let d = decode_at(h, 250, total, total * 8);
+        for i in 0..d.rows() {
+            let global = d.first_row as usize + i;
+            let got = &d.bytes[d.offsets[i] as usize..d.offsets[i + 1] as usize];
+            match vals[global] {
+                Some(v) => {
+                    assert!(d.present(i), "row {} should be present", global);
+                    assert_eq!(got, v.as_bytes(), "row {}", global);
+                }
+                None => {
+                    assert!(!d.present(i), "row {} should be null", global);
+                    assert!(got.is_empty());
+                }
+            }
+        }
+        close_handle(h);
+    }
+
+    #[test]
+    fn decode_page_date32_and_timestamp_raw_bits() {
+        let (_dir, path) = crate::test_utils::get_temp_file_path("date_ts.parquet");
+        let total = 300usize;
+        let dates: Vec<Option<i32>> = (0..total)
+            .map(|i| {
+                if i % 5 == 0 {
+                    None
+                } else {
+                    Some(19000 + i as i32)
+                }
+            })
+            .collect();
+        let tss: Vec<Option<i64>> = (0..total)
+            .map(|i| {
+                if i % 3 == 0 {
+                    None
+                } else {
+                    Some(1_700_000_000_000 + i as i64)
+                }
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", DataType::Date32, true),
+            Field::new("t", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Date32Array::from(dates.clone())),
+                Arc::new(TimestampMillisecondArray::from(tss.clone())),
+            ],
+        )
+        .unwrap();
+        write_file(&path, &batch, 100);
+
+        // Date32 → physical INT32, timestamp-millis → physical INT64; raw bits
+        // must match the logical values exactly (same as the old def-level path).
+        let hd = open_handle(&path, "d", TYPE_INT32);
+        let d = decode_at(hd, 150, total, 0);
+        for i in 0..d.rows() {
+            let global = d.first_row as usize + i;
+            match dates[global] {
+                Some(v) => {
+                    assert!(d.present(i));
+                    assert_eq!(d.longs[i], v as i64, "date row {}", global);
+                }
+                None => assert!(!d.present(i)),
+            }
+        }
+        close_handle(hd);
+
+        let ht = open_handle(&path, "t", TYPE_INT64);
+        let t = decode_at(ht, 150, total, 0);
+        for i in 0..t.rows() {
+            let global = t.first_row as usize + i;
+            match tss[global] {
+                Some(v) => {
+                    assert!(t.present(i));
+                    assert_eq!(t.longs[i], v, "ts row {}", global);
+                }
+                None => assert!(!t.present(i)),
+            }
+        }
+        close_handle(ht);
+    }
+
+    #[test]
+    fn decode_overflow_reports_sizes_then_retry_succeeds() {
+        let (_dir, path) = crate::test_utils::get_temp_file_path("overflow.parquet");
+        let total = 400usize;
+        let vals: Vec<Option<i64>> = (0..total).map(|i| Some(i as i64)).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vals))]).unwrap();
+        write_file(&path, &batch, 1000);
+
+        let h = open_handle(&path, "v", TYPE_INT64);
+        let mut first = 0i64;
+        let mut last = 0i64;
+        let mut tiny = vec![0u8; 8];
+        let mut actual_len = 0i64;
+        let mut presence = vec![0i64; 1];
+        let rc = unsafe {
+            parquet_decode_page_at_row(
+                h,
+                0,
+                &mut first,
+                &mut last,
+                tiny.as_mut_ptr(),
+                tiny.len() as i64,
+                &mut actual_len,
+                std::ptr::null_mut(),
+                0,
+                presence.as_mut_ptr(),
+                1,
+            )
+        };
+        assert_eq!(rc, RC_OVERFLOW);
+        let rows = (last - first + 1) as usize;
+        assert_eq!(rows, total);
+        assert_eq!(actual_len, (total * 8) as i64);
+        // Grow-and-retry with the reported sizes succeeds.
+        let d = decode_at(h, 0, rows, actual_len as usize);
+        assert_eq!(d.rows(), total);
+        assert_eq!(d.longs[123], 123);
+        close_handle(h);
+    }
+
+    // -------------------------------------------------------------------
+    // Per-handle locking: decodes on distinct handles do not serialise
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn concurrent_decode_on_distinct_handles() {
+        let (_dir, path) = crate::test_utils::get_temp_file_path("concurrent.parquet");
+        let total = 200usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let vals: Vec<Option<i64>> = (0..total).map(|i| Some(i as i64)).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vals.clone())),
+                Arc::new(Int64Array::from(vals)),
+            ],
+        )
+        .unwrap();
+        write_file(&path, &batch, 1000);
+
+        let h1 = open_handle(&path, "a", TYPE_INT64);
+        let h2 = open_handle(&path, "b", TYPE_INT64);
+
+        // Hold handle 1's *state* lock (as an in-flight decode would).
+        let cell1 = state_for_handle(h1, "test").unwrap();
+        let guard1 = cell1.lock().unwrap();
+
+        // A decode on handle 2 must complete while handle 1's lock is held —
+        // with the old registry-wide mutex this would deadlock/time out.
+        let (tx, rx) = mpsc::channel();
+        let t2 = std::thread::spawn(move || {
+            let d = decode_at(h2, 10, 200, 0);
+            tx.send(d.rows()).unwrap();
+        });
+        let rows = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("decode on handle 2 blocked while handle 1's state lock was held");
+        assert_eq!(rows, total);
+        t2.join().unwrap();
+
+        // And a decode on handle 1 itself must block until the lock is released.
+        let (tx1, rx1) = mpsc::channel();
+        let t1 = std::thread::spawn(move || {
+            let d = decode_at(h1, 10, 200, 0);
+            tx1.send(d.rows()).unwrap();
+        });
+        assert!(
+            rx1.recv_timeout(Duration::from_millis(300)).is_err(),
+            "decode on handle 1 should block while its state lock is held"
+        );
+        drop(guard1);
+        let rows = rx1
+            .recv_timeout(Duration::from_secs(10))
+            .expect("decode on handle 1 never completed after lock release");
+        assert_eq!(rows, total);
+        t1.join().unwrap();
+
+        close_handle(h1);
+        close_handle(h2);
+    }
+
+    // -------------------------------------------------------------------
+    // Sanity micro-benchmark: old low-level decode vs new arrow decode of a
+    // late page. Prints timings; run with `cargo test -- --nocapture`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn bench_late_page_decode_old_vs_new() {
+        let (_dir, path) = crate::test_utils::get_temp_file_path("bench.parquet");
+        let total = 200_000usize;
+        let page_rows = 20_000usize;
+        let vals: Vec<Option<i64>> = (0..total)
+            .map(|i| if i % 11 == 0 { None } else { Some(i as i64) })
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vals))]).unwrap();
+        write_file(&path, &batch, page_rows);
+
+        let h = open_handle(&path, "v", TYPE_INT64);
+        let late_row = (total - page_rows / 2) as i64; // inside the last page
+
+        // Locate the page via the handle's state so both paths decode the
+        // exact same rows.
+        let cell = state_for_handle(h, "bench").unwrap();
+        let (rg_idx, local_first, page_num_rows) = {
+            let state = cell.lock().unwrap();
+            let p = state.page_for_row(late_row).unwrap();
+            let e = &state.pages[p];
+            (e.rg_idx, e.local_first_row, e.num_rows as usize)
+        };
+
+        let iters = 20;
+
+        // OLD path: fresh row-group reader + skip_records + read_records +
+        // def-level expansion (what parquet_decode_page_at_row used to do).
+        let old_start = Instant::now();
+        for _ in 0..iters {
+            let state = cell.lock().unwrap();
+            let rg = state.reader.get_row_group(rg_idx).unwrap();
+            let col = rg.get_column_reader(state.leaf_idx).unwrap();
+            let ColumnReader::Int64ColumnReader(mut r) = col else {
+                panic!("expected int64 column")
+            };
+            if local_first > 0 {
+                assert_eq!(
+                    r.skip_records(local_first as usize).unwrap(),
+                    local_first as usize
+                );
+            }
+            let mut def_levels: Vec<i16> = Vec::with_capacity(page_num_rows);
+            let mut values: Vec<i64> = Vec::with_capacity(page_num_rows);
+            let (records, _, _) = r
+                .read_records(page_num_rows, Some(&mut def_levels), None, &mut values)
+                .unwrap();
+            assert_eq!(records, page_num_rows);
+            let mut longs = Vec::with_capacity(page_num_rows);
+            let mut di = 0usize;
+            for d in def_levels.iter().take(page_num_rows) {
+                if *d == 1 {
+                    longs.push(values[di]);
+                    di += 1;
+                } else {
+                    longs.push(0);
+                }
+            }
+            std::hint::black_box(longs);
+        }
+        let old_per_iter = old_start.elapsed() / iters;
+
+        // NEW path: the FFM entry point (arrow RowSelection decode).
+        let new_start = Instant::now();
+        for _ in 0..iters {
+            let d = decode_at(h, late_row, page_num_rows, 0);
+            std::hint::black_box(d.longs);
+        }
+        let new_per_iter = new_start.elapsed() / iters;
+
+        println!(
+            "late-page decode ({} rows, page {} rows): old {:?}/iter, new {:?}/iter",
+            total, page_num_rows, old_per_iter, new_per_iter
+        );
+
+        close_handle(h);
+    }
 }
