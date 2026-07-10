@@ -1551,6 +1551,24 @@ pub unsafe extern "C" fn parquet_liquid_cache_set_enabled(enabled: i32, max_memo
     crate::liquid_page_cache::set_enabled(enabled != 0, bytes);
 }
 
+/// Write the liquid page-cache counters `(hits, misses, backfills)` into `out` (3 i64 slots),
+/// so a benchmark can confirm the cache is actually serving hits. Returns the number of slots
+/// written (3), or 0 if `out` is null or `out_len < 3`.
+///
+/// # Safety
+/// `out` must point to at least `out_len` writable i64 slots.
+#[no_mangle]
+pub unsafe extern "C" fn parquet_liquid_cache_stats(out: *mut i64, out_len: i64) -> i64 {
+    if out.is_null() || out_len < 3 {
+        return 0;
+    }
+    let (hits, misses, backfills) = crate::liquid_page_cache::stats();
+    *out.add(0) = hits as i64;
+    *out.add(1) = misses as i64;
+    *out.add(2) = backfills as i64;
+    3
+}
+
 /// Slow-path single-value read at `row`.
 ///
 /// On success writes:
@@ -2094,10 +2112,11 @@ pub unsafe extern "C" fn parquet_decode_page_at_row(
         None
     };
     if let Some(eid) = lc_eid {
-        if let Some((longs, presence)) = crate::liquid_page_cache::get_page(eid) {
-            return write_primitive_page(
-                &longs,
-                &presence,
+        // Warm-run hot path: on a liquid hit, write the cached Int64Array straight into the FFM
+        // buffers (memcpy when no nulls) instead of rebuilding intermediate Vec<i64>+Vec<bool>.
+        if let Some(array) = crate::liquid_page_cache::get_page_array(eid) {
+            return write_primitive_page_from_arrow(
+                &array,
                 out_value_buf,
                 out_value_buf_cap,
                 out_value_actual_len,
@@ -2116,32 +2135,22 @@ pub unsafe extern "C" fn parquet_decode_page_at_row(
         | PhysicalType::INT64
         | PhysicalType::FLOAT
         | PhysicalType::DOUBLE => {
-            match lc_eid {
-                // Liquid on: build owned vecs so we can backfill the cache, then write.
-                Some(eid) => {
-                    let (longs, presence) = arrow_primitive_to_page(&array)?;
-                    crate::liquid_page_cache::put_page(eid, &longs, &presence);
-                    write_primitive_page(
-                        &longs,
-                        &presence,
-                        out_value_buf,
-                        out_value_buf_cap,
-                        out_value_actual_len,
-                        out_presence_bitset,
-                        out_presence_bits_cap,
-                    )
-                }
-                // Liquid off (codec default): write straight from the arrow array into
-                // the FFM buffers, skipping the intermediate Vec<i64> + Vec<bool>.
-                None => write_primitive_page_from_arrow(
-                    &array,
-                    out_value_buf,
-                    out_value_buf_cap,
-                    out_value_actual_len,
-                    out_presence_bitset,
-                    out_presence_bits_cap,
-                ),
+            // Liquid miss backfill: cache the decoded page (needs owned buffers), but still
+            // write the FFM output straight from the arrow array — no second copy.
+            if let Some(eid) = lc_eid {
+                let (longs, presence) = arrow_primitive_to_page(&array)?;
+                crate::liquid_page_cache::put_page(eid, &longs, &presence);
             }
+            // Both paths write from the arrow array (memcpy when 8-byte-native + no nulls),
+            // skipping the intermediate Vec<i64> + Vec<bool> on the FFM write.
+            write_primitive_page_from_arrow(
+                &array,
+                out_value_buf,
+                out_value_buf_cap,
+                out_value_actual_len,
+                out_presence_bitset,
+                out_presence_bits_cap,
+            )
         }
         PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY => {
             let (slices, presence) = arrow_bytes_to_page(&array)?;
@@ -2675,6 +2684,11 @@ unsafe fn write_primitive_page_from_arrow(
 /// Writes a decoded primitive page (per-row raw bits + presence bitset) to the
 /// caller buffers, or returns `RC_OVERFLOW` after recording the required value
 /// byte length.
+///
+/// Retained as the reference oracle for `direct_write_matches_reference`; production
+/// decode now writes straight from the arrow array via `write_primitive_page_from_arrow`
+/// on both the liquid-off and liquid-on paths.
+#[cfg(test)]
 unsafe fn write_primitive_page(
     longs: &[i64],
     presence: &[bool],

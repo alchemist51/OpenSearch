@@ -56,6 +56,7 @@ public class RustBridge {
     private static final MethodHandle CLOSE_COLUMN_READER;
     private static final MethodHandle OPEN_COLUMN_READER_COUNT;
     private static final MethodHandle LIQUID_CACHE_SET_ENABLED;
+    private static final MethodHandle LIQUID_CACHE_STATS;
     private static final MethodHandle READ_VALUE_AT_ROW;
     private static final MethodHandle READ_REPEATED_AT_ROW;
     private static final MethodHandle GET_COLUMN_NUM_PAGES;
@@ -322,6 +323,10 @@ public class RustBridge {
         LIQUID_CACHE_SET_ENABLED = linker.downcallHandle(
             lib.find("parquet_liquid_cache_set_enabled").orElseThrow(),
             FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG)
+        );
+        LIQUID_CACHE_STATS = linker.downcallHandle(
+            lib.find("parquet_liquid_cache_stats").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG)
         );
         READ_VALUE_AT_ROW = linker.downcallHandle(
             lib.find("parquet_read_value_at_row").orElseThrow(),
@@ -865,6 +870,23 @@ public class RustBridge {
      */
     public static void liquidCacheSetEnabled(boolean enabled, long maxMemoryBytes) {
         NativeCall.invokeVoid(LIQUID_CACHE_SET_ENABLED, enabled ? 1 : 0, maxMemoryBytes);
+    }
+
+    /**
+     * Returns the codec liquid page-cache counters {@code [hits, misses, backfills]}, so callers
+     * can confirm the cache is actually serving hits (a "liquid-on" run that is all misses tells
+     * you nothing about the hit path). Process-global, cumulative since JVM start.
+     */
+    public static long[] liquidCacheStats() {
+        try (var call = new NativeCall()) {
+            var buf = call.buf(3 * 8);
+            long n = NativeCall.invokeStatic(LIQUID_CACHE_STATS, buf, 3L);
+            long[] all = buf.toArray(ValueLayout.JAVA_LONG);
+            if (n < 3) {
+                return new long[] { 0, 0, 0 };
+            }
+            return all;
+        }
     }
 
     /**

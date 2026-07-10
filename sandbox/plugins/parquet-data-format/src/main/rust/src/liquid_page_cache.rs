@@ -54,6 +54,23 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// Configured max memory budget for the cache (bytes). Applied when the cache is first built.
 static MAX_MEMORY_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Observability counters, so a benchmark can confirm the liquid path is actually exercised
+/// (a "liquid-on" run that is all misses tells you nothing about the hit path). `hits` counts
+/// pages served from the cache, `misses` counts lookups that fell through to decode, `backfills`
+/// counts pages inserted after a miss.
+static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BACKFILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the cache counters: `(hits, misses, backfills)`.
+pub fn stats() -> (u64, u64, u64) {
+    (
+        HITS.load(Ordering::Relaxed),
+        MISSES.load(Ordering::Relaxed),
+        BACKFILLS.load(Ordering::Relaxed),
+    )
+}
+
 /// Codec-local file path → small integer id registry, so entries carry file identity without
 /// depending on DataFusion's file numbering.
 static FILE_IDS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
@@ -95,7 +112,9 @@ fn cache() -> &'static Arc<LiquidCache> {
 /// DataFusion file numbering.
 pub fn file_id(path: &str) -> u32 {
     let map = FILE_IDS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map.lock().expect("liquid_page_cache: file id registry poisoned");
+    let mut guard = map
+        .lock()
+        .expect("liquid_page_cache: file id registry poisoned");
     let next = guard.len() as u32;
     *guard.entry(path.to_string()).or_insert(next)
 }
@@ -106,6 +125,30 @@ pub fn file_id(path: &str) -> u32 {
 pub fn entry_id(file_id: u32, column_id: u32, page_idx: u32) -> EntryID {
     let v = ((file_id as usize) << 48) | ((column_id as usize) << 32) | (page_idx as usize);
     EntryID::from(v)
+}
+
+/// Look up a cached decoded page as the raw cached `ArrayRef` (an `Int64Array`), or `None` on
+/// a miss. The caller writes it straight into the FFM out-buffers via
+/// `write_primitive_page_from_arrow`, avoiding the per-element `Vec<i64>` + `Vec<bool>` rebuild
+/// that `get_page` performs. This is the warm-run hot path (every page is a hit), so skipping
+/// the rebuild matters. Returns `None` (falls back to decode) if the entry isn't an
+/// `Int64Array`, so the contract stays identical to `get_page`.
+pub fn get_page_array(eid: EntryID) -> Option<ArrayRef> {
+    let array: ArrayRef = match runtime().block_on(cache().get(&eid).read()) {
+        Some(a) => a,
+        None => {
+            MISSES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    // Only the Int64Array layout is cached (see put_page); guard the downcast so a future
+    // change to the cached type falls back to decode instead of mis-reading.
+    if array.as_any().downcast_ref::<Int64Array>().is_none() {
+        MISSES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    HITS.fetch_add(1, Ordering::Relaxed);
+    Some(array)
 }
 
 /// Look up a cached decoded page. Returns `(longs, presence)` in the exact form the decode arms
@@ -140,5 +183,10 @@ pub fn put_page(eid: EntryID, longs: &[i64], presence: &[bool]) {
     let array_ref: ArrayRef = Arc::new(array);
     // Best-effort: a CacheFull error just means this page is not cached this time.
     // `insert`/`get` return builder types that implement `IntoFuture`, so convert before block_on.
-    let _ = runtime().block_on(cache().insert(eid, array_ref).into_future());
+    if runtime()
+        .block_on(cache().insert(eid, array_ref).into_future())
+        .is_ok()
+    {
+        BACKFILLS.fetch_add(1, Ordering::Relaxed);
+    }
 }
