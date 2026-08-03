@@ -46,6 +46,24 @@ public abstract class DataFormat {
      */
     public abstract Set<FieldTypeCapabilities> supportedFields();
 
+    /**
+     * Whether this format is exempt from the per-segment cross-format row-count
+     * parity checks. Formats that store the same logical rows as other formats
+     * (the default) must report equal row counts per segment. A <b>derived</b>
+     * format — one whose files are computed from another format's data rather
+     * than ingested row-by-row (e.g. a materialized-view aggregate, one row per
+     * group) — reports its own row count and is exempt.
+     *
+     * <p>Exempt formats must never be used as the source of segment-ordinal to
+     * leaf mappings or merge-policy row accounting; those always come from a
+     * non-exempt (primary) format.
+     *
+     * @return true if this format's per-segment row count may differ from other formats'
+     */
+    public boolean exemptFromRowParity() {
+        return false;
+    }
+
     @Override
     public final boolean equals(Object o) {
         if (this == o) return true;
