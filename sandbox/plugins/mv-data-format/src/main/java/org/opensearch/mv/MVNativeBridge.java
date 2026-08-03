@@ -27,6 +27,10 @@ public final class MVNativeBridge {
 
     private static final MethodHandle MV_BUILD_POC;
     private static final MethodHandle MV_SEARCH_POC;
+    private static final MethodHandle MV_WRITER_CREATE;
+    private static final MethodHandle MV_WRITER_FEED;
+    private static final MethodHandle MV_WRITER_FINALIZE;
+    private static final MethodHandle MV_WRITER_ABORT;
 
     static {
         Linker linker = Linker.nativeLinker();
@@ -63,6 +67,22 @@ public final class MVNativeBridge {
                 ValueLayout.JAVA_LONG,
                 ValueLayout.ADDRESS
             )
+        );
+        MV_WRITER_CREATE = linker.downcallHandle(
+            lib.find("df_mv_writer_create").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG)
+        );
+        MV_WRITER_FEED = linker.downcallHandle(
+            lib.find("df_mv_writer_feed").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
+        );
+        MV_WRITER_FINALIZE = linker.downcallHandle(
+            lib.find("df_mv_writer_finalize").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG)
+        );
+        MV_WRITER_ABORT = linker.downcallHandle(
+            lib.find("df_mv_writer_abort").orElseThrow(),
+            FunctionDescriptor.ofVoid(ValueLayout.JAVA_LONG)
         );
     }
 
@@ -117,6 +137,36 @@ public final class MVNativeBridge {
                 out.lenOut()
             );
             return new String(out.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+        }
+    }
+
+    // ---- Streaming writer lifecycle (VSR model) ----
+
+    public static long writerCreate() {
+        try (var call = new NativeCall()) {
+            return call.invoke(MV_WRITER_CREATE);
+        }
+    }
+
+    public static void writerFeed(long writerId, long arrayAddress, long schemaAddress) {
+        try (var call = new NativeCall()) {
+            call.invoke(MV_WRITER_FEED, writerId, arrayAddress, schemaAddress);
+        }
+    }
+
+    public static long writerFinalize(long writerId, String outputFile) {
+        try (var call = new NativeCall()) {
+            var out = call.str(outputFile);
+            return call.invoke(MV_WRITER_FINALIZE, writerId, out.segment(), out.len());
+        }
+    }
+
+    public static void writerAbort(long writerId) {
+        // Void native call — NativeCall.invoke expects a long return; invoke directly.
+        try {
+            MV_WRITER_ABORT.invokeExact(writerId);
+        } catch (Throwable t) {
+            throw new RuntimeException("df_mv_writer_abort failed", t);
         }
     }
 }

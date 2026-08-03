@@ -579,6 +579,41 @@ pub unsafe extern "C" fn df_query_registry_top_n_by_current(
     Ok(written as i64)
 }
 
+/// POC(mv) streaming writer lifecycle — create/feed/finalize/abort.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_create() -> i64 {
+    Ok(crate::mv_writer::mv_writer_create())
+}
+
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_feed(writer_id: i64, array_ptr: i64, schema_ptr: i64) -> i64 {
+    use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+    let ffi_array = FFI_ArrowArray::from_raw(array_ptr as *mut FFI_ArrowArray);
+    let ffi_schema = FFI_ArrowSchema::from_raw(schema_ptr as *mut FFI_ArrowSchema);
+    let mut array_data = arrow_array::ffi::from_ffi(ffi_array, &ffi_schema)
+        .map_err(|e| format!("df_mv_writer_feed: import: {}", e))?;
+    array_data.align_buffers();
+    let struct_array = arrow_array::StructArray::from(array_data);
+    let batch = arrow_array::RecordBatch::from(struct_array);
+    crate::mv_writer::mv_writer_feed(writer_id, &batch)?;
+    Ok(0)
+}
+
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_finalize(writer_id: i64, out_ptr: *const u8, out_len: i64) -> i64 {
+    let output = str_from_raw(out_ptr, out_len).map_err(|e| format!("df_mv_writer_finalize: out: {}", e))?;
+    let rows = crate::mv_writer::mv_writer_finalize(writer_id, output)?;
+    Ok(rows)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_abort(writer_id: i64) {
+    crate::mv_writer::mv_writer_abort(writer_id);
+}
+
 /// POC(mv): Final-aggregate over MV state files. Writes result text (svc\tcount lines)
 /// into the caller buffer via write_out_buffer.
 #[ffm_safe]

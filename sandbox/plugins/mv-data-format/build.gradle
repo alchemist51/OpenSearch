@@ -23,6 +23,7 @@ dependencies {
   compileOnly project(':sandbox:plugins:parquet-data-format')
   implementation project(':sandbox:libs:dataformat-native')
 
+  compileOnly 'org.checkerframework:checker-qual:3.43.0'
   implementation "org.apache.arrow:arrow-vector:${versions.arrow}"
   implementation "org.apache.arrow:arrow-memory-core:${versions.arrow}"
   implementation "org.apache.arrow:arrow-c-data:${versions.arrow}"

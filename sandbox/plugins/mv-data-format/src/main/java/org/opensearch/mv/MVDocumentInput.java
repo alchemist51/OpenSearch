@@ -12,19 +12,24 @@ import org.opensearch.index.engine.dataformat.DocumentInput;
 import org.opensearch.index.mapper.MappedFieldType;
 
 /**
- * No-op document input: the MV format never consumes per-document fields —
- * its data is derived from the primary's flushed parquet at flush time.
+ * Capturing document input (VSR model): the composite engine broadcasts every
+ * field to every format; this input keeps only the MV's referenced column
+ * ({@code service}) for the forward buffer.
  */
-public final class MVDocumentInput implements DocumentInput<Void> {
+public final class MVDocumentInput implements DocumentInput<String> {
+
+    private String service;
 
     @Override
-    public Void getFinalInput() {
-        return null;
+    public String getFinalInput() {
+        return service;
     }
 
     @Override
     public void addField(MappedFieldType fieldType, Object value) {
-        // derived format: ignore all fields
+        if (MVConstants.GROUP_KEY.equals(fieldType.name()) && value != null) {
+            this.service = value.toString();
+        }
     }
 
     @Override
