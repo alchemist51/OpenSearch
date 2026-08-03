@@ -579,6 +579,61 @@ pub unsafe extern "C" fn df_query_registry_top_n_by_current(
     Ok(written as i64)
 }
 
+/// POC(mv): Final-aggregate over MV state files. Writes result text (svc\tcount lines)
+/// into the caller buffer via write_out_buffer.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_search_poc(
+    files_ptr: *const *const u8,
+    files_lens: *const i64,
+    files_count: i64,
+    group_ptr: *const u8,
+    group_len: i64,
+    state_ptr: *const u8,
+    state_len: i64,
+    out_ptr: *mut u8,
+    out_cap: i64,
+    out_len: *mut i64,
+) -> i64 {
+    let mut files = Vec::with_capacity(files_count as usize);
+    for i in 0..files_count as usize {
+        let f_ptr = *files_ptr.add(i);
+        let f_len = *files_lens.add(i);
+        files.push(
+            str_from_raw(f_ptr, f_len)
+                .map_err(|e| format!("df_mv_search_poc: file[{}]: {}", i, e))?
+                .to_string(),
+        );
+    }
+    let group = str_from_raw(group_ptr, group_len).map_err(|e| format!("df_mv_search_poc: group: {}", e))?;
+    let state = str_from_raw(state_ptr, state_len).map_err(|e| format!("df_mv_search_poc: state: {}", e))?;
+    let text = crate::mv_poc::mv_search_poc(&files, group, state)?;
+    write_out_buffer(text.as_bytes(), out_ptr, out_cap, out_len, "mv search result")?;
+    Ok(0)
+}
+
+/// POC(mv): build the hardcoded MV state file from a primary parquet file.
+/// Blocking; returns state-row count (>=0) on success.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_build_poc(
+    input_ptr: *const u8,
+    input_len: i64,
+    table_ptr: *const u8,
+    table_len: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    output_ptr: *const u8,
+    output_len: i64,
+) -> i64 {
+    let input = str_from_raw(input_ptr, input_len).map_err(|e| format!("df_mv_build_poc: input: {}", e))?;
+    let table = str_from_raw(table_ptr, table_len).map_err(|e| format!("df_mv_build_poc: table: {}", e))?;
+    let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_build_poc: sql: {}", e))?;
+    let output = str_from_raw(output_ptr, output_len).map_err(|e| format!("df_mv_build_poc: output: {}", e))?;
+    let rows = crate::mv_poc::mv_build_poc(input, table, sql, output)?;
+    Ok(rows)
+}
+
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn df_sql_to_substrait(

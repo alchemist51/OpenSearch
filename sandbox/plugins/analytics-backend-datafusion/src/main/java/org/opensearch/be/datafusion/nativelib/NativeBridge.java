@@ -113,6 +113,7 @@ public final class NativeBridge {
     private static final MethodHandle STREAM_GET_METRICS;
     private static final MethodHandle FREE_METRICS_BUF;
     private static final MethodHandle SQL_TO_SUBSTRAIT;
+    private static final MethodHandle MV_BUILD_POC;
     private static final MethodHandle REGISTER_FILTER_TREE_CALLBACKS;
     private static final MethodHandle CREATE_LOCAL_SESSION;
     private static final MethodHandle CLOSE_LOCAL_SESSION;
@@ -294,6 +295,21 @@ public final class NativeBridge {
         FREE_METRICS_BUF = linker.downcallHandle(
             lib.find("df_free_metrics_buf").orElseThrow(),
             FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG)
+        );
+        // POC(mv): i64 df_mv_build_poc(input_ptr, input_len, table_ptr, table_len, sql_ptr, sql_len, output_ptr, output_len)
+        MV_BUILD_POC = linker.downcallHandle(
+            lib.find("df_mv_build_poc").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG
+            )
         );
         // i64 df_sql_to_substrait(shard_ptr, table_ptr, table_len, sql_ptr, sql_len, runtime_ptr, out_ptr, out_cap, out_len)
         SQL_TO_SUBSTRAIT = linker.downcallHandle(
@@ -1213,6 +1229,27 @@ public final class NativeBridge {
     }
 
     // ---- Stubs ----
+
+    /** POC(mv): blocking MV state-file build from a primary parquet file. Returns state rows written. */
+    public static long mvBuildPoc(String inputFile, String tableName, String sql, String outputFile) {
+        try (var call = new NativeCall()) {
+            var in = call.str(inputFile);
+            var table = call.str(tableName);
+            var query = call.str(sql);
+            var out = call.str(outputFile);
+            return call.invoke(
+                MV_BUILD_POC,
+                in.segment(),
+                in.len(),
+                table.segment(),
+                table.len(),
+                query.segment(),
+                query.len(),
+                out.segment(),
+                out.len()
+            );
+        }
+    }
 
     public static byte[] sqlToSubstrait(long readerPtr, String tableName, String sql, long runtimePtr) {
         NativeHandle.validatePointer(readerPtr, "reader");

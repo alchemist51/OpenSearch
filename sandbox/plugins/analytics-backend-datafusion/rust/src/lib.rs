@@ -33,6 +33,7 @@ pub mod indexed_executor;
 pub mod indexed_table;
 pub mod local_executor;
 pub mod memory;
+pub mod mv_poc;
 pub mod memory_guard;
 pub mod native_error;
 pub mod partition_stream;
