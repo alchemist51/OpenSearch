@@ -101,22 +101,28 @@ public class MVDataFormatPocIT extends OpenSearchIntegTestCase {
                     // POC: merges disabled — keep flush segments pure
                     .put("index.composite.merge_on_refresh_max_size", "0b")
             )
-            .setMapping("service", "type=keyword")
+            .setMapping("service", "type=keyword", "status", "type=keyword", "latency_ms", "type=long")
             .get();
         ensureGreen(index);
 
-        // Golden segment 1: api,api,web,api,api -> api:4, web:1
-        for (String svc : List.of("api", "api", "web", "api", "api")) {
-            IndexResponse r = client().prepareIndex().setIndex(index).setSource("service", svc).get();
-            assertEquals(RestStatus.CREATED, r.status());
-        }
+        // Golden segment 1 (5 docs):
+        //   (api,200,30) (api,200,50) (web,200,40) (api,500,900) (api,200,25)
+        // -> states: (api,200): cnt=3 sum=105 min=25 max=50; (api,500): 1/900/900/900; (web,200): 1/40/40/40
+        indexDoc(index, "api", "200", 30);
+        indexDoc(index, "api", "200", 50);
+        indexDoc(index, "web", "200", 40);
+        indexDoc(index, "api", "500", 900);
+        indexDoc(index, "api", "200", 25);
         client().admin().indices().prepareRefresh(index).get();
 
-        // Golden segment 2: api,web,batch -> api:1, web:1, batch:1
-        for (String svc : List.of("api", "web", "batch")) {
-            IndexResponse r = client().prepareIndex().setIndex(index).setSource("service", svc).get();
-            assertEquals(RestStatus.CREATED, r.status());
-        }
+        // Golden segment 2 (3 docs):
+        //   (api,200,10) (web,200,80) (batch,200,60)
+        // -> states: (api,200): 1/10/10/10; (web,200): 1/80/80/80; (batch,200): 1/60/60/60
+        // Cross-segment: (api,200) split across segments; min winner in seg2 (10), max in seg1 (50);
+        // (web,200) max winner in seg2 (80).
+        indexDoc(index, "api", "200", 10);
+        indexDoc(index, "web", "200", 80);
+        indexDoc(index, "batch", "200", 60);
         client().admin().indices().prepareRefresh(index).get();
 
         // ---- Assert: every segment carries a materialized_view WriterFileSet ----
@@ -145,8 +151,8 @@ public class MVDataFormatPocIT extends OpenSearchIntegTestCase {
                 assertTrue("state file exists: " + mvFile, Files.exists(mvFile));
             }
             assertEquals("8 raw docs across segments", 8, totalPrimaryRows);
-            // seg1 has groups {api, web} = 2 rows; seg2 has {api, web, batch} = 3 rows
-            assertEquals("5 state rows across segments", 5, totalMvRows);
+            // seg1 groups: (api,200),(api,500),(web,200) = 3; seg2: (api,200),(web,200),(batch,200) = 3
+            assertEquals("6 state rows across segments", 6, totalMvRows);
 
             // ---- HARDCODED SEARCH: always goes to the MV state files ----
             java.util.List<String> stateFiles = new java.util.ArrayList<>();
@@ -156,10 +162,28 @@ public class MVDataFormatPocIT extends OpenSearchIntegTestCase {
                     stateFiles.add(Path.of(mv.directory()).resolve(f).toString());
                 }
             }
-            String result = MVNativeBridge.search(stateFiles, MVConstants.GROUP_KEY, MVConstants.COUNT_STATE_COL);
-            // Golden answers: api:5, web:2, batch:1 (sorted by service)
-            assertEquals("api\t5\nbatch\t1\nweb\t2\n", result);
+            String result = MVNativeBridge.searchV2(stateFiles, MVConstants.SEARCH_SQL);
+            // Golden answers (sorted by service, status):
+            //   api,200: cnt=4 sum=115 min=10 max=50
+            //   api,500: cnt=1 sum=900 min=900 max=900
+            //   batch,200: cnt=1 sum=60 min=60 max=60
+            //   web,200: cnt=2 sum=120 min=40 max=80
+            assertEquals(
+                "api\t200\t4\t115\t10\t50\n"
+                    + "api\t500\t1\t900\t900\t900\n"
+                    + "batch\t200\t1\t60\t60\t60\n"
+                    + "web\t200\t2\t120\t40\t80\n",
+                result
+            );
         }
+    }
+
+    private void indexDoc(String index, String service, String status, long latencyMs) {
+        IndexResponse r = client().prepareIndex()
+            .setIndex(index)
+            .setSource("service", service, "status", status, "latency_ms", latencyMs)
+            .get();
+        assertEquals(RestStatus.CREATED, r.status());
     }
 
     private IndexShard getPrimaryShard(String indexName) {

@@ -13,6 +13,7 @@ import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
@@ -20,13 +21,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 /**
- * POC(mv) forward buffer: a small VSR holding only the MV's referenced
- * columns (here: {@code service}). Rows append during indexing; at rotation
- * the batch exports via Arrow C Data and feeds the native background state.
+ * POC(mv) forward buffer (v2): VSR with the MV's referenced columns —
+ * service, status (utf8) and latency_ms (int64). Rotation exports via Arrow
+ * C Data and feeds the native DataFusion-maintained state.
  *
- * <p>Rollback contract: rotation happens BEFORE appending a new doc
- * (see {@link MVWriter#addDoc}), so a failed doc is always still in this
- * buffer — {@code truncateTo} undoes it without touching folded state.
+ * <p>Rollback contract unchanged: rotation happens BEFORE appending, so a
+ * failed doc is always still in this buffer; truncateTo undoes it.
  */
 final class MVForwardBuffer implements AutoCloseable {
 
@@ -35,22 +35,35 @@ final class MVForwardBuffer implements AutoCloseable {
     private final BufferAllocator allocator;
     private final VectorSchemaRoot vsr;
     private final VarCharVector serviceVector;
+    private final VarCharVector statusVector;
+    private final BigIntVector latencyVector;
     private int rowCount = 0;
 
     MVForwardBuffer() {
-        // POC: private allocator; production enrolls in the shared Arrow allocator.
         this.allocator = new RootAllocator(64L * 1024 * 1024);
-        this.serviceVector = new VarCharVector(MVConstants.GROUP_KEY, allocator);
-        this.vsr = new VectorSchemaRoot(List.of(serviceVector));
+        this.serviceVector = new VarCharVector("service", allocator);
+        this.statusVector = new VarCharVector("status", allocator);
+        this.latencyVector = new BigIntVector("latency_ms", allocator);
+        this.vsr = new VectorSchemaRoot(List.of(serviceVector, statusVector, latencyVector));
     }
 
-    void append(String service) {
-        if (service == null) {
-            serviceVector.setNull(rowCount);
+    void append(MVDocumentInput.Row row) {
+        setVarChar(serviceVector, rowCount, row.service());
+        setVarChar(statusVector, rowCount, row.status());
+        if (row.latencyMs() == null) {
+            latencyVector.setNull(rowCount);
         } else {
-            serviceVector.setSafe(rowCount, service.getBytes(StandardCharsets.UTF_8));
+            latencyVector.setSafe(rowCount, row.latencyMs());
         }
         rowCount++;
+    }
+
+    private static void setVarChar(VarCharVector v, int idx, String value) {
+        if (value == null) {
+            v.setNull(idx);
+        } else {
+            v.setSafe(idx, value.getBytes(StandardCharsets.UTF_8));
+        }
     }
 
     int rowCount() {
@@ -61,15 +74,10 @@ final class MVForwardBuffer implements AutoCloseable {
         return rowCount >= ROTATION_THRESHOLD;
     }
 
-    /** Undo appended-but-not-folded rows (rollback path). */
     void truncateTo(int rows) {
         rowCount = rows;
     }
 
-    /**
-     * Exports the buffered rows and feeds them into the native background
-     * state, then resets the buffer. No-op for an empty buffer.
-     */
     void rotateInto(long writerHandle) {
         if (rowCount == 0) {
             return;

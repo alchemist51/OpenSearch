@@ -579,11 +579,42 @@ pub unsafe extern "C" fn df_query_registry_top_n_by_current(
     Ok(written as i64)
 }
 
+/// POC(mv) v2 search: Final-fold via a caller-provided SQL template
+/// (placeholder __MV_STATES__ replaced with the UNION ALL of state files).
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_search_v2(
+    files_ptr: *const *const u8,
+    files_lens: *const i64,
+    files_count: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    out_ptr: *mut u8,
+    out_cap: i64,
+    out_len: *mut i64,
+) -> i64 {
+    let mut files = Vec::with_capacity(files_count as usize);
+    for i in 0..files_count as usize {
+        let f_ptr = *files_ptr.add(i);
+        let f_len = *files_lens.add(i);
+        files.push(
+            str_from_raw(f_ptr, f_len)
+                .map_err(|e| format!("df_mv_search_v2: file[{}]: {}", i, e))?
+                .to_string(),
+        );
+    }
+    let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_search_v2: sql: {}", e))?;
+    let text = crate::mv_writer::mv_search_v2(&files, sql)?;
+    write_out_buffer(text.as_bytes(), out_ptr, out_cap, out_len, "mv search v2 result")?;
+    Ok(0)
+}
+
 /// POC(mv) streaming writer lifecycle — create/feed/finalize/abort.
 #[ffm_safe]
 #[no_mangle]
-pub unsafe extern "C" fn df_mv_writer_create() -> i64 {
-    Ok(crate::mv_writer::mv_writer_create())
+pub unsafe extern "C" fn df_mv_writer_create(sql_ptr: *const u8, sql_len: i64, num_group_cols: i64) -> i64 {
+    let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_writer_create: sql: {}", e))?;
+    Ok(crate::mv_writer::mv_writer_create(sql, num_group_cols))
 }
 
 #[ffm_safe]

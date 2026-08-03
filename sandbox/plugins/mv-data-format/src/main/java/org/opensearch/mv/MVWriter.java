@@ -51,7 +51,7 @@ public final class MVWriter implements Writer<MVDocumentInput> {
         this.shardPath = shardPath;
         this.tableName = tableName;
         this.buffer = new MVForwardBuffer();
-        this.nativeWriter = MVNativeBridge.writerCreate();
+        this.nativeWriter = MVNativeBridge.writerCreate(MVConstants.MV_SQL, MVConstants.GROUP_KEYS.size());
     }
 
     @Override
