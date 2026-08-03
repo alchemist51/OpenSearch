@@ -214,3 +214,32 @@ async fn mv_state_roundtrip_count_group_by_service() {
         "answer must be identical after merge"
     );
 }
+
+
+#[tokio::test]
+async fn probe_state_schema_min_max() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("service", DataType::Utf8, true),
+        Field::new("latency_ms", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b", "a", "c", "b"])),
+            Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5])),
+        ],
+    )
+    .unwrap();
+    let ctx = SessionContext::new();
+    let mem = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+    ctx.register_table("t", Arc::new(mem)).unwrap();
+    let df = ctx
+        .sql("SELECT service, COUNT(*), SUM(latency_ms), MIN(latency_ms), MAX(latency_ms) FROM t GROUP BY service")
+        .await
+        .unwrap();
+    let physical = df.create_physical_plan().await.unwrap();
+    let partial = find_partial(&physical).unwrap();
+    for f in partial.schema().fields() {
+        eprintln!("STATE FIELD: {}", f.name());
+    }
+}

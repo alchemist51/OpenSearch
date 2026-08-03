@@ -12,30 +12,39 @@ import org.opensearch.index.engine.dataformat.DocumentInput;
 import org.opensearch.index.mapper.MappedFieldType;
 
 /**
- * Capturing document input (VSR model): the composite engine broadcasts every
- * field to every format; this input keeps only the MV's referenced column
- * ({@code service}) for the forward buffer.
+ * Capturing document input (VSR model, v2): keeps the MV's referenced
+ * columns — group keys (service, status) and the metric (latency_ms) —
+ * from the composite broadcast.
  */
-public final class MVDocumentInput implements DocumentInput<String> {
+public final class MVDocumentInput implements DocumentInput<MVDocumentInput.Row> {
+
+    /** Captured values for one document. */
+    public record Row(String service, String status, Long latencyMs) {}
 
     private String service;
+    private String status;
+    private Long latencyMs;
 
     @Override
-    public String getFinalInput() {
-        return service;
+    public Row getFinalInput() {
+        return new Row(service, status, latencyMs);
     }
 
     @Override
     public void addField(MappedFieldType fieldType, Object value) {
-        if (MVConstants.GROUP_KEY.equals(fieldType.name()) && value != null) {
-            this.service = value.toString();
+        if (value == null) {
+            return;
+        }
+        switch (fieldType.name()) {
+            case "service" -> this.service = value.toString();
+            case "status" -> this.status = value.toString();
+            case "latency_ms" -> this.latencyMs = ((Number) value).longValue();
+            default -> { /* not referenced by the MV */ }
         }
     }
 
     @Override
-    public void setRowId(String rowIdFieldName, long rowId) {
-        // derived format: row identity comes from the primary
-    }
+    public void setRowId(String rowIdFieldName, long rowId) {}
 
     @Override
     public long getFieldCount(String fieldName) {

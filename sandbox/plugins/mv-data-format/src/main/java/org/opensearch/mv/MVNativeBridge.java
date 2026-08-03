@@ -31,6 +31,7 @@ public final class MVNativeBridge {
     private static final MethodHandle MV_WRITER_FEED;
     private static final MethodHandle MV_WRITER_FINALIZE;
     private static final MethodHandle MV_WRITER_ABORT;
+    private static final MethodHandle MV_SEARCH_V2;
 
     static {
         Linker linker = Linker.nativeLinker();
@@ -70,7 +71,7 @@ public final class MVNativeBridge {
         );
         MV_WRITER_CREATE = linker.downcallHandle(
             lib.find("df_mv_writer_create").orElseThrow(),
-            FunctionDescriptor.of(ValueLayout.JAVA_LONG)
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
         );
         MV_WRITER_FEED = linker.downcallHandle(
             lib.find("df_mv_writer_feed").orElseThrow(),
@@ -83,6 +84,20 @@ public final class MVNativeBridge {
         MV_WRITER_ABORT = linker.downcallHandle(
             lib.find("df_mv_writer_abort").orElseThrow(),
             FunctionDescriptor.ofVoid(ValueLayout.JAVA_LONG)
+        );
+        MV_SEARCH_V2 = linker.downcallHandle(
+            lib.find("df_mv_search_v2").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS
+            )
         );
     }
 
@@ -142,9 +157,10 @@ public final class MVNativeBridge {
 
     // ---- Streaming writer lifecycle (VSR model) ----
 
-    public static long writerCreate() {
+    public static long writerCreate(String definitionSql, int numGroupCols) {
         try (var call = new NativeCall()) {
-            return call.invoke(MV_WRITER_CREATE);
+            var sql = call.str(definitionSql);
+            return call.invoke(MV_WRITER_CREATE, sql.segment(), sql.len(), (long) numGroupCols);
         }
     }
 
@@ -158,6 +174,27 @@ public final class MVNativeBridge {
         try (var call = new NativeCall()) {
             var out = call.str(outputFile);
             return call.invoke(MV_WRITER_FINALIZE, writerId, out.segment(), out.len());
+        }
+    }
+
+    /** v2 search: SQL template with __MV_STATES__ placeholder over the state files. */
+    public static String searchV2(java.util.List<String> stateFiles, String sqlTemplate) {
+        try (var call = new NativeCall()) {
+            var files = call.strArray(stateFiles.toArray(new String[0]));
+            var sql = call.str(sqlTemplate);
+            var out = call.outBuffer(1024 * 1024);
+            call.invoke(
+                MV_SEARCH_V2,
+                files.ptrs(),
+                files.lens(),
+                (long) stateFiles.size(),
+                sql.segment(),
+                sql.len(),
+                out.data(),
+                (long) out.capacity(),
+                out.lenOut()
+            );
+            return new String(out.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
         }
     }
 
