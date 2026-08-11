@@ -150,7 +150,7 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
                 .sorted()
                 .toList();
             NativeBridge.sessionAttachMV(handle.getPointer(), mvFilePaths, coveredRawFileNames);
-            logger.debug(
+            logger.info(
                 "mv-binding [{}]: attached {} state files, {} covered raw files",
                 node.mvId(),
                 mvFilePaths.size(),

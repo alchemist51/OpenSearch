@@ -47,7 +47,7 @@ use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::prelude::SessionContext;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
-use native_bridge_common::{log_debug, log_error};
+use native_bridge_common::{log_debug, log_error, log_info};
 
 /// Shard-local MV coverage, attached via `df_session_attach_mv`.
 pub struct MVBinding {
@@ -124,7 +124,7 @@ async fn try_apply(
         return Ok(None);
     };
 
-    log_debug!(
+    log_info!(
         "mv_read: bound {} state files; raw branch narrowed by {} covered files",
         binding.mv_file_paths.len(),
         binding.covered_raw_file_names.len()
