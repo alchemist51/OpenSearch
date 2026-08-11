@@ -217,8 +217,11 @@ async fn union_of_state_and_uncovered_raw_matches_full_raw() {
     let binding = MVBinding {
         mv_file_paths: vec![mv1],
         covered_raw_file_names: HashSet::from(["seg1.parquet".to_string()]),
+        strict: false,
     };
-    let bound = apply_mv_binding(&ctx, Arc::clone(&partial), &binding).await;
+    let bound = apply_mv_binding(&ctx, Arc::clone(&partial), &binding)
+        .await
+        .expect("binding must not error");
     assert!(
         !Arc::ptr_eq(&bound, &partial),
         "binding must produce a rewritten plan, not fall back"
@@ -253,8 +256,11 @@ async fn all_covered_serves_entirely_from_state_files() {
             "seg1.parquet".to_string(),
             "seg2.parquet".to_string(),
         ]),
+        strict: false,
     };
-    let bound = apply_mv_binding(&ctx, Arc::clone(&partial), &binding).await;
+    let bound = apply_mv_binding(&ctx, Arc::clone(&partial), &binding)
+        .await
+        .expect("binding must not error");
     assert!(!Arc::ptr_eq(&bound, &partial), "binding must apply");
 
     let states = collect(bound, ctx.task_ctx()).await.expect("collect union");
@@ -282,8 +288,11 @@ async fn mismatched_state_schema_falls_back_to_raw_plan() {
     let binding = MVBinding {
         mv_file_paths: vec![bogus],
         covered_raw_file_names: HashSet::from(["seg1.parquet".to_string()]),
+        strict: false,
     };
-    let bound = apply_mv_binding(&ctx, Arc::clone(&partial), &binding).await;
+    let bound = apply_mv_binding(&ctx, Arc::clone(&partial), &binding)
+        .await
+        .expect("non-strict fallback must not error");
     assert!(
         Arc::ptr_eq(&bound, &partial),
         "schema mismatch must return the original plan untouched"
@@ -294,4 +303,116 @@ async fn mismatched_state_schema_falls_back_to_raw_plan() {
         .await
         .expect("collect raw partial");
     assert_eq!(final_fold(states).await, golden());
+}
+
+/// Strict MV-only mode, all covered: the plan must contain NO raw scan of the
+/// payments directory (state files only) and still produce the golden answer.
+#[tokio::test]
+async fn strict_all_covered_serves_from_state_files_only() {
+    let tmp = TempDir::new().expect("tmpdir");
+    let raw_dir = tmp.path().join("raw");
+    let mv_dir = tmp.path().join("mv");
+    std::fs::create_dir_all(&raw_dir).unwrap();
+    std::fs::create_dir_all(&mv_dir).unwrap();
+
+    let mv1 = write_state_file(&mv_dir, "seg1.mv.parquet", segment1()).await;
+    let mv2 = write_state_file(&mv_dir, "seg2.mv.parquet", segment2()).await;
+
+    let ctx = setup_raw(&raw_dir).await;
+    let partial = partial_over_raw(&ctx).await;
+
+    let binding = MVBinding {
+        mv_file_paths: vec![mv1, mv2],
+        covered_raw_file_names: HashSet::from([
+            "seg1.parquet".to_string(),
+            "seg2.parquet".to_string(),
+        ]),
+        strict: true,
+    };
+    let bound = apply_mv_binding(&ctx, Arc::clone(&partial), &binding)
+        .await
+        .expect("strict all-covered must succeed");
+
+    // The plan must not reference ANY raw file: displayable plan mentions the
+    // mv dir but never the raw dir.
+    let display = datafusion::physical_plan::displayable(bound.as_ref())
+        .indent(true)
+        .to_string();
+    let raw_dir_str = raw_dir.to_string_lossy().into_owned();
+    assert!(
+        !display.contains(&raw_dir_str),
+        "strict plan must contain no raw scan; plan:\n{display}"
+    );
+    assert!(
+        display.contains("mv"),
+        "strict plan should scan the state files; plan:\n{display}"
+    );
+
+    let states = collect(bound, ctx.task_ctx())
+        .await
+        .expect("collect strict");
+    assert_eq!(final_fold(states).await, golden());
+}
+
+/// Strict mode with an uncovered raw file: hard error, not silent fallback.
+#[tokio::test]
+async fn strict_with_uncovered_file_errors() {
+    let tmp = TempDir::new().expect("tmpdir");
+    let raw_dir = tmp.path().join("raw");
+    let mv_dir = tmp.path().join("mv");
+    std::fs::create_dir_all(&raw_dir).unwrap();
+    std::fs::create_dir_all(&mv_dir).unwrap();
+
+    let mv1 = write_state_file(&mv_dir, "seg1.mv.parquet", segment1()).await;
+
+    let ctx = setup_raw(&raw_dir).await;
+    let partial = partial_over_raw(&ctx).await;
+
+    let binding = MVBinding {
+        mv_file_paths: vec![mv1],
+        covered_raw_file_names: HashSet::from(["seg1.parquet".to_string()]), // seg2 uncovered
+        strict: true,
+    };
+    let err = apply_mv_binding(&ctx, Arc::clone(&partial), &binding)
+        .await
+        .expect_err("strict with uncovered raw files must error");
+    assert!(
+        err.to_string().contains("not covered by MV state"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Strict mode with a mismatched state schema: hard error, not silent fallback.
+#[tokio::test]
+async fn strict_schema_mismatch_errors() {
+    let tmp = TempDir::new().expect("tmpdir");
+    let raw_dir = tmp.path().join("raw");
+    let mv_dir = tmp.path().join("mv");
+    std::fs::create_dir_all(&raw_dir).unwrap();
+    std::fs::create_dir_all(&mv_dir).unwrap();
+
+    write_parquet(&mv_dir.join("bogus.mv.parquet"), &[raw_batch(&segment1())]);
+    let bogus = mv_dir
+        .join("bogus.mv.parquet")
+        .to_string_lossy()
+        .into_owned();
+
+    let ctx = setup_raw(&raw_dir).await;
+    let partial = partial_over_raw(&ctx).await;
+
+    let binding = MVBinding {
+        mv_file_paths: vec![bogus],
+        covered_raw_file_names: HashSet::from([
+            "seg1.parquet".to_string(),
+            "seg2.parquet".to_string(),
+        ]),
+        strict: true,
+    };
+    let err = apply_mv_binding(&ctx, Arc::clone(&partial), &binding)
+        .await
+        .expect_err("strict with mismatched schema must error");
+    assert!(
+        err.to_string().contains("did not apply"),
+        "unexpected error: {err}"
+    );
 }

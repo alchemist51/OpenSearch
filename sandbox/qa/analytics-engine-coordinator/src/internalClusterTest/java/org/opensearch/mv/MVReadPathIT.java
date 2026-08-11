@@ -210,6 +210,43 @@ public class MVReadPathIT extends OpenSearchIntegTestCase {
         assertEquals(2L, ((Number) rows.get(2)[1]).longValue());
     }
 
+    public void testStrictModeProvesQueryServedFromMVOnly() throws Exception {
+        createCompositeIndexWithMV();
+        seedGoldenSegments();
+        MVRegistryHolder.set(MVRegistry.ofStatic(Map.of(INDEX, List.of(pocDefinition()))));
+
+        // Strict MV-only mode: every fallback in the read chain becomes a hard
+        // error and the native plan is the state-file scan ALONE — no raw scan
+        // node exists, so raw parquet physically cannot be read. The query
+        // SUCCEEDING with golden answers is therefore proof it was served
+        // exclusively from MV state files.
+        System.setProperty("mv.poc.strict_read", "true");
+        try (
+            MockLogAppender appender = MockLogAppender.createForLoggers(
+                LogManager.getLogger("org.opensearch.be.datafusion.ShardScanInstructionHandler")
+            )
+        ) {
+            appender.addExpectation(
+                new MockLogAppender.SeenEventExpectation(
+                    "strict mv binding attached",
+                    "org.opensearch.be.datafusion.ShardScanInstructionHandler",
+                    Level.INFO,
+                    "*mv-binding*attached*[STRICT MV-only]*"
+                )
+            );
+            List<Object[]> rows = runner().executeSql(QUERY);
+            appender.assertAllExpectationsMatched();
+            rows.sort(Comparator.comparing((Object[] r) -> String.valueOf(r[0])).thenComparing(r -> String.valueOf(r[1])));
+            assertEquals(4, rows.size());
+            assertRow(rows.get(0), "api", "200", 4L, 115L, 10L, 50L);
+            assertRow(rows.get(1), "api", "500", 1L, 900L, 900L, 900L);
+            assertRow(rows.get(2), "batch", "200", 1L, 60L, 60L, 60L);
+            assertRow(rows.get(3), "web", "200", 2L, 120L, 40L, 80L);
+        } finally {
+            System.clearProperty("mv.poc.strict_read");
+        }
+    }
+
     // ── Infrastructure ──────────────────────────────────────────────────────
 
     private SqlPlanRunner runner() {

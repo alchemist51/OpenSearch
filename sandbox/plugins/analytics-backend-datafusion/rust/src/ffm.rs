@@ -1667,6 +1667,7 @@ pub unsafe extern "C" fn df_session_attach_mv(
     mv_paths_len: i64,
     covered_names_ptr: *const u8,
     covered_names_len: i64,
+    strict: u8,
 ) -> i64 {
     let handle = &mut *(handle_ptr as *mut crate::session_context::SessionContextHandle);
     let mv_paths = str_from_raw(mv_paths_ptr, mv_paths_len)
@@ -1689,6 +1690,7 @@ pub unsafe extern "C" fn df_session_attach_mv(
     handle.mv_binding = Some(crate::mv_read::MVBinding {
         mv_file_paths,
         covered_raw_file_names,
+        strict: strict != 0,
     });
     Ok(0)
 }

@@ -27,6 +27,15 @@
 //! Every step is fallback-first: any mismatch (schema shape, plan shape,
 //! scan-leaf shape) returns the original plan untouched — the query is then
 //! answered entirely from raw parquet. Never wrong, only slower.
+//!
+//! ## Strict (MV-only) mode — POC verification
+//!
+//! With [`MVBinding::strict`] set, the contract inverts to fail-closed:
+//! every fallback path becomes a hard error, every raw file must be covered,
+//! and the produced plan is the aliased state-file scan ONLY — no raw scan
+//! node exists in the plan, so the query physically cannot read raw parquet.
+//! A successful strict query is therefore proof the answer came exclusively
+//! from MV state files. POC/testing only; never enable in production paths.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -56,6 +65,9 @@ pub struct MVBinding {
     /// Raw parquet file NAMES (last path segment) of covered segments —
     /// excluded from the raw branch when the MV branch is taken.
     pub covered_raw_file_names: HashSet<String>,
+    /// POC MV-only verification mode: fallbacks become hard errors and the
+    /// plan must be servable from state files alone (see module docs).
+    pub strict: bool,
 }
 
 /// Rewrites a stripped Partial plan into UNION(mv scan, Partial over uncovered).
@@ -64,13 +76,19 @@ pub async fn apply_mv_binding(
     ctx: &SessionContext,
     stripped: Arc<dyn ExecutionPlan>,
     binding: &MVBinding,
-) -> Arc<dyn ExecutionPlan> {
+) -> Result<Arc<dyn ExecutionPlan>> {
     match try_apply(ctx, Arc::clone(&stripped), binding).await {
-        Ok(Some(plan)) => plan,
-        Ok(None) => stripped,
+        Ok(Some(plan)) => Ok(plan),
+        Ok(None) if binding.strict => Err(datafusion::common::DataFusionError::Execution(
+            "mv_read strict: binding did not apply (fallback path taken); \
+             see preceding mv_read log for the reason"
+                .to_string(),
+        )),
+        Ok(None) => Ok(stripped),
+        Err(e) if binding.strict => Err(e),
         Err(e) => {
             log_error!("mv_read: binding failed, falling back to raw plan: {}", e);
-            stripped
+            Ok(stripped)
         }
     }
 }
@@ -118,11 +136,29 @@ async fn try_apply(
     // Narrow the raw branch to uncovered files. If the scan leaf can't be
     // rewritten (unexpected plan shape), fall back — running covered segments
     // through BOTH branches would double-count.
-    let Some(narrowed) = narrow_scan_files(Arc::clone(&stripped), &binding.covered_raw_file_names)?
+    let Some((narrowed, remaining_raw_files)) =
+        narrow_scan_files(Arc::clone(&stripped), &binding.covered_raw_file_names)?
     else {
         log_debug!("mv_read: could not narrow raw scan — fallback");
         return Ok(None);
     };
+
+    if binding.strict {
+        // MV-only: every raw file must be covered, and the plan is the state
+        // scan alone — no raw scan node exists, raw parquet cannot be read.
+        if remaining_raw_files > 0 {
+            return Err(datafusion::common::DataFusionError::Execution(format!(
+                "mv_read strict: {} raw file(s) not covered by MV state — \
+                 query cannot be served from the MV alone",
+                remaining_raw_files
+            )));
+        }
+        log_info!(
+            "mv_read strict: serving from {} state files ONLY (no raw scan in plan)",
+            binding.mv_file_paths.len()
+        );
+        return Ok(Some(aliased_mv));
+    }
 
     log_info!(
         "mv_read: bound {} state files; raw branch narrowed by {} covered files",
@@ -190,7 +226,7 @@ fn alias_positionally(
 fn narrow_scan_files(
     plan: Arc<dyn ExecutionPlan>,
     covered: &HashSet<String>,
-) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+) -> Result<Option<(Arc<dyn ExecutionPlan>, usize)>> {
     if let Some(source_exec) = plan.downcast_ref::<DataSourceExec>() {
         let Some(file_config) = source_exec
             .data_source()
@@ -199,6 +235,7 @@ fn narrow_scan_files(
         else {
             return Ok(None);
         };
+        let mut remaining = 0usize;
         let narrowed_groups: Vec<FileGroup> = file_config
             .file_groups
             .iter()
@@ -208,7 +245,11 @@ fn narrow_scan_files(
                         .iter()
                         .filter(|pf| {
                             let name = pf.object_meta.location.filename().unwrap_or_default();
-                            !covered.contains(name)
+                            let keep = !covered.contains(name);
+                            if keep {
+                                remaining += 1;
+                            }
+                            keep
                         })
                         .cloned()
                         .collect(),
@@ -219,7 +260,7 @@ fn narrow_scan_files(
             .with_file_groups(narrowed_groups)
             .build();
         let narrowed: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(narrowed_config);
-        return Ok(Some(narrowed));
+        return Ok(Some((narrowed, remaining)));
     }
     // Recurse through single-child wrappers; bail on multi-input nodes.
     let children = plan.children();
@@ -227,7 +268,9 @@ fn narrow_scan_files(
         return Ok(None);
     }
     match narrow_scan_files(Arc::clone(children[0]), covered)? {
-        Some(new_child) => Ok(Some(plan.with_new_children(vec![new_child])?)),
+        Some((new_child, remaining)) => {
+            Ok(Some((plan.with_new_children(vec![new_child])?, remaining)))
+        }
         None => Ok(None),
     }
 }

@@ -618,7 +618,7 @@ public final class NativeBridge {
             FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG)
         );
 
-        // i64 df_session_attach_mv(session_ptr, mv_paths_ptr, mv_paths_len, covered_names_ptr, covered_names_len)
+        // i64 df_session_attach_mv(session_ptr, mv_paths_ptr, mv_paths_len, covered_names_ptr, covered_names_len, strict)
         SESSION_ATTACH_MV = linker.downcallHandle(
             lib.find("df_session_attach_mv").orElseThrow(),
             FunctionDescriptor.of(
@@ -627,7 +627,8 @@ public final class NativeBridge {
                 ValueLayout.ADDRESS,
                 ValueLayout.JAVA_LONG,
                 ValueLayout.ADDRESS,
-                ValueLayout.JAVA_LONG
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_BYTE
             )
         );
 
@@ -1616,16 +1617,26 @@ public final class NativeBridge {
      * whether to exercise it and silently falls back to the raw-only plan when the
      * state schema does not line up.
      *
+     * <p>{@code strict} enables the POC MV-only verification mode: every fallback
+     * in the native read path becomes a hard error and the produced plan is the
+     * state-file scan alone (no raw scan node) — a successful query proves the
+     * answer came exclusively from MV state files. Testing/POC only.
+     *
      * @param handlePtr pointer returned by {@link #createSessionContext}
      */
-    public static void sessionAttachMV(long handlePtr, java.util.List<String> mvFilePaths, java.util.List<String> coveredRawFileNames) {
+    public static void sessionAttachMV(
+        long handlePtr,
+        java.util.List<String> mvFilePaths,
+        java.util.List<String> coveredRawFileNames,
+        boolean strict
+    ) {
         NativeHandle.validatePointer(handlePtr, "sessionContext");
         String mvJoined = String.join("\n", mvFilePaths);
         String coveredJoined = String.join("\n", coveredRawFileNames);
         try (var call = new NativeCall()) {
             var mv = call.str(mvJoined);
             var covered = call.str(coveredJoined);
-            call.invoke(SESSION_ATTACH_MV, handlePtr, mv.segment(), mv.len(), covered.segment(), covered.len());
+            call.invoke(SESSION_ATTACH_MV, handlePtr, mv.segment(), mv.len(), covered.segment(), covered.len(), (byte) (strict ? 1 : 0));
         }
     }
 

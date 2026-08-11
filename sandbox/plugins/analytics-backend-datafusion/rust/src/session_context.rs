@@ -517,7 +517,7 @@ pub async fn prepare_partial_plan(
     // Fallback-first: any mismatch returns `stripped` unchanged. TopK fragments
     // are excluded in v0 (the root is a Sort, not the Partial — mv_read bails).
     let stripped = match handle.mv_binding.as_ref() {
-        Some(binding) => crate::mv_read::apply_mv_binding(&handle.ctx, stripped, binding).await,
+        Some(binding) => crate::mv_read::apply_mv_binding(&handle.ctx, stripped, binding).await?,
         None => stripped,
     };
 

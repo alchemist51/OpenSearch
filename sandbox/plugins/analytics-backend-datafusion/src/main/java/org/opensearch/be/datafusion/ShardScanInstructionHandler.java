@@ -49,6 +49,14 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
     /** Composite-engine format name of the primary columnar format this backend scans. */
     static final String PARQUET_FORMAT_NAME = "parquet";
 
+    /**
+     * POC MV-only verification mode (system property). When set, the MV attach
+     * requests strict native behavior: fallbacks become hard errors and the plan
+     * is the state-file scan alone — a successful query PROVES it was served
+     * exclusively from MV state files. Testing only; never set in production.
+     */
+    static final String MV_STRICT_READ_PROPERTY = "mv.poc.strict_read";
+
     private final DataFusionPlugin plugin;
 
     ShardScanInstructionHandler(DataFusionPlugin plugin) {
@@ -149,14 +157,21 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
                 .flatMap(s -> s.files().stream())
                 .sorted()
                 .toList();
-            NativeBridge.sessionAttachMV(handle.getPointer(), mvFilePaths, coveredRawFileNames);
+            boolean strict = Boolean.getBoolean(MV_STRICT_READ_PROPERTY);
+            NativeBridge.sessionAttachMV(handle.getPointer(), mvFilePaths, coveredRawFileNames, strict);
             logger.info(
-                "mv-binding [{}]: attached {} state files, {} covered raw files",
+                "mv-binding [{}]: attached {} state files, {} covered raw files{}",
                 node.mvId(),
                 mvFilePaths.size(),
-                coveredRawFileNames.size()
+                coveredRawFileNames.size(),
+                strict ? " [STRICT MV-only]" : ""
             );
         } catch (Exception e) {
+            if (Boolean.getBoolean(MV_STRICT_READ_PROPERTY)) {
+                // Strict MV-only verification: a swallowed attach failure would
+                // silently run raw and fake the proof. Fail closed.
+                throw new IllegalStateException("mv-binding [" + node.mvId() + "]: attach failed in strict MV-only mode", e);
+            }
             // The binding is best-effort: any failure here must leave the session in
             // its default (raw-only) state rather than failing the query.
             logger.warn("mv-binding [{}]: attach failed, falling back to raw scan", node.mvId(), e);

@@ -42,7 +42,7 @@
 //! (wrong, since predicate stats are supersets).
 //!
 //! # Child ordering
-//!
+//! 
 //! The candidate stage sorts AND/OR children by [`subtree_cost`] before
 //! walking (cheap-first), which lets a narrow Predicate leaf — or a
 //! Predicate-dominated nested subtree — short-circuit a whole AND group
