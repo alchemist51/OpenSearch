@@ -19,7 +19,8 @@ import org.opensearch.index.mapper.MappedFieldType;
 public final class MVDocumentInput implements DocumentInput<MVDocumentInput.Row> {
 
     /** Captured values for one document. */
-    public record Row(String service, String status, Long latencyMs) {}
+    public record Row(String service, String status, Long latencyMs) {
+    }
 
     private String service;
     private String status;
@@ -39,7 +40,8 @@ public final class MVDocumentInput implements DocumentInput<MVDocumentInput.Row>
             case "service" -> this.service = value.toString();
             case "status" -> this.status = value.toString();
             case "latency_ms" -> this.latencyMs = ((Number) value).longValue();
-            default -> { /* not referenced by the MV */ }
+            default -> {
+                /* not referenced by the MV */ }
         }
     }
 

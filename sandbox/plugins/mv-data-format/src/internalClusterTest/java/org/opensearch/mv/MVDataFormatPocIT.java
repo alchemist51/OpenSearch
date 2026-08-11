@@ -16,6 +16,7 @@ import org.opensearch.arrow.allocator.ArrowBasePlugin;
 import org.opensearch.be.datafusion.DataFusionPlugin;
 import org.opensearch.be.lucene.LucenePlugin;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.network.NetworkModule;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.FeatureFlags;
@@ -23,14 +24,13 @@ import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.composite.CompositeDataFormatPlugin;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.IndexService;
+import org.opensearch.index.engine.DataFormatAwareEngine;
 import org.opensearch.index.engine.exec.Segment;
 import org.opensearch.index.engine.exec.WriterFileSet;
-import org.opensearch.index.engine.DataFormatAwareEngine;
 import org.opensearch.index.engine.exec.coord.CatalogSnapshot;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardTestCase;
 import org.opensearch.indices.IndicesService;
-import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.parquet.ParquetDataFormatPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.test.OpenSearchIntegTestCase;
@@ -106,7 +106,7 @@ public class MVDataFormatPocIT extends OpenSearchIntegTestCase {
         ensureGreen(index);
 
         // Golden segment 1 (5 docs):
-        //   (api,200,30) (api,200,50) (web,200,40) (api,500,900) (api,200,25)
+        // (api,200,30) (api,200,50) (web,200,40) (api,500,900) (api,200,25)
         // -> states: (api,200): cnt=3 sum=105 min=25 max=50; (api,500): 1/900/900/900; (web,200): 1/40/40/40
         indexDoc(index, "api", "200", 30);
         indexDoc(index, "api", "200", 50);
@@ -116,7 +116,7 @@ public class MVDataFormatPocIT extends OpenSearchIntegTestCase {
         client().admin().indices().prepareRefresh(index).get();
 
         // Golden segment 2 (3 docs):
-        //   (api,200,10) (web,200,80) (batch,200,60)
+        // (api,200,10) (web,200,80) (batch,200,60)
         // -> states: (api,200): 1/10/10/10; (web,200): 1/80/80/80; (batch,200): 1/60/60/60
         // Cross-segment: (api,200) split across segments; min winner in seg2 (10), max in seg1 (50);
         // (web,200) max winner in seg2 (80).
@@ -164,10 +164,10 @@ public class MVDataFormatPocIT extends OpenSearchIntegTestCase {
             }
             String result = MVNativeBridge.searchV2(stateFiles, MVConstants.SEARCH_SQL);
             // Golden answers (sorted by service, status):
-            //   api,200: cnt=4 sum=115 min=10 max=50
-            //   api,500: cnt=1 sum=900 min=900 max=900
-            //   batch,200: cnt=1 sum=60 min=60 max=60
-            //   web,200: cnt=2 sum=120 min=40 max=80
+            // api,200: cnt=4 sum=115 min=10 max=50
+            // api,500: cnt=1 sum=900 min=900 max=900
+            // batch,200: cnt=1 sum=60 min=60 max=60
+            // web,200: cnt=2 sum=120 min=40 max=80
             assertEquals(
                 "api\t200\t4\t115\t10\t50\n"
                     + "api\t500\t1\t900\t900\t900\n"

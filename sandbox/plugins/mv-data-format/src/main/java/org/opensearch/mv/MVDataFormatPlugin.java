@@ -15,10 +15,10 @@ import org.opensearch.index.engine.dataformat.DataFormatPlugin;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
 import org.opensearch.index.engine.dataformat.IndexingEngineConfig;
 import org.opensearch.index.engine.dataformat.IndexingExecutionEngine;
-import org.opensearch.index.mapper.MappedFieldType;
-import org.opensearch.index.store.checksum.GenericCRC32ChecksumHandler;
 import org.opensearch.index.engine.dataformat.ReaderManagerConfig;
 import org.opensearch.index.engine.exec.EngineReaderManager;
+import org.opensearch.index.mapper.MappedFieldType;
+import org.opensearch.index.store.checksum.GenericCRC32ChecksumHandler;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchBackEndPlugin;
 
