@@ -34,6 +34,7 @@ import org.apache.calcite.sql2rel.RelDecorrelator;
 import org.apache.calcite.tools.RelBuilder;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.analytics.planner.mv.MVRewritePhase;
 import org.opensearch.analytics.planner.rel.OpenSearchDistributionTraitDef;
 import org.opensearch.analytics.planner.rules.ExtractLiteralAggRule;
 import org.opensearch.analytics.planner.rules.OpenSearchAggLiteralArgProjectSplitRule;
@@ -128,6 +129,13 @@ public class PlannerImpl {
         modifiedRelNode = reduceExpressions(modifiedRelNode, listener);
         modifiedRelNode = pushdownRules(modifiedRelNode, listener);
         modifiedRelNode = decomposeAggregates(modifiedRelNode, listener);
+        // MV transparent-rewrite phase: match the canonicalized (post-decompose)
+        // tree against eligible MV definitions and record annotations in the
+        // PlannerContext side-channel. Never restructures the tree — marking and
+        // everything after it see the exact shape they see today. Must stay
+        // between decomposeAggregates (definitions are stored in decomposed form)
+        // and mark. See mv-search-side-integration-plan.md §2.1, decisions D1/D2.
+        modifiedRelNode = MVRewritePhase.annotate(modifiedRelNode, context);
         modifiedRelNode = mark(modifiedRelNode, context, listener);
         LOGGER.debug("After marking:\n{}", RelOptUtil.toString(modifiedRelNode));
         modifiedRelNode = splitAggLiteralArgProject(modifiedRelNode, listener);

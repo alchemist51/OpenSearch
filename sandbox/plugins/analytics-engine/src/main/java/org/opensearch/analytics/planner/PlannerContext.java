@@ -8,12 +8,18 @@
 
 package org.opensearch.analytics.planner;
 
+import org.opensearch.analytics.planner.mv.MVRegistry;
+import org.opensearch.analytics.planner.mv.MVRewriteAnnotation;
 import org.opensearch.analytics.planner.rel.OpenSearchDistributionTraitDef;
 import org.opensearch.analytics.settings.DelegationBlockList;
 import org.opensearch.analytics.settings.PlannerSettings;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.common.Nullable;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * Shared context available to all planner rules.
@@ -37,6 +43,12 @@ public class PlannerContext {
     // block-list). Defaults to planner defaults; DefaultPlanExecutor injects the live, settings-backed
     // instance via setPlannerSettings before planning.
     private PlannerSettings plannerSettings = PlannerSettings.defaults();
+
+    // MV transparent rewrite (decision D1: side-channel, not tree-attached).
+    // Registry defaults to EMPTY — MVRewritePhase is a zero-cost no-op — until
+    // MV metadata lands and the executor injects the live registry.
+    private MVRegistry mvRegistry = MVRegistry.EMPTY;
+    private final Map<String, MVRewriteAnnotation> mvRewriteAnnotations = new HashMap<>();
 
     public PlannerContext(CapabilityRegistry capabilityRegistry, ClusterState clusterState) {
         this(capabilityRegistry, clusterState, null, false, true);
@@ -117,6 +129,32 @@ public class PlannerContext {
 
     public ClusterState getClusterState() {
         return clusterState;
+    }
+
+    /** The MV registry consulted by {@code MVRewritePhase}. Never null; defaults to {@link MVRegistry#EMPTY}. */
+    public MVRegistry getMVRegistry() {
+        return mvRegistry;
+    }
+
+    /** Inject the live MV registry. Called by the executor before planning; tests wire {@code MVRegistry.ofStatic}. */
+    public void setMVRegistry(MVRegistry mvRegistry) {
+        this.mvRegistry = mvRegistry == null ? MVRegistry.EMPTY : mvRegistry;
+    }
+
+    /** Records an MV rewrite option for the scan with the given table key (see {@code MVRewritePhase#tableKey}). */
+    public void putMVRewriteAnnotation(String tableKey, MVRewriteAnnotation annotation) {
+        mvRewriteAnnotations.put(tableKey, annotation);
+    }
+
+    /** The MV rewrite option recorded for a table key, or null. Consumed by the DAG layer at fragment emission. */
+    @Nullable
+    public MVRewriteAnnotation getMVRewriteAnnotation(String tableKey) {
+        return mvRewriteAnnotations.get(tableKey);
+    }
+
+    /** All recorded MV rewrite options, keyed by table identity. Unmodifiable view. */
+    public Map<String, MVRewriteAnnotation> getMVRewriteAnnotations() {
+        return Collections.unmodifiableMap(mvRewriteAnnotations);
     }
 
     public double getOversamplingFactor() {
