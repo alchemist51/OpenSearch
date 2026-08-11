@@ -144,6 +144,7 @@ pub async fn execute_indexed_query(
         aggregate_mode: crate::agg_mode::Mode::Default,
         has_topk: false,
         prepared_plan: None,
+        mv_binding: None,
         phantom_reservation: None,
     };
     let ptr = Box::into_raw(Box::new(handle)) as i64;

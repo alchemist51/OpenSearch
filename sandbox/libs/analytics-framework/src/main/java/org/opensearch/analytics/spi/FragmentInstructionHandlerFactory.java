@@ -31,6 +31,16 @@ public interface FragmentInstructionHandlerFactory {
      */
     Optional<InstructionNode> createShardScanNode(boolean requestsRowIds);
 
+    /**
+     * Creates a shard scan instruction node carrying a materialized-view rewrite binding
+     * (see {@link ShardScanInstructionNode}). Default ignores the binding — backends that
+     * can serve MV state files (DataFusion) override. Never called with
+     * {@code requestsRowIds=true} or together with delegation.
+     */
+    default Optional<InstructionNode> createShardScanNode(boolean requestsRowIds, String mvId, String mvStateFingerprint) {
+        return createShardScanNode(requestsRowIds);
+    }
+
     /** Creates a filter delegation instruction node with the given delegation metadata. */
     Optional<InstructionNode> createFilterDelegationNode(
         FilterTreeShape treeShape,

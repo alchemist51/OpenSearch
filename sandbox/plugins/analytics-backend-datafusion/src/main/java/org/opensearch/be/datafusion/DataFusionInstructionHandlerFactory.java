@@ -44,6 +44,11 @@ public class DataFusionInstructionHandlerFactory implements FragmentInstructionH
     }
 
     @Override
+    public Optional<InstructionNode> createShardScanNode(boolean requestsRowIds, String mvId, String mvStateFingerprint) {
+        return Optional.of(new ShardScanInstructionNode(requestsRowIds, mvId, mvStateFingerprint));
+    }
+
+    @Override
     public Optional<InstructionNode> createFilterDelegationNode(
         FilterTreeShape treeShape,
         int delegatedPredicateCount,

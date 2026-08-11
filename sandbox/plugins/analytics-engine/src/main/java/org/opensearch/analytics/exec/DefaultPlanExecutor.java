@@ -261,6 +261,9 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
             preferMetadataDriver
         );
         plannerContext.setPlannerSettings(plannerSettings);
+        // MV transparent rewrite: POC static wiring (see MVRegistryHolder) until the
+        // MV metadata milestone provides a cluster-state-backed per-query registry.
+        plannerContext.setMVRegistry(org.opensearch.analytics.planner.mv.MVRegistryHolder.get());
         RelNode plan = PlannerImpl.createPlan(logicalFragment, plannerContext);
         final String fullPlan = profile ? RelOptUtil.toString(plan) : null;
         QueryDAG dag = DAGBuilder.build(plan, capabilityRegistry, clusterService, indexNameExpressionResolver);
@@ -269,7 +272,7 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
         // Collapse multi-backend stages to a single chosen alternative before conversion
         // so the convertor runs once per stage and the wire request carries one PlanAlternative.
         PlanAlternativeSelector.selectAll(dag, capabilityRegistry, preferMetadataDriver);
-        FragmentConversionDriver.convertAll(dag, capabilityRegistry);
+        FragmentConversionDriver.convertAll(dag, capabilityRegistry, plannerContext.getMVRewriteAnnotations());
         final long planningTimeNanos = System.nanoTime() - planStartNanos;
         final long planningTimeMs = TimeUnit.NANOSECONDS.toMillis(planningTimeNanos);
         logger.debug("[DefaultPlanExecutor] QueryDAG:\n{}", dag);

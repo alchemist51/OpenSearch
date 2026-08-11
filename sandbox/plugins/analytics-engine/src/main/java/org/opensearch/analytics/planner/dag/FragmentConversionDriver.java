@@ -19,6 +19,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.planner.CapabilityRegistry;
 import org.opensearch.analytics.planner.RelNodeUtils;
+import org.opensearch.analytics.planner.mv.MVRewriteAnnotation;
 import org.opensearch.analytics.planner.rel.AggregateMode;
 import org.opensearch.analytics.planner.rel.AnnotatedPredicate;
 import org.opensearch.analytics.planner.rel.AnnotationResolver;
@@ -45,6 +46,7 @@ import org.opensearch.analytics.spi.WireFormat;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Function;
 
 /**
@@ -81,7 +83,18 @@ public class FragmentConversionDriver {
      * {@link StagePlan#convertedBytes()} on each plan.
      */
     public static void convertAll(QueryDAG dag, CapabilityRegistry registry) {
-        convertStage(dag.rootStage(), registry);
+        convertAll(dag, registry, Map.of());
+    }
+
+    /**
+     * Variant carrying the planner's MV rewrite annotations (side-channel from
+     * {@code MVRewritePhase}, keyed by dot-joined qualified table name). When a shard
+     * fragment's scan leaf has an annotation and the fragment is MV-compatible
+     * (partial aggregate present, no row-id request, no delegation — decision D3),
+     * the emitted shard-scan instruction carries the MV binding.
+     */
+    public static void convertAll(QueryDAG dag, CapabilityRegistry registry, Map<String, MVRewriteAnnotation> mvAnnotations) {
+        convertStage(dag.rootStage(), registry, mvAnnotations);
         // Root stage executes locally at coordinator — store factory for instruction dispatch.
         Stage root = dag.rootStage();
         if (root.getExchangeSinkProvider() != null && !root.getPlanAlternatives().isEmpty()) {
@@ -90,9 +103,9 @@ public class FragmentConversionDriver {
         }
     }
 
-    private static void convertStage(Stage stage, CapabilityRegistry registry) {
+    private static void convertStage(Stage stage, CapabilityRegistry registry, Map<String, MVRewriteAnnotation> mvAnnotations) {
         for (Stage child : stage.getChildStages()) {
-            convertStage(child, registry);
+            convertStage(child, registry, mvAnnotations);
         }
         // After children are converted, surface any decorator-induced schema delta as
         // postDecorationSchemaBytes on the child plans. The reduce sink consults this when
@@ -127,7 +140,7 @@ public class FragmentConversionDriver {
 
             // Assemble instruction list
             List<DelegatedExpression> delegated = delegationBytes.getResult();
-            List<InstructionNode> instructions = assembleInstructions(backend, plan, treeShape, delegationBytes);
+            List<InstructionNode> instructions = assembleInstructions(backend, plan, treeShape, delegationBytes, mvAnnotations);
 
             converted.add(plan.withConvertedBytes(bytes, delegated).withInstructions(instructions));
             LOGGER.debug(
@@ -225,7 +238,8 @@ public class FragmentConversionDriver {
         AnalyticsSearchBackendPlugin backend,
         StagePlan plan,
         FilterTreeShape treeShape,
-        IntraOperatorDelegationBytes delegationBytes
+        IntraOperatorDelegationBytes delegationBytes,
+        Map<String, MVRewriteAnnotation> mvAnnotations
     ) {
         FragmentInstructionHandlerFactory factory = backend.getInstructionHandlerFactory();
         LinkedList<InstructionNode> instructions = new LinkedList<>();
@@ -237,12 +251,22 @@ public class FragmentConversionDriver {
             // backend so it picks the row-id-aware table provider regardless of delegation.
             boolean requestsRowIds = tableScan.getRowType().getFieldNames().contains(OpenSearchLateMaterialization.ROW_ID_FIELD);
             List<DelegatedExpression> delegated = delegationBytes.getResult();
+            boolean hasPartialAggregate = containsPartialAggregate(resolvedFragment);
+            // MV binding gate (decision D3 + QTF exclusion): the binding travels only on a
+            // plain shard scan whose fragment computes a partial aggregate. State rows carry
+            // no row ids and delegated predicates were proven against raw columns, so either
+            // condition disables the binding — the fragment then runs today's raw plan.
+            MVRewriteAnnotation mvAnnotation = mvAnnotations.get(String.join(".", tableScan.getTable().getQualifiedName()));
+            boolean bindMV = mvAnnotation != null && requestsRowIds == false && delegated.isEmpty() && hasPartialAggregate;
             if (!delegated.isEmpty()) {
                 factory.createShardScanWithDelegationNode(treeShape, delegated.size(), requestsRowIds).ifPresent(instructions::add);
+            } else if (bindMV) {
+                factory.createShardScanNode(requestsRowIds, mvAnnotation.mvId(), mvAnnotation.stateSchemaFingerprint())
+                    .ifPresent(instructions::add);
             } else {
                 factory.createShardScanNode(requestsRowIds).ifPresent(instructions::add);
             }
-            if (containsPartialAggregate(resolvedFragment)) {
+            if (hasPartialAggregate) {
                 factory.createPartialAggregateNode().ifPresent(instructions::add);
             }
         } else if (leaf instanceof OpenSearchStageInputScan && containsEngineNativeAggregate(resolvedFragment, AggregateMode.FINAL)) {

@@ -605,15 +605,26 @@ pub unsafe extern "C" fn df_mv_search_v2(
     }
     let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_search_v2: sql: {}", e))?;
     let text = crate::mv_writer::mv_search_v2(&files, sql)?;
-    write_out_buffer(text.as_bytes(), out_ptr, out_cap, out_len, "mv search v2 result")?;
+    write_out_buffer(
+        text.as_bytes(),
+        out_ptr,
+        out_cap,
+        out_len,
+        "mv search v2 result",
+    )?;
     Ok(0)
 }
 
 /// POC(mv) streaming writer lifecycle — create/feed/finalize/abort.
 #[ffm_safe]
 #[no_mangle]
-pub unsafe extern "C" fn df_mv_writer_create(sql_ptr: *const u8, sql_len: i64, num_group_cols: i64) -> i64 {
-    let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_writer_create: sql: {}", e))?;
+pub unsafe extern "C" fn df_mv_writer_create(
+    sql_ptr: *const u8,
+    sql_len: i64,
+    num_group_cols: i64,
+) -> i64 {
+    let sql =
+        str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_writer_create: sql: {}", e))?;
     Ok(crate::mv_writer::mv_writer_create(sql, num_group_cols))
 }
 
@@ -634,8 +645,13 @@ pub unsafe extern "C" fn df_mv_writer_feed(writer_id: i64, array_ptr: i64, schem
 
 #[ffm_safe]
 #[no_mangle]
-pub unsafe extern "C" fn df_mv_writer_finalize(writer_id: i64, out_ptr: *const u8, out_len: i64) -> i64 {
-    let output = str_from_raw(out_ptr, out_len).map_err(|e| format!("df_mv_writer_finalize: out: {}", e))?;
+pub unsafe extern "C" fn df_mv_writer_finalize(
+    writer_id: i64,
+    out_ptr: *const u8,
+    out_len: i64,
+) -> i64 {
+    let output =
+        str_from_raw(out_ptr, out_len).map_err(|e| format!("df_mv_writer_finalize: out: {}", e))?;
     let rows = crate::mv_writer::mv_writer_finalize(writer_id, output)?;
     Ok(rows)
 }
@@ -671,10 +687,18 @@ pub unsafe extern "C" fn df_mv_search_poc(
                 .to_string(),
         );
     }
-    let group = str_from_raw(group_ptr, group_len).map_err(|e| format!("df_mv_search_poc: group: {}", e))?;
-    let state = str_from_raw(state_ptr, state_len).map_err(|e| format!("df_mv_search_poc: state: {}", e))?;
+    let group = str_from_raw(group_ptr, group_len)
+        .map_err(|e| format!("df_mv_search_poc: group: {}", e))?;
+    let state = str_from_raw(state_ptr, state_len)
+        .map_err(|e| format!("df_mv_search_poc: state: {}", e))?;
     let text = crate::mv_poc::mv_search_poc(&files, group, state)?;
-    write_out_buffer(text.as_bytes(), out_ptr, out_cap, out_len, "mv search result")?;
+    write_out_buffer(
+        text.as_bytes(),
+        out_ptr,
+        out_cap,
+        out_len,
+        "mv search result",
+    )?;
     Ok(0)
 }
 
@@ -692,10 +716,13 @@ pub unsafe extern "C" fn df_mv_build_poc(
     output_ptr: *const u8,
     output_len: i64,
 ) -> i64 {
-    let input = str_from_raw(input_ptr, input_len).map_err(|e| format!("df_mv_build_poc: input: {}", e))?;
-    let table = str_from_raw(table_ptr, table_len).map_err(|e| format!("df_mv_build_poc: table: {}", e))?;
+    let input =
+        str_from_raw(input_ptr, input_len).map_err(|e| format!("df_mv_build_poc: input: {}", e))?;
+    let table =
+        str_from_raw(table_ptr, table_len).map_err(|e| format!("df_mv_build_poc: table: {}", e))?;
     let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_build_poc: sql: {}", e))?;
-    let output = str_from_raw(output_ptr, output_len).map_err(|e| format!("df_mv_build_poc: output: {}", e))?;
+    let output = str_from_raw(output_ptr, output_len)
+        .map_err(|e| format!("df_mv_build_poc: output: {}", e))?;
     let rows = crate::mv_poc::mv_build_poc(input, table, sql, output)?;
     Ok(rows)
 }
@@ -1616,6 +1643,53 @@ pub unsafe extern "C" fn df_prepare_partial_plan(
                 .instrument(crate::session_context::prepare_partial_plan(handle, bytes)),
         )
         .map_err(|e| e.to_string())?;
+    Ok(0)
+}
+
+/// Attaches a materialized-view coverage binding to an open session.
+///
+/// `mv_paths` / `covered_names` are newline-joined string lists: absolute paths
+/// of MV state parquet files, and raw parquet file NAMES of the covered
+/// segments (to exclude from the raw branch). Must be called between
+/// `df_create_session_context` and `df_prepare_partial_plan`; the binding is
+/// exercised (or silently dropped) at prepare time — see `mv_read`.
+///
+/// Returns 0 on success; < 0 is a negated error-string pointer.
+///
+/// # Safety
+/// `handle_ptr` must be a valid pointer returned by `df_create_session_context`.
+/// String pointers must reference valid UTF-8 of the given lengths.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_session_attach_mv(
+    handle_ptr: i64,
+    mv_paths_ptr: *const u8,
+    mv_paths_len: i64,
+    covered_names_ptr: *const u8,
+    covered_names_len: i64,
+) -> i64 {
+    let handle = &mut *(handle_ptr as *mut crate::session_context::SessionContextHandle);
+    let mv_paths = str_from_raw(mv_paths_ptr, mv_paths_len)
+        .map_err(|e| format!("df_session_attach_mv: mv_paths: {}", e))?;
+    let covered_names = str_from_raw(covered_names_ptr, covered_names_len)
+        .map_err(|e| format!("df_session_attach_mv: covered_names: {}", e))?;
+    let mv_file_paths: Vec<String> = mv_paths
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let covered_raw_file_names: std::collections::HashSet<String> = covered_names
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if mv_file_paths.is_empty() {
+        return Ok(0); // nothing covered — leave the session raw-only
+    }
+    handle.mv_binding = Some(crate::mv_read::MVBinding {
+        mv_file_paths,
+        covered_raw_file_names,
+    });
     Ok(0)
 }
 
