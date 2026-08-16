@@ -48,4 +48,11 @@ public final class MVDataFormat extends DataFormat {
         // Aggregated rows: one row per group, not one per document.
         return true;
     }
+
+    @Override
+    public boolean mayEmitNoFiles() {
+        // Separate-index mode ships state elsewhere (nothing to register here);
+        // embedded mode may skip a generation for later backfill.
+        return true;
+    }
 }

@@ -64,6 +64,22 @@ public abstract class DataFormat {
         return false;
     }
 
+    /**
+     * Whether this format may legally produce NO files for a generation whose
+     * primary flushed. False for regular formats — the composite flush contract
+     * is files-for-all-formats-or-none, so a missing file set means data loss.
+     * Derived formats whose output lives elsewhere return true: a format that
+     * ships its state to an external location (e.g. a separate MV index,
+     * ship-before-commit) has nothing to register in this index's catalog, and
+     * a derived format may also skip a generation it will cover later
+     * (skip-and-backfill).
+     *
+     * @return true if an empty flush result is legal for this format
+     */
+    public boolean mayEmitNoFiles() {
+        return false;
+    }
+
     @Override
     public final boolean equals(Object o) {
         if (this == o) return true;

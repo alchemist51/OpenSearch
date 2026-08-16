@@ -35,10 +35,26 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<MVDataFor
 
     private final ShardPath shardPath;
     private final String tableName;
+    private final String sourceIndexName;
+    /** Target MV index for the separate-index ship path; null = embedded mode. */
+    private final String shipTarget;
+    private final java.util.function.Supplier<org.opensearch.transport.client.Client> clientSupplier;
 
     public MVIndexingEngine(ShardPath shardPath, String indexName) {
+        this(shardPath, indexName, null, () -> null);
+    }
+
+    public MVIndexingEngine(
+        ShardPath shardPath,
+        String indexName,
+        String shipTarget,
+        java.util.function.Supplier<org.opensearch.transport.client.Client> clientSupplier
+    ) {
         this.shardPath = shardPath;
+        this.sourceIndexName = indexName;
         this.tableName = indexName.replace('-', '_').replace('.', '_');
+        this.shipTarget = shipTarget;
+        this.clientSupplier = clientSupplier;
         try {
             Files.createDirectories(shardPath.getDataPath().resolve(MVConstants.DIR));
         } catch (IOException e) {
@@ -48,7 +64,15 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<MVDataFor
 
     @Override
     public Writer<MVDocumentInput> createWriter(WriterConfig config) {
-        return new MVWriter(config.writerGeneration(), shardPath, tableName);
+        MVStateShipper shipper = null;
+        if (shipTarget != null) {
+            org.opensearch.transport.client.Client client = clientSupplier.get();
+            if (client == null) {
+                throw new IllegalStateException("mv ship target [" + shipTarget + "] configured but node client not initialized");
+            }
+            shipper = new MVStateShipper(client, shipTarget, sourceIndexName, shardPath.getShardId());
+        }
+        return new MVWriter(config.writerGeneration(), shardPath, tableName, shipper);
     }
 
     @Override

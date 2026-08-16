@@ -129,7 +129,19 @@ fn partial_states_over(
     batches: Vec<RecordBatch>,
 ) -> Result<Vec<RecordBatch>, String> {
     block_on(async move {
-        let ctx = SessionContext::new();
+        // Build the session WITHOUT CombinePartialFinalAggregate: on small
+        // single-partition inputs that rule collapses the Partial/Final pair
+        // into Single mode and the Partial node this writer depends on
+        // disappears ("no Partial aggregate in plan" — the near-empty-batch
+        // flush failure). Same rule removal the engine applies on every
+        // execution path (agg_mode.rs).
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features()
+            .with_physical_optimizer_rules(
+                crate::agg_mode::physical_optimizer_rules_without_combine(),
+            )
+            .build();
+        let ctx = SessionContext::new_with_state(state);
         let mem = MemTable::try_new(schema, vec![batches]).map_err(|e| format!("memtable: {e}"))?;
         ctx.register_table("mv_input", Arc::new(mem)).map_err(|e| format!("register: {e}"))?;
         let df = ctx.sql(sql).await.map_err(|e| format!("plan: {e}"))?;
@@ -154,7 +166,19 @@ fn partial_reduce(
     }
     let state_schema = state_batches[0].schema();
     block_on(async move {
-        let ctx = SessionContext::new();
+        // Build the session WITHOUT CombinePartialFinalAggregate: on small
+        // single-partition inputs that rule collapses the Partial/Final pair
+        // into Single mode and the Partial node this writer depends on
+        // disappears ("no Partial aggregate in plan" — the near-empty-batch
+        // flush failure). Same rule removal the engine applies on every
+        // execution path (agg_mode.rs).
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features()
+            .with_physical_optimizer_rules(
+                crate::agg_mode::physical_optimizer_rules_without_combine(),
+            )
+            .build();
+        let ctx = SessionContext::new_with_state(state);
         // Plan the definition over a dummy raw table to obtain the aggregate
         // node shape (group exprs + aggregate exprs + schemas)...
         let dummy = MemTable::try_new(input_schema, vec![vec![]]).map_err(|e| format!("dummy: {e}"))?;
@@ -266,7 +290,19 @@ pub fn mv_search_v2(
     select_final_sql: &str,
 ) -> Result<String, String> {
     block_on(async move {
-        let ctx = SessionContext::new();
+        // Build the session WITHOUT CombinePartialFinalAggregate: on small
+        // single-partition inputs that rule collapses the Partial/Final pair
+        // into Single mode and the Partial node this writer depends on
+        // disappears ("no Partial aggregate in plan" — the near-empty-batch
+        // flush failure). Same rule removal the engine applies on every
+        // execution path (agg_mode.rs).
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features()
+            .with_physical_optimizer_rules(
+                crate::agg_mode::physical_optimizer_rules_without_combine(),
+            )
+            .build();
+        let ctx = SessionContext::new_with_state(state);
         for (i, f) in state_files.iter().enumerate() {
             ctx.register_parquet(&format!("mv_{i}"), f.as_str(), ParquetReadOptions::default())
                 .await

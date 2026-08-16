@@ -32,7 +32,42 @@ import java.util.function.Supplier;
  */
 public class MVDataFormatPlugin extends Plugin implements DataFormatPlugin, SearchBackEndPlugin<MVReaderManager.MVReader> {
 
+    /**
+     * Node client captured at component creation; used by the separate-index
+     * ship path (POC wiring — production ships over a dedicated transport
+     * action with an ack listener rather than a blocking client bulk).
+     */
+    private volatile org.opensearch.transport.client.Client client;
+
     public MVDataFormatPlugin() {}
+
+    @Override
+    public java.util.Collection<Object> createComponents(
+        org.opensearch.transport.client.Client client,
+        org.opensearch.cluster.service.ClusterService clusterService,
+        org.opensearch.threadpool.ThreadPool threadPool,
+        org.opensearch.watcher.ResourceWatcherService resourceWatcherService,
+        org.opensearch.script.ScriptService scriptService,
+        org.opensearch.core.xcontent.NamedXContentRegistry xContentRegistry,
+        org.opensearch.env.Environment environment,
+        org.opensearch.env.NodeEnvironment nodeEnvironment,
+        org.opensearch.core.common.io.stream.NamedWriteableRegistry namedWriteableRegistry,
+        org.opensearch.cluster.metadata.IndexNameExpressionResolver indexNameExpressionResolver,
+        java.util.function.Supplier<org.opensearch.repositories.RepositoriesService> repositoriesServiceSupplier
+    ) {
+        this.client = client;
+        return java.util.List.of();
+    }
+
+    @Override
+    public java.util.List<org.opensearch.common.settings.Setting<?>> getSettings() {
+        return java.util.List.of(
+            org.opensearch.common.settings.Setting.simpleString(
+                MVConstants.SHIP_TARGET_SETTING,
+                org.opensearch.common.settings.Setting.Property.IndexScope
+            )
+        );
+    }
 
     @Override
     public DataFormat getDataFormat() {
@@ -41,7 +76,13 @@ public class MVDataFormatPlugin extends Plugin implements DataFormatPlugin, Sear
 
     @Override
     public IndexingExecutionEngine<?, ?> indexingEngine(IndexingEngineConfig config) {
-        return new MVIndexingEngine(config.store().shardPath(), config.indexSettings().getIndex().getName());
+        String shipTarget = config.indexSettings().getSettings().get(MVConstants.SHIP_TARGET_SETTING);
+        return new MVIndexingEngine(
+            config.store().shardPath(),
+            config.indexSettings().getIndex().getName(),
+            shipTarget == null || shipTarget.isEmpty() ? null : shipTarget,
+            () -> client
+        );
     }
 
     @Override

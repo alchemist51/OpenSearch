@@ -71,7 +71,9 @@ public class CompositeMergeExecutor {
                 }
                 // Verify secondary merged row count matches primary.
                 // POC(mv): derived formats (aggregated rows) are exempt — see DataFormat#exemptFromRowParity.
-                if (primaryResult.mergedFiles() != null && secondaryResult.mergedFiles() != null && secondary.exemptFromRowParity() == false) {
+                if (primaryResult.mergedFiles() != null
+                    && secondaryResult.mergedFiles() != null
+                    && secondary.exemptFromRowParity() == false) {
                     long primaryRows = primaryResult.mergedFiles().numRows();
                     long secondaryRows = secondaryResult.mergedFiles().numRows();
                     if (primaryRows != secondaryRows) {

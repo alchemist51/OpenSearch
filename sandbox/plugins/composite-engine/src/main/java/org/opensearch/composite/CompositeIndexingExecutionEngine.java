@@ -362,8 +362,14 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
         }
 
         // No merge on refresh — pass through all segments
-        assert newSegments.stream().allMatch(s -> s.dfGroupedSearchableFiles().size() >= 1 + secondaryEngines.size())
-            : "refresh result segments must contain all configured formats";
+        assert newSegments.stream()
+            .allMatch(
+                s -> s.dfGroupedSearchableFiles().containsKey(primaryEngine.getDataFormat().name())
+                    && secondaryEngines.stream()
+                        .allMatch(
+                            e -> e.getDataFormat().mayEmitNoFiles() || s.dfGroupedSearchableFiles().containsKey(e.getDataFormat().name())
+                        )
+            ) : "refresh result segments must contain all configured formats (optional mayEmitNoFiles formats excepted)";
         return new RefreshResult(List.copyOf(newSegments));
     }
 
@@ -414,7 +420,12 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
         for (Segment seg : result.refreshedSegments()) {
             WriterFileSet ownFiles = seg.dfGroupedSearchableFiles().get(ownFormat.name());
             Segment.Builder builder = mergedByGen.computeIfAbsent(seg.generation(), Segment::builder);
-            builder.addSearchableFiles(ownFormat, ownFiles);
+            if (ownFiles != null) {
+                // A format that produced nothing for this generation (legal for
+                // DataFormat.mayEmitNoFiles() formats, e.g. state shipped to a
+                // separate index) simply has no entry in the segment's map.
+                builder.addSearchableFiles(ownFormat, ownFiles);
+            }
         }
     }
 

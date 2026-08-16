@@ -41,15 +41,22 @@ public final class MVWriter implements Writer<MVDocumentInput> {
     private final String tableName;
     private final MVForwardBuffer buffer;
     private final long nativeWriter;
+    /** Non-null = separate-index mode: ship state rows before commit, keep no local file. */
+    private final MVStateShipper shipper;
     private long acceptedRows = 0;
     private long foldedRows = 0; // rows already rotated into the background state
     private volatile long mappingVersion = 1L;
     private volatile WriterState state = WriterState.ACTIVE;
 
     public MVWriter(long writerGeneration, ShardPath shardPath, String tableName) {
+        this(writerGeneration, shardPath, tableName, null);
+    }
+
+    public MVWriter(long writerGeneration, ShardPath shardPath, String tableName, MVStateShipper shipper) {
         this.writerGeneration = writerGeneration;
         this.shardPath = shardPath;
         this.tableName = tableName;
+        this.shipper = shipper;
         this.buffer = new MVForwardBuffer();
         this.nativeWriter = MVNativeBridge.writerCreate(MVConstants.MV_SQL, MVConstants.GROUP_KEYS.size());
     }
@@ -92,6 +99,24 @@ public final class MVWriter implements Writer<MVDocumentInput> {
 
         Path mvDir = shardPath.getDataPath().resolve(MVConstants.DIR);
         Files.createDirectories(mvDir);
+
+        if (shipper != null) {
+            // Separate-index mode (Approach 2): finalize to a scratch file, ship
+            // the state rows to the MV index, and only then let the flush
+            // succeed — ship-before-commit. The source tracks NO MV files (the
+            // MV index owns its physical layout); the scratch file exists only
+            // as the export source and is removed either way.
+            Path scratch = mvDir.resolve(".ship_" + Long.toHexString(writerGeneration) + ".mv.parquet");
+            try {
+                long stateRows = MVNativeBridge.writerFinalize(nativeWriter, scratch.toString());
+                long shipped = shipper.ship(scratch.toString(), writerGeneration);
+                logger.info("mv flush gen={} shipped {} of {} state rows before commit", writerGeneration, shipped, stateRows);
+            } finally {
+                Files.deleteIfExists(scratch);
+            }
+            return FileInfos.empty();
+        }
+
         Path mvFile = mvDir.resolve(MVConstants.mvFileName(writerGeneration));
 
         long stateRows = MVNativeBridge.writerFinalize(nativeWriter, mvFile.toString());

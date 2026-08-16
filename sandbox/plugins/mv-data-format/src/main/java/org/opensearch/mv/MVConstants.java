@@ -53,6 +53,24 @@ public final class MVConstants {
     /** Directory name under the shard data path; also the format name. */
     public static final String DIR = MVDataFormat.NAME;
 
+    /**
+     * Raw state export over a finalized state file (separate-index ship path):
+     * SELECT of the state columns verbatim — no folding, the MV index folds on
+     * read. Order matches {@link #SHIP_FIELDS}.
+     */
+    public static final String EXPORT_SQL = "SELECT service, status, "
+        + "\"count(Int64(1))[count]\", "
+        + "\"sum(mv_input.latency_ms)[sum]\", "
+        + "\"min(mv_input.latency_ms)[value]\", "
+        + "\"max(mv_input.latency_ms)[value]\" "
+        + "FROM __MV_STATES__ ORDER BY service, status";
+
+    /** MV-index document field names, parallel to {@link #EXPORT_SQL} columns. */
+    public static final List<String> SHIP_FIELDS = List.of("service", "status", "cnt", "lat_sum", "lat_min", "lat_max");
+
+    /** Source index setting naming the target MV index; presence enables the ship path. */
+    public static final String SHIP_TARGET_SETTING = "index.mv.ship_target";
+
     /** MV state file name for a writer generation. */
     public static String mvFileName(long writerGeneration) {
         return "_mv_poc_" + Long.toHexString(writerGeneration) + ".mv.parquet";
