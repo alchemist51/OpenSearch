@@ -52,7 +52,7 @@ public final class MVNativeBridge {
             )
         );
         // i64 df_mv_search_poc(files_ptr, files_lens, files_count, group_ptr, group_len,
-        //                      state_ptr, state_len, out_ptr, out_cap, out_len)
+        // state_ptr, state_len, out_ptr, out_cap, out_len)
         MV_SEARCH_POC = linker.downcallHandle(
             lib.find("df_mv_search_poc").orElseThrow(() -> new IllegalStateException("df_mv_search_poc symbol missing")),
             FunctionDescriptor.of(

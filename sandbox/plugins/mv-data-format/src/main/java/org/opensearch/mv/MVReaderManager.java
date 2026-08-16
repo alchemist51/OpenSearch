@@ -29,7 +29,8 @@ public final class MVReaderManager implements EngineReaderManager<MVReaderManage
     private static final Logger logger = LogManager.getLogger(MVReaderManager.class);
 
     /** Snapshot-scoped view of MV state files. */
-    public record MVReader(List<WriterFileSet> stateFiles) {}
+    public record MVReader(List<WriterFileSet> stateFiles) {
+    }
 
     @Override
     public MVReader getReader(CatalogSnapshot catalogSnapshot) {

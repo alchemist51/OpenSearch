@@ -27,9 +27,8 @@ public final class MVConstants {
     private MVConstants() {}
 
     /** The MV definition executed by the native writer over fed batches. */
-    public static final String MV_SQL =
-        "SELECT service, status, COUNT(*), SUM(latency_ms), MIN(latency_ms), MAX(latency_ms) "
-            + "FROM mv_input GROUP BY service, status";
+    public static final String MV_SQL = "SELECT service, status, COUNT(*), SUM(latency_ms), MIN(latency_ms), MAX(latency_ms) "
+        + "FROM mv_input GROUP BY service, status";
 
     /** Group-by columns (leading state-file columns; also the sort key). */
     public static final List<String> GROUP_KEYS = List.of("service", "status");

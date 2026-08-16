@@ -163,9 +163,10 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
         // the durable apply, so this also proves the shard-addressed routing.
         // (Asserted via log scan below; the routing decision is logged at INFO.)
 
-        // Ship happened synchronously inside the source's refresh (ship-before-
-        // commit); make the target's rows searchable and fold on read.
-        client().admin().indices().prepareRefresh(TARGET).get();
+        // THE SUPERSET GUARANTEE (design contract): the ack certifies durable
+        // AND searchable, and the source committed after the ack — so the
+        // target must already serve all shipped state with NO explicit target
+        // refresh here. This read is the contract's assertion.
         SearchResponse folded = foldOnRead();
 
         Terms services = folded.getAggregations().get("by_service");
@@ -188,7 +189,7 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
 
         indexDoc("api", "200", 30);
         client().admin().indices().prepareRefresh(SOURCE).get();
-        client().admin().indices().prepareRefresh(TARGET).get();
+        // No target refresh: the ack already certified searchability.
         assertEquals(1, client().prepareSearch(TARGET).setSize(0).get().getHits().getTotalHits().value());
 
         // Break the invariant's precondition: CLOSE the target, ingest more.
@@ -226,7 +227,7 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
                 throw new AssertionError("flush still failing after target recreated", e);
             }
         });
-        client().admin().indices().prepareRefresh(TARGET).get();
+        // No target refresh (superset guarantee holds through the heal too).
         assertBusy(() -> {
             long docs = client().prepareSearch(TARGET).setSize(0).get().getHits().getTotalHits().value();
             assertTrue("web/200 state must arrive after heal, saw " + docs + " docs", docs >= 1);

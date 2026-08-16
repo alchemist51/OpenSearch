@@ -150,6 +150,12 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
             }
             // Durability before ack: fsync the translog to the last applied op.
             shard.sync();
+            // Searchability before ack (design contract, README "current
+            // understanding" step 4-5): the ack certifies BOTH durable and
+            // searchable, so when the source commits (step 6) the target's
+            // latest view already supersets any source view a query can hold —
+            // the whole consistency story, no snapshot mapping needed.
+            shard.refresh("mv_ship");
             logger.debug(
                 "mv ship-apply: {} state rows into [{}][{}] ({})",
                 applied,
