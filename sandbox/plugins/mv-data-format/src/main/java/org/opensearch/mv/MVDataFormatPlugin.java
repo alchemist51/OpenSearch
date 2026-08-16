@@ -15,10 +15,11 @@ import org.opensearch.index.engine.dataformat.DataFormatPlugin;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
 import org.opensearch.index.engine.dataformat.IndexingEngineConfig;
 import org.opensearch.index.engine.dataformat.IndexingExecutionEngine;
-import org.opensearch.index.mapper.MappedFieldType;
-import org.opensearch.index.store.checksum.GenericCRC32ChecksumHandler;
 import org.opensearch.index.engine.dataformat.ReaderManagerConfig;
 import org.opensearch.index.engine.exec.EngineReaderManager;
+import org.opensearch.index.mapper.MappedFieldType;
+import org.opensearch.index.store.checksum.GenericCRC32ChecksumHandler;
+import org.opensearch.plugins.ActionPlugin.ActionHandler;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchBackEndPlugin;
 
@@ -34,7 +35,8 @@ public class MVDataFormatPlugin extends Plugin
     implements
         DataFormatPlugin,
         SearchBackEndPlugin<MVReaderManager.MVReader>,
-        org.opensearch.plugins.ClusterPlugin {
+        org.opensearch.plugins.ClusterPlugin,
+        org.opensearch.plugins.ActionPlugin {
 
     /**
      * Node client captured at component creation; used by the separate-index
@@ -42,6 +44,7 @@ public class MVDataFormatPlugin extends Plugin
      * action with an ack listener rather than a blocking client bulk).
      */
     private volatile org.opensearch.transport.client.Client client;
+    private volatile org.opensearch.cluster.service.ClusterService clusterService;
 
     public MVDataFormatPlugin() {}
 
@@ -60,6 +63,7 @@ public class MVDataFormatPlugin extends Plugin
         java.util.function.Supplier<org.opensearch.repositories.RepositoriesService> repositoriesServiceSupplier
     ) {
         this.client = client;
+        this.clusterService = clusterService;
         return java.util.List.of();
     }
 
@@ -86,6 +90,13 @@ public class MVDataFormatPlugin extends Plugin
     }
 
     @Override
+    public
+        java.util.List<ActionHandler<? extends org.opensearch.action.ActionRequest, ? extends org.opensearch.core.action.ActionResponse>>
+        getActions() {
+        return java.util.List.of(new ActionHandler<>(MVShipStateAction.INSTANCE, MVShipStateTransportHandler.class));
+    }
+
+    @Override
     public DataFormat getDataFormat() {
         return MVDataFormat.INSTANCE;
     }
@@ -97,7 +108,8 @@ public class MVDataFormatPlugin extends Plugin
             config.store().shardPath(),
             config.indexSettings().getIndex().getName(),
             shipTarget == null || shipTarget.isEmpty() ? null : shipTarget,
-            () -> client
+            () -> client,
+            () -> clusterService
         );
     }
 

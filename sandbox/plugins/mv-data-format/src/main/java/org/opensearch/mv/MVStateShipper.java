@@ -10,13 +10,11 @@ package org.opensearch.mv;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.action.bulk.BulkRequestBuilder;
-import org.opensearch.action.bulk.BulkResponse;
-import org.opensearch.action.support.WriteRequest;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.transport.client.Client;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -53,12 +51,20 @@ final class MVStateShipper {
     private final String targetIndex;
     private final String sourceIndex;
     private final ShardId shardId;
+    private final org.opensearch.cluster.service.ClusterService clusterService;
 
-    MVStateShipper(Client client, String targetIndex, String sourceIndex, ShardId shardId) {
+    MVStateShipper(
+        Client client,
+        String targetIndex,
+        String sourceIndex,
+        ShardId shardId,
+        org.opensearch.cluster.service.ClusterService clusterService
+    ) {
         this.client = client;
         this.targetIndex = targetIndex;
         this.sourceIndex = sourceIndex;
         this.shardId = shardId;
+        this.clusterService = clusterService;
     }
 
     /**
@@ -74,7 +80,8 @@ final class MVStateShipper {
             return 0;
         }
         String[] lines = tsv.split("\n");
-        BulkRequestBuilder bulk = client.prepareBulk().setRefreshPolicy(WriteRequest.RefreshPolicy.NONE);
+        List<String> docIds = new ArrayList<>();
+        List<Map<String, Object>> docs = new ArrayList<>();
         int row = 0;
         for (String line : lines) {
             if (line.isEmpty()) continue;
@@ -94,27 +101,35 @@ final class MVStateShipper {
             doc.put("_mv_source_index", sourceIndex);
             doc.put("_mv_source_shard", shardId.id());
             doc.put("_mv_source_generation", writerGeneration);
-            String docId = sourceIndex + "." + shardId.id() + "." + writerGeneration + "." + row;
-            bulk.add(client.prepareIndex(targetIndex).setId(docId).setSource(doc));
+            docIds.add(sourceIndex + "." + shardId.id() + "." + writerGeneration + "." + row);
+            docs.add(doc);
             row++;
         }
-        BulkResponse response;
+        // Shard-addressed ship to the ORDINAL-PAIRED target shard (source shard
+        // i -> target shard i; a doc-routed bulk would spray across all target
+        // shards and defeat the colocation pairing). The transport handler
+        // applies locally when colocated (no serialization) and forwards once
+        // when the pair is split; either way the ack means durable-in-translog.
+        int targetShard = shardId.id() % clusterService.state().metadata().index(targetIndex).getNumberOfShards();
+        MVShipStateAction.Request request = new MVShipStateAction.Request(targetIndex, targetShard, docIds, docs);
+        MVShipStateAction.Response response;
         try {
-            response = bulk.get();
+            response = client.execute(MVShipStateAction.INSTANCE, request).actionGet();
         } catch (Exception e) {
-            throw new IOException("mv ship: bulk to [" + targetIndex + "] failed for gen=" + writerGeneration, e);
-        }
-        if (response.hasFailures()) {
-            throw new IOException("mv ship: bulk to [" + targetIndex + "] had failures: " + response.buildFailureMessage());
+            throw new IOException(
+                "mv ship: transport ship to [" + targetIndex + "][" + targetShard + "] failed gen=" + writerGeneration,
+                e
+            );
         }
         logger.info(
-            "mv ship: gen={} shipped {} state rows from {}[{}] -> [{}] (acked)",
+            "mv ship: gen={} shipped {} state rows from {}[{}] -> [{}][{}] (acked durable)",
             writerGeneration,
-            row,
+            response.applied(),
             sourceIndex,
             shardId.id(),
-            targetIndex
+            targetIndex,
+            targetShard
         );
-        return row;
+        return response.applied();
     }
 }

@@ -11,6 +11,8 @@ package org.opensearch.mv;
 import com.carrotsearch.randomizedtesting.ThreadFilter;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
 import org.opensearch.action.index.IndexResponse;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.arrow.allocator.ArrowBasePlugin;
@@ -30,6 +32,7 @@ import org.opensearch.search.aggregations.bucket.terms.Terms;
 import org.opensearch.search.aggregations.metrics.Max;
 import org.opensearch.search.aggregations.metrics.Min;
 import org.opensearch.search.aggregations.metrics.Sum;
+import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.opensearch.transport.Netty4ModulePlugin;
 
@@ -106,26 +109,59 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
             .build();
     }
 
-    public void testShipBeforeCommitAndFoldOnRead() {
+    public void testShipBeforeCommitAndFoldOnRead() throws Exception {
         createSourceIndex();
         createTargetIndex();
         assertColocated();
 
-        // Golden segment 1 (5 docs) -> gen 1 ships 3 state rows:
-        // (api,200): cnt=3 sum=105 min=25 max=50; (api,500): 1/900; (web,200): 1/40
-        indexDoc("api", "200", 30);
-        indexDoc("api", "200", 50);
-        indexDoc("web", "200", 40);
-        indexDoc("api", "500", 900);
-        indexDoc("api", "200", 25);
-        client().admin().indices().prepareRefresh(SOURCE).get();
+        // With the pair colocated (asserted above), the ship must take the
+        // LOCAL apply path — never the remote forward. A remote or missing
+        // apply event fails the test.
+        try (
+            MockLogAppender appender = MockLogAppender.createForLoggers(
+                LogManager.getLogger("org.opensearch.mv.MVShipStateTransportHandler")
+            )
+        ) {
+            appender.addExpectation(
+                new MockLogAppender.SeenEventExpectation(
+                    "local ship apply",
+                    "org.opensearch.mv.MVShipStateTransportHandler",
+                    Level.INFO,
+                    "*mv ship-apply path=local*"
+                )
+            );
+            appender.addExpectation(
+                new MockLogAppender.UnseenEventExpectation(
+                    "no remote forward while colocated",
+                    "org.opensearch.mv.MVShipStateTransportHandler",
+                    Level.INFO,
+                    "*mv ship-apply path=remote*"
+                )
+            );
 
-        // Golden segment 2 (3 docs) -> gen 2 ships 3 state rows; (api,200) and
-        // (web,200) now exist in BOTH generations — folded on read only.
-        indexDoc("api", "200", 10);
-        indexDoc("web", "200", 80);
-        indexDoc("batch", "200", 60);
-        client().admin().indices().prepareRefresh(SOURCE).get();
+            // Golden segment 1 (5 docs) -> gen 1 ships 3 state rows:
+            // (api,200): cnt=3 sum=105 min=25 max=50; (api,500): 1/900; (web,200): 1/40
+            indexDoc("api", "200", 30);
+            indexDoc("api", "200", 50);
+            indexDoc("web", "200", 40);
+            indexDoc("api", "500", 900);
+            indexDoc("api", "200", 25);
+            client().admin().indices().prepareRefresh(SOURCE).get();
+
+            // Golden segment 2 (3 docs) -> gen 2 ships 3 state rows; (api,200) and
+            // (web,200) now exist in BOTH generations — folded on read only.
+            indexDoc("api", "200", 10);
+            indexDoc("web", "200", 80);
+            indexDoc("batch", "200", 60);
+            client().admin().indices().prepareRefresh(SOURCE).get();
+
+            appender.assertAllExpectationsMatched();
+        }
+
+        // With the pair colocated, every ship must take the LOCAL apply path
+        // (no serialization). The log fires from the transport handler before
+        // the durable apply, so this also proves the shard-addressed routing.
+        // (Asserted via log scan below; the routing decision is logged at INFO.)
 
         // Ship happened synchronously inside the source's refresh (ship-before-
         // commit); make the target's rows searchable and fold on read.

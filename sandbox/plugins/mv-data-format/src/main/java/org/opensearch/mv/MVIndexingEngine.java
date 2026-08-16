@@ -39,22 +39,25 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<MVDataFor
     /** Target MV index for the separate-index ship path; null = embedded mode. */
     private final String shipTarget;
     private final java.util.function.Supplier<org.opensearch.transport.client.Client> clientSupplier;
+    private final java.util.function.Supplier<org.opensearch.cluster.service.ClusterService> clusterServiceSupplier;
 
     public MVIndexingEngine(ShardPath shardPath, String indexName) {
-        this(shardPath, indexName, null, () -> null);
+        this(shardPath, indexName, null, () -> null, () -> null);
     }
 
     public MVIndexingEngine(
         ShardPath shardPath,
         String indexName,
         String shipTarget,
-        java.util.function.Supplier<org.opensearch.transport.client.Client> clientSupplier
+        java.util.function.Supplier<org.opensearch.transport.client.Client> clientSupplier,
+        java.util.function.Supplier<org.opensearch.cluster.service.ClusterService> clusterServiceSupplier
     ) {
         this.shardPath = shardPath;
         this.sourceIndexName = indexName;
         this.tableName = indexName.replace('-', '_').replace('.', '_');
         this.shipTarget = shipTarget;
         this.clientSupplier = clientSupplier;
+        this.clusterServiceSupplier = clusterServiceSupplier;
         try {
             Files.createDirectories(shardPath.getDataPath().resolve(MVConstants.DIR));
         } catch (IOException e) {
@@ -70,7 +73,7 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<MVDataFor
             if (client == null) {
                 throw new IllegalStateException("mv ship target [" + shipTarget + "] configured but node client not initialized");
             }
-            shipper = new MVStateShipper(client, shipTarget, sourceIndexName, shardPath.getShardId());
+            shipper = new MVStateShipper(client, shipTarget, sourceIndexName, shardPath.getShardId(), clusterServiceSupplier.get());
         }
         return new MVWriter(config.writerGeneration(), shardPath, tableName, shipper);
     }
