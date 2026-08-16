@@ -61,7 +61,7 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
  * FINAL) is diagrammed in the separate-index folder and lands later.
  */
 @ThreadLeakFilters(filters = MVSeparateIndexPocIT.NativeThreadFilter.class)
-@OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 1)
+@OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 2)
 public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
 
     public static class NativeThreadFilter implements ThreadFilter {
@@ -107,8 +107,9 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
     }
 
     public void testShipBeforeCommitAndFoldOnRead() {
-        createTargetIndex();
         createSourceIndex();
+        createTargetIndex();
+        assertColocated();
 
         // Golden segment 1 (5 docs) -> gen 1 ships 3 state rows:
         // (api,200): cnt=3 sum=105 min=25 max=50; (api,500): 1/900; (web,200): 1/40
@@ -145,8 +146,9 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
     }
 
     public void testShipFailureFailsTheFlushAndRetryHeals() throws Exception {
-        createTargetIndex();
         createSourceIndex();
+        createTargetIndex();
+        assertColocated();
 
         indexDoc("api", "200", 30);
         client().admin().indices().prepareRefresh(SOURCE).get();
@@ -174,10 +176,13 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
             // Engine failure cascaded before the response — equally a refused commit.
         }
 
-        // Heal: reopen the target; the engine recovers and the retried flush
-        // re-ships (deterministic doc ids make re-shipping idempotent).
+        // Heal: reopen the target; retry the source's failed allocation (its
+        // recovery flush kept failing while the target was closed and used up
+        // the allocation retries); the retried flush re-ships (deterministic
+        // doc ids make re-shipping idempotent).
         assertAcked(client().admin().indices().prepareOpen(TARGET));
-        ensureGreen(TARGET);
+        client().admin().cluster().prepareReroute().setRetryFailed(true).get();
+        ensureGreen(TARGET, SOURCE);
         assertBusy(() -> {
             try {
                 client().admin().indices().prepareRefresh(SOURCE).get();
@@ -218,7 +223,12 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
         client().admin()
             .indices()
             .prepareCreate(TARGET)
-            .setSettings(Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0))
+            .setSettings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                    .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                    .put(MVConstants.COLOCATE_WITH_SETTING, SOURCE)
+            )
             .setMapping(
                 "service",
                 "type=keyword",
@@ -241,6 +251,17 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
             )
             .get();
         ensureGreen(TARGET);
+    }
+
+    /**
+     * The colocation decider must put the target's primary on the node holding
+     * the source's primary (ordinal pairing, 2 data nodes make this a real
+     * constraint rather than a tautology).
+     */
+    private void assertColocated() {
+        String sourceNode = getClusterState().routingTable().index(SOURCE).shard(0).primaryShard().currentNodeId();
+        String targetNode = getClusterState().routingTable().index(TARGET).shard(0).primaryShard().currentNodeId();
+        assertEquals("MV target primary must colocate with the source primary", sourceNode, targetNode);
     }
 
     /** Fold-on-read: terms(service,status) with SUM(cnt), SUM(lat_sum), MIN(lat_min), MAX(lat_max). */

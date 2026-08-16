@@ -30,7 +30,11 @@ import java.util.function.Supplier;
  * "materialized_view" format; indices opt in via
  * {@code index.composite.secondary_data_formats: ["materialized_view"]}.
  */
-public class MVDataFormatPlugin extends Plugin implements DataFormatPlugin, SearchBackEndPlugin<MVReaderManager.MVReader> {
+public class MVDataFormatPlugin extends Plugin
+    implements
+        DataFormatPlugin,
+        SearchBackEndPlugin<MVReaderManager.MVReader>,
+        org.opensearch.plugins.ClusterPlugin {
 
     /**
      * Node client captured at component creation; used by the separate-index
@@ -65,8 +69,20 @@ public class MVDataFormatPlugin extends Plugin implements DataFormatPlugin, Sear
             org.opensearch.common.settings.Setting.simpleString(
                 MVConstants.SHIP_TARGET_SETTING,
                 org.opensearch.common.settings.Setting.Property.IndexScope
+            ),
+            org.opensearch.common.settings.Setting.simpleString(
+                MVConstants.COLOCATE_WITH_SETTING,
+                org.opensearch.common.settings.Setting.Property.IndexScope
             )
         );
+    }
+
+    @Override
+    public java.util.Collection<org.opensearch.cluster.routing.allocation.decider.AllocationDecider> createAllocationDeciders(
+        org.opensearch.common.settings.Settings settings,
+        org.opensearch.common.settings.ClusterSettings clusterSettings
+    ) {
+        return java.util.List.of(new MVColocationAllocationDecider());
     }
 
     @Override

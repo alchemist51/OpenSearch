@@ -71,6 +71,13 @@ public final class MVConstants {
     /** Source index setting naming the target MV index; presence enables the ship path. */
     public static final String SHIP_TARGET_SETTING = "index.mv.ship_target";
 
+    /**
+     * Target index setting naming the SOURCE index whose primaries this
+     * index's primaries must colocate with (ordinal 1:1 pairing). Consumed by
+     * {@link MVColocationAllocationDecider}.
+     */
+    public static final String COLOCATE_WITH_SETTING = "index.mv.colocate_with";
+
     /** MV state file name for a writer generation. */
     public static String mvFileName(long writerGeneration) {
         return "_mv_poc_" + Long.toHexString(writerGeneration) + ".mv.parquet";
