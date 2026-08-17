@@ -84,8 +84,12 @@ opensearch-repository-azure = { path = "../../../plugins/native-repository-azure
 opensearch-repository-fs = { path = "../../../plugins/native-repository-fs/src/main/rust" }
 
 [profile.release]
-lto = true
-codegen-units = 1
+# POC iteration speed: LTO off + parallel codegen. Fat LTO with
+# codegen-units=1 is the *benchmarking* configuration — restore it
+# (lto = true, codegen-units = 1) before taking performance numbers;
+# expect noticeably slower query/fold paths without it.
+lto = false
+codegen-units = 16
 incremental = true
 debug = "line-tables-only"
 strip = false
