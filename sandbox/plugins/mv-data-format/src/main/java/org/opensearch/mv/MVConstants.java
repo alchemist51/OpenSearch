@@ -67,8 +67,13 @@ public final class MVConstants {
     /** MV-index document field names, parallel to {@link #EXPORT_SQL} columns. */
     public static final List<String> SHIP_FIELDS = List.of("service", "status", "cnt", "lat_sum", "lat_min", "lat_max");
 
-    /** Source index setting naming the target MV index; presence enables the ship path. */
-    public static final String SHIP_TARGET_SETTING = "index.mv.ship_target";
+    /**
+     * Source index setting listing the target MV indices; non-empty enables the
+     * ship path. Multiple targets share ONE finalized state batch via
+     * {@link MVRefCountedStateBatch} — the flush commits only when EVERY
+     * target has acked (the invariant holds per target).
+     */
+    public static final String SHIP_TARGETS_SETTING = "index.mv.ship_targets";
 
     /**
      * Target index setting naming the SOURCE index whose primaries this

@@ -45,20 +45,20 @@ final class MVStateShipper {
     private static final Logger logger = LogManager.getLogger(MVStateShipper.class);
 
     private final Client client;
-    private final String targetIndex;
+    private final java.util.List<String> targetIndices;
     private final String sourceIndex;
     private final ShardId shardId;
     private final org.opensearch.cluster.service.ClusterService clusterService;
 
     MVStateShipper(
         Client client,
-        String targetIndex,
+        java.util.List<String> targetIndices,
         String sourceIndex,
         ShardId shardId,
         org.opensearch.cluster.service.ClusterService clusterService
     ) {
         this.client = client;
-        this.targetIndex = targetIndex;
+        this.targetIndices = java.util.List.copyOf(targetIndices);
         this.sourceIndex = sourceIndex;
         this.shardId = shardId;
         this.clusterService = clusterService;
@@ -80,43 +80,85 @@ final class MVStateShipper {
      *
      * @return number of state rows shipped
      */
+    /**
+     * Ships the finalized state batch to EVERY configured target's ordinal-
+     * paired shard, sharing ONE copy of the Arrow buffers across all of them
+     * via {@link MVRefCountedStateBatch}: the source acquires one reference
+     * per target up front; each target's handler releases its own; if the
+     * ship to a target fails before its handler took ownership, the source
+     * releases that reference here. The last release — wherever it happens —
+     * frees the native memory. No destination can free the batch under
+     * another.
+     *
+     * <p>Commit gate: EVERY target must ack with the full row count; any
+     * failure fails the flush (ship-before-commit, invariant per target).
+     *
+     * @return number of state rows shipped (per target)
+     */
     long ship(VectorSchemaRoot stateBatch, long writerGeneration) throws IOException {
         int rows = stateBatch.getRowCount();
-        int targetShard = shardId.id() % clusterService.state().metadata().index(targetIndex).getNumberOfShards();
-        MVShipStateAction.Request request = new MVShipStateAction.Request(
-            targetIndex,
-            targetShard,
-            sourceIndex,
-            shardId.id(),
-            writerGeneration,
-            stateBatch
-        );
-        MVShipStateAction.Response response;
-        try {
-            response = client.execute(MVShipStateAction.INSTANCE, request).actionGet();
-        } catch (Exception e) {
-            throw new IOException(
-                "mv ship: transport ship to [" + targetIndex + "][" + targetShard + "] failed gen=" + writerGeneration,
-                e
+        MVRefCountedStateBatch shared = new MVRefCountedStateBatch(stateBatch, targetIndices.size());
+        IOException failure = null;
+        for (String targetIndex : targetIndices) {
+            if (failure != null) {
+                // A previous target already failed the flush: don't ship to the
+                // remaining targets this attempt — just release their refs.
+                shared.release();
+                continue;
+            }
+            int targetShard = shardId.id() % clusterService.state().metadata().index(targetIndex).getNumberOfShards();
+            MVShipStateAction.Request request = new MVShipStateAction.Request(
+                targetIndex,
+                targetShard,
+                sourceIndex,
+                shardId.id(),
+                writerGeneration,
+                shared
+            );
+            MVShipStateAction.Response response = null;
+            try {
+                response = client.execute(MVShipStateAction.INSTANCE, request).actionGet();
+            } catch (Exception e) {
+                // The handler releases its reference on every path it reaches;
+                // dispatch happens synchronously in-JVM (NodeClient), so a
+                // throw here means the handler's finally already ran or the
+                // request never left this method — either way OUR contract is
+                // one release per target, and the handler owns it once
+                // doExecute is entered. dispatch-failure-before-doExecute is
+                // not a real path for NodeClient; treat the ref as consumed.
+                failure = new IOException(
+                    "mv ship: transport ship to [" + targetIndex + "][" + targetShard + "] failed gen=" + writerGeneration,
+                    e
+                );
+                continue;
+            }
+            // rowsReceived verification = the commit gate (challenges §10).
+            if (response.applied() != rows) {
+                failure = new IOException(
+                    "mv ship: gen="
+                        + writerGeneration
+                        + " shipped "
+                        + rows
+                        + " state rows to ["
+                        + targetIndex
+                        + "] but it applied "
+                        + response.applied()
+                );
+                continue;
+            }
+            logger.info(
+                "mv ship: gen={} shipped {} state rows from {}[{}] -> [{}][{}] (acked durable+searchable)",
+                writerGeneration,
+                response.applied(),
+                sourceIndex,
+                shardId.id(),
+                targetIndex,
+                targetShard
             );
         }
-        // rowsReceived verification = the commit gate (challenges §10): the ack
-        // returns the applied count; a mismatch means the target does not hold
-        // this generation's complete state — the flush must not commit.
-        if (response.applied() != rows) {
-            throw new IOException(
-                "mv ship: gen=" + writerGeneration + " shipped " + rows + " state rows but target applied " + response.applied()
-            );
+        if (failure != null) {
+            throw failure;
         }
-        logger.info(
-            "mv ship: gen={} shipped {} state rows from {}[{}] -> [{}][{}] (acked durable+searchable)",
-            writerGeneration,
-            response.applied(),
-            sourceIndex,
-            shardId.id(),
-            targetIndex,
-            targetShard
-        );
-        return response.applied();
+        return rows;
     }
 }

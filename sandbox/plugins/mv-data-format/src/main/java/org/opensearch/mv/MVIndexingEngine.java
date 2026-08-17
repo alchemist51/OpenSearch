@@ -36,26 +36,26 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<MVDataFor
     private final ShardPath shardPath;
     private final String tableName;
     private final String sourceIndexName;
-    /** Target MV index for the separate-index ship path; null = embedded mode. */
-    private final String shipTarget;
+    /** Target MV indices for the separate-index ship path; empty = embedded mode. */
+    private final java.util.List<String> shipTargets;
     private final java.util.function.Supplier<org.opensearch.transport.client.Client> clientSupplier;
     private final java.util.function.Supplier<org.opensearch.cluster.service.ClusterService> clusterServiceSupplier;
 
     public MVIndexingEngine(ShardPath shardPath, String indexName) {
-        this(shardPath, indexName, null, () -> null, () -> null);
+        this(shardPath, indexName, java.util.List.of(), () -> null, () -> null);
     }
 
     public MVIndexingEngine(
         ShardPath shardPath,
         String indexName,
-        String shipTarget,
+        java.util.List<String> shipTargets,
         java.util.function.Supplier<org.opensearch.transport.client.Client> clientSupplier,
         java.util.function.Supplier<org.opensearch.cluster.service.ClusterService> clusterServiceSupplier
     ) {
         this.shardPath = shardPath;
         this.sourceIndexName = indexName;
         this.tableName = indexName.replace('-', '_').replace('.', '_');
-        this.shipTarget = shipTarget;
+        this.shipTargets = shipTargets == null ? java.util.List.of() : java.util.List.copyOf(shipTargets);
         this.clientSupplier = clientSupplier;
         this.clusterServiceSupplier = clusterServiceSupplier;
         try {
@@ -68,12 +68,12 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<MVDataFor
     @Override
     public Writer<MVDocumentInput> createWriter(WriterConfig config) {
         MVStateShipper shipper = null;
-        if (shipTarget != null) {
+        if (shipTargets.isEmpty() == false) {
             org.opensearch.transport.client.Client client = clientSupplier.get();
             if (client == null) {
-                throw new IllegalStateException("mv ship target [" + shipTarget + "] configured but node client not initialized");
+                throw new IllegalStateException("mv ship targets " + shipTargets + " configured but node client not initialized");
             }
-            shipper = new MVStateShipper(client, shipTarget, sourceIndexName, shardPath.getShardId(), clusterServiceSupplier.get());
+            shipper = new MVStateShipper(client, shipTargets, sourceIndexName, shardPath.getShardId(), clusterServiceSupplier.get());
         }
         return new MVWriter(config.writerGeneration(), shardPath, tableName, shipper);
     }

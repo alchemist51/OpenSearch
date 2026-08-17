@@ -70,8 +70,10 @@ public class MVDataFormatPlugin extends Plugin
     @Override
     public java.util.List<org.opensearch.common.settings.Setting<?>> getSettings() {
         return java.util.List.of(
-            org.opensearch.common.settings.Setting.simpleString(
-                MVConstants.SHIP_TARGET_SETTING,
+            org.opensearch.common.settings.Setting.listSetting(
+                MVConstants.SHIP_TARGETS_SETTING,
+                java.util.List.of(),
+                java.util.function.Function.identity(),
                 org.opensearch.common.settings.Setting.Property.IndexScope
             ),
             org.opensearch.common.settings.Setting.simpleString(
@@ -103,11 +105,11 @@ public class MVDataFormatPlugin extends Plugin
 
     @Override
     public IndexingExecutionEngine<?, ?> indexingEngine(IndexingEngineConfig config) {
-        String shipTarget = config.indexSettings().getSettings().get(MVConstants.SHIP_TARGET_SETTING);
+        java.util.List<String> shipTargets = config.indexSettings().getSettings().getAsList(MVConstants.SHIP_TARGETS_SETTING);
         return new MVIndexingEngine(
             config.store().shardPath(),
             config.indexSettings().getIndex().getName(),
-            shipTarget == null || shipTarget.isEmpty() ? null : shipTarget,
+            shipTargets == null ? java.util.List.of() : shipTargets,
             () -> client,
             () -> clusterService
         );

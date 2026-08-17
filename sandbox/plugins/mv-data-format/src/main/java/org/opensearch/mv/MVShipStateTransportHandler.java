@@ -70,6 +70,10 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
 
     @Override
     protected void doExecute(Task task, MVShipStateAction.Request request, ActionListener<MVShipStateAction.Response> listener) {
+        // Any exit that does not enter applyLocally must release this
+        // handler's reference on the shared batch — applyLocally releases in
+        // its own finally once entered.
+        boolean handedOff = false;
         try {
             org.opensearch.cluster.routing.ShardRouting primary = clusterService.state()
                 .routingTable()
@@ -107,17 +111,25 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
                 return;
             }
             logger.info("mv ship-apply path=local target=[{}][{}]", request.targetIndex(), request.targetShard());
+            handedOff = true;
             applyLocally(request, listener);
         } catch (Exception e) {
             listener.onFailure(e);
+        } finally {
+            if (handedOff == false) {
+                request.stateBatch().release();
+            }
         }
     }
 
     private void applyLocally(MVShipStateAction.Request request, ActionListener<MVShipStateAction.Response> listener) {
-        // The handler OWNS the shipped Arrow root: close it whether the apply
-        // succeeds or fails (the buffers are the native writer's finalized
-        // state — the release callback frees the Rust allocation on close).
-        try (org.apache.arrow.vector.VectorSchemaRoot batch = request.stateBatch()) {
+        // The handler owns ONE REFERENCE on the shared batch (the same buffers
+        // may be in flight to other targets): release it on every exit path,
+        // never close the root directly — the last release across all
+        // consumers frees the native allocation.
+        MVRefCountedStateBatch shared = request.stateBatch();
+        try {
+            org.apache.arrow.vector.VectorSchemaRoot batch = shared.root();
             IndexShard shard = indicesService.indexServiceSafe(clusterService.state().metadata().index(request.targetIndex()).getIndex())
                 .getShard(request.targetShard());
             int rows = batch.getRowCount();
@@ -194,6 +206,8 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
             listener.onResponse(new MVShipStateAction.Response(rows));
         } catch (Exception e) {
             listener.onFailure(e);
+        } finally {
+            shared.release();
         }
     }
 }

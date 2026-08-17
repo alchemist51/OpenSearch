@@ -234,9 +234,68 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
         });
     }
 
+    /**
+     * One finalized state batch, TWO targets: the ref-counted handoff shares
+     * the same Arrow buffers across both ships — no destination frees the
+     * batch under the other (a refcount bug surfaces as a use-after-free,
+     * a double-free IllegalState, or an allocator leak — the test JVM runs
+     * with arrow.memory.debug.allocator). Both targets must independently
+     * fold to the exact goldens.
+     */
+    public void testOneBatchShipsToMultipleTargets() {
+        String target2 = "mv_payments_2";
+        createSourceIndexWithTargets(TARGET, target2);
+        createTargetIndex(TARGET);
+        createTargetIndex(target2);
+        assertColocated();
+
+        seedGoldenSegments();
+
+        for (String t : new String[] { TARGET, target2 }) {
+            SearchResponse folded = client().prepareSearch(t)
+                .setSize(0)
+                .addAggregation(
+                    org.opensearch.search.aggregations.AggregationBuilders.terms("by_service")
+                        .field("service")
+                        .subAggregation(
+                            org.opensearch.search.aggregations.AggregationBuilders.terms("by_status")
+                                .field("status")
+                                .subAggregation(org.opensearch.search.aggregations.AggregationBuilders.sum("cnt").field("cnt"))
+                                .subAggregation(org.opensearch.search.aggregations.AggregationBuilders.sum("lat_sum").field("lat_sum"))
+                                .subAggregation(org.opensearch.search.aggregations.AggregationBuilders.min("lat_min").field("lat_min"))
+                                .subAggregation(org.opensearch.search.aggregations.AggregationBuilders.max("lat_max").field("lat_max"))
+                        )
+                )
+                .get();
+            Terms services = folded.getAggregations().get("by_service");
+            assertGroup(services, "api", "200", 4, 115, 10, 50);
+            assertGroup(services, "api", "500", 1, 900, 900, 900);
+            assertGroup(services, "batch", "200", 1, 60, 60, 60);
+            assertGroup(services, "web", "200", 2, 120, 40, 80);
+        }
+    }
+
+    /** Golden dataset: 2 segments, 8 docs -> 6 state rows (3 per generation). */
+    private void seedGoldenSegments() {
+        indexDoc("api", "200", 30);
+        indexDoc("api", "200", 50);
+        indexDoc("web", "200", 40);
+        indexDoc("api", "500", 900);
+        indexDoc("api", "200", 25);
+        client().admin().indices().prepareRefresh(SOURCE).get();
+        indexDoc("api", "200", 10);
+        indexDoc("web", "200", 80);
+        indexDoc("batch", "200", 60);
+        client().admin().indices().prepareRefresh(SOURCE).get();
+    }
+
     // ── Infrastructure ──────────────────────────────────────────────────────
 
     private void createSourceIndex() {
+        createSourceIndexWithTargets(TARGET);
+    }
+
+    private void createSourceIndexWithTargets(String... targets) {
         client().admin()
             .indices()
             .prepareCreate(SOURCE)
@@ -249,7 +308,7 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
                     .put("index.composite.primary_data_format", "parquet")
                     .putList("index.composite.secondary_data_formats", "lucene", "materialized_view")
                     .put("index.composite.merge_on_refresh_max_size", "0b")
-                    .put(MVConstants.SHIP_TARGET_SETTING, TARGET)
+                    .putList(MVConstants.SHIP_TARGETS_SETTING, targets)
             )
             .setMapping("service", "type=keyword", "status", "type=keyword", "latency_ms", "type=long")
             .get();
@@ -257,9 +316,13 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
     }
 
     private void createTargetIndex() {
+        createTargetIndex(TARGET);
+    }
+
+    private void createTargetIndex(String name) {
         client().admin()
             .indices()
-            .prepareCreate(TARGET)
+            .prepareCreate(name)
             .setSettings(
                 Settings.builder()
                     .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
@@ -287,7 +350,7 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
                 "type=long"
             )
             .get();
-        ensureGreen(TARGET);
+        ensureGreen(name);
     }
 
     /**

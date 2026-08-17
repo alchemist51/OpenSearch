@@ -8,7 +8,6 @@
 
 package org.opensearch.mv;
 
-import org.apache.arrow.vector.VectorSchemaRoot;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.ActionType;
@@ -51,8 +50,12 @@ public final class MVShipStateAction extends ActionType<MVShipStateAction.Respon
      * wire serialization is deliberately unsupported and loudly fails if the
      * rule is ever broken.
      *
-     * <p>Ownership: the handler consumes and closes the root (its try/finally),
-     * whether the apply succeeds or fails.
+     * <p>Ownership: the request carries a REFERENCE on a shared
+     * {@link MVRefCountedStateBatch} (the same batch may be in flight to
+     * multiple targets); the handler releases exactly its own reference in
+     * its finally, success or failure — never closing the batch under other
+     * consumers. The last release, wherever it happens, frees the native
+     * memory.
      */
     public static class Request extends ActionRequest {
         private final String targetIndex;
@@ -60,7 +63,7 @@ public final class MVShipStateAction extends ActionType<MVShipStateAction.Respon
         private final String sourceIndex;
         private final int sourceShard;
         private final long writerGeneration;
-        private final VectorSchemaRoot stateBatch;
+        private final MVRefCountedStateBatch stateBatch;
 
         public Request(
             String targetIndex,
@@ -68,7 +71,7 @@ public final class MVShipStateAction extends ActionType<MVShipStateAction.Respon
             String sourceIndex,
             int sourceShard,
             long writerGeneration,
-            VectorSchemaRoot stateBatch
+            MVRefCountedStateBatch stateBatch
         ) {
             this.targetIndex = targetIndex;
             this.targetShard = targetShard;
@@ -112,7 +115,7 @@ public final class MVShipStateAction extends ActionType<MVShipStateAction.Respon
             return writerGeneration;
         }
 
-        public VectorSchemaRoot stateBatch() {
+        public MVRefCountedStateBatch stateBatch() {
             return stateBatch;
         }
 
