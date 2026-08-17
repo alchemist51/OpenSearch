@@ -25,6 +25,7 @@ import java.lang.invoke.MethodHandle;
  */
 public final class MVNativeBridge {
 
+    private static final MethodHandle MV_INIT_RUNTIME;
     private static final MethodHandle MV_BUILD_POC;
     private static final MethodHandle MV_SEARCH_POC;
     private static final MethodHandle MV_WRITER_CREATE;
@@ -37,6 +38,15 @@ public final class MVNativeBridge {
     static {
         Linker linker = Linker.nativeLinker();
         SymbolLookup lib = NativeLibraryLoader.symbolLookup();
+        // Real-node finding: each plugin classloader loads ITS OWN native
+        // instance (separate globals). The MV writers therefore need the
+        // runtime manager initialized in THIS instance — the DataFusion
+        // plugin's init lives in a different one. POC-grade; production
+        // consolidates on one shared native instance.
+        MV_INIT_RUNTIME = linker.downcallHandle(
+            lib.find("df_init_runtime_manager").orElseThrow(),
+            FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT, ValueLayout.JAVA_DOUBLE, ValueLayout.JAVA_DOUBLE)
+        );
         // i64 df_mv_build_poc(input_ptr, input_len, table_ptr, table_len, sql_ptr, sql_len, output_ptr, output_len)
         MV_BUILD_POC = linker.downcallHandle(
             lib.find("df_mv_build_poc").orElseThrow(() -> new IllegalStateException("df_mv_build_poc symbol missing")),
@@ -108,6 +118,15 @@ public final class MVNativeBridge {
     }
 
     private MVNativeBridge() {}
+
+    /** Initializes this native instance's tokio runtime manager (idempotent per instance). */
+    public static void initRuntime(int cpuThreads) {
+        try {
+            MV_INIT_RUNTIME.invokeExact(cpuThreads, 1.0d, 1.0d);
+        } catch (Throwable t) {
+            throw new RuntimeException("df_init_runtime_manager failed", t);
+        }
+    }
 
     /**
      * Blocking MV state-file build: reads {@code inputFile} (primary parquet),

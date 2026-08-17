@@ -65,6 +65,9 @@ public class MVDataFormatPlugin extends Plugin
     ) {
         this.client = client;
         this.clusterService = clusterService;
+        // See MVNativeBridge.initRuntime: on real nodes this plugin's native
+        // instance is separate from the DataFusion plugin's.
+        MVNativeBridge.initRuntime(Runtime.getRuntime().availableProcessors());
         return java.util.List.of();
     }
 
