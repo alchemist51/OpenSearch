@@ -17,10 +17,13 @@ java { sourceCompatibility = JavaVersion.toVersion(25); targetCompatibility = Ja
 dependencies {
   compileOnly project(':plugins:arrow-base')
 
-  // POC HACK: reach directly into the datafusion backend (NativeBridge/reader/session)
-  // and parquet format (RustBridge writer, path convention). Flagged in mv-incremental-lld.
-  compileOnly project(':sandbox:plugins:analytics-backend-datafusion')
-  compileOnly project(':sandbox:plugins:parquet-data-format')
+  // dataformat-native must BUNDLE into the plugin zip: NativeLibraryLoader/
+  // NativeCall are used from this plugin's own classloader. NOTE: compileOnly
+  // deps on OTHER PLUGIN projects poison the bundler — everything on their
+  // classpaths is treated as provided and silently excluded from this zip
+  // (that's how dataformat-native + arrow-c-data went missing and real nodes
+  // died with NoClassDefFoundError at first write). Keep plugin-project deps
+  // OUT of the main scope; ITs may depend on them in their own scope.
   implementation project(':sandbox:libs:dataformat-native')
 
   compileOnly 'org.checkerframework:checker-qual:3.43.0'
