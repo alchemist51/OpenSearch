@@ -65,9 +65,15 @@ public class MVDataFormatPlugin extends Plugin
     ) {
         this.client = client;
         this.clusterService = clusterService;
-        // See MVNativeBridge.initRuntime: on real nodes this plugin's native
-        // instance is separate from the DataFusion plugin's.
-        MVNativeBridge.initRuntime(Runtime.getRuntime().availableProcessors());
+        // NOTE (real-node deployment): all native-using plugins must share ONE
+        // native instance — deploy with -Dnative.lib.path pointing at a single
+        // .so (SymbolLookup.libraryLookup dlopens the same handle; globals
+        // shared; the DataFusion plugin's start() initializes the runtime
+        // manager for everyone). Without the property, each classloader
+        // extracts its OWN temp copy of the embedded lib = separate globals =
+        // "Runtime manager not initialized" from every plugin that didn't
+        // init its own. Do NOT init here: double-init corrupts the shared
+        // manager.
         return java.util.List.of();
     }
 
