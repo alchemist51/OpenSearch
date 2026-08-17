@@ -31,7 +31,15 @@ import java.util.Map;
  * Pass-through refresh (parquet-engine pattern); merges deliberately
  * unsupported in the POC.
  */
-public final class MVIndexingEngine implements IndexingExecutionEngine<MVDataFormat, MVDocumentInput> {
+public final class MVIndexingEngine
+    implements
+        IndexingExecutionEngine<org.opensearch.index.engine.dataformat.DerivedDataFormat, MVDocumentInput> {
+
+    /** Definition this engine's writers maintain (SOURCE raw defn or TARGET fold). */
+    private final MVDefinitionSpec spec;
+
+    /** The derived format this engine serves (materialized_view on sources, mv_state on targets). */
+    private final org.opensearch.index.engine.dataformat.DerivedDataFormat format;
 
     private final ShardPath shardPath;
     private final String tableName;
@@ -42,16 +50,20 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<MVDataFor
     private final java.util.function.Supplier<org.opensearch.cluster.service.ClusterService> clusterServiceSupplier;
 
     public MVIndexingEngine(ShardPath shardPath, String indexName) {
-        this(shardPath, indexName, java.util.List.of(), () -> null, () -> null);
+        this(shardPath, indexName, MVDefinitionSpec.SOURCE, MVDataFormat.INSTANCE, java.util.List.of(), () -> null, () -> null);
     }
 
     public MVIndexingEngine(
         ShardPath shardPath,
         String indexName,
+        MVDefinitionSpec spec,
+        org.opensearch.index.engine.dataformat.DerivedDataFormat format,
         java.util.List<String> shipTargets,
         java.util.function.Supplier<org.opensearch.transport.client.Client> clientSupplier,
         java.util.function.Supplier<org.opensearch.cluster.service.ClusterService> clusterServiceSupplier
     ) {
+        this.spec = spec;
+        this.format = format;
         this.shardPath = shardPath;
         this.sourceIndexName = indexName;
         this.tableName = indexName.replace('-', '_').replace('.', '_');
@@ -59,7 +71,7 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<MVDataFor
         this.clientSupplier = clientSupplier;
         this.clusterServiceSupplier = clusterServiceSupplier;
         try {
-            Files.createDirectories(shardPath.getDataPath().resolve(MVConstants.DIR));
+            Files.createDirectories(shardPath.getDataPath().resolve(getDataFormat().name()));
         } catch (IOException e) {
             throw new RuntimeException("failed to create mv dir", e);
         }
@@ -75,7 +87,7 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<MVDataFor
             }
             shipper = new MVStateShipper(client, shipTargets, sourceIndexName, shardPath.getShardId(), clusterServiceSupplier.get());
         }
-        return new MVWriter(config.writerGeneration(), shardPath, tableName, shipper);
+        return new MVWriter(config.writerGeneration(), shardPath, tableName, spec, getDataFormat(), shipper);
     }
 
     @Override
@@ -102,8 +114,8 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<MVDataFor
     }
 
     @Override
-    public MVDataFormat getDataFormat() {
-        return MVDataFormat.INSTANCE;
+    public org.opensearch.index.engine.dataformat.DerivedDataFormat getDataFormat() {
+        return format;
     }
 
     @Override
@@ -140,7 +152,7 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<MVDataFor
 
     @Override
     public MVDocumentInput newDocumentInput() {
-        return new MVDocumentInput();
+        return new MVDocumentInput(spec);
     }
 
     @Override

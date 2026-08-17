@@ -8,17 +8,16 @@
 
 package org.opensearch.mv;
 
-import org.opensearch.index.engine.dataformat.DataFormat;
-import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
-
-import java.util.Set;
+import org.opensearch.index.engine.dataformat.DerivedDataFormat;
 
 /**
- * POC materialized-view data format. A <b>derived</b> secondary format: it never
- * ingests documents (claims no field capabilities); its per-segment files are
- * aggregate state computed from the parquet primary's flushed file.
+ * POC materialized-view data format on a SOURCE index: a {@link
+ * DerivedDataFormat} whose per-segment output is aggregate state computed
+ * from the ingest broadcast (embedded mode) or shipped to a separate MV
+ * index before commit (ship mode). The derived-format contract (row-parity
+ * exempt, may emit no files, never claims fields) comes from the base type.
  */
-public final class MVDataFormat extends DataFormat {
+public final class MVDataFormat extends DerivedDataFormat {
 
     public static final String NAME = "materialized_view";
     public static final MVDataFormat INSTANCE = new MVDataFormat();
@@ -28,31 +27,5 @@ public final class MVDataFormat extends DataFormat {
     @Override
     public String name() {
         return NAME;
-    }
-
-    @Override
-    public long priority() {
-        // Never wins a capability claim; always a secondary.
-        return Long.MAX_VALUE;
-    }
-
-    @Override
-    public Set<FieldTypeCapabilities> supportedFields() {
-        // Claims nothing: MV reads its input from the primary's flushed file,
-        // not from DocumentInput.
-        return Set.of();
-    }
-
-    @Override
-    public boolean exemptFromRowParity() {
-        // Aggregated rows: one row per group, not one per document.
-        return true;
-    }
-
-    @Override
-    public boolean mayEmitNoFiles() {
-        // Separate-index mode ships state elsewhere (nothing to register here);
-        // embedded mode may skip a generation for later backfill.
-        return true;
     }
 }

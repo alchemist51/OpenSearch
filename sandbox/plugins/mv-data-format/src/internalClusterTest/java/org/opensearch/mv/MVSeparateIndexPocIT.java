@@ -14,7 +14,6 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.opensearch.action.index.IndexResponse;
-import org.opensearch.action.search.SearchResponse;
 import org.opensearch.arrow.allocator.ArrowBasePlugin;
 import org.opensearch.be.datafusion.DataFusionPlugin;
 import org.opensearch.be.lucene.LucenePlugin;
@@ -27,11 +26,6 @@ import org.opensearch.composite.CompositeDataFormatPlugin;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.parquet.ParquetDataFormatPlugin;
 import org.opensearch.plugins.Plugin;
-import org.opensearch.search.aggregations.AggregationBuilders;
-import org.opensearch.search.aggregations.bucket.terms.Terms;
-import org.opensearch.search.aggregations.metrics.Max;
-import org.opensearch.search.aggregations.metrics.Min;
-import org.opensearch.search.aggregations.metrics.Sum;
 import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.opensearch.transport.Netty4ModulePlugin;
@@ -86,6 +80,7 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
             ParquetDataFormatPlugin.class,
             CompositeDataFormatPlugin.class,
             MVDataFormatPlugin.class,
+            MVStateDataFormatPlugin.class,
             LucenePlugin.class,
             DataFusionPlugin.class,
             Netty4ModulePlugin.class
@@ -164,27 +159,29 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
         // (Asserted via log scan below; the routing decision is logged at INFO.)
 
         // THE SUPERSET GUARANTEE (design contract): the ack certifies durable
-        // AND searchable, and the source committed after the ack — so the
-        // target must already serve all shipped state with NO explicit target
-        // refresh here. This read is the contract's assertion.
-        SearchResponse folded = foldOnRead();
+        // AND searchable (the target's snapshot published BEFORE the ack), and
+        // the source committed after the ack — the target must already hold
+        // the complete folded state with NO explicit target refresh here.
+        // (The composite target has no classic _search path; the final fold
+        // over its mv_state files IS the read.)
+        assertGoldenFoldOverTargetState(TARGET);
 
-        Terms services = folded.getAggregations().get("by_service");
-        // Golden answers: api/200 cnt=4 sum=115 min=10 max=50; api/500 1/900/900/900;
-        // batch/200 1/60/60/60; web/200 2/120/40/80
-        assertGroup(services, "api", "200", 4, 115, 10, 50);
-        assertGroup(services, "api", "500", 1, 900, 900, 900);
-        assertGroup(services, "batch", "200", 1, 60, 60, 60);
-        assertGroup(services, "web", "200", 2, 120, 40, 80);
-
-        // 6 raw state docs (3 per generation) — folding happened on read, not on write.
-        long stateDocs = client().prepareSearch(TARGET).setSize(0).get().getHits().getTotalHits().value();
-        assertEquals("state docs = sum of per-generation group counts", 6, stateDocs);
+        // The target's OWN derived format: every target generation carries an
+        // mv_state file set with FOLDED state (the fold definition ran over
+        // the shipped rows at the target's refresh).
+        assertTargetHasFoldedStateFiles();
     }
 
     public void testShipFailureFailsTheFlushAndRetryHeals() throws Exception {
         createSourceIndex();
-        createTargetIndex();
+        // Plain (non-composite) target for THIS test: the invariant under test
+        // is entirely source-side (ship failure => flush refusal => heal via
+        // idempotent re-ship) and does not depend on the target's engine.
+        // Close/reopen of a COMPOSITE index currently livelocks on the shard
+        // lock (slow native close vs reopen — known composite-engine gap,
+        // tracked in the KB); staging the outage via close needs the plain
+        // engine until that is fixed.
+        createPlainTargetIndex(TARGET);
         assertColocated();
 
         indexDoc("api", "200", 30);
@@ -218,8 +215,21 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
         // the allocation retries); the retried flush re-ships (deterministic
         // doc ids make re-shipping idempotent).
         assertAcked(client().admin().indices().prepareOpen(TARGET));
-        client().admin().cluster().prepareReroute().setRetryFailed(true).get();
-        ensureGreen(TARGET, SOURCE);
+        // The composite engine's close releases native resources slowly; the
+        // reopened shard can race the old shard lock and burn allocation
+        // retries (also: the source's own recovery keeps failing until the
+        // target is up — ship-before-commit through recovery). Keep retrying
+        // failed allocations until both indices settle.
+        assertBusy(() -> {
+            client().admin().cluster().prepareReroute().setRetryFailed(true).get();
+            org.opensearch.action.admin.cluster.health.ClusterHealthResponse health = client().admin()
+                .cluster()
+                .prepareHealth(TARGET, SOURCE)
+                .setWaitForGreenStatus()
+                .setTimeout(org.opensearch.common.unit.TimeValue.timeValueSeconds(5))
+                .get();
+            assertFalse("cluster must settle green after target reopen", health.isTimedOut());
+        }, 90, java.util.concurrent.TimeUnit.SECONDS);
         assertBusy(() -> {
             try {
                 client().admin().indices().prepareRefresh(SOURCE).get();
@@ -242,7 +252,7 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
      * with arrow.memory.debug.allocator). Both targets must independently
      * fold to the exact goldens.
      */
-    public void testOneBatchShipsToMultipleTargets() {
+    public void testOneBatchShipsToMultipleTargets() throws Exception {
         String target2 = "mv_payments_2";
         createSourceIndexWithTargets(TARGET, target2);
         createTargetIndex(TARGET);
@@ -251,27 +261,72 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
 
         seedGoldenSegments();
 
-        for (String t : new String[] { TARGET, target2 }) {
-            SearchResponse folded = client().prepareSearch(t)
-                .setSize(0)
-                .addAggregation(
-                    org.opensearch.search.aggregations.AggregationBuilders.terms("by_service")
-                        .field("service")
-                        .subAggregation(
-                            org.opensearch.search.aggregations.AggregationBuilders.terms("by_status")
-                                .field("status")
-                                .subAggregation(org.opensearch.search.aggregations.AggregationBuilders.sum("cnt").field("cnt"))
-                                .subAggregation(org.opensearch.search.aggregations.AggregationBuilders.sum("lat_sum").field("lat_sum"))
-                                .subAggregation(org.opensearch.search.aggregations.AggregationBuilders.min("lat_min").field("lat_min"))
-                                .subAggregation(org.opensearch.search.aggregations.AggregationBuilders.max("lat_max").field("lat_max"))
-                        )
-                )
-                .get();
-            Terms services = folded.getAggregations().get("by_service");
-            assertGroup(services, "api", "200", 4, 115, 10, 50);
-            assertGroup(services, "api", "500", 1, 900, 900, 900);
-            assertGroup(services, "batch", "200", 1, 60, 60, 60);
-            assertGroup(services, "web", "200", 2, 120, 40, 80);
+        assertGoldenFoldOverTargetState(TARGET);
+        assertGoldenFoldOverTargetState(target2);
+    }
+
+    /**
+     * Final fold over the target's OWN mv_state files == the goldens. This is
+     * the composite target's read (production: the analytics engine path).
+     */
+    private void assertGoldenFoldOverTargetState(String targetIndex) throws Exception {
+        java.util.List<String> files = targetStateFiles(targetIndex);
+        assertFalse("target [" + targetIndex + "] must have mv_state files", files.isEmpty());
+        String result = MVNativeBridge.searchV2(files, MVConstants.TARGET_FOLD_SEARCH_SQL);
+        assertEquals(
+            "api\t200\t4\t115\t10\t50\n" + "api\t500\t1\t900\t900\t900\n" + "batch\t200\t1\t60\t60\t60\n" + "web\t200\t2\t120\t40\t80\n",
+            result
+        );
+    }
+
+    private java.util.List<String> targetStateFiles(String targetIndex) throws Exception {
+        java.util.List<String> files = new java.util.ArrayList<>();
+        try (
+            org.opensearch.common.concurrent.GatedCloseable<org.opensearch.index.engine.exec.coord.CatalogSnapshot> ref = targetEngine(
+                targetIndex
+            ).acquireSnapshot()
+        ) {
+            for (org.opensearch.index.engine.exec.WriterFileSet set : ref.get().getSearchableFiles(MVStateDataFormat.NAME)) {
+                for (String f : set.files()) {
+                    files.add(java.nio.file.Path.of(set.directory()).resolve(f).toString());
+                }
+            }
+        }
+        return files;
+    }
+
+    private org.opensearch.index.engine.DataFormatAwareEngine targetEngine(String targetIndex) {
+        String nodeName = getClusterState().nodes()
+            .get(getClusterState().routingTable().index(targetIndex).shard(0).primaryShard().currentNodeId())
+            .getName();
+        org.opensearch.indices.IndicesService indicesService = internalCluster().getInstance(
+            org.opensearch.indices.IndicesService.class,
+            nodeName
+        );
+        org.opensearch.index.shard.IndexShard shard = indicesService.indexServiceSafe(
+            getClusterState().metadata().index(targetIndex).getIndex()
+        ).getShard(0);
+        return (org.opensearch.index.engine.DataFormatAwareEngine) org.opensearch.index.shard.IndexShardTestCase.getIndexer(shard);
+    }
+
+    /**
+     * Asserts the target's catalog snapshot carries mv_state file sets — the
+     * target's derived format materialized folded state per generation.
+     */
+    private void assertTargetHasFoldedStateFiles() throws Exception {
+        try (
+            org.opensearch.common.concurrent.GatedCloseable<org.opensearch.index.engine.exec.coord.CatalogSnapshot> ref = targetEngine(
+                TARGET
+            ).acquireSnapshot()
+        ) {
+            java.util.Collection<org.opensearch.index.engine.exec.WriterFileSet> stateSets = ref.get()
+                .getSearchableFiles(MVStateDataFormat.NAME);
+            assertFalse("target must carry mv_state file sets (folded state per generation)", stateSets.isEmpty());
+            long foldedRows = stateSets.stream().mapToLong(org.opensearch.index.engine.exec.WriterFileSet::numRows).sum();
+            // Each target generation folds ITS shipped rows: gen1 folds 3 source-
+            // gen-1 rows -> 3 groups; gen2 folds 3 source-gen-2 rows -> 3 groups.
+            // (Cross-generation folding happens at target MERGE — disabled here.)
+            assertEquals("folded state rows across target generations", 6, foldedRows);
         }
     }
 
@@ -319,7 +374,7 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
         createTargetIndex(TARGET);
     }
 
-    private void createTargetIndex(String name) {
+    private void createPlainTargetIndex(String name) {
         client().admin()
             .indices()
             .prepareCreate(name)
@@ -327,6 +382,50 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
                 Settings.builder()
                     .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
                     .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                    .put(MVConstants.COLOCATE_WITH_SETTING, SOURCE)
+            )
+            .setMapping(
+                "service",
+                "type=keyword",
+                "status",
+                "type=keyword",
+                "cnt",
+                "type=long",
+                "lat_sum",
+                "type=long",
+                "lat_min",
+                "type=long",
+                "lat_max",
+                "type=long",
+                "_mv_source_index",
+                "type=keyword",
+                "_mv_source_shard",
+                "type=long",
+                "_mv_source_generation",
+                "type=long"
+            )
+            .get();
+        ensureGreen(name);
+    }
+
+    private void createTargetIndex(String name) {
+        // The TARGET is itself a DataFormatAwareEngine composite index: parquet
+        // primary + lucene (search + capabilities) + the mv_state DERIVED
+        // format, whose definition is the FOLD of the shipped state schema —
+        // per target generation the mv_state writer materializes folded,
+        // group-key-sorted state (the embedded-MV shape on the MV index).
+        client().admin()
+            .indices()
+            .prepareCreate(name)
+            .setSettings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                    .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                    .put("index.pluggable.dataformat.enabled", true)
+                    .put("index.pluggable.dataformat", "composite")
+                    .put("index.composite.primary_data_format", "parquet")
+                    .putList("index.composite.secondary_data_formats", "lucene", "mv_state")
+                    .put("index.composite.merge_on_refresh_max_size", "0b")
                     .put(MVConstants.COLOCATE_WITH_SETTING, SOURCE)
             )
             .setMapping(
@@ -362,37 +461,6 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
         String sourceNode = getClusterState().routingTable().index(SOURCE).shard(0).primaryShard().currentNodeId();
         String targetNode = getClusterState().routingTable().index(TARGET).shard(0).primaryShard().currentNodeId();
         assertEquals("MV target primary must colocate with the source primary", sourceNode, targetNode);
-    }
-
-    /** Fold-on-read: terms(service,status) with SUM(cnt), SUM(lat_sum), MIN(lat_min), MAX(lat_max). */
-    private SearchResponse foldOnRead() {
-        return client().prepareSearch(TARGET)
-            .setSize(0)
-            .addAggregation(
-                AggregationBuilders.terms("by_service")
-                    .field("service")
-                    .subAggregation(
-                        AggregationBuilders.terms("by_status")
-                            .field("status")
-                            .subAggregation(AggregationBuilders.sum("cnt").field("cnt"))
-                            .subAggregation(AggregationBuilders.sum("lat_sum").field("lat_sum"))
-                            .subAggregation(AggregationBuilders.min("lat_min").field("lat_min"))
-                            .subAggregation(AggregationBuilders.max("lat_max").field("lat_max"))
-                    )
-            )
-            .get();
-    }
-
-    private static void assertGroup(Terms services, String service, String status, long cnt, long sum, long min, long max) {
-        Terms.Bucket serviceBucket = services.getBucketByKey(service);
-        assertNotNull("service bucket " + service, serviceBucket);
-        Terms statuses = serviceBucket.getAggregations().get("by_status");
-        Terms.Bucket statusBucket = statuses.getBucketByKey(status);
-        assertNotNull("status bucket " + service + "/" + status, statusBucket);
-        assertEquals("cnt " + service + "/" + status, cnt, (long) ((Sum) statusBucket.getAggregations().get("cnt")).getValue());
-        assertEquals("sum " + service + "/" + status, sum, (long) ((Sum) statusBucket.getAggregations().get("lat_sum")).getValue());
-        assertEquals("min " + service + "/" + status, min, (long) ((Min) statusBucket.getAggregations().get("lat_min")).getValue());
-        assertEquals("max " + service + "/" + status, max, (long) ((Max) statusBucket.getAggregations().get("lat_max")).getValue());
     }
 
     private void indexDoc(String service, String status, long latencyMs) {

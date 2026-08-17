@@ -109,6 +109,8 @@ public class MVDataFormatPlugin extends Plugin
         return new MVIndexingEngine(
             config.store().shardPath(),
             config.indexSettings().getIndex().getName(),
+            MVDefinitionSpec.SOURCE,
+            MVDataFormat.INSTANCE,
             shipTargets == null ? java.util.List.of() : shipTargets,
             () -> client,
             () -> clusterService

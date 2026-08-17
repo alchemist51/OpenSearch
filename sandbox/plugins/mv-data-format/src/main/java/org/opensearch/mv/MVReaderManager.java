@@ -28,13 +28,24 @@ public final class MVReaderManager implements EngineReaderManager<MVReaderManage
 
     private static final Logger logger = LogManager.getLogger(MVReaderManager.class);
 
+    /** Format name whose file sets this manager exposes (materialized_view or mv_state). */
+    private final String formatName;
+
+    public MVReaderManager() {
+        this(MVDataFormat.NAME);
+    }
+
+    public MVReaderManager(String formatName) {
+        this.formatName = formatName;
+    }
+
     /** Snapshot-scoped view of MV state files. */
     public record MVReader(List<WriterFileSet> stateFiles) {
     }
 
     @Override
     public MVReader getReader(CatalogSnapshot catalogSnapshot) {
-        return new MVReader(List.copyOf(catalogSnapshot.getSearchableFiles(MVDataFormat.NAME)));
+        return new MVReader(List.copyOf(catalogSnapshot.getSearchableFiles(formatName)));
     }
 
     @Override
@@ -43,7 +54,7 @@ public final class MVReaderManager implements EngineReaderManager<MVReaderManage
     @Override
     public void afterRefresh(boolean didRefresh, CatalogSnapshot catalogSnapshot) {
         if (didRefresh && catalogSnapshot != null) {
-            logger.debug("mv afterRefresh: {} state file sets", catalogSnapshot.getSearchableFiles(MVDataFormat.NAME).size());
+            logger.debug("mv afterRefresh [{}]: {} state file sets", formatName, catalogSnapshot.getSearchableFiles(formatName).size());
         }
     }
 

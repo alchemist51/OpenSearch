@@ -48,17 +48,28 @@ public final class MVWriter implements Writer<MVDocumentInput> {
     private volatile long mappingVersion = 1L;
     private volatile WriterState state = WriterState.ACTIVE;
 
+    /** The format this writer registers its files under (source vs target-fold). */
+    private final org.opensearch.index.engine.dataformat.DataFormat dataFormat;
+
     public MVWriter(long writerGeneration, ShardPath shardPath, String tableName) {
-        this(writerGeneration, shardPath, tableName, null);
+        this(writerGeneration, shardPath, tableName, MVDefinitionSpec.SOURCE, MVDataFormat.INSTANCE, null);
     }
 
-    public MVWriter(long writerGeneration, ShardPath shardPath, String tableName, MVStateShipper shipper) {
+    public MVWriter(
+        long writerGeneration,
+        ShardPath shardPath,
+        String tableName,
+        MVDefinitionSpec spec,
+        org.opensearch.index.engine.dataformat.DataFormat dataFormat,
+        MVStateShipper shipper
+    ) {
         this.writerGeneration = writerGeneration;
         this.shardPath = shardPath;
         this.tableName = tableName;
+        this.dataFormat = dataFormat;
         this.shipper = shipper;
-        this.buffer = new MVForwardBuffer();
-        this.nativeWriter = MVNativeBridge.writerCreate(MVConstants.MV_SQL, MVConstants.GROUP_KEYS.size());
+        this.buffer = new MVForwardBuffer(spec);
+        this.nativeWriter = MVNativeBridge.writerCreate(spec.sql(), spec.groupKeys());
     }
 
     @Override
@@ -97,7 +108,7 @@ public final class MVWriter implements Writer<MVDocumentInput> {
         buffer.rotateInto(nativeWriter);
         foldedRows = acceptedRows;
 
-        Path mvDir = shardPath.getDataPath().resolve(MVConstants.DIR);
+        Path mvDir = shardPath.getDataPath().resolve(dataFormat.name());
         Files.createDirectories(mvDir);
 
         if (shipper != null) {
@@ -138,7 +149,7 @@ public final class MVWriter implements Writer<MVDocumentInput> {
             mvFile.getFileName().toString(),
             Math.max(stateRows, 1)
         );
-        return FileInfos.builder().putWriterFileSet(MVDataFormat.INSTANCE, fileSet).build();
+        return FileInfos.builder().putWriterFileSet(dataFormat, fileSet).build();
     }
 
     @Override

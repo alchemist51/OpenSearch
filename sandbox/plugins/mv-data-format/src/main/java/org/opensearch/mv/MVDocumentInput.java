@@ -11,24 +11,29 @@ package org.opensearch.mv;
 import org.opensearch.index.engine.dataformat.DocumentInput;
 import org.opensearch.index.mapper.MappedFieldType;
 
-/**
- * Capturing document input (VSR model, v2): keeps the MV's referenced
- * columns — group keys (service, status) and the metric (latency_ms) —
- * from the composite broadcast.
- */
-public final class MVDocumentInput implements DocumentInput<MVDocumentInput.Row> {
+import java.util.List;
 
-    /** Captured values for one document. */
-    public record Row(String service, String status, Long latencyMs) {
+/**
+ * Capturing document input (VSR model): keeps the definition's referenced
+ * columns from the composite broadcast, in the spec's buffer order (group
+ * keys first). Spec-driven so the same class serves the SOURCE definition
+ * (raw fields) and the TARGET fold definition (state fields).
+ */
+public final class MVDocumentInput implements DocumentInput<Object[]> {
+
+    private final List<MVDefinitionSpec.Column> columns;
+    private final Object[] values;
+
+    public MVDocumentInput(MVDefinitionSpec spec) {
+        this.columns = spec.columns();
+        this.values = new Object[columns.size()];
     }
 
-    private String service;
-    private String status;
-    private Long latencyMs;
-
     @Override
-    public Row getFinalInput() {
-        return new Row(service, status, latencyMs);
+    public Object[] getFinalInput() {
+        Object[] row = values.clone();
+        java.util.Arrays.fill(values, null);
+        return row;
     }
 
     @Override
@@ -36,13 +41,15 @@ public final class MVDocumentInput implements DocumentInput<MVDocumentInput.Row>
         if (value == null) {
             return;
         }
-        switch (fieldType.name()) {
-            case "service" -> this.service = value.toString();
-            case "status" -> this.status = value.toString();
-            case "latency_ms" -> this.latencyMs = ((Number) value).longValue();
-            default -> {
-                /* not referenced by the MV */ }
+        for (int i = 0; i < columns.size(); i++) {
+            MVDefinitionSpec.Column col = columns.get(i);
+            if (col.name().equals(fieldType.name())) {
+                values[i] = col.type() == MVDefinitionSpec.ColumnType.UTF8 ? value.toString() : ((Number) value).longValue();
+                return;
+            }
         }
+        // Field not referenced by the definition (e.g. provenance fields on
+        // the target) — ignored.
     }
 
     @Override

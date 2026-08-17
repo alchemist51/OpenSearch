@@ -82,6 +82,17 @@ public final class MVConstants {
      */
     public static final String COLOCATE_WITH_SETTING = "index.mv.colocate_with";
 
+    /**
+     * Final fold over the TARGET's mv_state files (state column names from the
+     * TARGET_FOLD definition, DataFusion format_state_name output).
+     */
+    public static final String TARGET_FOLD_SEARCH_SQL = "SELECT service, status, "
+        + "SUM(\"sum(mv_input.cnt)[sum]\") AS cnt, "
+        + "SUM(\"sum(mv_input.lat_sum)[sum]\") AS lat_sum, "
+        + "MIN(\"min(mv_input.lat_min)[value]\") AS lat_min, "
+        + "MAX(\"max(mv_input.lat_max)[value]\") AS lat_max "
+        + "FROM __MV_STATES__ GROUP BY service, status ORDER BY service, status";
+
     /** MV state file name for a writer generation. */
     public static String mvFileName(long writerGeneration) {
         return "_mv_poc_" + Long.toHexString(writerGeneration) + ".mv.parquet";
