@@ -677,15 +677,26 @@ public class CatalogSnapshotManager implements Closeable {
      * where rows are silently dropped or duplicated during merge.
      */
     private boolean assertRowCountConservation(Set<Segment> sourceSegments, Segment mergedSegment) {
+        // Derived formats (row-parity exempt) are excluded on BOTH sides:
+        // their merge is a recompute/fold, so the merged state legitimately
+        // has FEWER rows than the inputs (e.g. mv_state folding shipped
+        // state across generations). Conservation is asserted only for
+        // formats that carry the documents themselves.
         long sourceRows = 0;
         for (Segment seg : sourceSegments) {
-            for (WriterFileSet wfs : seg.dfGroupedSearchableFiles().values()) {
-                sourceRows += wfs.numRows();
+            for (Map.Entry<String, WriterFileSet> entry : seg.dfGroupedSearchableFiles().entrySet()) {
+                if (ROW_PARITY_EXEMPT_FORMATS.contains(entry.getKey())) {
+                    continue;
+                }
+                sourceRows += entry.getValue().numRows();
             }
         }
         long mergedRows = 0;
-        for (WriterFileSet wfs : mergedSegment.dfGroupedSearchableFiles().values()) {
-            mergedRows += wfs.numRows();
+        for (Map.Entry<String, WriterFileSet> entry : mergedSegment.dfGroupedSearchableFiles().entrySet()) {
+            if (ROW_PARITY_EXEMPT_FORMATS.contains(entry.getKey())) {
+                continue;
+            }
+            mergedRows += entry.getValue().numRows();
         }
         if (sourceRows != mergedRows) {
             logger.error("Row count mismatch: source segments have {} rows but merged segment has {} rows", sourceRows, mergedRows);
