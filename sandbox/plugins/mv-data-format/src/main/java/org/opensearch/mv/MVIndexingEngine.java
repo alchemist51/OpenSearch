@@ -85,7 +85,7 @@ public final class MVIndexingEngine
             if (client == null) {
                 throw new IllegalStateException("mv ship targets " + shipTargets + " configured but node client not initialized");
             }
-            shipper = new MVStateShipper(client, shipTargets, sourceIndexName, shardPath.getShardId(), clusterServiceSupplier.get());
+            shipper = new MVStateShipper(client, shipTargets, sourceIndexName, shardPath.getShardId(), clusterServiceSupplier.get(), spec);
         }
         return new MVWriter(config.writerGeneration(), shardPath, tableName, spec, getDataFormat(), shipper);
     }

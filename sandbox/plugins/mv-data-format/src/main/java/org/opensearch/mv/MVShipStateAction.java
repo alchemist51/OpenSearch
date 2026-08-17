@@ -63,6 +63,7 @@ public final class MVShipStateAction extends ActionType<MVShipStateAction.Respon
         private final String sourceIndex;
         private final int sourceShard;
         private final long writerGeneration;
+        private final java.util.List<String> shipFields;
         private final MVRefCountedStateBatch stateBatch;
 
         public Request(
@@ -71,8 +72,10 @@ public final class MVShipStateAction extends ActionType<MVShipStateAction.Respon
             String sourceIndex,
             int sourceShard,
             long writerGeneration,
+            java.util.List<String> shipFields,
             MVRefCountedStateBatch stateBatch
         ) {
+            this.shipFields = shipFields;
             this.targetIndex = targetIndex;
             this.targetShard = targetShard;
             this.sourceIndex = sourceIndex;
@@ -113,6 +116,10 @@ public final class MVShipStateAction extends ActionType<MVShipStateAction.Respon
 
         public long writerGeneration() {
             return writerGeneration;
+        }
+
+        public java.util.List<String> shipFields() {
+            return shipFields;
         }
 
         public MVRefCountedStateBatch stateBatch() {

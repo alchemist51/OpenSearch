@@ -134,10 +134,11 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
                 .getShard(request.targetShard());
             int rows = batch.getRowCount();
             java.util.List<org.apache.arrow.vector.FieldVector> vectors = batch.getFieldVectors();
-            if (vectors.size() != MVConstants.SHIP_FIELDS.size()) {
+            java.util.List<String> shipFields = request.shipFields();
+            if (vectors.size() != shipFields.size()) {
                 listener.onFailure(
                     new IllegalStateException(
-                        "mv ship apply: state batch has " + vectors.size() + " columns, expected " + MVConstants.SHIP_FIELDS.size()
+                        "mv ship apply: state batch has " + vectors.size() + " columns, expected " + shipFields.size()
                     )
                 );
                 return;
@@ -154,7 +155,7 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
                     } else if (value instanceof Number n) {
                         value = n.longValue();
                     }
-                    doc.put(MVConstants.SHIP_FIELDS.get(col), value);
+                    doc.put(shipFields.get(col), value);
                 }
                 doc.put("_mv_source_index", request.sourceIndex());
                 doc.put("_mv_source_shard", request.sourceShard());

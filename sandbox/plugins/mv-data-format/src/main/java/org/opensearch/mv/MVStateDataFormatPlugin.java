@@ -43,10 +43,11 @@ public class MVStateDataFormatPlugin extends Plugin implements DataFormatPlugin,
 
     @Override
     public IndexingExecutionEngine<?, ?> indexingEngine(IndexingEngineConfig config) {
+        String definition = config.indexSettings().getSettings().get(MVConstants.DEFINITION_SETTING, "payments");
         return new MVIndexingEngine(
             config.store().shardPath(),
             config.indexSettings().getIndex().getName(),
-            MVDefinitionSpec.TARGET_FOLD,
+            MVDefinitionSpec.fold(definition),
             MVStateDataFormat.INSTANCE,
             java.util.List.of(),
             () -> null,

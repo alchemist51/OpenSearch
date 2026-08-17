@@ -75,6 +75,9 @@ public final class MVConstants {
      */
     public static final String SHIP_TARGETS_SETTING = "index.mv.ship_targets";
 
+    /** Index setting naming the MV definition (POC named-spec registry). */
+    public static final String DEFINITION_SETTING = "index.mv.definition";
+
     /**
      * Target index setting naming the SOURCE index whose primaries this
      * index's primaries must colocate with (ordinal 1:1 pairing). Consumed by

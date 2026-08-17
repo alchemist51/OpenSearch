@@ -49,14 +49,17 @@ final class MVStateShipper {
     private final String sourceIndex;
     private final ShardId shardId;
     private final org.opensearch.cluster.service.ClusterService clusterService;
+    private final MVDefinitionSpec spec;
 
     MVStateShipper(
         Client client,
         java.util.List<String> targetIndices,
         String sourceIndex,
         ShardId shardId,
-        org.opensearch.cluster.service.ClusterService clusterService
+        org.opensearch.cluster.service.ClusterService clusterService,
+        MVDefinitionSpec spec
     ) {
+        this.spec = spec;
         this.client = client;
         this.targetIndices = java.util.List.copyOf(targetIndices);
         this.sourceIndex = sourceIndex;
@@ -113,6 +116,7 @@ final class MVStateShipper {
                 sourceIndex,
                 shardId.id(),
                 writerGeneration,
+                spec.shipFields(),
                 shared
             );
             MVShipStateAction.Response response = null;
