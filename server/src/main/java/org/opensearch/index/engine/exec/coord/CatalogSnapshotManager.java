@@ -697,7 +697,7 @@ public class CatalogSnapshotManager implements Closeable {
     // POC(mv): formats exempt from row parity — derived formats whose rows are aggregates
     // of the primary's rows. TODO(mv): replace with DataFormat.exemptFromRowParity() once
     // the registry is reachable from here (needs plumbing through the engine constructor).
-    private static final java.util.Set<String> ROW_PARITY_EXEMPT_FORMATS = java.util.Set.of("materialized_view");
+    private static final java.util.Set<String> ROW_PARITY_EXEMPT_FORMATS = java.util.Set.of("materialized_view", "mv_state");
 
     private void verifyPerSegmentCrossFormatRowCountParity(List<Segment> segments) {
         for (Segment seg : segments) {
