@@ -93,8 +93,8 @@ public final class MVConstants {
         + "MAX(\"max(mv_input.lat_max)[value]\") AS lat_max "
         + "FROM __MV_STATES__ GROUP BY service, status ORDER BY service, status";
 
-    /** MV state file name for a writer generation. */
+    /** MV state file name for a writer generation (Arrow IPC — decision 17). */
     public static String mvFileName(long writerGeneration) {
-        return "_mv_poc_" + Long.toHexString(writerGeneration) + ".mv.parquet";
+        return "_mv_poc_" + Long.toHexString(writerGeneration) + ".mv.arrow";
     }
 }
