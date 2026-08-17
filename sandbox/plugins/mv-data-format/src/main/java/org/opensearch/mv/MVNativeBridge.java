@@ -27,6 +27,7 @@ public final class MVNativeBridge {
 
     private static final MethodHandle MV_INIT_RUNTIME;
     private static final MethodHandle MV_BUILD_POC;
+    private static final MethodHandle MV_BUILD_ARROW;
     private static final MethodHandle MV_SEARCH_POC;
     private static final MethodHandle MV_WRITER_CREATE;
     private static final MethodHandle MV_WRITER_FEED;
@@ -64,6 +65,20 @@ public final class MVNativeBridge {
         );
         // i64 df_mv_search_poc(files_ptr, files_lens, files_count, group_ptr, group_len,
         // state_ptr, state_len, out_ptr, out_cap, out_len)
+        MV_BUILD_ARROW = linker.downcallHandle(
+            lib.find("df_mv_build_arrow").orElseThrow(() -> new IllegalStateException("df_mv_build_arrow not found")),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG
+            )
+        );
         MV_SEARCH_POC = linker.downcallHandle(
             lib.find("df_mv_search_poc").orElseThrow(() -> new IllegalStateException("df_mv_search_poc symbol missing")),
             FunctionDescriptor.of(
@@ -149,6 +164,30 @@ public final class MVNativeBridge {
                 query.len(),
                 out.segment(),
                 out.len()
+            );
+        }
+    }
+
+    /**
+     * Refresh-time ship build: Partial over one parquet file, sorted state
+     * batch exported via Arrow C-Data into the given FFI struct addresses.
+     * Returns the state row count.
+     */
+    public static long buildArrow(String inputFile, String tableName, String sql, long arrayAddr, long schemaAddr) {
+        try (var call = new NativeCall()) {
+            var in = call.str(inputFile);
+            var table = call.str(tableName);
+            var query = call.str(sql);
+            return call.invoke(
+                MV_BUILD_ARROW,
+                in.segment(),
+                in.len(),
+                table.segment(),
+                table.len(),
+                query.segment(),
+                query.len(),
+                arrayAddr,
+                schemaAddr
             );
         }
     }

@@ -118,7 +118,7 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         }
         return queries;
     }
-
+    // indexed_filter(0) --> ffm --> map [0 --> query0]
     @Override
     public int createProvider(int annotationId) {
         Query query = queriesByAnnotationId.get(annotationId);

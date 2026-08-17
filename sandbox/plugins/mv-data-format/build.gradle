@@ -26,6 +26,7 @@ dependencies {
   // OUT of the main scope; ITs may depend on them in their own scope.
   implementation project(':sandbox:libs:dataformat-native')
 
+
   compileOnly 'org.checkerframework:checker-qual:3.43.0'
   implementation "org.apache.arrow:arrow-vector:${versions.arrow}"
   implementation "org.apache.arrow:arrow-memory-core:${versions.arrow}"
@@ -43,6 +44,10 @@ tasks.named('compileInternalClusterTestJava').configure {
 }
 
 dependencies {
+  // IT-scope only (does NOT leak into the plugin zip): the in-JVM test
+  // cluster instantiates the sibling plugins directly.
+  internalClusterTestImplementation project(':sandbox:plugins:analytics-backend-datafusion')
+  internalClusterTestImplementation project(':sandbox:plugins:parquet-data-format')
   internalClusterTestImplementation project(':sandbox:plugins:composite-engine')
   internalClusterTestImplementation project(':sandbox:plugins:analytics-backend-datafusion')
   internalClusterTestImplementation project(':sandbox:plugins:analytics-backend-lucene')

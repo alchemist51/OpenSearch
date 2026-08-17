@@ -745,6 +745,30 @@ pub unsafe extern "C" fn df_mv_build_poc(
     Ok(rows)
 }
 
+/// Refresh-time ship build: run the definition's Partial over one parquet
+/// file and export the sorted state batch via Arrow C-Data (no scratch file).
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_build_arrow(
+    input_ptr: *const u8,
+    input_len: i64,
+    table_ptr: *const u8,
+    table_len: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    array_addr: i64,
+    schema_addr: i64,
+) -> i64 {
+    let input = str_from_raw(input_ptr, input_len)
+        .map_err(|e| format!("df_mv_build_arrow: input: {}", e))?;
+    let table = str_from_raw(table_ptr, table_len)
+        .map_err(|e| format!("df_mv_build_arrow: table: {}", e))?;
+    let sql =
+        str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_build_arrow: sql: {}", e))?;
+    let rows = crate::mv_poc::mv_build_arrow(input, table, sql, array_addr, schema_addr)?;
+    Ok(rows)
+}
+
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn df_sql_to_substrait(

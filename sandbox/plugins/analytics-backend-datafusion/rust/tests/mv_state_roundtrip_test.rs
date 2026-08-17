@@ -45,15 +45,16 @@ fn segment2() -> Vec<&'static str> {
 }
 
 fn raw_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![Field::new("service", DataType::Utf8, true)]))
+    Arc::new(Schema::new(vec![Field::new(
+        "service",
+        DataType::Utf8,
+        true,
+    )]))
 }
 
 fn raw_batch(services: Vec<&str>) -> RecordBatch {
-    RecordBatch::try_new(
-        raw_schema(),
-        vec![Arc::new(StringArray::from(services))],
-    )
-    .expect("raw batch")
+    RecordBatch::try_new(raw_schema(), vec![Arc::new(StringArray::from(services))])
+        .expect("raw batch")
 }
 
 /// Runs `SELECT service, COUNT(*) FROM t GROUP BY service` with the physical
@@ -102,10 +103,7 @@ fn write_parquet(path: &std::path::Path, batches: &[RecordBatch]) {
 /// Final-mode aggregation over state rows registered as table `t_states`,
 /// built programmatically: AggregateExec(Final) whose input scans the state
 /// table. Group-by = service; aggregate = count(*) resuming from state.
-async fn final_over_states(
-    ctx: &SessionContext,
-    state_table: &str,
-) -> Vec<(String, i64)> {
+async fn final_over_states(ctx: &SessionContext, state_table: &str) -> Vec<(String, i64)> {
     // Build the Final the same way the engine does: plan the same SQL against
     // a dummy raw table to get a Partial/Final pair, then splice the Final's
     // aggregate expressions over a scan of the state table.
@@ -147,8 +145,7 @@ async fn mv_state_roundtrip_count_group_by_service() {
     // ---- FLUSH BUILD: per-segment Partial states → parquet MV files ----
     for (i, seg) in [segment1(), segment2()].into_iter().enumerate() {
         let table = format!("raw_seg{i}");
-        let mem = MemTable::try_new(raw_schema(), vec![vec![raw_batch(seg)]])
-            .expect("memtable");
+        let mem = MemTable::try_new(raw_schema(), vec![vec![raw_batch(seg)]]).expect("memtable");
         ctx.register_table(&table, Arc::new(mem)).expect("register");
         let states = partial_states(&ctx, &table).await;
         assert!(!states.is_empty(), "partial produced state batches");
@@ -214,7 +211,6 @@ async fn mv_state_roundtrip_count_group_by_service() {
         "answer must be identical after merge"
     );
 }
-
 
 #[tokio::test]
 async fn probe_state_schema_min_max() {

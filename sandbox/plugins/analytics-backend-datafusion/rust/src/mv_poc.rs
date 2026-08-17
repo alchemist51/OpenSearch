@@ -24,13 +24,15 @@ use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use parquet::arrow::ArrowWriter;
 
-/// Builds the MV state file. Returns the number of state rows written.
-pub fn mv_build_poc(
+/// Shared core: run the definition's Partial stage over one parquet file and
+/// sort the resulting state rows by the group key (col 0) so downstream merges
+/// are streaming k-way folds (memory ∝ cursors, not groups). Sort cost ∝
+/// #groups, never #docs.
+fn build_sorted_state(
     input_file: &str,
     table_name: &str,
     sql: &str,
-    output_file: &str,
-) -> Result<i64, String> {
+) -> Result<arrow_array::RecordBatch, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -57,9 +59,8 @@ pub fn mv_build_poc(
             .await
             .map_err(|e| format!("mv_poc collect partial: {e}"))?;
 
-        // Always write a file, even for zero groups — the composite flush
-        // contract requires "files for all formats or none" when the primary
-        // flushed. Schema comes from the plan even when batches are empty.
+        // Schema comes from the plan even when batches are empty — callers
+        // rely on a well-formed (possibly zero-row) state batch.
         let schema = if batches.is_empty() {
             return Err(
                 "mv_poc: partial produced no batches (expected at least an empty batch)"
@@ -69,9 +70,6 @@ pub fn mv_build_poc(
             batches[0].schema()
         };
 
-        // Sort states by the group key (col 0) so merges are streaming k-way
-        // folds (memory ∝ cursors, not groups). Sort-after-aggregation: cost
-        // ∝ #groups, never #docs.
         let concatenated = arrow::compute::concat_batches(&schema, &batches)
             .map_err(|e| format!("mv_poc concat: {e}"))?;
         let sort_indices = arrow::compute::sort_to_indices(concatenated.column(0), None, None)
@@ -81,30 +79,73 @@ pub fn mv_build_poc(
             .iter()
             .map(|c| arrow::compute::take(c.as_ref(), &sort_indices, None))
             .collect();
-        let sorted = arrow_array::RecordBatch::try_new(
-            schema.clone(),
+        arrow_array::RecordBatch::try_new(
+            schema,
             sorted_columns.map_err(|e| format!("mv_poc take: {e}"))?,
         )
-        .map_err(|e| format!("mv_poc sorted batch: {e}"))?;
-
-        // State files are Arrow IPC (decision 17) — same format the streaming
-        // writer's finalize emits; fold readers use register_arrow.
-        let file =
-            File::create(output_file).map_err(|e| format!("mv_poc create {output_file}: {e}"))?;
-        let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &schema)
-            .map_err(|e| format!("mv_poc ipc writer: {e}"))?;
-        writer
-            .write(&sorted)
-            .map_err(|e| format!("mv_poc write batch: {e}"))?;
-        writer.finish().map_err(|e| format!("mv_poc finish: {e}"))?;
-        Ok(sorted.num_rows() as i64)
+        .map_err(|e| format!("mv_poc sorted batch: {e}"))
     })
+}
+
+/// Builds the MV state file (Arrow IPC, decision 17 — the fold readers use
+/// register_arrow). Returns the number of state rows written.
+pub fn mv_build_poc(
+    input_file: &str,
+    table_name: &str,
+    sql: &str,
+    output_file: &str,
+) -> Result<i64, String> {
+    let sorted = build_sorted_state(input_file, table_name, sql)?;
+    let file =
+        File::create(output_file).map_err(|e| format!("mv_poc create {output_file}: {e}"))?;
+    let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &sorted.schema())
+        .map_err(|e| format!("mv_poc ipc writer: {e}"))?;
+    writer
+        .write(&sorted)
+        .map_err(|e| format!("mv_poc write batch: {e}"))?;
+    writer.finish().map_err(|e| format!("mv_poc finish: {e}"))?;
+    Ok(sorted.num_rows() as i64)
+}
+
+/// Refresh-time build for the ship path: same Partial build + group-key sort
+/// as [`mv_build_poc`], but the sorted state batch is EXPORTED via Arrow
+/// C-Data into caller-provided struct addresses (zero copy into the JVM)
+/// instead of being written to a file. Returns the state row count.
+pub fn mv_build_arrow(
+    input_file: &str,
+    table_name: &str,
+    sql: &str,
+    array_addr: i64,
+    schema_addr: i64,
+) -> Result<i64, String> {
+    use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+    use arrow_array::Array; // into_data
+    let sorted = build_sorted_state(input_file, table_name, sql)?;
+    let rows = sorted.num_rows() as i64;
+    let struct_array: arrow_array::StructArray = sorted.into();
+    let data = struct_array.into_data();
+    let ffi_schema = FFI_ArrowSchema::try_from(data.data_type())
+        .map_err(|e| format!("mv_build_arrow schema export: {e}"))?;
+    let ffi_array = FFI_ArrowArray::new(&data);
+    unsafe {
+        std::ptr::write(array_addr as *mut FFI_ArrowArray, ffi_array);
+        std::ptr::write(schema_addr as *mut FFI_ArrowSchema, ffi_schema);
+    }
+    Ok(rows)
 }
 
 fn find_partial(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
     if let Some(agg) = plan.downcast_ref::<AggregateExec>() {
-        if *agg.mode() == AggregateMode::Partial {
-            return Some(plan.clone());
+        // Partial: the state-producing stage of a split plan. Single /
+        // SinglePartitioned: small inputs (e.g. one tiny parquet) skip the
+        // split — output schema EQUALS the Partial state schema because MV
+        // definitions are pre-decomposed to their mergeable core (SUM/COUNT/
+        // MIN/MAX only; no raw AVG), so accepting it is exact, not a fallback.
+        match agg.mode() {
+            AggregateMode::Partial | AggregateMode::Single | AggregateMode::SinglePartitioned => {
+                return Some(plan.clone());
+            }
+            _ => {}
         }
     }
     for child in plan.children() {

@@ -12,7 +12,6 @@ import org.apache.calcite.sql.type.AbstractSqlType;
 import org.apache.calcite.sql.type.SqlTypeName;
 
 import java.util.Locale;
-
 /**
  * Calcite type marker for an OpenSearch {@code ip} column. Backed by
  * {@link SqlTypeName#VARBINARY} so planner coercion is unchanged; the subclass exists

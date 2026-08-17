@@ -24,6 +24,9 @@ import java.util.List;
  */
 public final class MVConstants {
 
+    /** Canonical table name every definition SQL is written against. */
+    public static final String INPUT_TABLE = "mv_input";
+
     private MVConstants() {}
 
     /** The MV definition executed by the native writer over fed batches. */
