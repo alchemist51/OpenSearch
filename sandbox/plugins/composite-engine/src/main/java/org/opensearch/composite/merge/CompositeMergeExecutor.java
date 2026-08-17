@@ -60,7 +60,7 @@ public class CompositeMergeExecutor {
             for (DataFormat secondary : plan.secondaryFormats()) {
                 FormatMergeResult secondaryResult = mergeFormat(plan, secondary, mapping);
                 // Verify secondary produced output when primary did
-                if (primaryResult.mergedFiles() != null && secondaryResult.mergedFiles() == null) {
+                if (primaryResult.mergedFiles() != null && secondaryResult.mergedFiles() == null && secondary.mayEmitNoFiles() == false) {
                     throw new IllegalStateException(
                         "Primary format ["
                             + plan.primaryFormat().name()

@@ -92,9 +92,44 @@ public final class MVIndexingEngine
 
     @Override
     public Merger getMerger() {
-        // POC: merges disabled for the demo index (merge_on_refresh off, no
-        // background force-merge in the test). Fails loudly if one sneaks in.
-        return mergeInput -> { throw new UnsupportedOperationException("POC(mv): merge not implemented"); };
+        // Recompute-on-merge (the safe default from the separate-index design,
+        // implementation-state §8): derive the merged segment's state by
+        // running the definition over the MERGED PRIMARY parquet file. Always
+        // consistent with the post-merge document set (and with the future
+        // orphan sweep, which is doc-level). The state⊕state fold merger is
+        // the later optimization, gated on the sweep's watermark.
+        //
+        // Ship mode (source with ship targets): merges are a NON-EVENT — no
+        // logical data change, nothing to re-ship, no local files to produce.
+        return mergeInput -> {
+            if (shipTargets.isEmpty() == false) {
+                return new org.opensearch.index.engine.dataformat.MergeResult(java.util.Map.of(), null);
+            }
+            long gen = mergeInput.newWriterGeneration();
+            // Merged primary parquet path by the engine's naming convention
+            // (POC path coupling, same as the original derived-build).
+            java.nio.file.Path parquetDir = shardPath.getDataPath().resolve("parquet");
+            // Engine naming: merge outputs are "_parquet_file_generation_merged_<hexgen>"
+            // (plain "_parquet_file_generation_<hexgen>" for flush outputs).
+            java.nio.file.Path merged = parquetDir.resolve("_parquet_file_generation_merged_" + Long.toHexString(gen) + ".parquet");
+            if (java.nio.file.Files.exists(merged) == false) {
+                merged = parquetDir.resolve("_parquet_file_generation_" + Long.toHexString(gen) + ".parquet");
+            }
+            if (java.nio.file.Files.exists(merged) == false) {
+                throw new java.io.IOException("mv merge: merged parquet not found for gen " + gen + " in " + parquetDir);
+            }
+            java.nio.file.Path mvDir = shardPath.getDataPath().resolve(format.name());
+            java.nio.file.Files.createDirectories(mvDir);
+            java.nio.file.Path out = mvDir.resolve(MVConstants.mvFileName(gen));
+            long rows = MVNativeBridge.buildStateFile(merged.toString(), "mv_input", spec.sql(), out.toString());
+            org.opensearch.index.engine.exec.MonoFileWriterSet fileSet = org.opensearch.index.engine.exec.MonoFileWriterSet.of(
+                mvDir.toAbsolutePath(),
+                gen,
+                out.getFileName().toString(),
+                Math.max(rows, 1)
+            );
+            return new org.opensearch.index.engine.dataformat.MergeResult(java.util.Map.of(getDataFormat(), fileSet), null);
+        };
     }
 
     @Override

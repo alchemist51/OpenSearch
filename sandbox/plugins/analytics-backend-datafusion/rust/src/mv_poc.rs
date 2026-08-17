@@ -25,7 +25,12 @@ use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use parquet::arrow::ArrowWriter;
 
 /// Builds the MV state file. Returns the number of state rows written.
-pub fn mv_build_poc(input_file: &str, table_name: &str, sql: &str, output_file: &str) -> Result<i64, String> {
+pub fn mv_build_poc(
+    input_file: &str,
+    table_name: &str,
+    sql: &str,
+    output_file: &str,
+) -> Result<i64, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -37,13 +42,16 @@ pub fn mv_build_poc(input_file: &str, table_name: &str, sql: &str, output_file: 
             .await
             .map_err(|e| format!("mv_poc register_parquet({input_file}): {e}"))?;
 
-        let df = ctx.sql(sql).await.map_err(|e| format!("mv_poc plan sql: {e}"))?;
+        let df = ctx
+            .sql(sql)
+            .await
+            .map_err(|e| format!("mv_poc plan sql: {e}"))?;
         let physical = df
             .create_physical_plan()
             .await
             .map_err(|e| format!("mv_poc physical plan: {e}"))?;
-        let partial =
-            find_partial(&physical).ok_or_else(|| "mv_poc: no Partial aggregate in plan".to_string())?;
+        let partial = find_partial(&physical)
+            .ok_or_else(|| "mv_poc: no Partial aggregate in plan".to_string())?;
 
         let batches = collect(partial, ctx.task_ctx())
             .await
@@ -53,7 +61,10 @@ pub fn mv_build_poc(input_file: &str, table_name: &str, sql: &str, output_file: 
         // contract requires "files for all formats or none" when the primary
         // flushed. Schema comes from the plan even when batches are empty.
         let schema = if batches.is_empty() {
-            return Err("mv_poc: partial produced no batches (expected at least an empty batch)".to_string());
+            return Err(
+                "mv_poc: partial produced no batches (expected at least an empty batch)"
+                    .to_string(),
+            );
         } else {
             batches[0].schema()
         };
@@ -76,11 +87,16 @@ pub fn mv_build_poc(input_file: &str, table_name: &str, sql: &str, output_file: 
         )
         .map_err(|e| format!("mv_poc sorted batch: {e}"))?;
 
-        let file = File::create(output_file).map_err(|e| format!("mv_poc create {output_file}: {e}"))?;
-        let mut writer =
-            ArrowWriter::try_new(file, schema, None).map_err(|e| format!("mv_poc writer: {e}"))?;
-        writer.write(&sorted).map_err(|e| format!("mv_poc write batch: {e}"))?;
-        writer.close().map_err(|e| format!("mv_poc close: {e}"))?;
+        // State files are Arrow IPC (decision 17) — same format the streaming
+        // writer's finalize emits; fold readers use register_arrow.
+        let file =
+            File::create(output_file).map_err(|e| format!("mv_poc create {output_file}: {e}"))?;
+        let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &schema)
+            .map_err(|e| format!("mv_poc ipc writer: {e}"))?;
+        writer
+            .write(&sorted)
+            .map_err(|e| format!("mv_poc write batch: {e}"))?;
+        writer.finish().map_err(|e| format!("mv_poc finish: {e}"))?;
         Ok(sorted.num_rows() as i64)
     })
 }
@@ -101,7 +117,11 @@ fn find_partial(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>>
 
 /// POC(mv) search: Final-style aggregation over MV state files. Returns rows
 /// as "service\tcount" lines joined by newlines (POC-grade wire format).
-pub fn mv_search_poc(state_files: &[String], group_key: &str, state_col: &str) -> Result<String, String> {
+pub fn mv_search_poc(
+    state_files: &[String],
+    group_key: &str,
+    state_col: &str,
+) -> Result<String, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
