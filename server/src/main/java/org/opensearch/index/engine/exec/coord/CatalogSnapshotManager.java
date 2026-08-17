@@ -31,6 +31,7 @@ import org.opensearch.index.shard.ShardPath;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -590,15 +591,26 @@ public class CatalogSnapshotManager implements Closeable {
         if (writerFileSetMap.isEmpty()) {
             throw new IllegalArgumentException("writerFileSetMap must not be empty");
         }
-        // Check for null values (format participated but returned no result)
+        // A null value means the format participated but produced no result.
+        // For mayEmitNoFiles formats that is a LEGAL outcome (e.g. a derived
+        // format in ship mode treats merges as a non-event — nothing local to
+        // produce); for all other formats it means the merge was incomplete.
+        Map<DataFormat, WriterFileSet> present = new HashMap<>();
         for (Map.Entry<DataFormat, WriterFileSet> entry : writerFileSetMap.entrySet()) {
             if (entry.getValue() == null) {
+                if (entry.getKey().mayEmitNoFiles()) {
+                    continue;
+                }
                 throw new IllegalStateException("WriterFileSet is null for format [" + entry.getKey().name() + "] — merge was incomplete");
             }
+            present.put(entry.getKey(), entry.getValue());
         }
-        long generation = writerFileSetMap.values().iterator().next().writerGeneration();
+        if (present.isEmpty()) {
+            throw new IllegalStateException("merge produced no files for any format — nothing to register");
+        }
+        long generation = present.values().iterator().next().writerGeneration();
         Segment.Builder segment = Segment.builder(generation);
-        for (Map.Entry<DataFormat, WriterFileSet> entry : writerFileSetMap.entrySet()) {
+        for (Map.Entry<DataFormat, WriterFileSet> entry : present.entrySet()) {
             segment.addSearchableFiles(entry.getKey(), entry.getValue());
         }
         return segment.build();
