@@ -96,4 +96,9 @@ final class MVForwardBuffer implements AutoCloseable {
         vsr.close();
         allocator.close();
     }
+
+    /** The buffer's allocator — also used to import the finalized state batch for the ship path. */
+    org.apache.arrow.memory.BufferAllocator allocator() {
+        return allocator;
+    }
 }

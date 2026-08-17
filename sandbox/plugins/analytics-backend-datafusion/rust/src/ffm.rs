@@ -605,15 +605,26 @@ pub unsafe extern "C" fn df_mv_search_v2(
     }
     let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_search_v2: sql: {}", e))?;
     let text = crate::mv_writer::mv_search_v2(&files, sql)?;
-    write_out_buffer(text.as_bytes(), out_ptr, out_cap, out_len, "mv search v2 result")?;
+    write_out_buffer(
+        text.as_bytes(),
+        out_ptr,
+        out_cap,
+        out_len,
+        "mv search v2 result",
+    )?;
     Ok(0)
 }
 
 /// POC(mv) streaming writer lifecycle — create/feed/finalize/abort.
 #[ffm_safe]
 #[no_mangle]
-pub unsafe extern "C" fn df_mv_writer_create(sql_ptr: *const u8, sql_len: i64, num_group_cols: i64) -> i64 {
-    let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_writer_create: sql: {}", e))?;
+pub unsafe extern "C" fn df_mv_writer_create(
+    sql_ptr: *const u8,
+    sql_len: i64,
+    num_group_cols: i64,
+) -> i64 {
+    let sql =
+        str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_writer_create: sql: {}", e))?;
     Ok(crate::mv_writer::mv_writer_create(sql, num_group_cols))
 }
 
@@ -634,10 +645,33 @@ pub unsafe extern "C" fn df_mv_writer_feed(writer_id: i64, array_ptr: i64, schem
 
 #[ffm_safe]
 #[no_mangle]
-pub unsafe extern "C" fn df_mv_writer_finalize(writer_id: i64, out_ptr: *const u8, out_len: i64) -> i64 {
-    let output = str_from_raw(out_ptr, out_len).map_err(|e| format!("df_mv_writer_finalize: out: {}", e))?;
+pub unsafe extern "C" fn df_mv_writer_finalize(
+    writer_id: i64,
+    out_ptr: *const u8,
+    out_len: i64,
+) -> i64 {
+    let output =
+        str_from_raw(out_ptr, out_len).map_err(|e| format!("df_mv_writer_finalize: out: {}", e))?;
     let rows = crate::mv_writer::mv_writer_finalize(writer_id, output)?;
     Ok(rows)
+}
+
+/// Finalizes the MV writer and exports the sorted state batch via Arrow
+/// C-Data into caller-allocated `FFI_ArrowArray`/`FFI_ArrowSchema` structs
+/// (zero copy — the JVM imports the same buffers; Rust's release callback
+/// frees them when the consumer closes). Returns the state row count.
+///
+/// # Safety
+/// `array_addr` / `schema_addr` must point to caller-allocated, uninitialized
+/// ArrowArray / ArrowSchema C structs that the caller will import exactly once.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_finalize_arrow(
+    writer_id: i64,
+    array_addr: i64,
+    schema_addr: i64,
+) -> i64 {
+    crate::mv_writer::mv_writer_finalize_arrow(writer_id, array_addr, schema_addr)
 }
 
 #[no_mangle]
@@ -671,10 +705,18 @@ pub unsafe extern "C" fn df_mv_search_poc(
                 .to_string(),
         );
     }
-    let group = str_from_raw(group_ptr, group_len).map_err(|e| format!("df_mv_search_poc: group: {}", e))?;
-    let state = str_from_raw(state_ptr, state_len).map_err(|e| format!("df_mv_search_poc: state: {}", e))?;
+    let group = str_from_raw(group_ptr, group_len)
+        .map_err(|e| format!("df_mv_search_poc: group: {}", e))?;
+    let state = str_from_raw(state_ptr, state_len)
+        .map_err(|e| format!("df_mv_search_poc: state: {}", e))?;
     let text = crate::mv_poc::mv_search_poc(&files, group, state)?;
-    write_out_buffer(text.as_bytes(), out_ptr, out_cap, out_len, "mv search result")?;
+    write_out_buffer(
+        text.as_bytes(),
+        out_ptr,
+        out_cap,
+        out_len,
+        "mv search result",
+    )?;
     Ok(0)
 }
 
@@ -692,10 +734,13 @@ pub unsafe extern "C" fn df_mv_build_poc(
     output_ptr: *const u8,
     output_len: i64,
 ) -> i64 {
-    let input = str_from_raw(input_ptr, input_len).map_err(|e| format!("df_mv_build_poc: input: {}", e))?;
-    let table = str_from_raw(table_ptr, table_len).map_err(|e| format!("df_mv_build_poc: table: {}", e))?;
+    let input =
+        str_from_raw(input_ptr, input_len).map_err(|e| format!("df_mv_build_poc: input: {}", e))?;
+    let table =
+        str_from_raw(table_ptr, table_len).map_err(|e| format!("df_mv_build_poc: table: {}", e))?;
     let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_build_poc: sql: {}", e))?;
-    let output = str_from_raw(output_ptr, output_len).map_err(|e| format!("df_mv_build_poc: output: {}", e))?;
+    let output = str_from_raw(output_ptr, output_len)
+        .map_err(|e| format!("df_mv_build_poc: output: {}", e))?;
     let rows = crate::mv_poc::mv_build_poc(input, table, sql, output)?;
     Ok(rows)
 }

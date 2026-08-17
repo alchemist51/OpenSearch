@@ -8,6 +8,7 @@
 
 package org.opensearch.mv;
 
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.ActionType;
@@ -16,9 +17,6 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
 
 /**
  * POC(mv) shard-addressed state ship: carries one source generation's state
@@ -45,43 +43,53 @@ public final class MVShipStateAction extends ActionType<MVShipStateAction.Respon
         super(NAME, Response::new);
     }
 
-    /** One source generation's state rows for one target shard. */
+    /**
+     * One source generation's state batch for one target shard, carried as the
+     * LIVE ARROW ROOT — the same buffers the native writer finalized into,
+     * zero copies since. Legal because this action is LOCAL-ONLY by the hard
+     * locality rule (the handler runs in the same JVM via NodeClient dispatch);
+     * wire serialization is deliberately unsupported and loudly fails if the
+     * rule is ever broken.
+     *
+     * <p>Ownership: the handler consumes and closes the root (its try/finally),
+     * whether the apply succeeds or fails.
+     */
     public static class Request extends ActionRequest {
         private final String targetIndex;
         private final int targetShard;
-        private final List<String> docIds;
-        private final List<Map<String, Object>> docs;
+        private final String sourceIndex;
+        private final int sourceShard;
+        private final long writerGeneration;
+        private final VectorSchemaRoot stateBatch;
 
-        public Request(String targetIndex, int targetShard, List<String> docIds, List<Map<String, Object>> docs) {
+        public Request(
+            String targetIndex,
+            int targetShard,
+            String sourceIndex,
+            int sourceShard,
+            long writerGeneration,
+            VectorSchemaRoot stateBatch
+        ) {
             this.targetIndex = targetIndex;
             this.targetShard = targetShard;
-            this.docIds = docIds;
-            this.docs = docs;
+            this.sourceIndex = sourceIndex;
+            this.sourceShard = sourceShard;
+            this.writerGeneration = writerGeneration;
+            this.stateBatch = stateBatch;
         }
 
         public Request(StreamInput in) throws IOException {
-            super(in);
-            this.targetIndex = in.readString();
-            this.targetShard = in.readVInt();
-            int n = in.readVInt();
-            this.docIds = new ArrayList<>(n);
-            this.docs = new ArrayList<>(n);
-            for (int i = 0; i < n; i++) {
-                docIds.add(in.readString());
-                docs.add(in.readMap());
-            }
+            throw new UnsupportedOperationException(
+                "mv_ship_state is local-only (hard locality rule): the request carries live Arrow buffers "
+                    + "and must never cross a wire — receiving it remotely means the rule was broken"
+            );
         }
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
-            super.writeTo(out);
-            out.writeString(targetIndex);
-            out.writeVInt(targetShard);
-            out.writeVInt(docIds.size());
-            for (int i = 0; i < docIds.size(); i++) {
-                out.writeString(docIds.get(i));
-                out.writeMap(docs.get(i));
-            }
+            throw new UnsupportedOperationException(
+                "mv_ship_state is local-only (hard locality rule): the request carries live Arrow buffers and cannot be serialized"
+            );
         }
 
         public String targetIndex() {
@@ -92,12 +100,20 @@ public final class MVShipStateAction extends ActionType<MVShipStateAction.Respon
             return targetShard;
         }
 
-        public List<String> docIds() {
-            return docIds;
+        public String sourceIndex() {
+            return sourceIndex;
         }
 
-        public List<Map<String, Object>> docs() {
-            return docs;
+        public int sourceShard() {
+            return sourceShard;
+        }
+
+        public long writerGeneration() {
+            return writerGeneration;
+        }
+
+        public VectorSchemaRoot stateBatch() {
+            return stateBatch;
         }
 
         @Override

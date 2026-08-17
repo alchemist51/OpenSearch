@@ -114,16 +114,45 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
     }
 
     private void applyLocally(MVShipStateAction.Request request, ActionListener<MVShipStateAction.Response> listener) {
-        try {
+        // The handler OWNS the shipped Arrow root: close it whether the apply
+        // succeeds or fails (the buffers are the native writer's finalized
+        // state — the release callback frees the Rust allocation on close).
+        try (org.apache.arrow.vector.VectorSchemaRoot batch = request.stateBatch()) {
             IndexShard shard = indicesService.indexServiceSafe(clusterService.state().metadata().index(request.targetIndex()).getIndex())
                 .getShard(request.targetShard());
-            int applied = 0;
-            for (int i = 0; i < request.docIds().size(); i++) {
+            int rows = batch.getRowCount();
+            java.util.List<org.apache.arrow.vector.FieldVector> vectors = batch.getFieldVectors();
+            if (vectors.size() != MVConstants.SHIP_FIELDS.size()) {
+                listener.onFailure(
+                    new IllegalStateException(
+                        "mv ship apply: state batch has " + vectors.size() + " columns, expected " + MVConstants.SHIP_FIELDS.size()
+                    )
+                );
+                return;
+            }
+            for (int row = 0; row < rows; row++) {
+                java.util.Map<String, Object> doc = new java.util.HashMap<>();
+                // Positional mapping — the state contract (group keys first,
+                // then state columns); names in the batch carry the writer's
+                // alias and are not compared.
+                for (int col = 0; col < vectors.size(); col++) {
+                    Object value = vectors.get(col).getObject(row);
+                    if (value instanceof org.apache.arrow.vector.util.Text t) {
+                        value = t.toString();
+                    } else if (value instanceof Number n) {
+                        value = n.longValue();
+                    }
+                    doc.put(MVConstants.SHIP_FIELDS.get(col), value);
+                }
+                doc.put("_mv_source_index", request.sourceIndex());
+                doc.put("_mv_source_shard", request.sourceShard());
+                doc.put("_mv_source_generation", request.writerGeneration());
+                String docId = request.sourceIndex() + "." + request.sourceShard() + "." + request.writerGeneration() + "." + row;
                 try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
-                    builder.map(request.docs().get(i));
+                    builder.map(doc);
                     SourceToParse source = new SourceToParse(
                         request.targetIndex(),
-                        request.docIds().get(i),
+                        docId,
                         BytesReference.bytes(builder),
                         MediaTypeRegistry.JSON
                     );
@@ -139,13 +168,12 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
                     if (result.getResultType() != Engine.Result.Type.SUCCESS) {
                         listener.onFailure(
                             new IllegalStateException(
-                                "mv ship apply failed for [" + request.docIds().get(i) + "]: " + result.getResultType(),
+                                "mv ship apply failed for [" + docId + "]: " + result.getResultType(),
                                 result.getFailure()
                             )
                         );
                         return;
                     }
-                    applied++;
                 }
             }
             // Durability before ack: fsync the translog to the last applied op.
@@ -158,12 +186,12 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
             shard.refresh("mv_ship");
             logger.debug(
                 "mv ship-apply: {} state rows into [{}][{}] ({})",
-                applied,
+                rows,
                 request.targetIndex(),
                 request.targetShard(),
                 transportService.getLocalNode().getId()
             );
-            listener.onResponse(new MVShipStateAction.Response(applied));
+            listener.onResponse(new MVShipStateAction.Response(rows));
         } catch (Exception e) {
             listener.onFailure(e);
         }

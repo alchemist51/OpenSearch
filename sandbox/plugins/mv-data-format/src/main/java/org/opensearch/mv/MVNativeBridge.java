@@ -30,6 +30,7 @@ public final class MVNativeBridge {
     private static final MethodHandle MV_WRITER_CREATE;
     private static final MethodHandle MV_WRITER_FEED;
     private static final MethodHandle MV_WRITER_FINALIZE;
+    private static final MethodHandle MV_WRITER_FINALIZE_ARROW;
     private static final MethodHandle MV_WRITER_ABORT;
     private static final MethodHandle MV_SEARCH_V2;
 
@@ -80,6 +81,11 @@ public final class MVNativeBridge {
         MV_WRITER_FINALIZE = linker.downcallHandle(
             lib.find("df_mv_writer_finalize").orElseThrow(),
             FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG)
+        );
+        // i64 df_mv_writer_finalize_arrow(writer_id, array_addr, schema_addr)
+        MV_WRITER_FINALIZE_ARROW = linker.downcallHandle(
+            lib.find("df_mv_writer_finalize_arrow").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
         );
         MV_WRITER_ABORT = linker.downcallHandle(
             lib.find("df_mv_writer_abort").orElseThrow(),
@@ -167,6 +173,18 @@ public final class MVNativeBridge {
     public static void writerFeed(long writerId, long arrayAddress, long schemaAddress) {
         try (var call = new NativeCall()) {
             call.invoke(MV_WRITER_FEED, writerId, arrayAddress, schemaAddress);
+        }
+    }
+
+    /**
+     * Finalizes the writer and exports the sorted state batch via Arrow C-Data
+     * into the given caller-allocated struct addresses — zero copy; the caller
+     * imports the structs exactly once and owns the resulting root. Returns
+     * the state row count.
+     */
+    public static long writerFinalizeArrow(long writerId, long arrayAddress, long schemaAddress) {
+        try (var call = new NativeCall()) {
+            return call.invoke(MV_WRITER_FINALIZE_ARROW, writerId, arrayAddress, schemaAddress);
         }
     }
 

@@ -8,16 +8,13 @@
 
 package org.opensearch.mv;
 
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.transport.client.Client;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 
 /**
  * POC(mv) separate-index ship path: exports a finalized state file's rows and
@@ -74,44 +71,26 @@ final class MVStateShipper {
      *
      * @return number of state rows shipped
      */
-    long ship(String stateFile, long writerGeneration) throws IOException {
-        String tsv = MVNativeBridge.searchV2(List.of(stateFile), MVConstants.EXPORT_SQL);
-        if (tsv.isEmpty()) {
-            return 0;
-        }
-        String[] lines = tsv.split("\n");
-        List<String> docIds = new ArrayList<>();
-        List<Map<String, Object>> docs = new ArrayList<>();
-        int row = 0;
-        for (String line : lines) {
-            if (line.isEmpty()) continue;
-            String[] cols = line.split("\t");
-            if (cols.length != MVConstants.SHIP_FIELDS.size()) {
-                throw new IOException(
-                    "mv ship: state row has " + cols.length + " columns, expected " + MVConstants.SHIP_FIELDS.size() + ": " + line
-                );
-            }
-            Map<String, Object> doc = new HashMap<>();
-            doc.put(MVConstants.SHIP_FIELDS.get(0), cols[0]);
-            doc.put(MVConstants.SHIP_FIELDS.get(1), cols[1]);
-            for (int i = 2; i < cols.length; i++) {
-                doc.put(MVConstants.SHIP_FIELDS.get(i), Long.parseLong(cols[i]));
-            }
-            // Provenance fields: which source shard/generation produced this state row.
-            doc.put("_mv_source_index", sourceIndex);
-            doc.put("_mv_source_shard", shardId.id());
-            doc.put("_mv_source_generation", writerGeneration);
-            docIds.add(sourceIndex + "." + shardId.id() + "." + writerGeneration + "." + row);
-            docs.add(doc);
-            row++;
-        }
-        // Shard-addressed ship to the ORDINAL-PAIRED target shard (source shard
-        // i -> target shard i; a doc-routed bulk would spray across all target
-        // shards and defeat the colocation pairing). The transport handler
-        // applies locally when colocated (no serialization) and forwards once
-        // when the pair is split; either way the ack means durable-in-translog.
+    /**
+     * Ships the finalized state batch — the LIVE Arrow root, zero copies since
+     * the native writer produced it — to the ordinal-paired target shard and
+     * blocks until the durable+searchable ack. Throws on ANY failure — the
+     * caller must fail the flush (ship-before-commit). The handler owns and
+     * closes the root.
+     *
+     * @return number of state rows shipped
+     */
+    long ship(VectorSchemaRoot stateBatch, long writerGeneration) throws IOException {
+        int rows = stateBatch.getRowCount();
         int targetShard = shardId.id() % clusterService.state().metadata().index(targetIndex).getNumberOfShards();
-        MVShipStateAction.Request request = new MVShipStateAction.Request(targetIndex, targetShard, docIds, docs);
+        MVShipStateAction.Request request = new MVShipStateAction.Request(
+            targetIndex,
+            targetShard,
+            sourceIndex,
+            shardId.id(),
+            writerGeneration,
+            stateBatch
+        );
         MVShipStateAction.Response response;
         try {
             response = client.execute(MVShipStateAction.INSTANCE, request).actionGet();
@@ -121,8 +100,16 @@ final class MVStateShipper {
                 e
             );
         }
+        // rowsReceived verification = the commit gate (challenges §10): the ack
+        // returns the applied count; a mismatch means the target does not hold
+        // this generation's complete state — the flush must not commit.
+        if (response.applied() != rows) {
+            throw new IOException(
+                "mv ship: gen=" + writerGeneration + " shipped " + rows + " state rows but target applied " + response.applied()
+            );
+        }
         logger.info(
-            "mv ship: gen={} shipped {} state rows from {}[{}] -> [{}][{}] (acked durable)",
+            "mv ship: gen={} shipped {} state rows from {}[{}] -> [{}][{}] (acked durable+searchable)",
             writerGeneration,
             response.applied(),
             sourceIndex,

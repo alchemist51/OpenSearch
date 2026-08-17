@@ -101,18 +101,28 @@ public final class MVWriter implements Writer<MVDocumentInput> {
         Files.createDirectories(mvDir);
 
         if (shipper != null) {
-            // Separate-index mode (Approach 2): finalize to a scratch file, ship
-            // the state rows to the MV index, and only then let the flush
-            // succeed — ship-before-commit. The source tracks NO MV files (the
-            // MV index owns its physical layout); the scratch file exists only
-            // as the export source and is removed either way.
-            Path scratch = mvDir.resolve(".ship_" + Long.toHexString(writerGeneration) + ".mv.parquet");
-            try {
-                long stateRows = MVNativeBridge.writerFinalize(nativeWriter, scratch.toString());
-                long shipped = shipper.ship(scratch.toString(), writerGeneration);
+            // Separate-index mode (Approach 2): finalize the state batch and
+            // hand it to the target as the LIVE ARROW BUFFERS via C-Data —
+            // no scratch file, no row re-encoding, zero copies (the handler
+            // reads the same memory the native fold produced). Ship-before-
+            // commit: only a durable+searchable ack lets the flush succeed.
+            // The source tracks NO MV files (the MV index owns its layout).
+            org.apache.arrow.memory.BufferAllocator shipAllocator = buffer.allocator();
+            try (
+                org.apache.arrow.c.ArrowArray array = org.apache.arrow.c.ArrowArray.allocateNew(shipAllocator);
+                org.apache.arrow.c.ArrowSchema schema = org.apache.arrow.c.ArrowSchema.allocateNew(shipAllocator)
+            ) {
+                long stateRows = MVNativeBridge.writerFinalizeArrow(nativeWriter, array.memoryAddress(), schema.memoryAddress());
+                org.apache.arrow.vector.VectorSchemaRoot stateBatch = org.apache.arrow.c.Data.importVectorSchemaRoot(
+                    shipAllocator,
+                    array,
+                    schema,
+                    null
+                );
+                // Ownership passes to the ship action's handler (closes in its
+                // try/finally); on ship failure the flush fails either way.
+                long shipped = shipper.ship(stateBatch, writerGeneration);
                 logger.info("mv flush gen={} shipped {} of {} state rows before commit", writerGeneration, shipped, stateRows);
-            } finally {
-                Files.deleteIfExists(scratch);
             }
             return FileInfos.empty();
         }

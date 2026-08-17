@@ -36,8 +36,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, RecordBatch};
-use datafusion::catalog::TableProvider;
 use arrow_schema::Schema;
+use datafusion::catalog::TableProvider;
 use datafusion::datasource::MemTable;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::{collect, ExecutionPlan};
@@ -143,12 +143,18 @@ fn partial_states_over(
             .build();
         let ctx = SessionContext::new_with_state(state);
         let mem = MemTable::try_new(schema, vec![batches]).map_err(|e| format!("memtable: {e}"))?;
-        ctx.register_table("mv_input", Arc::new(mem)).map_err(|e| format!("register: {e}"))?;
+        ctx.register_table("mv_input", Arc::new(mem))
+            .map_err(|e| format!("register: {e}"))?;
         let df = ctx.sql(sql).await.map_err(|e| format!("plan: {e}"))?;
-        let physical = df.create_physical_plan().await.map_err(|e| format!("physical: {e}"))?;
+        let physical = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| format!("physical: {e}"))?;
         let partial = find_agg_with_mode(&physical, AggregateMode::Partial)
             .ok_or("no Partial aggregate in plan")?;
-        collect(partial, ctx.task_ctx()).await.map_err(|e| format!("collect: {e}"))
+        collect(partial, ctx.task_ctx())
+            .await
+            .map_err(|e| format!("collect: {e}"))
     })?
 }
 
@@ -181,10 +187,15 @@ fn partial_reduce(
         let ctx = SessionContext::new_with_state(state);
         // Plan the definition over a dummy raw table to obtain the aggregate
         // node shape (group exprs + aggregate exprs + schemas)...
-        let dummy = MemTable::try_new(input_schema, vec![vec![]]).map_err(|e| format!("dummy: {e}"))?;
-        ctx.register_table("mv_input", Arc::new(dummy)).map_err(|e| format!("register: {e}"))?;
+        let dummy =
+            MemTable::try_new(input_schema, vec![vec![]]).map_err(|e| format!("dummy: {e}"))?;
+        ctx.register_table("mv_input", Arc::new(dummy))
+            .map_err(|e| format!("register: {e}"))?;
         let df = ctx.sql(sql).await.map_err(|e| format!("plan: {e}"))?;
-        let physical = df.create_physical_plan().await.map_err(|e| format!("physical: {e}"))?;
+        let physical = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| format!("physical: {e}"))?;
         let partial = find_agg_with_mode(&physical, AggregateMode::Partial)
             .ok_or("no Partial aggregate in plan")?;
         let agg = partial
@@ -210,7 +221,9 @@ fn partial_reduce(
         )
         .map_err(|e| format!("PartialReduce construct: {e}"))?;
 
-        collect(Arc::new(reduce), ctx.task_ctx()).await.map_err(|e| format!("collect reduce: {e}"))
+        collect(Arc::new(reduce), ctx.task_ctx())
+            .await
+            .map_err(|e| format!("collect reduce: {e}"))
     })?
 }
 
@@ -235,7 +248,9 @@ pub fn mv_writer_feed(id: i64, batch: &RecordBatch) -> Result<(), String> {
     Ok(())
 }
 
-pub fn mv_writer_finalize(id: i64, output_file: &str) -> Result<i64, String> {
+/// Shared finalize core: removes the writer, folds all accumulated state via
+/// PartialReduce, and lexsorts by the group-key columns. Cost ∝ groups.
+fn finalize_sorted_batch(id: i64) -> Result<RecordBatch, String> {
     let handle = {
         WRITERS
             .lock()
@@ -255,27 +270,58 @@ pub fn mv_writer_finalize(id: i64, output_file: &str) -> Result<i64, String> {
 
     // Single sort by group keys (leading columns), cost ∝ groups.
     let state_schema = folded[0].schema();
-    let concatenated =
-        arrow::compute::concat_batches(&state_schema, &folded).map_err(|e| format!("concat: {e}"))?;
+    let concatenated = arrow::compute::concat_batches(&state_schema, &folded)
+        .map_err(|e| format!("concat: {e}"))?;
     let sort_cols: Vec<arrow::compute::SortColumn> = (0..st.num_group_cols)
-        .map(|i| arrow::compute::SortColumn { values: concatenated.column(i).clone(), options: None })
+        .map(|i| arrow::compute::SortColumn {
+            values: concatenated.column(i).clone(),
+            options: None,
+        })
         .collect();
-    let indices =
-        arrow::compute::lexsort_to_indices(&sort_cols, None).map_err(|e| format!("lexsort: {e}"))?;
+    let indices = arrow::compute::lexsort_to_indices(&sort_cols, None)
+        .map_err(|e| format!("lexsort: {e}"))?;
     let sorted_columns: Result<Vec<_>, _> = concatenated
         .columns()
         .iter()
         .map(|c| arrow::compute::take(c.as_ref(), &indices, None))
         .collect();
-    let sorted = RecordBatch::try_new(state_schema.clone(), sorted_columns.map_err(|e| format!("take: {e}"))?)
-        .map_err(|e| format!("sorted batch: {e}"))?;
+    RecordBatch::try_new(
+        state_schema,
+        sorted_columns.map_err(|e| format!("take: {e}"))?,
+    )
+    .map_err(|e| format!("sorted batch: {e}"))
+}
 
+pub fn mv_writer_finalize(id: i64, output_file: &str) -> Result<i64, String> {
+    let sorted = finalize_sorted_batch(id)?;
+    let state_schema = sorted.schema();
     let file = File::create(output_file).map_err(|e| format!("create {output_file}: {e}"))?;
     let mut writer =
         ArrowWriter::try_new(file, state_schema, None).map_err(|e| format!("writer: {e}"))?;
     writer.write(&sorted).map_err(|e| format!("write: {e}"))?;
     writer.close().map_err(|e| format!("close: {e}"))?;
     Ok(sorted.num_rows() as i64)
+}
+
+/// Separate-index ship path: finalize and export the sorted state batch via
+/// Arrow C-Data into caller-provided FFI struct addresses — ZERO COPY into
+/// the JVM (the Java side imports the same buffers; the release callback
+/// frees the Rust allocation when the JVM consumer closes). No scratch
+/// parquet file, no row re-encoding.
+pub fn mv_writer_finalize_arrow(id: i64, array_addr: i64, schema_addr: i64) -> Result<i64, String> {
+    use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+    let sorted = finalize_sorted_batch(id)?;
+    let rows = sorted.num_rows() as i64;
+    let struct_array: arrow_array::StructArray = sorted.into();
+    let data = struct_array.into_data();
+    let ffi_schema = FFI_ArrowSchema::try_from(data.data_type())
+        .map_err(|e| format!("finalize_arrow schema export: {e}"))?;
+    let ffi_array = FFI_ArrowArray::new(&data);
+    unsafe {
+        std::ptr::write(array_addr as *mut FFI_ArrowArray, ffi_array);
+        std::ptr::write(schema_addr as *mut FFI_ArrowSchema, ffi_schema);
+    }
+    Ok(rows)
 }
 
 pub fn mv_writer_abort(id: i64) {
@@ -285,10 +331,7 @@ pub fn mv_writer_abort(id: i64) {
 /// POC(mv) v2 search: Final-fold over MV state files by re-running the
 /// definition's aggregation in Final mode over the states. Kept SQL-based for
 /// the POC: SUM the count/sum states, MIN/MAX the extrema states.
-pub fn mv_search_v2(
-    state_files: &[String],
-    select_final_sql: &str,
-) -> Result<String, String> {
+pub fn mv_search_v2(state_files: &[String], select_final_sql: &str) -> Result<String, String> {
     block_on(async move {
         // Build the session WITHOUT CombinePartialFinalAggregate: on small
         // single-partition inputs that rule collapses the Partial/Final pair
@@ -304,17 +347,27 @@ pub fn mv_search_v2(
             .build();
         let ctx = SessionContext::new_with_state(state);
         for (i, f) in state_files.iter().enumerate() {
-            ctx.register_parquet(&format!("mv_{i}"), f.as_str(), ParquetReadOptions::default())
-                .await
-                .map_err(|e| format!("register {f}: {e}"))?;
+            ctx.register_parquet(
+                &format!("mv_{i}"),
+                f.as_str(),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .map_err(|e| format!("register {f}: {e}"))?;
         }
         let union_sql = (0..state_files.len())
             .map(|i| format!("SELECT * FROM mv_{i}"))
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
         let sql = select_final_sql.replace("__MV_STATES__", &format!("({union_sql})"));
-        let df = ctx.sql(&sql).await.map_err(|e| format!("search sql: {e}"))?;
-        let batches = df.collect().await.map_err(|e| format!("search collect: {e}"))?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| format!("search sql: {e}"))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("search collect: {e}"))?;
 
         let mut out = String::new();
         for b in &batches {
@@ -327,7 +380,11 @@ pub fn mv_search_v2(
                         .as_any()
                         .downcast_ref::<arrow_array::StringArray>()
                         .ok_or("utf8 downcast")?;
-                    cells.push(if sa.is_valid(row) { sa.value(row).to_string() } else { "null".to_string() });
+                    cells.push(if sa.is_valid(row) {
+                        sa.value(row).to_string()
+                    } else {
+                        "null".to_string()
+                    });
                 }
                 out.push_str(&cells.join("\t"));
                 out.push('\n');
