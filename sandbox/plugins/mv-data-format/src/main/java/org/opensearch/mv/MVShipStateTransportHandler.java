@@ -179,6 +179,21 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
                         false
                     );
                     if (result.getResultType() != Engine.Result.Type.SUCCESS) {
+                        // Idempotent re-ship vs APPEND-ONLY composite target:
+                        // recovery replay re-ships a generation whose rows may
+                        // already exist under the same deterministic doc id.
+                        // Presence satisfies the invariant — tolerate-duplicate
+                        // IS the idempotency on an append-only index (overwrite
+                        // is impossible there). Divergent stale-orphan content
+                        // is the generation-watermark sweep's job (designed,
+                        // pending). POC-accepted risk until the sweep lands.
+                        Exception failure = result.getFailure();
+                        boolean alreadyExists = failure != null
+                            && (failure.getClass().getSimpleName().contains("AppendOnlyIndexOperationRetryException")
+                                || failure.getClass().getSimpleName().contains("VersionConflictEngineException"));
+                        if (alreadyExists) {
+                            continue; // row present => counts toward the ack
+                        }
                         listener.onFailure(
                             new IllegalStateException(
                                 "mv ship apply failed for [" + docId + "]: " + result.getResultType(),
