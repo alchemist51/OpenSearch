@@ -36,7 +36,8 @@ public class MVDataFormatPlugin extends Plugin
         DataFormatPlugin,
         SearchBackEndPlugin<MVReaderManager.MVReader>,
         org.opensearch.plugins.ClusterPlugin,
-        org.opensearch.plugins.ActionPlugin {
+        org.opensearch.plugins.ActionPlugin,
+        org.opensearch.plugins.ExtensiblePlugin {
 
     /**
      * Node client captured at component creation; used by the separate-index
