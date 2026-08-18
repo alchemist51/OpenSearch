@@ -59,6 +59,7 @@ public record MVDefinitionSpec(List<Column> columns, int groupKeys, String sql, 
         return switch (name) {
             case "payments" -> SOURCE;
             case "clickbench_q9" -> CLICKBENCH_Q9;
+            case "clickbench_q9_native" -> CLICKBENCH_Q9_NATIVE;
             default -> throw new IllegalArgumentException("unknown mv definition [" + name + "]");
         };
     }
@@ -67,6 +68,7 @@ public record MVDefinitionSpec(List<Column> columns, int groupKeys, String sql, 
         return switch (name) {
             case "payments" -> TARGET_FOLD;
             case "clickbench_q9" -> CLICKBENCH_Q9_FOLD;
+            case "clickbench_q9_native" -> CLICKBENCH_Q9_NATIVE_FOLD;
             default -> throw new IllegalArgumentException("unknown mv fold definition [" + name + "]");
         };
     }
@@ -127,5 +129,44 @@ public record MVDefinitionSpec(List<Column> columns, int groupKeys, String sql, 
         1,
         "SELECT \"RegionID\", SUM(cnt), SUM(adv_sum), SUM(res_sum), MIN(res_min), MAX(res_max) FROM mv_input GROUP BY \"RegionID\"",
         List.of("RegionID", "cnt", "adv_sum", "res_sum", "res_min", "res_max")
+    );
+
+    /**
+     * ZERO-TRANSLATION q9 (native read validation): the definition IS the
+     * query — AVG kept intact so the state file carries DataFusion's own avg
+     * state pair [count, sum] in the query's exact partial column order:
+     * [RegionID, sum(AdvEngineID)[sum], count(*)[count], avg[count], avg[sum]].
+     * A strict read then serves these files AS the fragment's Partial output
+     * and the coordinator Final merges + evaluates (divide-once) natively.
+     */
+    public static final MVDefinitionSpec CLICKBENCH_Q9_NATIVE = new MVDefinitionSpec(
+        List.of(
+            new Column("RegionID", ColumnType.INT64),
+            new Column("AdvEngineID", ColumnType.INT64),
+            new Column("ResolutionWidth", ColumnType.INT64)
+        ),
+        1,
+        "SELECT \"RegionID\", SUM(\"AdvEngineID\"), COUNT(*), AVG(\"ResolutionWidth\") FROM mv_input GROUP BY \"RegionID\"",
+        List.of("RegionID", "adv_sum", "cnt", "avg_cnt", "avg_sum")
+    );
+
+    /**
+     * Fold of {@link #CLICKBENCH_Q9_NATIVE}'s state on the target. The
+     * UNSIGNED cast keeps the folded avg-count column bit-identical to
+     * DataFusion's avg state type (UInt64) — the strict read compares
+     * positional types EXACTLY and throws on any drift (crude by design
+     * for the validation phase).
+     */
+    public static final MVDefinitionSpec CLICKBENCH_Q9_NATIVE_FOLD = new MVDefinitionSpec(
+        List.of(
+            new Column("RegionID", ColumnType.INT64),
+            new Column("adv_sum", ColumnType.INT64),
+            new Column("cnt", ColumnType.INT64),
+            new Column("avg_cnt", ColumnType.INT64),
+            new Column("avg_sum", ColumnType.INT64)
+        ),
+        1,
+        "SELECT \"RegionID\", SUM(adv_sum), SUM(cnt), SUM(CAST(avg_cnt AS BIGINT UNSIGNED)), SUM(avg_sum) FROM mv_input GROUP BY \"RegionID\"",
+        List.of("RegionID", "adv_sum", "cnt", "avg_cnt", "avg_sum")
     );
 }

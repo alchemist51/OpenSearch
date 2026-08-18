@@ -300,6 +300,16 @@ pub async fn execute_with_context(
         // ProjectRowIdOptimizer (registered in session_context when strategy=ListingTable).
         let physical_plan = dataframe.create_physical_plan().await?;
 
+        // MV read path (vanilla shard-fragment path): a session binding replaces
+        // the aggregate's input with the mv-state file scan (STRICT — any
+        // misalignment throws; never a silent fallback, never a wrong answer).
+        let physical_plan = match handle.mv_binding.as_ref() {
+            Some(binding) => {
+                crate::mv_read::apply_mv_binding(&handle.ctx, physical_plan, binding).await?
+            }
+            None => physical_plan,
+        };
+
         let target_schema = crate::schema_coerce::coerce_inferred_schema(physical_plan.schema());
         let physical_plan =
             crate::relabel_exec::wrap_if_relabel_needed(physical_plan, target_schema)?;

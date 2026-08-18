@@ -72,6 +72,10 @@ pub struct SessionContextHandle {
     /// Phantom reservation holding pool capacity for untracked memory.
     /// Dropped when the handle is closed, releasing the capacity.
     pub(crate) phantom_reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
+    /// Materialized-view coverage binding attached via `df_session_attach_mv`
+    /// between session creation and `prepare_partial_plan`. None = no binding =
+    /// today's raw-only plan. See `mv_read` for the prepare-time plan surgery.
+    pub(crate) mv_binding: Option<crate::mv_read::MVBinding>,
 }
 
 /// Configuration for indexed execution with filter delegation, provided by Java.
@@ -416,6 +420,7 @@ pub async unsafe fn create_session_context(
         has_topk,
         prepared_plan: None,
         phantom_reservation: phantom,
+        mv_binding: None,
     };
     Ok(Box::into_raw(Box::new(handle)) as i64)
 }
@@ -507,6 +512,16 @@ pub async fn prepare_partial_plan(
     )?;
 
     let target_schema = crate::schema_coerce::coerce_inferred_schema(stripped.schema());
+    // MV read path: when the session carries a binding, apply the prepare-time
+    // plan surgery (strict mode on this branch: REPLACE the Partial with the
+    // aliased mv-state scan — the separate-index superset guarantee makes the
+    // whole-fragment substitution exact). Runs BEFORE RelabelExec wrapping so
+    // the substituted plan is what gets relabeled.
+    let stripped = match handle.mv_binding.as_ref() {
+        Some(binding) => crate::mv_read::apply_mv_binding(&handle.ctx, stripped, binding).await?,
+        None => stripped,
+    };
+
     let stripped = crate::relabel_exec::wrap_if_relabel_needed(stripped, target_schema)?;
     handle.prepared_plan = Some(stripped);
     Ok(())
@@ -811,6 +826,7 @@ mod tests {
             has_topk: false,
             prepared_plan: None,
             phantom_reservation: None,
+            mv_binding: None,
         };
         (handle, buf)
     }

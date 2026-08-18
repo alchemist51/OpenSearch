@@ -148,6 +148,7 @@ public final class NativeBridge {
     private static final MethodHandle QUERY_REGISTRY_TOP_N_BY_CURRENT;
     private static final MethodHandle DF_NATIVE_NODE_STATS;
     private static final MethodHandle PREPARE_PARTIAL_PLAN;
+    private static final MethodHandle SESSION_ATTACH_MV;
     private static final MethodHandle PREPARE_FINAL_PLAN;
     private static final MethodHandle EXECUTE_LOCAL_PREPARED_PLAN;
     private static final MethodHandle FETCH_BY_ROW_IDS;
@@ -615,6 +616,20 @@ public final class NativeBridge {
         PREPARE_PARTIAL_PLAN = linker.downcallHandle(
             lib.find("df_prepare_partial_plan").orElseThrow(),
             FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG)
+        );
+
+        // i64 df_session_attach_mv(session_ptr, mv_paths_ptr, mv_paths_len, covered_names_ptr, covered_names_len, strict)
+        SESSION_ATTACH_MV = linker.downcallHandle(
+            lib.find("df_session_attach_mv").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_BYTE
+            )
         );
 
         // i64 df_prepare_final_plan(session_ptr, bytes_ptr, bytes_len)
@@ -1807,4 +1822,37 @@ public final class NativeBridge {
     }
 
     public static void initLogger() {}
+
+    /**
+     * Attaches a materialized-view coverage binding to an open SessionContext.
+     * {@code mvFilePaths} are absolute paths of MV state parquet files for covered
+     * segments; {@code coveredRawFileNames} are the raw parquet file names (not paths)
+     * of those same covered segments, to be excluded from the raw scan when the MV
+     * branch is taken. Both lists are newline-joined (parquet file names cannot
+     * contain newlines). The binding is an option: {@code preparePartialPlan} decides
+     * whether to exercise it and silently falls back to the raw-only plan when the
+     * state schema does not line up.
+     *
+     * <p>{@code strict} enables the POC MV-only verification mode: every fallback
+     * in the native read path becomes a hard error and the produced plan is the
+     * state-file scan alone (no raw scan node) — a successful query proves the
+     * answer came exclusively from MV state files. Testing/POC only.
+     *
+     * @param handlePtr pointer returned by {@link #createSessionContext}
+     */
+    public static void sessionAttachMV(
+        long handlePtr,
+        java.util.List<String> mvFilePaths,
+        java.util.List<String> coveredRawFileNames,
+        boolean strict
+    ) {
+        NativeHandle.validatePointer(handlePtr, "sessionContext");
+        String mvJoined = String.join("\n", mvFilePaths);
+        String coveredJoined = String.join("\n", coveredRawFileNames);
+        try (var call = new NativeCall()) {
+            var mv = call.str(mvJoined);
+            var covered = call.str(coveredJoined);
+            call.invoke(SESSION_ATTACH_MV, handlePtr, mv.segment(), mv.len(), covered.segment(), covered.len(), (byte) (strict ? 1 : 0));
+        }
+    }
 }

@@ -35,6 +35,7 @@ pub mod local_executor;
 pub mod memory;
 pub mod memory_guard;
 pub mod mv_poc;
+pub mod mv_read;
 pub mod mv_writer;
 pub mod native_error;
 pub mod partition_stream;

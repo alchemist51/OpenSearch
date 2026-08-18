@@ -157,6 +157,11 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
                     Object value = vectors.get(col).getObject(row);
                     if (value instanceof org.apache.arrow.vector.util.Text t) {
                         value = t.toString();
+                    } else if (value instanceof Double || value instanceof Float) {
+                        // Floating state values (e.g. avg's sum half) must NOT
+                        // be truncated to long — the whole avg correctness
+                        // rides on this bit of plumbing.
+                        value = ((Number) value).doubleValue();
                     } else if (value instanceof Number n) {
                         value = n.longValue();
                     }

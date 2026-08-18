@@ -749,6 +749,42 @@ pub unsafe extern "C" fn df_mv_build_poc(
 /// file and export the sorted state batch via Arrow C-Data (no scratch file).
 #[ffm_safe]
 #[no_mangle]
+pub unsafe extern "C" fn df_session_attach_mv(
+    handle_ptr: i64,
+    mv_paths_ptr: *const u8,
+    mv_paths_len: i64,
+    covered_names_ptr: *const u8,
+    covered_names_len: i64,
+    strict: u8,
+) -> i64 {
+    let handle = &mut *(handle_ptr as *mut crate::session_context::SessionContextHandle);
+    let mv_paths = str_from_raw(mv_paths_ptr, mv_paths_len)
+        .map_err(|e| format!("df_session_attach_mv: mv_paths: {}", e))?;
+    let covered_names = str_from_raw(covered_names_ptr, covered_names_len)
+        .map_err(|e| format!("df_session_attach_mv: covered_names: {}", e))?;
+    let mv_file_paths: Vec<String> = mv_paths
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let covered_raw_file_names: std::collections::HashSet<String> = covered_names
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if mv_file_paths.is_empty() {
+        return Ok(0); // nothing covered — leave the session raw-only
+    }
+    handle.mv_binding = Some(crate::mv_read::MVBinding {
+        mv_file_paths,
+        covered_raw_file_names,
+        strict: strict != 0,
+    });
+    Ok(0)
+}
+
+#[ffm_safe]
+#[no_mangle]
 pub unsafe extern "C" fn df_mv_build_arrow(
     input_ptr: *const u8,
     input_len: i64,

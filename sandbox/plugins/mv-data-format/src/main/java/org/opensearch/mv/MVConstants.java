@@ -86,6 +86,15 @@ public final class MVConstants {
      */
     public static final String VIEWS_SETTING = "index.mv.views";
 
+    /**
+     * Validation-scoped read gate (dynamic, on the MV TARGET index): when
+     * true, analytics scans of this index serve the catalog snapshot's
+     * mv_state Arrow files as the fragment's PARTIAL output (strict — any
+     * misalignment throws). The query keeps the ORIGINAL definition shape;
+     * the coordinator Final computes final answers (incl. avg) natively.
+     */
+    public static final String SERVE_STATE_SETTING = "index.mv.serve_state";
+
     /** Index setting naming the MV definition (POC named-spec registry). */
     public static final String DEFINITION_SETTING = "index.mv.definition";
 

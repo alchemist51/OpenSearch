@@ -98,6 +98,12 @@ public class MVDataFormatPlugin extends Plugin
                 "payments",
                 org.opensearch.common.settings.Setting.Property.IndexScope
             ),
+            org.opensearch.common.settings.Setting.boolSetting(
+                MVConstants.SERVE_STATE_SETTING,
+                false,
+                org.opensearch.common.settings.Setting.Property.IndexScope,
+                org.opensearch.common.settings.Setting.Property.Dynamic
+            ),
             org.opensearch.common.settings.Setting.listSetting(
                 MVConstants.VIEWS_SETTING,
                 java.util.List.of(),

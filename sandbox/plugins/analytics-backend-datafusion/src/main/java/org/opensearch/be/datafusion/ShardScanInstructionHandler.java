@@ -91,7 +91,50 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
                     context.getFragmentBytes()
                 );
             }
+            attachMVStateIfServing(context, sessionCtxHandle);
             return new DataFusionSessionState(sessionCtxHandle);
         }
+    }
+
+    /**
+     * Validation-scoped MV read (crude by design, decision pending prod shape):
+     * when the scanned index carries {@code index.mv.serve_state=true} (a
+     * dynamic setting on the MV TARGET index), attach its own catalog
+     * snapshot's {@code mv_state} Arrow files to the native session in STRICT
+     * mode. The prepared plan's Partial is then REPLACED by the state-file
+     * scan — the files ARE Partial output (zero-translation contract:
+     * the definition is the query, state columns positionally match the
+     * query's partial schema) — and the coordinator's Final merges and
+     * evaluates natively (avg = merge counts+sums, divide once at the end).
+     * STRICT: any misalignment (schema, types, plan shape) is a hard error —
+     * never a silent fallback, never a wrong answer.
+     */
+    private static void attachMVStateIfServing(ShardScanExecutionContext context, SessionContextHandle handle) {
+        org.opensearch.index.IndexSettings indexSettings = context.getIndexSettings();
+        if (indexSettings == null || indexSettings.getSettings().getAsBoolean("index.mv.serve_state", false) == false) {
+            return;
+        }
+        org.opensearch.index.engine.exec.coord.CatalogSnapshot snapshot = context.getReader().catalogSnapshot();
+        java.util.Collection<org.opensearch.index.engine.exec.WriterFileSet> stateSets = snapshot.getSearchableFiles("mv_state");
+        if (stateSets == null || stateSets.isEmpty()) {
+            throw new IllegalStateException(
+                "index.mv.serve_state is set but the catalog snapshot has no mv_state files (index="
+                    + indexSettings.getIndex().getName()
+                    + ")"
+            );
+        }
+        java.util.List<String> stateFilePaths = stateSets.stream()
+            .flatMap(fs -> fs.files().stream().map(f -> fs.directory() + "/" + f))
+            .sorted()
+            .toList();
+        // Strict always: this read mode exists to VALIDATE the MV mechanism —
+        // a fallback to raw scans would silently invalidate the experiment.
+        org.apache.logging.log4j.LogManager.getLogger(ShardScanInstructionHandler.class)
+            .info(
+                "mv read: serving {} state files as Partial output (strict) for [{}]",
+                stateFilePaths.size(),
+                indexSettings.getIndex().getName()
+            );
+        NativeBridge.sessionAttachMV(handle.getPointer(), stateFilePaths, java.util.List.of(), true);
     }
 }
