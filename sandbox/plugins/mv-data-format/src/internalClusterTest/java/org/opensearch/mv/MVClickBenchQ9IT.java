@@ -146,10 +146,6 @@ public class MVClickBenchQ9IT extends OpenSearchIntegTestCase {
                 "type=long",
                 "res_max",
                 "type=long",
-                "_mv_source_index",
-                "type=keyword",
-                "_mv_source_shard",
-                "type=long",
                 "_mv_source_generation",
                 "type=long"
             )

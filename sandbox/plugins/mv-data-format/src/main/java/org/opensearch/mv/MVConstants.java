@@ -78,6 +78,14 @@ public final class MVConstants {
      */
     public static final String SHIP_TARGETS_SETTING = "index.mv.ship_targets";
 
+    /**
+     * User-facing MV declaration (decisions 20/22/23): list of
+     * {@code definition} or {@code definition:targetName} entries on the
+     * SOURCE index. Everything else (formats, ship targets, the target index
+     * itself) is derived — see {@link MVViewsService}.
+     */
+    public static final String VIEWS_SETTING = "index.mv.views";
+
     /** Index setting naming the MV definition (POC named-spec registry). */
     public static final String DEFINITION_SETTING = "index.mv.definition";
 

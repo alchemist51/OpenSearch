@@ -157,8 +157,11 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
                     }
                     doc.put(shipFields.get(col), value);
                 }
-                doc.put("_mv_source_index", request.sourceIndex());
-                doc.put("_mv_source_shard", request.sourceShard());
+                // Provenance (decision 21): ONE field. Idempotency lives in the
+                // deterministic _id (source.shard.gen.row); source index+shard are
+                // constants per target shard under ordinal-paired colocation. The
+                // generation field alone has a query job — the orphan sweep's
+                // delete-by-generation.
                 doc.put("_mv_source_generation", request.writerGeneration());
                 String docId = request.sourceIndex() + "." + request.sourceShard() + "." + request.writerGeneration() + "." + row;
                 try (XContentBuilder builder = XContentFactory.jsonBuilder()) {

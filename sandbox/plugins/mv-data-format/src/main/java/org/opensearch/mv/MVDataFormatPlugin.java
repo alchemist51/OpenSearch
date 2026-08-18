@@ -65,6 +65,9 @@ public class MVDataFormatPlugin extends Plugin
     ) {
         this.client = client;
         this.clusterService = clusterService;
+        // D20/D23/D24: auto-create MV target indices for sources declaring
+        // index.mv.views (cluster-manager only; tolerant of re-entry).
+        clusterService.addListener(new MVViewsService.TargetCreator(client));
         // NOTE (real-node deployment): all native-using plugins must share ONE
         // native instance — deploy with -Dnative.lib.path pointing at a single
         // .so (SymbolLookup.libraryLookup dlopens the same handle; globals
@@ -94,8 +97,19 @@ public class MVDataFormatPlugin extends Plugin
                 MVConstants.DEFINITION_SETTING,
                 "payments",
                 org.opensearch.common.settings.Setting.Property.IndexScope
+            ),
+            org.opensearch.common.settings.Setting.listSetting(
+                MVConstants.VIEWS_SETTING,
+                java.util.List.of(),
+                java.util.function.Function.identity(),
+                org.opensearch.common.settings.Setting.Property.IndexScope
             )
         );
+    }
+
+    @Override
+    public java.util.Collection<org.opensearch.index.shard.IndexSettingProvider> getAdditionalIndexSettingProviders() {
+        return java.util.List.of(new MVViewsService.Provider());
     }
 
     @Override

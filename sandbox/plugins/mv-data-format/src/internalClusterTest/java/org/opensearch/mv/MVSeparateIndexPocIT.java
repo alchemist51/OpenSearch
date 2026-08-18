@@ -397,10 +397,6 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
                 "type=long",
                 "lat_max",
                 "type=long",
-                "_mv_source_index",
-                "type=keyword",
-                "_mv_source_shard",
-                "type=long",
                 "_mv_source_generation",
                 "type=long"
             )
@@ -440,10 +436,6 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
                 "lat_min",
                 "type=long",
                 "lat_max",
-                "type=long",
-                "_mv_source_index",
-                "type=keyword",
-                "_mv_source_shard",
                 "type=long",
                 "_mv_source_generation",
                 "type=long"
