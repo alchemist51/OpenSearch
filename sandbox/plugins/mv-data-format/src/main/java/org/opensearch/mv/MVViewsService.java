@@ -48,12 +48,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * index creation, so the source is empty by definition. The future
  * add-MV-to-existing-index API must add its own race-free emptiness check.
  *
- * <p>OPEN GAP (found by MVViewsIT): a mapping submitted INSIDE the same
- * create-index request is validated against a settings view that does not
- * include provider-derived formats — the composite capability check fails
- * with "Configured formats: [parquet]". Mapping applied after creation (or
- * via templates) works. Needs a MetadataCreateIndexService-side look before
- * this UX ships.
+ * <p>RESOLVED (was "the mapping gap"): the composite plugin's own
+ * IndexSettingProvider used to contribute cluster-default formats for every
+ * new index; provider iteration order is undefined, so on losing orders its
+ * empty secondary list overwrote this provider's derived formats (breaking
+ * inline mappings deterministically-ish and shard recovery seed-dependently).
+ * The composite provider now defers when `index.mv.views` is declared.
  *
  * <p>Names (decision 23): {@code definition:name} uses {@code name} as the
  * target index; a bare {@code definition} generates

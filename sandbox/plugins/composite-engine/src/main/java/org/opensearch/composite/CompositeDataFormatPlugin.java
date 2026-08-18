@@ -322,6 +322,18 @@ public class CompositeDataFormatPlugin extends Plugin implements DataFormatPlugi
                     }
                 }
 
+                // MV views declaration (index.mv.views): the MV plugin's own
+                // IndexSettingProvider derives the full format stack for such
+                // indices. Providers cannot see each other's output and their
+                // iteration order is UNDEFINED (HashSet) — contributing
+                // cluster defaults here would nondeterministically overwrite
+                // the MV-derived formats (observed: secondary list persisted
+                // as [] on the losing order, failing every capability check
+                // and shard recovery). Key-string check by design: no
+                // compile dependency on the MV plugin.
+                if (templateAndRequestSettings.hasValue("index.mv.views")) {
+                    return Settings.EMPTY;
+                }
                 Settings.Builder out = Settings.builder();
                 if (PRIMARY_DATA_FORMAT.exists(templateAndRequestSettings) == false) {
                     out.put(PRIMARY_DATA_FORMAT.getKey(), clusterPrimary);

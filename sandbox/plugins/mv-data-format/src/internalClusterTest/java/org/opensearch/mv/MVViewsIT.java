@@ -44,13 +44,6 @@ import java.util.regex.Pattern;
  */
 @ThreadLeakFilters(filters = MVViewsIT.NativeThreadFilter.class)
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 1)
-@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "provider-derived formats invisible to some validation paths")
-// SEED-DEPENDENT FLAKE (pre-existing, verified by stashing all later changes):
-// on some seeds the source shard's recovery evaluates the _field_names
-// metadata field's capabilities against formats [parquet] — the SAME
-// "provider-derived settings invisible to a validation path" root cause as
-// the documented create+mapping gap (MVViewsService javadoc). Passes on
-// other seeds end to end. Re-enable with the MetadataCreateIndexService fix.
 public class MVViewsIT extends OpenSearchIntegTestCase {
 
     public static class NativeThreadFilter implements ThreadFilter {
@@ -105,15 +98,9 @@ public class MVViewsIT extends OpenSearchIntegTestCase {
                     .put("index.composite.merge_on_refresh_max_size", "0b")
                     .putList(MVConstants.VIEWS_SETTING, "payments")
             )
-            // Mapping applied AFTER create (open gap, noted in MVViewsService:
-            // a mapping inside the same create request is validated against a
-            // settings view that misses provider-derived formats — the
-            // capability check then fails with "Configured formats: [parquet]").
-            .get();
-        client().admin()
-            .indices()
-            .preparePutMapping(SOURCE)
-            .setSource("service", "type=keyword", "status", "type=keyword", "latency_ms", "type=long")
+            // Mapping INLINE in the create — works since the provider-collision
+            // fix (the composite plugin's provider defers to MV-derived formats).
+            .setMapping("service", "type=keyword", "status", "type=keyword", "latency_ms", "type=long")
             .get();
         ensureGreen(SOURCE);
 
