@@ -159,8 +159,6 @@ public class MVClickBenchQ9PplIT extends AnalyticsRestTestCase {
                 + "  \"res_sum\":  { \"type\": \"integer\" },"
                 + "  \"res_min\":  { \"type\": \"integer\" },"
                 + "  \"res_max\":  { \"type\": \"integer\" },"
-                + "  \"_mv_source_index\":      { \"type\": \"keyword\" },"
-                + "  \"_mv_source_shard\":      { \"type\": \"long\" },"
                 + "  \"_mv_source_generation\": { \"type\": \"long\" }"
                 + "}}"
                 + "}"

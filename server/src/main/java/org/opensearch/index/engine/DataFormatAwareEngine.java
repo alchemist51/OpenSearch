@@ -103,6 +103,7 @@ import org.opensearch.search.suggest.completion.CompletionStats;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.io.UnsupportedEncodingException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -1193,7 +1194,12 @@ public class DataFormatAwareEngine implements Indexer {
                             // and available to the deletion policy when onCommit is triggered.
                             translogManager.ensureCanFlush();
                             translogManager.syncTranslog();
-                            Map<String, String> commitData = new HashMap<>();
+                            // Cross-index commit coordination (decision 25):
+                            // format engines may trigger dependent commits and
+                            // contribute commit meta; failure refuses THIS commit.
+                            Map<String, String> participantEntries = indexingExecutionEngine.beforeCommit();
+
+                            Map<String, String> commitData = new HashMap<>(participantEntries);
                             commitData.put(
                                 CatalogSnapshot.LAST_COMPOSITE_WRITER_GEN_KEY,
                                 Long.toString(snapshot.getLastWriterGeneration())
@@ -1471,6 +1477,20 @@ public class DataFormatAwareEngine implements Indexer {
     @Override
     public void onMergesDrained(Runnable listener) {
         mergeScheduler.onDrained(listener);
+    }
+
+    /**
+     * Version of the latest (possibly uncommitted) catalog snapshot. Used by
+     * cross-index commit coordination (a ship ack reports the version its
+     * apply produced; the source commits only after this version is durable
+     * on the target — decision 25).
+     */
+    public long latestCatalogSnapshotVersion() {
+        try (GatedConditionalCloseable<CatalogSnapshot> ref = catalogSnapshotManager.acquireSnapshotForCommit()) {
+            return ref.get().getVersion();
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to read latest catalog snapshot version", e);
+        }
     }
 
     /**

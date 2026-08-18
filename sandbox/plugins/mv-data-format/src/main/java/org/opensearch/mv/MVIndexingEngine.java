@@ -48,6 +48,8 @@ public final class MVIndexingEngine
     private final java.util.List<String> shipTargets;
     private final java.util.function.Supplier<org.opensearch.transport.client.Client> clientSupplier;
     private final java.util.function.Supplier<org.opensearch.cluster.service.ClusterService> clusterServiceSupplier;
+    /** Per-target high-water of ship-acked catalog snapshot versions (commit sync, decision 25). */
+    private final java.util.concurrent.ConcurrentMap<String, Long> targetSnapshotHighWater = new java.util.concurrent.ConcurrentHashMap<>();
 
     public MVIndexingEngine(ShardPath shardPath, String indexName) {
         this(shardPath, indexName, MVDefinitionSpec.SOURCE, MVDataFormat.INSTANCE, java.util.List.of(), () -> null, () -> null);
@@ -85,9 +87,44 @@ public final class MVIndexingEngine
             if (client == null) {
                 throw new IllegalStateException("mv ship targets " + shipTargets + " configured but node client not initialized");
             }
-            shipper = new MVStateShipper(client, shipTargets, sourceIndexName, shardPath.getShardId(), clusterServiceSupplier.get(), spec);
+            shipper = new MVStateShipper(
+                client,
+                shipTargets,
+                sourceIndexName,
+                shardPath.getShardId(),
+                clusterServiceSupplier.get(),
+                spec,
+                targetSnapshotHighWater
+            );
         }
         return new MVWriter(config.writerGeneration(), shardPath, tableName, spec, getDataFormat(), shipper);
+    }
+
+    @Override
+    public java.util.Map<String, String> beforeCommit() throws java.io.IOException {
+        // Commit sync (decision 25): before the SOURCE commits, every ship
+        // target must durably commit a catalog snapshot >= the version its
+        // ship acks reported — the superset rule at commit granularity.
+        // Target-side engines (no ship targets) are a no-op: no recursion.
+        if (shipTargets.isEmpty() || targetSnapshotHighWater.isEmpty()) {
+            return java.util.Map.of();
+        }
+        java.util.Map<String, String> meta = new java.util.HashMap<>();
+        for (java.util.Map.Entry<String, Long> entry : targetSnapshotHighWater.entrySet()) {
+            String target = entry.getKey();
+            long minVersion = entry.getValue();
+            try {
+                MVCommitSyncAction.Response response = clientSupplier.get()
+                    .execute(MVCommitSyncAction.INSTANCE, new MVCommitSyncAction.Request(target, shardPath.getShardId().id(), minVersion))
+                    .actionGet();
+                meta.put("mv.commit." + target, Long.toString(response.committedVersion()));
+            } catch (Exception e) {
+                // Refusal semantics, same as a failed ship: the source never
+                // commits ahead of its target's durability.
+                throw new java.io.IOException("mv commit sync failed for target [" + target + "] (min version " + minVersion + ")", e);
+            }
+        }
+        return meta;
     }
 
     @Override

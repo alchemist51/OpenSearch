@@ -4437,6 +4437,21 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         recoveryState.getVerifyIndex().checkIndexTime(Math.max(0, TimeValue.nsecToMSec(System.nanoTime() - timeNS)));
     }
 
+    /**
+     * Latest catalog snapshot version of this shard's composite engine, or
+     * {@code -1} if the shard is not composite-backed. Used by cross-index
+     * commit coordination (the MV commit sync, decision 25): a ship ack
+     * reports the version its apply produced; the source commits only after
+     * that version is durable here.
+     */
+    public long compositeCatalogSnapshotVersion() {
+        Indexer indexer = getIndexerOrNull();
+        if (indexer instanceof org.opensearch.index.engine.DataFormatAwareEngine dfe) {
+            return dfe.latestCatalogSnapshotVersion();
+        }
+        return -1L;
+    }
+
     Indexer getIndexer() {
         Indexer engine = getIndexerOrNull();
         if (engine == null) {

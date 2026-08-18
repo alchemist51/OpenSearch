@@ -120,6 +120,22 @@ public interface IndexingExecutionEngine<T extends DataFormat, P extends Documen
      *
      * @return the checksum strategy, or {@code null} if this engine does not pre-compute checksums
      */
+    /**
+     * Called by the engine INSIDE its commit section, after the pre-commit
+     * refresh and before commit data is written. A format engine may use it
+     * to coordinate cross-index durability (e.g. a derived format triggering
+     * its ship target's commit — the MV commit-sync of decision 25) and may
+     * contribute entries to the commit user data (merged under the format's
+     * own key namespace). Throwing FAILS the flush — same refusal semantics
+     * as a failed ship: the index never commits ahead of its obligations.
+     *
+     * @return extra commit user-data entries; empty map for none
+     * @throws IOException to refuse the commit
+     */
+    default java.util.Map<String, String> beforeCommit() throws IOException {
+        return java.util.Map.of();
+    }
+
     default FormatChecksumStrategy getChecksumStrategy() {
         return null;
     }

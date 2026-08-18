@@ -50,6 +50,8 @@ final class MVStateShipper {
     private final ShardId shardId;
     private final org.opensearch.cluster.service.ClusterService clusterService;
     private final MVDefinitionSpec spec;
+    /** Engine-owned per-target high-water of acked catalog snapshot versions (commit sync, decision 25). */
+    private final java.util.concurrent.ConcurrentMap<String, Long> targetSnapshotHighWater;
 
     MVStateShipper(
         Client client,
@@ -57,7 +59,8 @@ final class MVStateShipper {
         String sourceIndex,
         ShardId shardId,
         org.opensearch.cluster.service.ClusterService clusterService,
-        MVDefinitionSpec spec
+        MVDefinitionSpec spec,
+        java.util.concurrent.ConcurrentMap<String, Long> targetSnapshotHighWater
     ) {
         this.spec = spec;
         this.client = client;
@@ -65,6 +68,7 @@ final class MVStateShipper {
         this.sourceIndex = sourceIndex;
         this.shardId = shardId;
         this.clusterService = clusterService;
+        this.targetSnapshotHighWater = targetSnapshotHighWater;
     }
 
     /**
@@ -149,6 +153,9 @@ final class MVStateShipper {
                         + response.applied()
                 );
                 continue;
+            }
+            if (response.snapshotVersion() >= 0) {
+                targetSnapshotHighWater.merge(targetIndex, response.snapshotVersion(), Math::max);
             }
             logger.info(
                 "mv ship: gen={} shipped {} state rows from {}[{}] -> [{}][{}] (acked durable+searchable)",

@@ -124,7 +124,10 @@ public class MVDataFormatPlugin extends Plugin
     public
         java.util.List<ActionHandler<? extends org.opensearch.action.ActionRequest, ? extends org.opensearch.core.action.ActionResponse>>
         getActions() {
-        return java.util.List.of(new ActionHandler<>(MVShipStateAction.INSTANCE, MVShipStateTransportHandler.class));
+        return java.util.List.of(
+            new ActionHandler<>(MVShipStateAction.INSTANCE, MVShipStateTransportHandler.class),
+            new ActionHandler<>(MVCommitSyncAction.INSTANCE, MVCommitSyncTransportHandler.class)
+        );
     }
 
     @Override

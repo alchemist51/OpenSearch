@@ -135,22 +135,35 @@ public final class MVShipStateAction extends ActionType<MVShipStateAction.Respon
     /** Ack: rows are durably applied on the target primary. */
     public static class Response extends ActionResponse {
         private final int applied;
+        /**
+         * Target catalog snapshot version covering this apply (post-refresh).
+         * The source's commit sync (decision 25) commits the target AT LEAST
+         * to this version before committing itself.
+         */
+        private final long snapshotVersion;
 
-        public Response(int applied) {
+        public Response(int applied, long snapshotVersion) {
             this.applied = applied;
+            this.snapshotVersion = snapshotVersion;
         }
 
         public Response(StreamInput in) throws IOException {
             this.applied = in.readVInt();
+            this.snapshotVersion = in.readVLong();
         }
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
             out.writeVInt(applied);
+            out.writeVLong(snapshotVersion);
         }
 
         public int applied() {
             return applied;
+        }
+
+        public long snapshotVersion() {
+            return snapshotVersion;
         }
     }
 }

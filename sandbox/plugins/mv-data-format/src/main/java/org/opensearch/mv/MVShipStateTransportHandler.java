@@ -49,6 +49,11 @@ import org.opensearch.transport.TransportService;
  */
 public final class MVShipStateTransportHandler extends HandledTransportAction<MVShipStateAction.Request, MVShipStateAction.Response> {
 
+    /** Latest catalog snapshot version of the target's composite engine (post-refresh); -1 for plain targets. */
+    static long engineSnapshotVersion(org.opensearch.index.shard.IndexShard shard) {
+        return shard.compositeCatalogSnapshotVersion();
+    }
+
     private static final Logger logger = LogManager.getLogger(MVShipStateTransportHandler.class);
 
     private final IndicesService indicesService;
@@ -222,7 +227,8 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
                 request.targetShard(),
                 transportService.getLocalNode().getId()
             );
-            listener.onResponse(new MVShipStateAction.Response(rows));
+            long snapshotVersion = engineSnapshotVersion(shard);
+            listener.onResponse(new MVShipStateAction.Response(rows, snapshotVersion));
         } catch (Exception e) {
             listener.onFailure(e);
         } finally {

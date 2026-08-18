@@ -227,6 +227,23 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
 
     /** {@inheritDoc} Delegates to the primary engine's merger. */
     @Override
+    public java.util.Map<String, String> beforeCommit() throws java.io.IOException {
+        // Fan out to every per-format engine (primary + secondaries); merged
+        // entries land in the composite commit's user data. Key collisions
+        // are a programming error — formats must namespace their keys.
+        java.util.Map<String, String> merged = new java.util.HashMap<>(primaryEngine.beforeCommit());
+        for (IndexingExecutionEngine<?, ?> secondary : secondaryEngines) {
+            for (java.util.Map.Entry<String, String> e : secondary.beforeCommit().entrySet()) {
+                String prev = merged.put(e.getKey(), e.getValue());
+                if (prev != null) {
+                    throw new IllegalStateException("duplicate commit user-data key from format engines: " + e.getKey());
+                }
+            }
+        }
+        return merged;
+    }
+
+    @Override
     public Merger getMerger() {
         return merger;
     }
