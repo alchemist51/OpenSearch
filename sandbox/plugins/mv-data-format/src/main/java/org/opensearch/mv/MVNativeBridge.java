@@ -28,6 +28,7 @@ public final class MVNativeBridge {
     private static final MethodHandle MV_INIT_RUNTIME;
     private static final MethodHandle MV_BUILD_POC;
     private static final MethodHandle MV_BUILD_ARROW;
+    private static final MethodHandle MV_MERGE_STATE;
     private static final MethodHandle MV_SEARCH_POC;
     private static final MethodHandle MV_WRITER_CREATE;
     private static final MethodHandle MV_WRITER_FEED;
@@ -76,6 +77,18 @@ public final class MVNativeBridge {
                 ValueLayout.ADDRESS,
                 ValueLayout.JAVA_LONG,
                 ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG
+            )
+        );
+        MV_MERGE_STATE = linker.downcallHandle(
+            lib.find("df_mv_merge_state").orElseThrow(() -> new IllegalStateException("df_mv_merge_state not found")),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
                 ValueLayout.JAVA_LONG
             )
         );
@@ -168,6 +181,22 @@ public final class MVNativeBridge {
         }
     }
 
+    /**
+     * DataFusion STATE-to-STATE merge used by
+     * {@link org.opensearch.mv.merge.DataFusionMVStateMergeStrategy}. The
+     * standard data-format merge framework owns candidate selection and
+     * scheduling; this native operation only folds the selected state files
+     * into one group-key-sorted state file with a schema compatible with its
+     * inputs. Returns the merged row count.
+     */
+    public static long mergeStateFiles(java.util.List<String> stateFiles, String foldSql, String outputFile) {
+        try (var call = new NativeCall()) {
+            var files = call.str(String.join("\n", stateFiles));
+            var query = call.str(foldSql);
+            var out = call.str(outputFile);
+            return call.invoke(MV_MERGE_STATE, files.segment(), files.len(), query.segment(), query.len(), out.segment(), out.len());
+        }
+    }
 
     /**
      * Refresh-time ship build: Partial over one parquet file, sorted state

@@ -48,6 +48,7 @@ public class DataFormatAwareMergePolicy implements MergeHandler.MergePolicy, Mer
     private final Logger logger;
     private final Directory sharedDirectory;
     private final DataFormatMergeContext mergeContext;
+    private final java.util.function.Predicate<List<Segment>> mergeEligibility;
 
     /**
      * Constructs a DataFormatAwareMergePolicy.
@@ -56,10 +57,26 @@ public class DataFormatAwareMergePolicy implements MergeHandler.MergePolicy, Mer
      * @param shardId     the shard ID for logging context
      */
     public DataFormatAwareMergePolicy(org.apache.lucene.index.MergePolicy mergePolicy, ShardId shardId) {
+        this(mergePolicy, shardId, segments -> true);
+    }
+
+    /**
+     * Constructs a policy with a final format-owned eligibility gate.
+     *
+     * @param mergePolicy Lucene candidate selector
+     * @param shardId shard ID for logging context
+     * @param mergeEligibility predicate applied to each proposed input group
+     */
+    public DataFormatAwareMergePolicy(
+        org.apache.lucene.index.MergePolicy mergePolicy,
+        ShardId shardId,
+        java.util.function.Predicate<List<Segment>> mergeEligibility
+    ) {
         this.luceneMergePolicy = mergePolicy;
         this.logger = Loggers.getLogger(getClass(), shardId);
         this.sharedDirectory = new ByteBuffersDirectory();
         this.mergeContext = new DataFormatMergeContext(logger);
+        this.mergeEligibility = Objects.requireNonNull(mergeEligibility);
     }
 
     /**
@@ -85,7 +102,7 @@ public class DataFormatAwareMergePolicy implements MergeHandler.MergePolicy, Mer
                 segmentsToMerge,
                 mergeContext
             );
-            return convertMergeSpecification(mergeSpec, segmentMap);
+            return eligible(convertMergeSpecification(mergeSpec, segmentMap));
         } catch (Exception e) {
             logger.error("Error finding force merge candidates", e);
             throw new RuntimeException("Error finding force merge candidates", e);
@@ -110,7 +127,7 @@ public class DataFormatAwareMergePolicy implements MergeHandler.MergePolicy, Mer
                 segmentInfos,
                 mergeContext
             );
-            return convertMergeSpecification(mergeSpec, segmentMap);
+            return eligible(convertMergeSpecification(mergeSpec, segmentMap));
         } catch (Exception e) {
             logger.error("Error finding merge candidates", e);
             throw new RuntimeException("Error finding merge candidates", e);
@@ -196,6 +213,10 @@ public class DataFormatAwareMergePolicy implements MergeHandler.MergePolicy, Mer
         }
 
         return merges;
+    }
+
+    private List<List<Segment>> eligible(List<List<Segment>> candidates) {
+        return candidates.stream().filter(mergeEligibility).toList();
     }
 
     private long calculateNumDocs(Segment segment) {

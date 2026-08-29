@@ -60,7 +60,7 @@ public class CompositeMergeExecutor {
             for (DataFormat secondary : plan.secondaryFormats()) {
                 FormatMergeResult secondaryResult = mergeFormat(plan, secondary, mapping);
                 // Verify secondary produced output when primary did
-                if (primaryResult.mergedFiles() != null && secondaryResult.mergedFiles() == null) {
+                if (primaryResult.mergedFiles() != null && secondaryResult.mergedFiles() == null && secondary.mayEmitNoFiles() == false) {
                     throw new IllegalStateException(
                         "Primary format ["
                             + plan.primaryFormat().name()
@@ -69,8 +69,11 @@ public class CompositeMergeExecutor {
                             + "] returned null — possible concurrent merge consumed segments"
                     );
                 }
-                // Verify secondary merged row count matches primary
-                if (primaryResult.mergedFiles() != null && secondaryResult.mergedFiles() != null) {
+                // Verify secondary merged row count matches primary.
+                // POC(mv): derived formats (aggregated rows) are exempt — see DataFormat#exemptFromRowParity.
+                if (primaryResult.mergedFiles() != null
+                    && secondaryResult.mergedFiles() != null
+                    && secondary.exemptFromRowParity() == false) {
                     long primaryRows = primaryResult.mergedFiles().numRows();
                     long secondaryRows = secondaryResult.mergedFiles().numRows();
                     if (primaryRows != secondaryRows) {

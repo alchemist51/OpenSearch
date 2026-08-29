@@ -731,6 +731,35 @@ pub unsafe extern "C" fn df_mv_build_arrow(
     let rows = crate::mv_poc::mv_build_arrow(input, table, sql, array_addr, schema_addr)?;
     Ok(rows)
 }
+
+/// State⊕state merge (code-complete, engine-gated OFF until the orphan
+/// sweep): folds newline-joined state files into one folded state file.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_merge_state(
+    files_ptr: *const u8,
+    files_len: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    output_ptr: *const u8,
+    output_len: i64,
+) -> i64 {
+    let files_joined = str_from_raw(files_ptr, files_len)
+        .map_err(|e| format!("df_mv_merge_state: files: {}", e))?;
+    let sql =
+        str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_merge_state: sql: {}", e))?;
+    let output = str_from_raw(output_ptr, output_len)
+        .map_err(|e| format!("df_mv_merge_state: output: {}", e))?;
+    let files: Vec<String> = files_joined
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if files.is_empty() {
+        return Err("df_mv_merge_state: no input files".to_string());
+    }
+    let rows = crate::mv_poc::mv_merge_state(&files, sql, output)?;
+    Ok(rows)
 }
 
 #[ffm_safe]

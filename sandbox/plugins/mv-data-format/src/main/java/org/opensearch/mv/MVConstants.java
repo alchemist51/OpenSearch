@@ -96,6 +96,15 @@ public final class MVConstants {
     public static final String SERVE_STATE_SETTING = "index.mv.serve_state";
 
     /**
+     * Selects the DataFusion STATE-to-STATE strategy for an {@code mv_state}
+     * format. This does not schedule or enable merges: candidate selection,
+     * scheduling, and global enablement remain owned by the standard
+     * data-format merge framework. Cursor certification still gates candidate
+     * eligibility. When false, the engine uses the DataFusion recompute
+     * strategy over the primary Parquet merge output.
+     */
+    public static final String STATE_MERGE_SETTING = "index.mv.state_merge_enabled";
+
     /**
      * Ordered logical names for columns in each MV state row. This is the durable
      * bridge between the positional Arrow aggregate-state contract and the target

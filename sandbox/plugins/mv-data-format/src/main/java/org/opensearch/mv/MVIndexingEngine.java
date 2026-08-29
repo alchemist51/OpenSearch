@@ -16,6 +16,11 @@ import org.opensearch.index.engine.dataformat.Writer;
 import org.opensearch.index.engine.dataformat.WriterConfig;
 import org.opensearch.index.engine.exec.Segment;
 import org.opensearch.index.shard.ShardPath;
+import org.opensearch.mv.merge.DataFusionMVRecomputeMergeStrategy;
+import org.opensearch.mv.merge.DataFusionMVStateMergeStrategy;
+import org.opensearch.mv.merge.MVMergeExecutor;
+import org.opensearch.mv.merge.MVMergeStrategy;
+import org.opensearch.mv.merge.NoOpMVMergeStrategy;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -81,7 +86,8 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
             "payments",
             java.util.List.of(),
             () -> null,
-            () -> null
+            () -> null,
+            false
         );
     }
 
@@ -93,7 +99,8 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
         String definitionName,
         java.util.List<String> shipTargets,
         java.util.function.Supplier<org.opensearch.transport.client.Client> clientSupplier,
-        java.util.function.Supplier<org.opensearch.cluster.service.ClusterService> clusterServiceSupplier
+        java.util.function.Supplier<org.opensearch.cluster.service.ClusterService> clusterServiceSupplier,
+        boolean stateMergeEnabled
     ) {
         this.spec = spec;
         this.format = format;
@@ -104,7 +111,15 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
         this.shipTargets = shipTargets == null ? java.util.List.of() : java.util.List.copyOf(shipTargets);
         this.clientSupplier = clientSupplier;
         this.clusterServiceSupplier = clusterServiceSupplier;
-        this.merger = null; // merge strategies added in next commit
+        MVMergeStrategy mergeStrategy;
+        if (this.shipTargets.isEmpty() == false) {
+            mergeStrategy = new NoOpMVMergeStrategy();
+        } else if (stateMergeEnabled && MVStateDataFormat.NAME.equals(format.name())) {
+            mergeStrategy = new DataFusionMVStateMergeStrategy(format, shardPath, spec.sql());
+        } else {
+            mergeStrategy = new DataFusionMVRecomputeMergeStrategy(format, shardPath, spec.sql());
+        }
+        this.merger = new MVMergeExecutor(mergeStrategy);
         try {
             Files.createDirectories(shardPath.getDataPath().resolve(getDataFormat().name()));
         } catch (IOException e) {
