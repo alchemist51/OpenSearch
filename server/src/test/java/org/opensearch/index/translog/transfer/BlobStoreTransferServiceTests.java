@@ -54,9 +54,11 @@ import java.nio.file.StandardOpenOption;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
@@ -135,6 +137,42 @@ public class BlobStoreTransferServiceTests extends OpenSearchTestCase {
         );
         assertTrue(latch.await(1000, TimeUnit.MILLISECONDS));
         assertTrue(succeeded.get());
+    }
+
+    public void testAsyncFileBackedSnapshotUsesRangeStreams() throws Exception {
+        BlobStore blobStore = createTestBlobStore();
+        MockAsyncFsContainer asyncContainer = new MockAsyncFsContainer((FsBlobStore) blobStore, BlobPath.cleanPath(), null);
+        FsBlobStore fsBlobStore = mock(FsBlobStore.class);
+        when(fsBlobStore.blobContainer(any())).thenReturn(asyncContainer);
+
+        Path testFile = createTempFile();
+        Files.write(testFile, randomByteArrayOfLength(128), StandardOpenOption.APPEND);
+        long primaryTerm = randomNonNegativeLong();
+        FileSnapshot.TransferFileSnapshot snapshot = new FileSnapshot.TransferFileSnapshot(testFile, primaryTerm, 1L) {
+            @Override
+            public InputStream inputStream() {
+                throw new AssertionError("file-backed async upload must not materialize the complete input stream");
+            }
+        };
+
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicBoolean succeeded = new AtomicBoolean(false);
+        AtomicReference<Exception> failure = new AtomicReference<>();
+        BlobStoreTransferService transferService = new BlobStoreTransferService(fsBlobStore, threadPool);
+        transferService.uploadBlobs(Set.of(snapshot), Map.of(primaryTerm, BlobPath.cleanPath()), ActionListener.wrap(response -> {
+            succeeded.set(true);
+            latch.countDown();
+        }, exception -> {
+            failure.set(exception);
+            latch.countDown();
+        }), WritePriority.HIGH, null);
+
+        assertTrue(latch.await(10, TimeUnit.SECONDS));
+        assertNull(failure.get());
+        assertTrue(succeeded.get());
+        try (InputStream readBack = asyncContainer.getDelegate().readBlob(snapshot.getName())) {
+            assertArrayEquals(Files.readAllBytes(testFile), readBack.readAllBytes());
+        }
     }
 
     public void testUploadBlobFromInputStreamSyncFSRepo() throws IOException, InterruptedException {

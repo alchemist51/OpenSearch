@@ -190,10 +190,18 @@ class CompositeWriter implements Writer<CompositeDocumentInput> {
             }
         }
         FileInfos result = builder.build();
-        assert result.writerFilesMap().isEmpty() || result.writerFilesMap().size() == 1 + secondaryWritersByFormat.size()
-            : "flush must produce files for all formats or none; got "
+        // All-or-none, except formats that may legally emit nothing (derived
+        // formats shipping state elsewhere, or skipping a generation for later
+        // backfill). Those don't count toward the expected file-set total.
+        long optionalFormats = secondaryWritersByFormat.keySet().stream().filter(DataFormat::mayEmitNoFiles).count();
+        long requiredTotal = 1 + secondaryWritersByFormat.size() - optionalFormats;
+        assert result.writerFilesMap().isEmpty()
+            || (result.writerFilesMap().size() >= requiredTotal && result.writerFilesMap().size() <= 1 + secondaryWritersByFormat.size())
+            : "flush must produce files for all non-optional formats or none; got "
                 + result.writerFilesMap().size()
                 + " expected 0 or "
+                + requiredTotal
+                + ".."
                 + (1 + secondaryWritersByFormat.size());
         return result;
     }

@@ -23,6 +23,7 @@ import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.InputStreamWithMetadata;
 import org.opensearch.common.blobstore.stream.write.WritePriority;
 import org.opensearch.common.blobstore.transfer.RemoteTransferContainer;
+import org.opensearch.common.blobstore.transfer.stream.OffsetRangeFileInputStream;
 import org.opensearch.common.blobstore.transfer.stream.OffsetRangeIndexInputStream;
 import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.core.action.ActionListener;
@@ -187,12 +188,28 @@ public class BlobStoreTransferService implements TransferService {
                 metadata = buildTransferFileMetadata(fileSnapshot.getMetadataFileInputStream());
             }
 
-            // Read content once using inputStream() to invoke any overrides (e.g., decryption)
-            byte[] fileContent;
-            try (InputStream inputStream = fileSnapshot.inputStream()) {
-                fileContent = inputStream.readAllBytes();
+            long contentLength;
+            RemoteTransferContainer.OffsetRangeInputStreamSupplier inputStreamSupplier;
+            if (cryptoMetadata == null && fileSnapshot.getPath() != null) {
+                // A file-backed translog can be much larger than Java's maximum byte-array size.
+                // Stream each multipart range from disk instead of materializing the whole file.
+                contentLength = fileSnapshot.getContentLength();
+                inputStreamSupplier = (size, position) -> new OffsetRangeFileInputStream(fileSnapshot.getPath(), size, position);
+            } else {
+                // Encrypted and in-memory snapshots may override inputStream() to transform content.
+                // Preserve that behavior until the crypto layer exposes a range-capable supplier.
+                byte[] fileContent;
+                try (InputStream inputStream = fileSnapshot.inputStream()) {
+                    fileContent = inputStream.readAllBytes();
+                }
+                contentLength = fileContent.length;
+                String resourceDescription = "FileSnapshot[" + fileSnapshot.getName() + "]";
+                inputStreamSupplier = (size, position) -> new OffsetRangeIndexInputStream(
+                    new ByteArrayIndexInput(resourceDescription, fileContent),
+                    size,
+                    position
+                );
             }
-            long contentLength = fileContent.length;
 
             ActionListener<Void> completionListener = ActionListener.wrap(resp -> listener.onResponse(fileSnapshot), ex -> {
                 logger.error(() -> new ParameterizedMessage("Failed to upload blob {}", fileSnapshot.getName()), ex);
@@ -202,15 +219,13 @@ public class BlobStoreTransferService implements TransferService {
             // Only the first generation doesn't have checksum
             assert (fileSnapshot.getChecksum() != null || fileSnapshot.getName().contains("-1."));
 
-            // Use ByteArrayIndexInput for async upload with the content from inputStream()
-            String resourceDesc = "FileSnapshot[" + fileSnapshot.getName() + "]";
             uploadBlobAsyncInternal(
                 fileSnapshot.getName(),
                 fileSnapshot.getName(),
                 contentLength,
                 blobPath,
                 writePriority,
-                (size, position) -> new OffsetRangeIndexInputStream(new ByteArrayIndexInput(resourceDesc, fileContent), size, position),
+                inputStreamSupplier,
                 fileSnapshot.getChecksum(),
                 completionListener,
                 metadata,

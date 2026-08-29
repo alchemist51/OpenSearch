@@ -133,6 +133,33 @@ public class CatalogSnapshotManagerTests extends OpenSearchTestCase {
         }
     }
 
+    public void testCommitPublishesSegmentsAndUserDataAtomically() throws Exception {
+        CatalogSnapshotManager manager = createManager(randomSegments(), Map.of("mv.watermark", "10"));
+        try {
+            CatalogSnapshot oldSnapshot;
+            try (GatedCloseable<CatalogSnapshot> oldRef = manager.acquireSnapshot()) {
+                oldSnapshot = oldRef.get();
+            }
+
+            List<Segment> newSegments = randomSegments();
+            Map<String, String> newUserData = new HashMap<>();
+            newUserData.put("mv.watermark", "20");
+            newUserData.put("mv.definition", "v1");
+
+            manager.commitNewSnapshot(newSegments, newUserData);
+            newUserData.put("mv.watermark", "999"); // caller mutation must not change the published snapshot
+
+            try (GatedCloseable<CatalogSnapshot> ref = manager.acquireSnapshot()) {
+                assertEquals(newSegments, ref.get().getSegments());
+                assertEquals("20", ref.get().getUserData().get("mv.watermark"));
+                assertEquals("v1", ref.get().getUserData().get("mv.definition"));
+            }
+            assertEquals("10", oldSnapshot.getUserData().get("mv.watermark"));
+        } finally {
+            manager.close();
+        }
+    }
+
     public void testReferenceCountingLifecycle() throws Exception {
         for (int iter = 0; iter < 100; iter++) {
             long initGen = randomIntBetween(0, 100);

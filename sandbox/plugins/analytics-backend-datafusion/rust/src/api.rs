@@ -924,7 +924,8 @@ pub async unsafe fn execute_query(
     let shard_view = &*(shard_view_ptr as *const ShardView);
     let runtime = &*(runtime_ptr as *const DataFusionRuntime);
     let cpu_executor = manager.cpu_executor();
-
+    //  a > 5 && name = 'arpit' --> ?
+    // substrait a > 5 && (indexed_filter)
     // Create per-query context (auto-registers in the global registry) and extract
     // its per-query memory pool overlaying the global pool.
     let global_pool = runtime.runtime_env.memory_pool.clone();

@@ -36,6 +36,7 @@ import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.index.engine.DerivedIndexEngine;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.DataFormatDescriptor;
 import org.opensearch.index.engine.dataformat.DataFormatPlugin;
@@ -322,6 +323,18 @@ public class CompositeDataFormatPlugin extends Plugin implements DataFormatPlugi
                     }
                 }
 
+                // MV views declaration (index.mv.views): the MV plugin's own
+                // IndexSettingProvider derives the full format stack for such
+                // indices. Providers cannot see each other's output and their
+                // iteration order is UNDEFINED (HashSet) — contributing
+                // cluster defaults here would nondeterministically overwrite
+                // the MV-derived formats (observed: secondary list persisted
+                // as [] on the losing order, failing every capability check
+                // and shard recovery). Key-string check by design: no
+                // compile dependency on the MV plugin.
+                if (templateAndRequestSettings.hasValue("index.mv.views")) {
+                    return Settings.EMPTY;
+                }
                 Settings.Builder out = Settings.builder();
                 if (PRIMARY_DATA_FORMAT.exists(templateAndRequestSettings) == false) {
                     out.put(PRIMARY_DATA_FORMAT.getKey(), clusterPrimary);
@@ -408,6 +421,16 @@ public class CompositeDataFormatPlugin extends Plugin implements DataFormatPlugi
         }
 
         List<DataFormat> formats = getConfiguredFormats(indexSettings, dataFormatRegistry);
+        if (indexSettings.getSettings().getAsBoolean(DerivedIndexEngine.DERIVED_INDEX_SETTING, false)
+            && formats.isEmpty() == false
+            && formats.stream().allMatch(DataFormat::exemptFromRowParity)) {
+            // A derived-only index has no document ingestion surface. System metadata
+            // mappers still initialize, but no format needs to claim their document
+            // capabilities; queries use the derived state-file schema directly. Do not
+            // mutate the field type's capability map here: metadata field types can be
+            // shared with already-open document indices.
+            return;
+        }
         if (formats.isEmpty()) {
             fieldType.setCapabilityMap(Map.of());
             return;

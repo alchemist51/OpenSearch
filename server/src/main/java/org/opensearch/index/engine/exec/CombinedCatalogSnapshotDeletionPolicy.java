@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 
 /**
  * A {@link CatalogSnapshotDeletionPolicy} that coordinates between CatalogSnapshot commits
@@ -43,6 +44,7 @@ public class CombinedCatalogSnapshotDeletionPolicy implements CatalogSnapshotDel
     private final Logger logger;
     private final TranslogDeletionPolicy translogDeletionPolicy;
     private final LongSupplier globalCheckpointSupplier;
+    private final Predicate<CatalogSnapshot> retainedSnapshot;
     private final Map<CatalogSnapshot, Integer> snapshottedCommits;
 
     private volatile CatalogSnapshot safeCommit;
@@ -55,9 +57,19 @@ public class CombinedCatalogSnapshotDeletionPolicy implements CatalogSnapshotDel
         TranslogDeletionPolicy translogDeletionPolicy,
         LongSupplier globalCheckpointSupplier
     ) {
+        this(logger, translogDeletionPolicy, globalCheckpointSupplier, snapshot -> false);
+    }
+
+    public CombinedCatalogSnapshotDeletionPolicy(
+        Logger logger,
+        TranslogDeletionPolicy translogDeletionPolicy,
+        LongSupplier globalCheckpointSupplier,
+        Predicate<CatalogSnapshot> retainedSnapshot
+    ) {
         this.logger = logger;
         this.translogDeletionPolicy = translogDeletionPolicy;
         this.globalCheckpointSupplier = globalCheckpointSupplier;
+        this.retainedSnapshot = retainedSnapshot;
         this.snapshottedCommits = new HashMap<>();
     }
 
@@ -92,7 +104,7 @@ public class CombinedCatalogSnapshotDeletionPolicy implements CatalogSnapshotDel
 
         List<CatalogSnapshot> toDelete = new ArrayList<>();
         for (int i = 0; i < keptPosition; i++) {
-            if (snapshottedCommits.containsKey(commits.get(i)) == false) {
+            if (snapshottedCommits.containsKey(commits.get(i)) == false && retainedSnapshot.test(commits.get(i)) == false) {
                 logger.debug("Delete catalog snapshot commit [{}]", commitDescription(commits.get(i)));
                 toDelete.add(commits.get(i));
             }
@@ -184,6 +196,15 @@ public class CombinedCatalogSnapshotDeletionPolicy implements CatalogSnapshotDel
         for (Segment segment : snapshot.getSegments()) {
             long segmentRows = -1;
             for (Map.Entry<String, WriterFileSet> entry : segment.dfGroupedSearchableFiles().entrySet()) {
+                // Derived formats fold rows (one per group, not per doc) —
+                // exempt from doc-count parity, same as at flush and merge.
+                // Found by the chaos harness: the target's FIRST commit (via
+                // commit sync during crash recovery) tripped this check with
+                // 47 state docs vs 38 folded mv_state rows — correct data,
+                // wrong assertion — and the refusal chain left the source red.
+                if (org.opensearch.index.engine.exec.coord.CatalogSnapshotManager.ROW_PARITY_EXEMPT_FORMATS.contains(entry.getKey())) {
+                    continue;
+                }
                 long numRows = entry.getValue().numRows();
                 if (segmentRows == -1) {
                     segmentRows = numRows;

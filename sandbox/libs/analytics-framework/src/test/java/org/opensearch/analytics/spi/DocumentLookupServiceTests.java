@@ -42,8 +42,8 @@ import static org.mockito.Mockito.when;
  *
  * <p>Coverage:
  * <ul>
- *   <li>{@code getById} — not-found, success (reserved/underscore field filtering), and the two
- *       Lucene/Parquet inconsistency ISE paths (missing file set, missing row).</li>
+ *   <li>{@code getById} — not-found (including a stale resolver hit whose generation is absent from the current catalog),
+ *       success (reserved/underscore field filtering), and missing-backend-row inconsistency.</li>
  *   <li>{@code getVersionMetadata} — not-found, version-field extraction with null source, and
  *       fallback defaults when version fields are absent.</li>
  *   <li>{@code getDocsAboveSeqNo} — rows without {@code _id} skipped, empty/wrong-format file sets
@@ -157,13 +157,16 @@ public class DocumentLookupServiceTests extends OpenSearchTestCase {
         assertFalse("metadata field excluded: " + source, source.contains("_seq_no"));
     }
 
-    public void testGetById_throwsISEWhenFileSetNull() throws Exception {
+    public void testGetById_notFoundWhenResolvedGenerationAbsentFromCurrentCatalog() throws Exception {
         when(resolver.resolveMetadata(reader, "doc1")).thenReturn(metadata("doc1", 0L, 7L));
         when(snapshot.findFileSet(FORMAT, 7L)).thenReturn(null);
 
-        IllegalStateException e = expectThrows(IllegalStateException.class, () -> service.getById("doc1", reader, INDEX));
-        assertTrue(e.getMessage(), e.getMessage().contains("no matching file set"));
-        assertTrue(e.getMessage(), e.getMessage().contains("doc1"));
+        DocumentLookupResult result = service.getById("doc1", reader, INDEX);
+
+        assertFalse(result.exists());
+        assertEquals("doc1", result.id());
+        assertEquals(Versions.NOT_FOUND, result.version());
+        assertNull(result.source());
     }
 
     public void testGetById_throwsISEWhenRowNull() throws Exception {

@@ -31,6 +31,7 @@ import org.opensearch.index.shard.ShardPath;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -236,6 +237,19 @@ public class CatalogSnapshotManager implements Closeable {
      * @param refreshedSegments the segments produced by the latest refresh
      */
     public synchronized void commitNewSnapshot(List<Segment> refreshedSegments) throws IOException {
+        commitNewSnapshot(refreshedSegments, latestCatalogSnapshot.getUserData());
+    }
+
+    /**
+     * Creates a new CatalogSnapshot from refreshed or externally-built segments and publishes
+     * the supplied user data in the same atomic snapshot installation. This is used by derived
+     * artifact producers that must bind progress metadata (for example, an upstream watermark)
+     * to the exact file set being made visible.
+     *
+     * @param refreshedSegments the complete segment list for the new snapshot
+     * @param userData immutable metadata describing exactly {@code refreshedSegments}
+     */
+    public synchronized void commitNewSnapshot(List<Segment> refreshedSegments, Map<String, String> userData) throws IOException {
         if (closed.get()) {
             throw new IllegalStateException("CatalogSnapshotManager is closed");
         }
@@ -252,7 +266,7 @@ public class CatalogSnapshotManager implements Closeable {
                 latestCatalogSnapshot.getVersion() + 1,  // New changes so this version is changed.
                 refreshedSegments,
                 latestCatalogSnapshot.getLastWriterGeneration() + 1,
-                latestCatalogSnapshot.getUserData(),
+                Map.copyOf(userData),
                 latestCatalogSnapshot.getLastCommitFileName(),
                 latestCatalogSnapshot.getLastCommitGeneration(),
                 latestCatalogSnapshot.getCommitDataFormatVersion()
@@ -590,15 +604,26 @@ public class CatalogSnapshotManager implements Closeable {
         if (writerFileSetMap.isEmpty()) {
             throw new IllegalArgumentException("writerFileSetMap must not be empty");
         }
-        // Check for null values (format participated but returned no result)
+        // A null value means the format participated but produced no result.
+        // For mayEmitNoFiles formats that is a LEGAL outcome (e.g. a derived
+        // format in ship mode treats merges as a non-event — nothing local to
+        // produce); for all other formats it means the merge was incomplete.
+        Map<DataFormat, WriterFileSet> present = new HashMap<>();
         for (Map.Entry<DataFormat, WriterFileSet> entry : writerFileSetMap.entrySet()) {
             if (entry.getValue() == null) {
+                if (entry.getKey().mayEmitNoFiles()) {
+                    continue;
+                }
                 throw new IllegalStateException("WriterFileSet is null for format [" + entry.getKey().name() + "] — merge was incomplete");
             }
+            present.put(entry.getKey(), entry.getValue());
         }
-        long generation = writerFileSetMap.values().iterator().next().writerGeneration();
+        if (present.isEmpty()) {
+            throw new IllegalStateException("merge produced no files for any format — nothing to register");
+        }
+        long generation = present.values().iterator().next().writerGeneration();
         Segment.Builder segment = Segment.builder(generation);
-        for (Map.Entry<DataFormat, WriterFileSet> entry : writerFileSetMap.entrySet()) {
+        for (Map.Entry<DataFormat, WriterFileSet> entry : present.entrySet()) {
             segment.addSearchableFiles(entry.getKey(), entry.getValue());
         }
         return segment.build();
@@ -665,15 +690,26 @@ public class CatalogSnapshotManager implements Closeable {
      * where rows are silently dropped or duplicated during merge.
      */
     private boolean assertRowCountConservation(Set<Segment> sourceSegments, Segment mergedSegment) {
+        // Derived formats (row-parity exempt) are excluded on BOTH sides:
+        // their merge is a recompute/fold, so the merged state legitimately
+        // has FEWER rows than the inputs (e.g. mv_state folding shipped
+        // state across generations). Conservation is asserted only for
+        // formats that carry the documents themselves.
         long sourceRows = 0;
         for (Segment seg : sourceSegments) {
-            for (WriterFileSet wfs : seg.dfGroupedSearchableFiles().values()) {
-                sourceRows += wfs.numRows();
+            for (Map.Entry<String, WriterFileSet> entry : seg.dfGroupedSearchableFiles().entrySet()) {
+                if (ROW_PARITY_EXEMPT_FORMATS.contains(entry.getKey())) {
+                    continue;
+                }
+                sourceRows += entry.getValue().numRows();
             }
         }
         long mergedRows = 0;
-        for (WriterFileSet wfs : mergedSegment.dfGroupedSearchableFiles().values()) {
-            mergedRows += wfs.numRows();
+        for (Map.Entry<String, WriterFileSet> entry : mergedSegment.dfGroupedSearchableFiles().entrySet()) {
+            if (ROW_PARITY_EXEMPT_FORMATS.contains(entry.getKey())) {
+                continue;
+            }
+            mergedRows += entry.getValue().numRows();
         }
         if (sourceRows != mergedRows) {
             logger.error("Row count mismatch: source segments have {} rows but merged segment has {} rows", sourceRows, mergedRows);
@@ -694,11 +730,27 @@ public class CatalogSnapshotManager implements Closeable {
      * single refresh — which produces silent correctness issues like different counts
      * from {@code match} vs {@code LIKE} over the same field.
      */
+    // POC(mv): formats exempt from row parity — derived formats whose rows are aggregates
+    // of the primary's rows. TODO(mv): replace with DataFormat.exemptFromRowParity() once
+    // the registry is reachable from here (needs plumbing through the engine constructor).
+    /**
+     * Formats whose row counts legitimately differ from the document-carrying
+     * formats in the same segment (derived formats: folded state has one row
+     * per GROUP, not per doc). Consulted by every parity check: flush-time
+     * (this class), merge conservation (this class), and the deletion
+     * policy's commit doc-count (CombinedCatalogSnapshotDeletionPolicy).
+     * TODO: replace the name set with DataFormat.exemptFromRowParity().
+     */
+    public static final java.util.Set<String> ROW_PARITY_EXEMPT_FORMATS = java.util.Set.of("materialized_view", "mv_state");
+
     private void verifyPerSegmentCrossFormatRowCountParity(List<Segment> segments) {
         for (Segment seg : segments) {
             long expected = -1L;
             String referenceFormat = null;
             for (Map.Entry<String, WriterFileSet> entry : seg.dfGroupedSearchableFiles().entrySet()) {
+                if (ROW_PARITY_EXEMPT_FORMATS.contains(entry.getKey())) {
+                    continue;
+                }
                 long rows = entry.getValue().numRows();
                 if (expected == -1L) {
                     expected = rows;

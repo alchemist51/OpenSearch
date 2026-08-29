@@ -307,6 +307,9 @@ public class DataFormatAwareNRTReplicationEngineTests extends OpenSearchTestCase
             WriterFileSet wfs = WriterFileSet.builder().directory(tmpDir).writerGeneration(1L).addFile("test.mock").addNumRows(3).build();
             Segment seg = Segment.builder(1L).addSearchableFiles(mockDataFormat, wfs).build();
             DataformatAwareCatalogSnapshot incoming = buildSnapshotWithSegments(engine, 1L, 1L, 3L, List.of(seg));
+            Map<String, String> incomingUserData = new HashMap<>(incoming.getUserData());
+            incomingUserData.put("mv.watermark", "10");
+            incoming.setUserData(incomingUserData, false);
 
             engine.updateCatalogSnapshot(incoming);
 
@@ -328,6 +331,9 @@ public class DataFormatAwareNRTReplicationEngineTests extends OpenSearchTestCase
             assertNotNull("user data should be available in committed state", userData);
             assertTrue("user data should contain translog UUID", userData.containsKey(Translog.TRANSLOG_UUID_KEY));
             assertTrue("user data should contain history UUID", userData.containsKey(Engine.HISTORY_UUID_KEY));
+            try (org.opensearch.common.concurrent.GatedCloseable<CatalogSnapshot> ref = engine.acquireSnapshot()) {
+                assertEquals("replicated custom user data must survive replica flush", "10", ref.get().getUserData().get("mv.watermark"));
+            }
         }
     }
 
