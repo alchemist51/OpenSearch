@@ -113,6 +113,7 @@ public final class NativeBridge {
     private static final MethodHandle STREAM_GET_METRICS;
     private static final MethodHandle FREE_METRICS_BUF;
     private static final MethodHandle SQL_TO_SUBSTRAIT;
+    private static final MethodHandle MV_BUILD_POC;
     private static final MethodHandle REGISTER_FILTER_TREE_CALLBACKS;
     private static final MethodHandle CREATE_LOCAL_SESSION;
     private static final MethodHandle CLOSE_LOCAL_SESSION;
@@ -135,6 +136,7 @@ public final class NativeBridge {
     private static final MethodHandle CACHE_MANAGER_UPDATE_SIZE_LIMIT;
     private static final MethodHandle CREATE_SESSION_CONTEXT;
     private static final MethodHandle CREATE_SESSION_CONTEXT_INDEXED;
+    private static final MethodHandle CREATE_MV_ONLY_SESSION_CONTEXT;
     private static final MethodHandle CLOSE_SESSION_CONTEXT;
     private static final MethodHandle EXECUTE_WITH_CONTEXT;
     private static final MethodHandle SET_COLUMN_INDEX_CACHE_LIMIT;
@@ -147,6 +149,7 @@ public final class NativeBridge {
     private static final MethodHandle QUERY_REGISTRY_TOP_N_BY_CURRENT;
     private static final MethodHandle DF_NATIVE_NODE_STATS;
     private static final MethodHandle PREPARE_PARTIAL_PLAN;
+    private static final MethodHandle SESSION_ATTACH_MV;
     private static final MethodHandle PREPARE_FINAL_PLAN;
     private static final MethodHandle EXECUTE_LOCAL_PREPARED_PLAN;
     private static final MethodHandle FETCH_BY_ROW_IDS;
@@ -294,6 +297,21 @@ public final class NativeBridge {
         FREE_METRICS_BUF = linker.downcallHandle(
             lib.find("df_free_metrics_buf").orElseThrow(),
             FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG)
+        );
+        // POC(mv): i64 df_mv_build_poc(input_ptr, input_len, table_ptr, table_len, sql_ptr, sql_len, output_ptr, output_len)
+        MV_BUILD_POC = linker.downcallHandle(
+            lib.find("df_mv_build_poc").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG
+            )
         );
         // i64 df_sql_to_substrait(shard_ptr, table_ptr, table_len, sql_ptr, sql_len, runtime_ptr, out_ptr, out_cap, out_len)
         SQL_TO_SUBSTRAIT = linker.downcallHandle(
@@ -458,6 +476,29 @@ public final class NativeBridge {
             )
         );
 
+        // MV-only session context: no shard_view_ptr required.
+        // i64 df_create_mv_only_session_context(runtime_ptr, table_name_ptr, table_name_len,
+        // context_id, has_partial_aggregate, query_config_ptr, plan_ptr, plan_len,
+        // state_paths_ptr, state_paths_len, state_fields_ptr, state_fields_len)
+        CREATE_MV_ONLY_SESSION_CONTEXT = linker.downcallHandle(
+            lib.find("df_create_mv_only_session_context").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,   // return: handle ptr
+                ValueLayout.JAVA_LONG,   // runtime_ptr
+                ValueLayout.ADDRESS,     // table_name_ptr
+                ValueLayout.JAVA_LONG,   // table_name_len
+                ValueLayout.JAVA_LONG,   // context_id
+                ValueLayout.JAVA_BYTE,   // hasPartialAggregate (0/1)
+                ValueLayout.JAVA_LONG,   // queryConfigPtr
+                ValueLayout.ADDRESS,     // planBytes
+                ValueLayout.JAVA_LONG,   // planLen
+                ValueLayout.ADDRESS,     // state_paths_ptr (newline-separated)
+                ValueLayout.JAVA_LONG,   // state_paths_len
+                ValueLayout.ADDRESS,     // state_fields_ptr (newline-separated, positional)
+                ValueLayout.JAVA_LONG    // state_fields_len
+            )
+        );
+
         // i64 df_cache_manager_add_files(runtime_ptr, files_ptr, files_len_ptr, files_count)
         CACHE_MANAGER_ADD_FILES = linker.downcallHandle(
             lib.find("df_cache_manager_add_files").orElseThrow(),
@@ -599,6 +640,20 @@ public final class NativeBridge {
         PREPARE_PARTIAL_PLAN = linker.downcallHandle(
             lib.find("df_prepare_partial_plan").orElseThrow(),
             FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG)
+        );
+
+        // i64 df_session_attach_mv(session_ptr, mv_paths_ptr, mv_paths_len, covered_names_ptr, covered_names_len, strict)
+        SESSION_ATTACH_MV = linker.downcallHandle(
+            lib.find("df_session_attach_mv").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_BYTE
+            )
         );
 
         // i64 df_prepare_final_plan(session_ptr, bytes_ptr, bytes_len)
@@ -1214,6 +1269,27 @@ public final class NativeBridge {
 
     // ---- Stubs ----
 
+    /** POC(mv): blocking MV state-file build from a primary parquet file. Returns state rows written. */
+    public static long mvBuildPoc(String inputFile, String tableName, String sql, String outputFile) {
+        try (var call = new NativeCall()) {
+            var in = call.str(inputFile);
+            var table = call.str(tableName);
+            var query = call.str(sql);
+            var out = call.str(outputFile);
+            return call.invoke(
+                MV_BUILD_POC,
+                in.segment(),
+                in.len(),
+                table.segment(),
+                table.len(),
+                query.segment(),
+                query.len(),
+                out.segment(),
+                out.len()
+            );
+        }
+    }
+
     public static byte[] sqlToSubstrait(long readerPtr, String tableName, String sql, long runtimePtr) {
         NativeHandle.validatePointer(readerPtr, "reader");
         NativeHandle.validatePointer(runtimePtr, "runtime");
@@ -1436,6 +1512,59 @@ public final class NativeBridge {
                 (byte) (hasPartialAggregate ? 1 : 0),
                 planSegment,
                 planLen
+            );
+            return new SessionContextHandle(ptr);
+        }
+    }
+
+    /**
+     * Creates a ready-to-query SessionContext for MV-only serving (no ShardView / parquet reader).
+     * Arrow state files are loaded into a MemTable and projected into the Substrait base schema's
+     * order using the explicit ordered state field contract.
+     *
+     * @param runtimePtr pointer to the DataFusion native runtime
+     * @param tableName logical table name for registration
+     * @param contextId query context ID for memory tracking
+     * @param hasPartialAggregate whether fragment has partial aggregate
+     * @param queryConfigPtr pointer to WireDatafusionQueryConfig
+     * @param planBytes Substrait plan bytes for schema widening
+     * @param stateFilePaths catalog-selected immutable Arrow IPC files
+     * @param stateFields logical names in physical Arrow state-column order
+     */
+    public static SessionContextHandle createMVOnlySessionContext(
+        long runtimePtr,
+        String tableName,
+        long contextId,
+        boolean hasPartialAggregate,
+        long queryConfigPtr,
+        byte[] planBytes,
+        java.util.List<String> stateFilePaths,
+        java.util.List<String> stateFields
+    ) {
+        NativeHandle.validatePointer(runtimePtr, "runtime");
+        String statePathsJoined = String.join("\n", stateFilePaths);
+        String stateFieldsJoined = String.join("\n", stateFields);
+        try (var call = new NativeCall()) {
+            var table = call.str(tableName);
+            var statePaths = call.str(statePathsJoined);
+            var fields = call.str(stateFieldsJoined);
+            boolean hasPlan = planBytes != null && planBytes.length > 0;
+            MemorySegment planSegment = hasPlan ? call.bytes(planBytes) : MemorySegment.NULL;
+            long planLen = hasPlan ? planBytes.length : 0L;
+            long ptr = call.invoke(
+                CREATE_MV_ONLY_SESSION_CONTEXT,
+                runtimePtr,
+                table.segment(),
+                table.len(),
+                contextId,
+                (byte) (hasPartialAggregate ? 1 : 0),
+                queryConfigPtr,
+                planSegment,
+                planLen,
+                statePaths.segment(),
+                statePaths.len(),
+                fields.segment(),
+                fields.len()
             );
             return new SessionContextHandle(ptr);
         }
@@ -1770,4 +1899,37 @@ public final class NativeBridge {
     }
 
     public static void initLogger() {}
+
+    /**
+     * Attaches a materialized-view coverage binding to an open SessionContext.
+     * {@code mvFilePaths} are absolute paths of MV state parquet files for covered
+     * segments; {@code coveredRawFileNames} are the raw parquet file names (not paths)
+     * of those same covered segments, to be excluded from the raw scan when the MV
+     * branch is taken. Both lists are newline-joined (parquet file names cannot
+     * contain newlines). The binding is an option: {@code preparePartialPlan} decides
+     * whether to exercise it and silently falls back to the raw-only plan when the
+     * state schema does not line up.
+     *
+     * <p>{@code strict} enables the POC MV-only verification mode: every fallback
+     * in the native read path becomes a hard error and the produced plan is the
+     * state-file scan alone (no raw scan node) — a successful query proves the
+     * answer came exclusively from MV state files. Testing/POC only.
+     *
+     * @param handlePtr pointer returned by {@link #createSessionContext}
+     */
+    public static void sessionAttachMV(
+        long handlePtr,
+        java.util.List<String> mvFilePaths,
+        java.util.List<String> coveredRawFileNames,
+        boolean strict
+    ) {
+        NativeHandle.validatePointer(handlePtr, "sessionContext");
+        String mvJoined = String.join("\n", mvFilePaths);
+        String coveredJoined = String.join("\n", coveredRawFileNames);
+        try (var call = new NativeCall()) {
+            var mv = call.str(mvJoined);
+            var covered = call.str(coveredJoined);
+            call.invoke(SESSION_ATTACH_MV, handlePtr, mv.segment(), mv.len(), covered.segment(), covered.len(), (byte) (strict ? 1 : 0));
+        }
+    }
 }

@@ -966,7 +966,10 @@ public class DataFusionPlugin extends Plugin
 
     @Override
     public List<String> getSupportedFormats() {
-        return List.of(SUPPORTED_FORMAT);
+        // Include mv_state so the planner selects DataFusion for MV target indices.
+        // ShardScanInstructionHandler routes serve_state targets to the MV-only session,
+        // which loads catalog-selected Arrow state directly into a MemTable.
+        return List.of(SUPPORTED_FORMAT, "mv_state");
     }
 
     @Override

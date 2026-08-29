@@ -60,6 +60,8 @@ dependencies {
   internalClusterTestImplementation project(':sandbox:plugins:parquet-data-format')
   // Composite engine plugin — provides the composite format dispatcher.
   internalClusterTestImplementation project(':sandbox:plugins:composite-engine')
+  internalClusterTestImplementation project(':sandbox:plugins:mv-data-format')
+  internalClusterTestImplementation project(':sandbox:plugins:mv-state-format')
   // TestPPLPlugin + UnifiedPPL action for driving queries from ITs.
   internalClusterTestImplementation project(':sandbox:plugins:test-ppl-frontend')
 

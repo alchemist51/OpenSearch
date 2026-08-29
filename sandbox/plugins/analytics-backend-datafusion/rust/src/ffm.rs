@@ -579,6 +579,41 @@ pub unsafe extern "C" fn df_query_registry_top_n_by_current(
     Ok(written as i64)
 }
 
+/// POC(mv) v2 search: Final-fold via a caller-provided SQL template
+/// (placeholder __MV_STATES__ replaced with the UNION ALL of state files).
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_search_v2(
+    files_ptr: *const *const u8,
+    files_lens: *const i64,
+    files_count: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    out_ptr: *mut u8,
+    out_cap: i64,
+    out_len: *mut i64,
+) -> i64 {
+    let mut files = Vec::with_capacity(files_count as usize);
+    for i in 0..files_count as usize {
+        let f_ptr = *files_ptr.add(i);
+        let f_len = *files_lens.add(i);
+        files.push(
+            str_from_raw(f_ptr, f_len)
+                .map_err(|e| format!("df_mv_search_v2: file[{}]: {}", i, e))?
+                .to_string(),
+        );
+    }
+    let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_search_v2: sql: {}", e))?;
+    let text = crate::mv_writer::mv_search_v2(&files, sql)?;
+    write_out_buffer(
+        text.as_bytes(),
+        out_ptr,
+        out_cap,
+        out_len,
+        "mv search v2 result",
+    )?;
+    Ok(0)
+}
 
 /// POC(mv) streaming writer lifecycle — create/feed/finalize/abort.
 #[ffm_safe]
@@ -708,6 +743,45 @@ pub unsafe extern "C" fn df_mv_build_poc(
         .map_err(|e| format!("df_mv_build_poc: output: {}", e))?;
     let rows = crate::mv_poc::mv_build_poc(input, table, sql, output)?;
     Ok(rows)
+}
+
+/// Refresh-time ship build: run the definition's Partial over one parquet
+/// file and export the sorted state batch via Arrow C-Data (no scratch file).
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_session_attach_mv(
+    handle_ptr: i64,
+    mv_paths_ptr: *const u8,
+    mv_paths_len: i64,
+    covered_names_ptr: *const u8,
+    covered_names_len: i64,
+    strict: u8,
+) -> i64 {
+    let handle = &mut *(handle_ptr as *mut crate::session_context::SessionContextHandle);
+    let mv_paths = str_from_raw(mv_paths_ptr, mv_paths_len)
+        .map_err(|e| format!("df_session_attach_mv: mv_paths: {}", e))?;
+    let covered_names = str_from_raw(covered_names_ptr, covered_names_len)
+        .map_err(|e| format!("df_session_attach_mv: covered_names: {}", e))?;
+    let mv_file_paths: Vec<String> = mv_paths
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let covered_raw_file_names: std::collections::HashSet<String> = covered_names
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if mv_file_paths.is_empty() {
+        return Ok(0); // nothing covered — leave the session raw-only
+    }
+
+    handle.mv_binding = Some(crate::mv_read::MVBinding {
+        mv_file_paths,
+        covered_raw_file_names,
+        strict: strict != 0,
+    });
+    Ok(0)
 }
 
 #[ffm_safe]
@@ -1294,6 +1368,62 @@ pub unsafe extern "C" fn df_create_session_context_indexed(
         .map_err(|e| e.to_string())
 }
 
+/// MV-only session context: no ShardView / parquet reader. Creates a DataFusion
+/// SessionContext with catalog-selected Arrow IPC state loaded into a MemTable and
+/// projected into Substrait plan order. The session is ready to serve queries
+/// immediately — no separate `df_session_attach_mv` call needed.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_create_mv_only_session_context(
+    runtime_ptr: i64,
+    table_name_ptr: *const u8,
+    table_name_len: i64,
+    context_id: i64,
+    has_partial_aggregate: u8,
+    query_config_ptr: i64,
+    plan_ptr: *const u8,
+    plan_len: i64,
+    state_paths_ptr: *const u8,
+    state_paths_len: i64,
+    state_fields_ptr: *const u8,
+    state_fields_len: i64,
+) -> i64 {
+    crate::search_stats::inc_listing_table_scan();
+    let table_name = str_from_raw(table_name_ptr, table_name_len)
+        .map_err(|e| format!("df_create_mv_only_session_context: table_name: {}", e))?;
+    let state_paths_str = str_from_raw(state_paths_ptr, state_paths_len)
+        .map_err(|e| format!("df_create_mv_only_session_context: state_paths: {}", e))?;
+    let state_file_paths: Vec<String> = state_paths_str
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let state_fields_str = str_from_raw(state_fields_ptr, state_fields_len)
+        .map_err(|e| format!("df_create_mv_only_session_context: state_fields: {}", e))?;
+    let state_fields: Vec<String> = state_fields_str
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let query_config =
+        crate::datafusion_query_config::DatafusionQueryConfig::from_ffm_ptr(query_config_ptr);
+    let plan_bytes: &[u8] = if plan_len > 0 {
+        slice::from_raw_parts(plan_ptr, plan_len as usize)
+    } else {
+        &[]
+    };
+    let mgr = get_rt_manager()?;
+    mgr.io_runtime
+        .block_on(crate::task_monitors::plan_setup_monitor().instrument(
+            crate::session_context::create_mv_only_session_context(
+                runtime_ptr,
+                table_name,
+                context_id,
+                has_partial_aggregate != 0,
+                query_config,
+                plan_bytes,
+                &state_file_paths,
+                &state_fields,
             ),
         ))
         .map_err(|e| e.to_string())

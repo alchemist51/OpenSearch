@@ -256,9 +256,9 @@ pub async fn execute_with_context(
             logical_plan.display_indent()
         );
 
-        // Empty shard: skip physical planning (ParquetExec errors on zero files)
-        // and emit an EmptyExec stream with the logical plan's output schema.
-        if handle.object_metas.is_empty() {
+        // Empty parquet shard: skip physical planning only when no alternate table
+        // provider (such as an MV-state MemTable) can produce rows.
+        if handle.object_metas.is_empty() && !handle.has_table_data {
             use datafusion::physical_plan::empty::EmptyExec;
             use datafusion::physical_plan::ExecutionPlan;
             let plan_schema: arrow::datatypes::SchemaRef =
@@ -299,6 +299,16 @@ pub async fn execute_with_context(
         // create_physical_plan runs all registered physical optimizer rules including
         // ProjectRowIdOptimizer (registered in session_context when strategy=ListingTable).
         let physical_plan = dataframe.create_physical_plan().await?;
+
+        // MV read path (vanilla shard-fragment path): a session binding replaces
+        // the aggregate's input with the mv-state file scan (STRICT — any
+        // misalignment throws; never a silent fallback, never a wrong answer).
+        let physical_plan = match handle.mv_binding.as_ref() {
+            Some(binding) => {
+                crate::mv_read::apply_mv_binding(&handle.ctx, physical_plan, binding).await?
+            }
+            None => physical_plan,
+        };
 
         let target_schema = crate::schema_coerce::coerce_inferred_schema(physical_plan.schema());
         let physical_plan =
