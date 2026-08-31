@@ -22,6 +22,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.composite.CompositeDataFormatPlugin;
+import org.opensearch.mv.MVDataFormat;
 import org.opensearch.mv.MVDataFormatPlugin;
 import org.opensearch.mv.MVNativeBridge;
 import org.opensearch.mv.MVStateDataFormat;
@@ -141,14 +142,17 @@ public class MVPullDataFusionIT extends OpenSearchIntegTestCase {
                         .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
                         .put("index.pluggable.dataformat.enabled", true)
                         .put("index.pluggable.dataformat", "composite")
-                        .put("index.composite.primary_data_format", MVStateDataFormat.NAME)
-                        .putList("index.composite.secondary_data_formats")
+                        .put("index.composite.primary_data_format", "parquet")
+                        .putList("index.composite.secondary_data_formats", "lucene")
                         .put("index.derived.enabled", true)
+                        // Canonical derived data-format category — the single control-plane
+                        // signal for a materialized-view target. mv_state is NOT a secondary
+                        // format and serve_state is no longer used.
+                        .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DATA_FORMAT, MVDataFormat.NAME)
                         .put("index.mv.definition", "pull_count_sum")
                         .putList("index.mv.state_fields", "RegionID", "cnt", "adv")
                         .put("index.mv.state_merge_enabled", true)
                         .put(MVPullSettings.PULL_INTERVAL.getKey(), "100ms")
-                        .put("index.mv.serve_state", true)
                         // Public settings only; MetadataCreateIndexService enriches private binding
                         // (UUID, topology, mapping mode). The deprecated index.mv_pull.source_index
                         // is NOT set — all pull targets use DerivedIndexBinding exclusively.

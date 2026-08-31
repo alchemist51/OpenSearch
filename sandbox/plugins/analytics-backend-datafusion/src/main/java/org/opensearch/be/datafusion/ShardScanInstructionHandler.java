@@ -25,9 +25,11 @@ import java.lang.foreign.MemorySegment;
  * Handles ShardScan instruction: creates a SessionContext via FFM and registers
  * the default ListingTable provider for parquet scans.
  *
- * <p>For MV target indices with {@code index.mv.serve_state=true}, after the session
- * is created the handler attaches the pre-computed Arrow state files which REPLACE
- * the parquet scan with pre-aggregated Partial output.
+ * <p>For derived materialized-view targets (indices declaring the canonical
+ * {@code index.derived.data_format=materialized_view} category), after the
+ * session is created the handler attaches the pre-computed Arrow state files
+ * (the category's target artifact) which REPLACE the parquet scan with
+ * pre-aggregated Partial output.
  */
 public class ShardScanInstructionHandler implements FragmentInstructionHandler<ShardScanInstructionNode> {
 
@@ -47,10 +49,18 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
         DataFusionService dataFusionService = plugin.getDataFusionService();
         DataFormatRegistry registry = plugin.getDataFormatRegistry();
 
-        // Check MV serve_state FIRST: if set, always use the MV-only path regardless
-        // of whether a DatafusionReader can be acquired (the mv_state format may register
-        // a reader, but it's not usable for creating a normal session context).
-        boolean mvServing = isMVServing(context);
+        // Dispatch through the DERIVED DATA-FORMAT CATEGORY: if the index declares
+        // index.derived.data_format and it resolves to a registered target-artifact
+        // format, always use the MV-only path regardless of whether a DatafusionReader
+        // can be acquired. This replaces the index.mv.serve_state boolean and the
+        // hardcoded "mv_state" format-list special cases.
+        String derivedCategory = org.opensearch.cluster.metadata.DerivedIndexBinding.dataFormatCategory(
+            context.getIndexSettings().getSettings()
+        );
+        org.opensearch.index.engine.dataformat.DataFormat derivedArtifact = derivedCategory == null
+            ? null
+            : registry.derivedTargetArtifact(derivedCategory);
+        boolean mvServing = derivedArtifact != null;
 
         DatafusionReader dfReader = null;
         if (!mvServing) {
@@ -106,8 +116,9 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
                 }
             } else {
                 // MV-only path: resolve state file paths from catalog, then create session
-                // with Arrow data registered directly.
-                java.util.List<String> stateFilePaths = resolveMVStateFiles(context);
+                // with Arrow data registered directly. The physical artifact format name
+                // comes from the derived category resolution (never a hardcoded string).
+                java.util.List<String> stateFilePaths = resolveMVStateFiles(context, derivedArtifact.name());
                 java.util.List<String> stateFields = resolveMVStateFields(context);
                 sessionCtxHandle = NativeBridge.createMVOnlySessionContext(
                     runtimePtr,
@@ -131,16 +142,11 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
         }
     }
 
-    private static boolean isMVServing(ShardScanExecutionContext context) {
-        org.opensearch.index.IndexSettings indexSettings = context.getIndexSettings();
-        return indexSettings != null && indexSettings.getSettings().getAsBoolean("index.mv.serve_state", false);
-    }
-
     private static java.util.List<String> resolveMVStateFields(ShardScanExecutionContext context) {
         java.util.List<String> stateFields = context.getIndexSettings().getSettings().getAsList("index.mv.state_fields");
         if (stateFields == null || stateFields.isEmpty()) {
             throw new IllegalStateException(
-                "index.mv.serve_state requires ordered index.mv.state_fields metadata (index="
+                "derived materialized-view target requires ordered index.mv.state_fields metadata (index="
                     + context.getIndexSettings().getIndex().getName()
                     + ")"
             );
@@ -148,12 +154,14 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
         return java.util.List.copyOf(stateFields);
     }
 
-    private static java.util.List<String> resolveMVStateFiles(ShardScanExecutionContext context) {
+    private static java.util.List<String> resolveMVStateFiles(ShardScanExecutionContext context, String artifactFormatName) {
         org.opensearch.index.engine.exec.coord.CatalogSnapshot snapshot = context.getReader().catalogSnapshot();
-        java.util.Collection<org.opensearch.index.engine.exec.WriterFileSet> stateSets = snapshot.getSearchableFiles("mv_state");
+        java.util.Collection<org.opensearch.index.engine.exec.WriterFileSet> stateSets = snapshot.getSearchableFiles(artifactFormatName);
         if (stateSets == null || stateSets.isEmpty()) {
             throw new IllegalStateException(
-                "index.mv.serve_state is set but the catalog snapshot has no mv_state files (index="
+                "derived materialized-view target has no ["
+                    + artifactFormatName
+                    + "] state files in the catalog snapshot (index="
                     + context.getIndexSettings().getIndex().getName()
                     + ")"
             );

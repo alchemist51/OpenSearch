@@ -139,7 +139,86 @@ public class NodeDerivedPullServiceTests extends OpenSearchTestCase {
             .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
             .put(IndexMetadata.SETTING_INDEX_UUID, shardId.getIndex().getUUID())
-            .put("index.composite.primary_data_format", TEST_FORMAT_ID)
+            .put("index.composite.primary_data_format", "parquet")
+            .putList("index.composite.secondary_data_formats", "lucene")
+            .put("index.derived.data_format", TEST_FORMAT_ID)
+            .put("index.derived.source.name", "source_idx")
+            .put("index.derived.source.uuid", UUID.randomUUID().toString())
+            .put("index.derived.source.number_of_shards", 1)
+            .build();
+        IndexMetadata metadata = IndexMetadata.builder(shardId.getIndex().getName()).settings(indexSettings).build();
+        IndexSettings idxSettings = new IndexSettings(metadata, Settings.EMPTY);
+        when(shard.indexSettings()).thenReturn(idxSettings);
+
+        return shard;
+    }
+
+    /**
+     * Creates a mock shard with the production MV target layout:
+     * parquet primary, lucene secondary, the derived data-format CATEGORY
+     * declared via index.derived.data_format, and a DerivedIndexBinding present.
+     */
+    private static IndexShard mockEligiblePrimaryShard(String category) {
+        IndexShard shard = mock(IndexShard.class);
+        ShardId shardId = new ShardId(new Index("test_mv_eligible", UUID.randomUUID().toString()), 0);
+        when(shard.shardId()).thenReturn(shardId);
+        when(shard.state()).thenReturn(IndexShardState.STARTED);
+
+        ShardRouting routing = TestShardRouting.newShardRouting(
+            shardId,
+            "node1",
+            true, // primary
+            org.opensearch.cluster.routing.ShardRoutingState.STARTED
+        );
+        when(shard.routingEntry()).thenReturn(routing);
+
+        Settings indexSettings = Settings.builder()
+            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .put(IndexMetadata.SETTING_INDEX_UUID, shardId.getIndex().getUUID())
+            .put("index.composite.primary_data_format", "parquet")
+            .putList("index.composite.secondary_data_formats", "lucene")
+            .put("index.derived.data_format", category)
+            .put("index.derived.source.name", "source_idx")
+            .put("index.derived.source.uuid", UUID.randomUUID().toString())
+            .put("index.derived.source.number_of_shards", 1)
+            .build();
+        IndexMetadata metadata = IndexMetadata.builder(shardId.getIndex().getName()).settings(indexSettings).build();
+        IndexSettings idxSettings = new IndexSettings(metadata, Settings.EMPTY);
+        when(shard.indexSettings()).thenReturn(idxSettings);
+
+        return shard;
+    }
+
+    /**
+     * Creates a mock primary shard with parquet primary and NO derived
+     * secondary format — a plain source index with a DerivedIndexBinding.
+     */
+    private static IndexShard mockParquetSourcePrimaryWithBinding() {
+        IndexShard shard = mock(IndexShard.class);
+        ShardId shardId = new ShardId(new Index("test_source", UUID.randomUUID().toString()), 0);
+        when(shard.shardId()).thenReturn(shardId);
+        when(shard.state()).thenReturn(IndexShardState.STARTED);
+
+        ShardRouting routing = TestShardRouting.newShardRouting(
+            shardId,
+            "node1",
+            true,
+            org.opensearch.cluster.routing.ShardRoutingState.STARTED
+        );
+        when(shard.routingEntry()).thenReturn(routing);
+
+        Settings indexSettings = Settings.builder()
+            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .put(IndexMetadata.SETTING_INDEX_UUID, shardId.getIndex().getUUID())
+            .put("index.composite.primary_data_format", "parquet")
+            .putList("index.composite.secondary_data_formats", "lucene")
+            .put("index.derived.source.name", "some_source")
+            .put("index.derived.source.uuid", UUID.randomUUID().toString())
+            .put("index.derived.source.number_of_shards", 1)
             .build();
         IndexMetadata metadata = IndexMetadata.builder(shardId.getIndex().getName()).settings(indexSettings).build();
         IndexSettings idxSettings = new IndexSettings(metadata, Settings.EMPTY);
@@ -304,16 +383,107 @@ public class NodeDerivedPullServiceTests extends OpenSearchTestCase {
      * eligibleFormatId returns null for shards without DerivedIndexBinding.
      */
     public void testEligibleFormatIdNullWithoutBinding() {
+        NodeDerivedPullService service = createService(noOpFormat(TEST_FORMAT_ID));
         IndexShard shard = mockNonEligibleShard();
-        assertNull(NodeDerivedPullService.eligibleFormatId(shard));
+        assertNull(service.eligibleFormatId(shard));
+        service.close();
     }
 
     /**
-     * eligibleFormatId returns null for replica shards.
+     * eligibleFormatId returns null for replica shards even with correct
+     * secondary format and binding.
      */
     public void testEligibleFormatIdNullForReplica() {
+        NodeDerivedPullService service = createService(noOpFormat(TEST_FORMAT_ID));
         IndexShard shard = mockReplicaShard();
-        assertNull(NodeDerivedPullService.eligibleFormatId(shard));
+        assertNull(service.eligibleFormatId(shard));
+        service.close();
+    }
+
+    // ── Eligibility matrix tests ─────────────────────────────────────────
+
+    /**
+     * Production layout: parquet primary + [lucene] secondary +
+     * index.derived.data_format category + DerivedIndexBinding + primary shard
+     * → eligible, returns the category (== registered formatId).
+     */
+    public void testEligibleParquetPrimaryWithDerivedCategory() {
+        NodeDerivedPullService service = createService(noOpFormat(TEST_FORMAT_ID));
+        IndexShard shard = mockEligiblePrimaryShard(TEST_FORMAT_ID);
+        assertEquals(TEST_FORMAT_ID, service.eligibleFormatId(shard));
+        service.close();
+    }
+
+    /**
+     * Parquet source with only lucene secondary and a DerivedIndexBinding
+     * but NO derived data-format category declared → not eligible.
+     */
+    public void testNotEligibleParquetSourceWithoutDerivedCategory() {
+        NodeDerivedPullService service = createService(noOpFormat(TEST_FORMAT_ID));
+        IndexShard shard = mockParquetSourcePrimaryWithBinding();
+        assertNull(service.eligibleFormatId(shard));
+        service.close();
+    }
+
+    /**
+     * A shard that declares a derived data-format category which is NOT
+     * registered on this node fails closed — no poller (fail-closed
+     * eligibility).
+     */
+    public void testNotEligibleUnregisteredDerivedCategory() {
+        NodeDerivedPullService service = createService(noOpFormat(TEST_FORMAT_ID));
+        // Shard declares "materialized_view" but only "test_derived" is registered.
+        IndexShard shard = mockEligiblePrimaryShard("materialized_view");
+        assertNull("unregistered derived category must not be eligible", service.eligibleFormatId(shard));
+        service.close();
+    }
+
+    /**
+     * The old broken layout (derived artifact as primary_data_format, no
+     * derived category) is NOT eligible: eligibility is category-driven and
+     * never inferred from the composite primary/secondary format lists.
+     */
+    public void testNotEligibleDerivedArtifactAsPrimaryWithoutCategory() {
+        NodeDerivedPullService service = createService(noOpFormat("mv_state"));
+        IndexShard shard = mock(IndexShard.class);
+        ShardId shardId = new ShardId(new Index("test_bad_mv", UUID.randomUUID().toString()), 0);
+        when(shard.shardId()).thenReturn(shardId);
+        when(shard.state()).thenReturn(IndexShardState.STARTED);
+        ShardRouting routing = TestShardRouting.newShardRouting(
+            shardId,
+            "node1",
+            true,
+            org.opensearch.cluster.routing.ShardRoutingState.STARTED
+        );
+        when(shard.routingEntry()).thenReturn(routing);
+        Settings indexSettings = Settings.builder()
+            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .put(IndexMetadata.SETTING_INDEX_UUID, shardId.getIndex().getUUID())
+            .put("index.composite.primary_data_format", "mv_state")
+            .putList("index.composite.secondary_data_formats")
+            .put("index.derived.source.name", "source_idx")
+            .put("index.derived.source.uuid", UUID.randomUUID().toString())
+            .put("index.derived.source.number_of_shards", 1)
+            .build();
+        IndexMetadata metadata = IndexMetadata.builder(shardId.getIndex().getName()).settings(indexSettings).build();
+        IndexSettings idxSettings = new IndexSettings(metadata, Settings.EMPTY);
+        when(shard.indexSettings()).thenReturn(idxSettings);
+
+        assertNull("mv_state as primary must not be eligible", service.eligibleFormatId(shard));
+        service.close();
+    }
+
+    /**
+     * Replica shard with correct secondary format is not eligible
+     * (only primaries run pollers).
+     */
+    public void testReplicaNotEligibleEvenWithCorrectFormat() {
+        NodeDerivedPullService service = createService(noOpFormat(TEST_FORMAT_ID));
+        IndexShard shard = mockReplicaShard();
+        assertNull("replica must not be eligible", service.eligibleFormatId(shard));
+        service.close();
     }
 
     /**
