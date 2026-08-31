@@ -10,6 +10,7 @@ package org.opensearch.mvpull;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
@@ -83,9 +84,12 @@ final class MVShardBuildService implements IndexEventListener, Closeable {
         }
     }
 
-    private static boolean isEligiblePrimary(IndexShard shard) {
+    private boolean isEligiblePrimary(IndexShard shard) {
         Settings settings = shard.indexSettings().getSettings();
-        if (MVPullSettings.SOURCE_INDEX.exists(settings) == false
+        IndexMetadata metadata = services.clusterService().state().metadata().index(shard.shardId().getIndex());
+        if (metadata == null
+            || metadata.getState() != IndexMetadata.State.OPEN
+            || MVPullSettings.SOURCE_INDEX.exists(settings) == false
             || shard.state() != IndexShardState.STARTED
             || shard.routingEntry().primary() == false) {
             return false;
