@@ -164,13 +164,8 @@ final class MVDataFusionReadEngine implements Closeable {
      * Does NOT compute the full aggregate — the artifact writer does that via buildStateFile.
      * Returns only observedMaxSeqNo and totalRows; groups map is empty.
      */
-    Delta searchDeltaByDefinition(
-        List<Path> parquetFiles,
-        String definitionName,
-        long fromExclusive,
-        long toInclusive,
-        long infosVersion
-    ) throws IOException {
+    Delta searchDeltaByDefinition(List<Path> parquetFiles, String definitionName, long fromExclusive, long toInclusive, long infosVersion)
+        throws IOException {
         Path staged = stagingRoot.resolve("gen-" + infosVersion);
         if (Files.exists(staged) == false) {
             Files.createDirectories(staged);
@@ -219,26 +214,57 @@ final class MVDataFusionReadEngine implements Closeable {
                     )
                 ) {
                     List<org.apache.arrow.vector.FieldVector> vectors = batch.getFieldVectors();
-                    if (batch.getRowCount() == 0) {
-                        return new Delta(new HashMap<>(), -1L, 0L);
-                    }
-                    long totalRowCount = ((Number) vectors.get(0).getObject(0)).longValue();
-                    Object maxSeq = vectors.get(1).getObject(0);
-                    long observedMax = maxSeq == null ? -1L : ((Number) maxSeq).longValue();
+                    CoverageTotals coverage = reduceCoverageRows(
+                        batch.getRowCount(),
+                        row -> vectors.get(0).getObject(row),
+                        row -> vectors.get(1).getObject(row)
+                    );
                     logger.debug(
-                        "mv_pull definition [{}] coverage check range=({}, {}] totalRows={} observedMax={}",
+                        "mv_pull definition [{}] coverage check range=({}, {}] partialRows={} totalRows={} observedMax={}",
                         definitionName,
                         fromExclusive,
                         toInclusive,
-                        totalRowCount,
-                        observedMax
+                        batch.getRowCount(),
+                        coverage.totalRows(),
+                        coverage.observedMaxSeqNo()
                     );
-                    return new Delta(new HashMap<>(), observedMax, totalRowCount);
+                    return new Delta(new HashMap<>(), coverage.observedMaxSeqNo(), coverage.totalRows());
                 }
             }
         } finally {
             cleanupStaged(staged);
         }
+    }
+
+    record CoverageTotals(long totalRows, long observedMaxSeqNo) {
+    }
+
+    /**
+     * Reduces DataFusion partial aggregate output. A global aggregate can emit
+     * one COUNT/MAX row per input partition because the native bridge stops at
+     * the partial aggregation boundary; coverage must combine every row.
+     */
+    static CoverageTotals reduceCoverageRows(
+        int rowCount,
+        java.util.function.IntFunction<Object> countAt,
+        java.util.function.IntFunction<Object> maxSeqNoAt
+    ) {
+        if (rowCount == 0) {
+            return new CoverageTotals(0L, -1L);
+        }
+        long totalRows = 0L;
+        long observedMaxSeqNo = -1L;
+        for (int row = 0; row < rowCount; row++) {
+            Object count = countAt.apply(row);
+            if (count != null) {
+                totalRows = Math.addExact(totalRows, ((Number) count).longValue());
+            }
+            Object maxSeqNo = maxSeqNoAt.apply(row);
+            if (maxSeqNo != null) {
+                observedMaxSeqNo = Math.max(observedMaxSeqNo, ((Number) maxSeqNo).longValue());
+            }
+        }
+        return new CoverageTotals(totalRows, observedMaxSeqNo);
     }
 
     Path stageParquetFiles(List<Path> parquetFiles, long generation) throws IOException {
