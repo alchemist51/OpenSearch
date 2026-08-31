@@ -62,7 +62,7 @@ public final class MVPullSettings {
     );
 
     /**
-     * Named definition for definition-driven pull (e.g. "clickbench_100mv").
+     * Named definition for definition-driven pull (e.g. "clickbench_100m").
      * When set, the poller generates SQL from the MVDefinitionSpec instead of
      * the legacy group_field/sum_field pair.
      */
