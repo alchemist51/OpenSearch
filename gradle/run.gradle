@@ -40,6 +40,17 @@ testClusters {
     testDistribution = 'archive'
     if (numZones > 1) numberOfZones = numZones
     if (numNodes > 1) numberOfNodes = numNodes
+
+    // Pull-based MV requires the source index to publish segments to remote store.
+    // Use one local fs repository for segment, translog, and cluster-state data.
+    def localRemoteStoreDir = project.layout.buildDirectory.dir('local-remote-store').get().asFile.absolutePath
+    setting 'path.repo', localRemoteStoreDir
+    setting 'node.attr.remote_store.segment.repository', 'local-remote-store'
+    setting 'node.attr.remote_store.translog.repository', 'local-remote-store'
+    setting 'node.attr.remote_store.state.repository', 'local-remote-store'
+    setting 'node.attr.remote_store.repository.local-remote-store.type', 'fs'
+    setting 'node.attr.remote_store.repository.local-remote-store.settings.location', localRemoteStoreDir
+
     if (findProperty("installedPlugins")) {
       installedPlugins = Eval.me(installedPlugins)
 
