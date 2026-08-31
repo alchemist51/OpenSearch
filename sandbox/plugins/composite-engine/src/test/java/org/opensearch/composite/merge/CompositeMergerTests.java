@@ -674,6 +674,35 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         assertTrue(ex.getMessage().contains("returned null"));
     }
 
+    public void testExecutorMergesDerivedOnlySegmentsWithoutInvokingPrimary() throws IOException {
+        // A derived (materialized-view) target is operation-free: force-merge selects
+        // segments that contain ONLY the derived artifact (mv_state) and NO primary
+        // (parquet) files. The executor must fold the derived state directly and must
+        // NOT invoke the primary merger on an empty input (which throws
+        // "No files to merge"). Regression for derived-only compaction.
+        Merger primaryMerger = mock(Merger.class);
+        Merger derivedMerger = mock(Merger.class);
+
+        DataFormat primary = stubFormat("parquet", 0);
+        DataFormat derived = stubFormat("mv_state", 50);
+
+        WriterFileSet mergedDerived = new WriterFileSet(createTempDir().toString(), 10L, Set.of("merged.mv.arrow"), 7, 1L);
+        when(derivedMerger.merge(any(MergeInput.class))).thenReturn(new MergeResult(Map.of(derived, mergedDerived)));
+
+        CompositeMergeExecutor executor = new CompositeMergeExecutor(Map.of(primary, primaryMerger, derived, derivedMerger));
+
+        // Plan over derived-only segments: the primary (parquet) contributes no files.
+        WriterFileSet inputDerived = new WriterFileSet(createTempDir().toString(), 1L, Set.of("in.mv.arrow"), 3, 1L);
+        MergePlan plan = new MergePlan(10L, primary, List.of(derived), Map.of(primary, List.of(), derived, List.of(inputDerived)));
+
+        MergeResult result = executor.execute(plan);
+
+        assertNotNull(result);
+        verify(primaryMerger, times(0)).merge(any());
+        verify(derivedMerger, times(1)).merge(any());
+        assertSame(mergedDerived, result.getMergedWriterFileSetForDataformat(derived));
+    }
+
     public void testExecutorThrowsOnRowCountMismatch() throws IOException {
         Merger primaryMerger = mock(Merger.class);
         Merger secondaryMerger = mock(Merger.class);

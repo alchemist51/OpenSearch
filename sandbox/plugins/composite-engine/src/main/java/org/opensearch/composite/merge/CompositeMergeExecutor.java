@@ -49,18 +49,34 @@ public class CompositeMergeExecutor {
     public MergeResult execute(MergePlan plan) {
         List<FormatMergeResult> completed = new ArrayList<>();
         try {
-            FormatMergeResult primaryResult = mergeFormat(plan, plan.primaryFormat(), null);
-            completed.add(primaryResult);
+            // Only merge formats that actually have input files in the selected segments.
+            // A derived target (e.g. a materialized view) is operation-free: the segments
+            // selected for compaction contain ONLY the derived artifact (mv_state) and no
+            // primary (parquet) or lucene files. Force-merging such segments must fold the
+            // derived state directly through the derived format's own Merger, without
+            // invoking the primary merger on an empty input (which throws "No files to
+            // merge"). Normal composite segments (all formats present) are unaffected.
+            FormatMergeResult primaryResult = null;
+            if (plan.filesFor(plan.primaryFormat()).isEmpty() == false) {
+                primaryResult = mergeFormat(plan, plan.primaryFormat(), null);
+                completed.add(primaryResult);
+            }
 
-            RowIdMapping mapping = plan.hasSecondaries()
+            RowIdMapping mapping = (primaryResult != null && plan.hasSecondaries())
                 ? primaryResult.rowIdMappingOpt()
                     .orElseThrow(() -> new IllegalStateException("Primary merge did not produce row-ID mapping required by secondaries"))
                 : null;
 
             for (DataFormat secondary : plan.secondaryFormats()) {
+                if (plan.filesFor(secondary).isEmpty()) {
+                    continue; // this format contributes no files to the selected segments
+                }
                 FormatMergeResult secondaryResult = mergeFormat(plan, secondary, mapping);
                 // Verify secondary produced output when primary did
-                if (primaryResult.mergedFiles() != null && secondaryResult.mergedFiles() == null && secondary.mayEmitNoFiles() == false) {
+                if (primaryResult != null
+                    && primaryResult.mergedFiles() != null
+                    && secondaryResult.mergedFiles() == null
+                    && secondary.mayEmitNoFiles() == false) {
                     throw new IllegalStateException(
                         "Primary format ["
                             + plan.primaryFormat().name()
@@ -71,7 +87,8 @@ public class CompositeMergeExecutor {
                 }
                 // Verify secondary merged row count matches primary.
                 // POC(mv): derived formats (aggregated rows) are exempt — see DataFormat#exemptFromRowParity.
-                if (primaryResult.mergedFiles() != null
+                if (primaryResult != null
+                    && primaryResult.mergedFiles() != null
                     && secondaryResult.mergedFiles() != null
                     && secondary.exemptFromRowParity() == false) {
                     long primaryRows = primaryResult.mergedFiles().numRows();
