@@ -129,6 +129,7 @@ pub async fn execute_indexed_query(
         ctx,
         table_path: shard_view.table_path.clone(),
         object_metas: shard_view.object_metas.clone(),
+        has_table_data: !shard_view.object_metas.is_empty(),
         writer_generations: shard_view.writer_generations.clone(),
         sort_fields: shard_view.sort_fields.clone(),
         sort_orders: shard_view.sort_orders.clone(),
@@ -145,6 +146,7 @@ pub async fn execute_indexed_query(
         has_topk: false,
         prepared_plan: None,
         phantom_reservation: None,
+        mv_binding: None,
     };
     let ptr = Box::into_raw(Box::new(handle)) as i64;
 
@@ -1430,6 +1432,13 @@ async unsafe fn execute_indexed_with_context_inner(
         crate::agg_mode::apply_aggregate_mode(physical_plan, aggregate_mode, handle.has_topk)?
     } else {
         physical_plan
+    };
+    // MV read path (indexed executor = the live shard fragment path on this
+    // branch): a session binding replaces the Partial with the mv-state file
+    // scan (STRICT — misalignment throws, never a silent fallback).
+    let physical_plan = match handle.mv_binding.as_ref() {
+        Some(binding) => crate::mv_read::apply_mv_binding(&ctx, physical_plan, binding).await?,
+        None => physical_plan,
     };
     let target_schema = crate::schema_coerce::coerce_inferred_schema(physical_plan.schema());
     let physical_plan = crate::relabel_exec::wrap_if_relabel_needed(physical_plan, target_schema)?;

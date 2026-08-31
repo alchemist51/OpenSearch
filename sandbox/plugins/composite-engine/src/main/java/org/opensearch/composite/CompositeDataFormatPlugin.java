@@ -36,10 +36,12 @@ import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.index.engine.DerivedIndexEngine;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.DataFormatDescriptor;
 import org.opensearch.index.engine.dataformat.DataFormatPlugin;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
+import org.opensearch.index.engine.dataformat.DerivedDataFormat;
 import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
 import org.opensearch.index.engine.dataformat.IndexingEngineConfig;
 import org.opensearch.index.engine.dataformat.IndexingExecutionEngine;
@@ -322,6 +324,18 @@ public class CompositeDataFormatPlugin extends Plugin implements DataFormatPlugi
                     }
                 }
 
+                // MV views declaration (index.mv.views): the MV plugin's own
+                // IndexSettingProvider derives the full format stack for such
+                // indices. Providers cannot see each other's output and their
+                // iteration order is UNDEFINED (HashSet) — contributing
+                // cluster defaults here would nondeterministically overwrite
+                // the MV-derived formats (observed: secondary list persisted
+                // as [] on the losing order, failing every capability check
+                // and shard recovery). Key-string check by design: no
+                // compile dependency on the MV plugin.
+                if (templateAndRequestSettings.hasValue("index.mv.views")) {
+                    return Settings.EMPTY;
+                }
                 Settings.Builder out = Settings.builder();
                 if (PRIMARY_DATA_FORMAT.exists(templateAndRequestSettings) == false) {
                     out.put(PRIMARY_DATA_FORMAT.getKey(), clusterPrimary);
@@ -358,7 +372,11 @@ public class CompositeDataFormatPlugin extends Plugin implements DataFormatPlugi
     ) {
         Settings settings = indexSettings.getSettings();
         String primaryFormatName = PRIMARY_DATA_FORMAT.get(settings);
-        List<String> secondaryFormatNames = SECONDARY_DATA_FORMATS.get(settings);
+        List<String> secondaryFormatNames = effectiveSecondaryFormatNames(indexSettings, dataFormatRegistry);
+
+        // Reject a derived target artifact (e.g. mv_state) declared in the
+        // ordinary primary/secondary lists — it is owned by the derived category.
+        validateNoDerivedTargetArtifactInDeclaredFormats(indexSettings, dataFormatRegistry);
 
         Map<String, Supplier<DataFormatDescriptor>> descriptors = new HashMap<>();
         if (primaryFormatName != null) {
@@ -372,10 +390,98 @@ public class CompositeDataFormatPlugin extends Plugin implements DataFormatPlugi
         return Map.copyOf(descriptors);
     }
 
+    /**
+     * Returns the effective set of secondary format names the composite engine
+     * must manage for an index: the user-declared
+     * {@code index.composite.secondary_data_formats} PLUS the physical
+     * target-artifact format contributed by the index's DERIVED DATA-FORMAT
+     * CATEGORY, when one is declared via {@code index.derived.data_format}.
+     *
+     * <p>This is the single place the derived category is projected onto the
+     * composite store's managed formats. A derived target (e.g. an MV index)
+     * therefore stores its state artifact ({@code mv_state}) WITHOUT that
+     * format ever appearing in the user-facing secondary list — the category
+     * owns it. When no category is declared, or the category is not registered,
+     * the user-declared list is returned unchanged.
+     */
+    private List<String> effectiveSecondaryFormatNames(IndexSettings indexSettings, DataFormatRegistry dataFormatRegistry) {
+        return resolveEffectiveSecondaryFormatNames(indexSettings, dataFormatRegistry);
+    }
+
+    /**
+     * Static, reusable form of {@link #effectiveSecondaryFormatNames}. Both this
+     * plugin's descriptor/strategy resolution AND
+     * {@code CompositeIndexingExecutionEngine} (which builds the per-shard flush
+     * engine set) must agree on the effective secondary formats, otherwise the
+     * derived artifact (mv_state) would be published without a corresponding
+     * composite engine/catalog format, corrupting the reader-to-catalog mapping.
+     */
+    static List<String> resolveEffectiveSecondaryFormatNames(IndexSettings indexSettings, DataFormatRegistry dataFormatRegistry) {
+        Settings settings = indexSettings.getSettings();
+        List<String> declared = SECONDARY_DATA_FORMATS.get(settings);
+        String category = org.opensearch.cluster.metadata.DerivedIndexBinding.dataFormatCategory(settings);
+        if (category == null) {
+            return declared;
+        }
+        DataFormat artifact = dataFormatRegistry.derivedTargetArtifact(category);
+        if (artifact == null || declared.contains(artifact.name())) {
+            return declared;
+        }
+        List<String> augmented = new ArrayList<>(declared);
+        augmented.add(artifact.name());
+        return List.copyOf(augmented);
+    }
+
+    /**
+     * Rejects any user-declared primary or secondary format that is a registered
+     * DERIVED TARGET ARTIFACT (e.g. {@code mv_state}). Such formats are managed
+     * exclusively through the derived category ({@code index.derived.data_format})
+     * and must not appear in the ordinary composite format lists. Source-side
+     * derived capture formats (which are not target artifacts) remain valid
+     * secondaries and are intentionally not rejected here.
+     */
+    private void validateNoDerivedTargetArtifactInDeclaredFormats(IndexSettings indexSettings, DataFormatRegistry dataFormatRegistry) {
+        Settings settings = indexSettings.getSettings();
+        String primary = PRIMARY_DATA_FORMAT.get(settings);
+        List<String> declaredSecondary = SECONDARY_DATA_FORMATS.get(settings);
+        List<String> declared = new ArrayList<>();
+        if (primary != null && primary.isEmpty() == false) {
+            declared.add(primary);
+        }
+        declared.addAll(declaredSecondary);
+        for (String name : declared) {
+            if (name == null || name.isEmpty()) {
+                continue;
+            }
+            DataFormat format = dataFormatRegistry.getRegisteredFormats()
+                .stream()
+                .filter(f -> f.name().equals(name))
+                .findFirst()
+                .orElse(null);
+            if (format instanceof DerivedDataFormat && ((DerivedDataFormat) format).isDerivedTargetArtifact()) {
+                throw new IllegalArgumentException(
+                    "data format ["
+                        + name
+                        + "] is a derived target artifact and must not be declared in "
+                        + "index.composite.primary_data_format / index.composite.secondary_data_formats; "
+                        + "use the derived category setting [index.derived.data_format="
+                        + ((DerivedDataFormat) format).category()
+                        + "] instead"
+                );
+            }
+        }
+    }
+
     private List<DataFormat> getConfiguredFormats(IndexSettings indexSettings, DataFormatRegistry dataFormatRegistry) {
         Settings settings = indexSettings.getSettings();
         String primaryFormatName = PRIMARY_DATA_FORMAT.get(settings);
-        List<String> secondaryFormatNames = SECONDARY_DATA_FORMATS.get(settings);
+        List<String> secondaryFormatNames = effectiveSecondaryFormatNames(indexSettings, dataFormatRegistry);
+
+        // A derived target-artifact format (e.g. mv_state) must NEVER be placed
+        // in the ordinary primary/secondary lists — it is owned by the derived
+        // category (index.derived.data_format) and injected by the composite
+        // store. Reject misuse loudly at resolution (create) time.
+        validateNoDerivedTargetArtifactInDeclaredFormats(indexSettings, dataFormatRegistry);
 
         List<DataFormat> configured = new ArrayList<>();
         if (primaryFormatName != null && primaryFormatName.isEmpty() == false) {
@@ -408,6 +514,16 @@ public class CompositeDataFormatPlugin extends Plugin implements DataFormatPlugi
         }
 
         List<DataFormat> formats = getConfiguredFormats(indexSettings, dataFormatRegistry);
+        if (indexSettings.getSettings().getAsBoolean(DerivedIndexEngine.DERIVED_INDEX_SETTING, false)
+            && formats.isEmpty() == false
+            && formats.stream().allMatch(DataFormat::exemptFromRowParity)) {
+            // A derived-only index has no document ingestion surface. System metadata
+            // mappers still initialize, but no format needs to claim their document
+            // capabilities; queries use the derived state-file schema directly. Do not
+            // mutate the field type's capability map here: metadata field types can be
+            // shared with already-open document indices.
+            return;
+        }
         if (formats.isEmpty()) {
             fieldType.setCapabilityMap(Map.of());
             return;
@@ -468,7 +584,7 @@ public class CompositeDataFormatPlugin extends Plugin implements DataFormatPlugi
     public Map<DataFormat, StoreStrategy> getStoreStrategies(IndexSettings indexSettings, DataFormatRegistry dataFormatRegistry) {
         Settings settings = indexSettings.getSettings();
         String primaryFormatName = PRIMARY_DATA_FORMAT.get(settings);
-        List<String> secondaryFormatNames = SECONDARY_DATA_FORMATS.get(settings);
+        List<String> secondaryFormatNames = effectiveSecondaryFormatNames(indexSettings, dataFormatRegistry);
 
         Map<DataFormat, StoreStrategy> strategies = new HashMap<>();
         if (primaryFormatName != null && primaryFormatName.isEmpty() == false) {

@@ -244,6 +244,108 @@ public class CompositeDataFormatPluginTests extends OpenSearchTestCase {
         assertEquals("parquet", descriptors.get("parquet").get().getFormatName());
     }
 
+    // ---- Derived data-format category (index.derived.data_format) ----
+
+    /**
+     * A derived target declares its category via index.derived.data_format and
+     * does NOT list the state-artifact format in secondary_data_formats. The
+     * composite engine must still manage the artifact: getFormatDescriptors must
+     * include the artifact's descriptor, resolved through the category.
+     */
+    public void testDerivedCategoryAugmentsFormatDescriptors() {
+        CompositeDataFormatPlugin plugin = new CompositeDataFormatPlugin();
+
+        IndexSettings indexSettings = buildIndexSettings(
+            Settings.builder()
+                .put("index.composite.primary_data_format", "parquet")
+                .putList("index.composite.secondary_data_formats", "lucene")
+                .put("index.derived.data_format", "materialized_view")
+                .build()
+        );
+
+        DataFormat parquet = CompositeTestHelper.stubFormat("parquet", 2, java.util.Set.of());
+        DataFormat lucene = CompositeTestHelper.stubFormat("lucene", 1, java.util.Set.of());
+        // mv_state is the materialized_view category's registered target artifact.
+        DataFormat mvState = derivedArtifactFormat("mv_state", "materialized_view");
+
+        DataFormatRegistry registry = mock(DataFormatRegistry.class);
+        when(registry.format("parquet")).thenReturn(parquet);
+        when(registry.format("lucene")).thenReturn(lucene);
+        when(registry.format("mv_state")).thenReturn(mvState);
+        when(registry.derivedTargetArtifact("materialized_view")).thenReturn(mvState);
+        when(registry.getFormatDescriptors(indexSettings, parquet)).thenReturn(
+            Map.of(
+                "parquet",
+                (Supplier<DataFormatDescriptor>) () -> new DataFormatDescriptor(
+                    "parquet",
+                    new org.opensearch.index.store.checksum.GenericCRC32ChecksumHandler()
+                )
+            )
+        );
+        when(registry.getFormatDescriptors(indexSettings, mvState)).thenReturn(
+            Map.of(
+                "mv_state",
+                (Supplier<DataFormatDescriptor>) () -> new DataFormatDescriptor(
+                    "mv_state",
+                    new org.opensearch.index.store.checksum.GenericCRC32ChecksumHandler()
+                )
+            )
+        );
+
+        Map<String, Supplier<DataFormatDescriptor>> descriptors = plugin.getFormatDescriptors(indexSettings, registry);
+        assertTrue("category must inject the mv_state artifact descriptor", descriptors.containsKey("mv_state"));
+    }
+
+    /**
+     * A user must not declare the derived target artifact (mv_state) in the
+     * ordinary secondary_data_formats — the composite engine rejects it and
+     * points at the derived category setting instead.
+     */
+    public void testRejectsDerivedTargetArtifactInSecondaryFormats() {
+        CompositeDataFormatPlugin plugin = new CompositeDataFormatPlugin();
+
+        IndexSettings indexSettings = buildIndexSettings(
+            Settings.builder()
+                .put("index.composite.primary_data_format", "parquet")
+                .putList("index.composite.secondary_data_formats", "lucene", "mv_state")
+                .build()
+        );
+
+        DataFormat parquet = CompositeTestHelper.stubFormat("parquet", 2, java.util.Set.of());
+        DataFormat lucene = CompositeTestHelper.stubFormat("lucene", 1, java.util.Set.of());
+        DataFormat mvState = derivedArtifactFormat("mv_state", "materialized_view");
+
+        DataFormatRegistry registry = mock(DataFormatRegistry.class);
+        when(registry.getRegisteredFormats()).thenReturn(java.util.Set.of(parquet, lucene, mvState));
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> plugin.getFormatDescriptors(indexSettings, registry)
+        );
+        assertTrue(e.getMessage().contains("derived target artifact"));
+        assertTrue(e.getMessage().contains("index.derived.data_format=materialized_view"));
+    }
+
+    /** A registered derived target-artifact format for tests. */
+    private static DataFormat derivedArtifactFormat(String name, String category) {
+        return new org.opensearch.index.engine.dataformat.DerivedDataFormat() {
+            @Override
+            public String name() {
+                return name;
+            }
+
+            @Override
+            public String category() {
+                return category;
+            }
+
+            @Override
+            public boolean isDerivedTargetArtifact() {
+                return true;
+            }
+        };
+    }
+
     public void testGetFormatDescriptorsEmptyWhenNoPluginsMatch() {
         CompositeDataFormatPlugin plugin = new CompositeDataFormatPlugin();
         DataFormatRegistry registry = mock(DataFormatRegistry.class);

@@ -316,7 +316,7 @@ public class DataFormatAwareNRTReplicationEngine implements Indexer {
         try (GatedConditionalCloseable<CatalogSnapshot> snapshotRef = catalogSnapshotManager.acquireSnapshotForCommit()) {
             CatalogSnapshot snapshot = snapshotRef.get();
 
-            Map<String, String> commitData = new HashMap<>();
+            Map<String, String> commitData = new HashMap<>(snapshot.getUserData());
             commitData.put(CatalogSnapshot.LAST_COMPOSITE_WRITER_GEN_KEY, Long.toString(snapshot.getLastWriterGeneration()));
             commitData.put(CatalogSnapshot.CATALOG_SNAPSHOT_ID, Long.toString(snapshot.getId()));
             commitData.put(Translog.TRANSLOG_UUID_KEY, translogManager.getTranslogUUID());

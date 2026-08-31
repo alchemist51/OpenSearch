@@ -17,12 +17,14 @@ import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.LifecycleAware;
 import org.opensearch.index.engine.SafeCommitInfo;
+import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.exec.coord.CatalogSnapshot;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.TranslogManager;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.Map;
 import java.util.function.BiFunction;
 
 /**
@@ -155,6 +157,28 @@ public interface Indexer
      * @return a gated closeable wrapping the catalog snapshot
      */
     GatedCloseable<CatalogSnapshot> acquireSnapshot();
+
+    /**
+     * Reserves a monotonically increasing writer generation for an externally-built
+     * data-format artifact. Only writable data-format-aware primaries support this.
+     */
+    default long reserveDerivedArtifactGeneration() {
+        throw new UnsupportedOperationException("derived artifact generations not supported on " + getClass().getSimpleName());
+    }
+
+    /**
+     * Publishes a prebuilt data-format artifact and progress metadata as one catalog
+     * snapshot, then durably flushes that snapshot. The file represented by
+     * {@code fileSet} must already exist and remain immutable.
+     *
+     * @param dataFormat format that owns the artifact
+     * @param fileSet immutable files and row metadata for one reserved generation
+     * @param userDataUpdates metadata (for example an upstream watermark) bound to the artifact
+     */
+    default void publishDerivedArtifact(DataFormat dataFormat, WriterFileSet fileSet, Map<String, String> userDataUpdates)
+        throws IOException {
+        throw new UnsupportedOperationException("derived artifact publication not supported on " + getClass().getSimpleName());
+    }
 
     /**
      * Serializes the given {@link CatalogSnapshot} to a byte array in the format expected by the

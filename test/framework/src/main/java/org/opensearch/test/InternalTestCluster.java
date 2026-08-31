@@ -99,7 +99,6 @@ import org.opensearch.index.IndexingPressure;
 import org.opensearch.index.engine.DocIdSeqNoAndSource;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineTestCase;
-import org.opensearch.index.engine.IngestionEngine;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.seqno.SeqNoStats;
 import org.opensearch.index.seqno.SequenceNumbers;
@@ -1412,10 +1411,14 @@ public final class InternalTestCluster extends TestCluster {
                 for (IndexService indexService : indexServices) {
                     for (IndexShard indexShard : indexService) {
                         try {
-                            if (IndexShardTestCase.getEngine(indexShard) instanceof IngestionEngine) {
-                                // no-op, as IngestionEngine does not use translog.
-                            } else if (IndexShardTestCase.getEngine(indexShard) instanceof InternalEngine) {
-                                IndexShardTestCase.getTranslog(indexShard).getDeletionPolicy().assertNoOpenTranslogRefs();
+                            if (IndexShardTestCase.getEngine(indexShard) instanceof InternalEngine) {
+                                // Translog-free InternalEngine subclasses (IngestionEngine, pull-based
+                                // derived engines) recover from pointers in commit userData and have
+                                // no translog references to assert on.
+                                if (IndexShardTestCase.getIndexer(indexShard)
+                                    .translogManager() instanceof org.opensearch.index.translog.InternalTranslogManager) {
+                                    IndexShardTestCase.getTranslog(indexShard).getDeletionPolicy().assertNoOpenTranslogRefs();
+                                }
                             }
                         } catch (AlreadyClosedException ok) {
                             // all good

@@ -126,7 +126,13 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
         Settings settings = indexSettings.getSettings();
 
         String primaryFormatName = CompositeDataFormatPlugin.PRIMARY_DATA_FORMAT.get(settings);
-        List<String> secondaryFormatNames = CompositeDataFormatPlugin.SECONDARY_DATA_FORMATS.get(settings);
+        // Include any physical target-artifact format contributed by the index's
+        // derived data-format category (index.derived.data_format) so the flush
+        // engine set matches the composite store's managed formats.
+        List<String> secondaryFormatNames = CompositeDataFormatPlugin.resolveEffectiveSecondaryFormatNames(
+            indexSettings,
+            dataFormatRegistry
+        );
 
         validateFormatsRegistered(dataFormatRegistry, primaryFormatName, secondaryFormatNames);
 
@@ -227,6 +233,121 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
 
     /** {@inheritDoc} Delegates to the primary engine's merger. */
     @Override
+    public void beforeRefresh() throws java.io.IOException {
+        primaryEngine.beforeRefresh();
+        for (IndexingExecutionEngine<?, ?> secondary : secondaryEngines) {
+            secondary.beforeRefresh();
+        }
+    }
+
+    @Override
+    public java.util.Map<String, String> beforeCommit(long committedLocalCheckpoint) throws java.io.IOException {
+        // Fan out to every per-format engine (primary + secondaries); merged
+        // entries land in the composite commit's user data. Key collisions
+        // are a programming error — formats must namespace their keys.
+        java.util.Map<String, String> merged = new java.util.HashMap<>(primaryEngine.beforeCommit(committedLocalCheckpoint));
+        for (IndexingExecutionEngine<?, ?> secondary : secondaryEngines) {
+            for (java.util.Map.Entry<String, String> e : secondary.beforeCommit(committedLocalCheckpoint).entrySet()) {
+                String prev = merged.put(e.getKey(), e.getValue());
+                if (prev != null) {
+                    throw new IllegalStateException("duplicate commit user-data key from format engines: " + e.getKey());
+                }
+            }
+        }
+        return merged;
+    }
+
+    @Override
+    public void afterCommit() {
+        primaryEngine.afterCommit();
+        for (IndexingExecutionEngine<?, ?> secondary : secondaryEngines) {
+            secondary.afterCommit();
+        }
+    }
+
+    @Override
+    public void afterCommit(long committedLocalCheckpoint) {
+        primaryEngine.afterCommit(committedLocalCheckpoint);
+        for (IndexingExecutionEngine<?, ?> secondary : secondaryEngines) {
+            secondary.afterCommit(committedLocalCheckpoint);
+        }
+    }
+
+    @Override
+    public boolean commitReady() {
+        if (primaryEngine.commitReady() == false) {
+            return false;
+        }
+        for (IndexingExecutionEngine<?, ?> secondary : secondaryEngines) {
+            if (secondary.commitReady() == false) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Override
+    public boolean isMergeEligible(java.util.List<org.opensearch.index.engine.exec.Segment> segments) {
+        if (primaryEngine.isMergeEligible(segments) == false) {
+            return false;
+        }
+        for (IndexingExecutionEngine<?, ?> secondary : secondaryEngines) {
+            if (secondary.isMergeEligible(segments) == false) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Override
+    public boolean retainCatalogSnapshot(org.opensearch.index.engine.exec.coord.CatalogSnapshot snapshot) {
+        if (primaryEngine.retainCatalogSnapshot(snapshot)) {
+            return true;
+        }
+        for (IndexingExecutionEngine<?, ?> secondary : secondaryEngines) {
+            if (secondary.retainCatalogSnapshot(snapshot)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public void onEngineOpen(long maxSeqNo, long localCheckpoint) {
+        primaryEngine.onEngineOpen(maxSeqNo, localCheckpoint);
+        for (IndexingExecutionEngine<?, ?> secondary : secondaryEngines) {
+            secondary.onEngineOpen(maxSeqNo, localCheckpoint);
+        }
+    }
+
+    @Override
+    public void onNoOp(long seqNo) {
+        primaryEngine.onNoOp(seqNo);
+        for (IndexingExecutionEngine<?, ?> secondary : secondaryEngines) {
+            secondary.onNoOp(seqNo);
+        }
+    }
+
+    @Override
+    public void bindTranslogSync(java.util.concurrent.Callable<Void> translogSync) {
+        primaryEngine.bindTranslogSync(translogSync);
+        for (IndexingExecutionEngine<?, ?> secondary : secondaryEngines) {
+            secondary.bindTranslogSync(translogSync);
+        }
+    }
+
+    @Override
+    public void bindCatalogSnapshotSupplier(
+        java.util.function.Supplier<
+            org.opensearch.common.concurrent.GatedCloseable<org.opensearch.index.engine.exec.coord.CatalogSnapshot>> catalogSnapshotSupplier
+    ) {
+        primaryEngine.bindCatalogSnapshotSupplier(catalogSnapshotSupplier);
+        for (IndexingExecutionEngine<?, ?> secondary : secondaryEngines) {
+            secondary.bindCatalogSnapshotSupplier(catalogSnapshotSupplier);
+        }
+    }
+
+    @Override
     public Merger getMerger() {
         return merger;
     }
@@ -299,7 +420,7 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
             Set<Long> existingGens = refreshInput.existingSegments().stream().map(Segment::generation).collect(Collectors.toSet());
             List<Segment> onlyNew = newSegments.stream().filter(s -> existingGens.contains(s.generation()) == false).toList();
 
-            if (onlyNew.size() > 1) {
+            if (onlyNew.size() > 1 && isMergeEligible(onlyNew)) {
                 try {
                     final long mergeStartNanos = System.nanoTime();
                     // Counts merge-on-refresh attempts; a subset overlay of merge_total (also
@@ -362,8 +483,14 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
         }
 
         // No merge on refresh — pass through all segments
-        assert newSegments.stream().allMatch(s -> s.dfGroupedSearchableFiles().size() >= 1 + secondaryEngines.size())
-            : "refresh result segments must contain all configured formats";
+        assert newSegments.stream()
+            .allMatch(
+                s -> s.dfGroupedSearchableFiles().containsKey(primaryEngine.getDataFormat().name())
+                    && secondaryEngines.stream()
+                        .allMatch(
+                            e -> e.getDataFormat().mayEmitNoFiles() || s.dfGroupedSearchableFiles().containsKey(e.getDataFormat().name())
+                        )
+            ) : "refresh result segments must contain all configured formats (optional mayEmitNoFiles formats excepted)";
         return new RefreshResult(List.copyOf(newSegments));
     }
 
@@ -414,7 +541,12 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
         for (Segment seg : result.refreshedSegments()) {
             WriterFileSet ownFiles = seg.dfGroupedSearchableFiles().get(ownFormat.name());
             Segment.Builder builder = mergedByGen.computeIfAbsent(seg.generation(), Segment::builder);
-            builder.addSearchableFiles(ownFormat, ownFiles);
+            if (ownFiles != null) {
+                // A format that produced nothing for this generation (legal for
+                // DataFormat.mayEmitNoFiles() formats, e.g. state shipped to a
+                // separate index) simply has no entry in the segment's map.
+                builder.addSearchableFiles(ownFormat, ownFiles);
+            }
         }
     }
 

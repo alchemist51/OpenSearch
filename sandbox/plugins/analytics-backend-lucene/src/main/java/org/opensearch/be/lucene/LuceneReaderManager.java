@@ -61,6 +61,8 @@ public class LuceneReaderManager implements EngineReaderManager<LuceneReader> {
     private volatile DirectoryReader initialWrappedReader;
     private final CheckedBiFunction<DirectoryReader, SegmentInfos, DirectoryReader, IOException> readerRefresher;
 
+    private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(LuceneReaderManager.class);
+
     /**
      * Creates a new LuceneReaderManager.
      *
@@ -121,13 +123,115 @@ public class LuceneReaderManager implements EngineReaderManager<LuceneReader> {
             currentWrappedReader.incRef();
             readerForSnapshot = currentWrappedReader;
         }
+        boolean lenientMapping = false;
+        if (readersAreSame(catalogSnapshot, currentReader) == false) {
+            // Rollback case (D29 reset / D30 sweep): the writer-following
+            // refresher only moves FORWARD. Try to reopen the baseline's
+            // exact commit from disk; when it is gone (lucene keeps only the
+            // last commit point and the target's writer is never rolled
+            // back — known POC gap, resolved by the DerivedIndexEngine in
+            // pull-model phase 4), fall back to the forward reader with a
+            // lenient generation mapping. Reads are unaffected: fold answers
+            // come from mv_state files, not this reader.
+            try {
+                org.apache.lucene.store.Directory dir = currentReader.directory();
+                org.apache.lucene.index.SegmentInfos exactInfos = findBaselineCommit(catalogSnapshot, dir);
+                currentWrappedReader.decRef(); // abandon the forward wrapper (creation or reuse ref)
+                currentReader = org.apache.lucene.index.StandardDirectoryReader.open(dir, exactInfos, java.util.List.of(), null, null);
+                currentWrappedReader = OpenSearchDirectoryReader.wrap(currentReader, shardId);
+                readerForSnapshot = currentWrappedReader;
+            } catch (IOException e) {
+                logger.warn(
+                    "mv rollback: baseline commit not reopenable for catalog id={} — serving the forward lucene reader "
+                        + "(fold reads unaffected; derived-engine writer rollback is the real fix): {}",
+                    catalogSnapshot.getId(),
+                    e.getMessage()
+                );
+                lenientMapping = true;
+            }
+        }
         // Catches refresh/merge-apply races where the refreshed reader's leaves disagree
         // with the catalog snapshot being registered.
-        assert readersAreSame(catalogSnapshot, currentReader);
+        assert lenientMapping || readersAreSame(catalogSnapshot, currentReader);
         assert OpenSearchDirectoryReader.unwrap(currentWrappedReader) == currentReader;
 
-        Map<Long, String> generationToSegmentName = buildGenerationToSegmentName(catalogSnapshot, currentReader.leaves());
+        Map<Long, String> generationToSegmentName = lenientMapping
+            ? buildLenientGenerationToSegmentName(catalogSnapshot, currentReader.leaves())
+            : buildGenerationToSegmentName(catalogSnapshot, currentReader.leaves());
         readers.put(catalogSnapshot.getId(), new LuceneReader(readerForSnapshot, generationToSegmentName));
+    }
+
+    /** Lenient variant for the rollback fallback: unmatched catalog segments are skipped, not fatal. */
+    private static Map<Long, String> buildLenientGenerationToSegmentName(CatalogSnapshot catalogSnapshot, List<LeafReaderContext> leaves) {
+        Map<Set<String>, String> filesToSegName = new HashMap<>(leaves.size());
+        for (int i = 0; i < leaves.size(); i++) {
+            SegmentReader sr = (SegmentReader) leaves.get(i).reader();
+            try {
+                filesToSegName.put(new HashSet<>(sr.getSegmentInfo().files()), sr.getSegmentInfo().info.name);
+            } catch (IOException e) {
+                throw new IllegalStateException("Failed to read files for leaf " + i, e);
+            }
+        }
+        Map<Long, String> out = new HashMap<>();
+        for (Segment seg : catalogSnapshot.getSegments()) {
+            WriterFileSet wfs = seg.dfGroupedSearchableFiles().get(LuceneDataFormat.LUCENE_FORMAT_NAME);
+            if (wfs == null) {
+                continue;
+            }
+            String segName = filesToSegName.get(wfs.files());
+            if (segName != null) {
+                out.put(seg.generation(), segName);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Finds the on-disk Lucene commit whose segment file set covers the given
+     * baseline catalog's lucene files (rollback support: D29 reset / D30
+     * sweep). The baseline was committed and its commit is retention-pinned
+     * by the deletion policy while its sidecar exists, so a matching commit
+     * must be present.
+     */
+    private static org.apache.lucene.index.SegmentInfos findBaselineCommit(
+        CatalogSnapshot catalogSnapshot,
+        org.apache.lucene.store.Directory directory
+    ) throws IOException {
+        Set<String> baselineFiles = new HashSet<>();
+        for (Segment seg : catalogSnapshot.getSegments()) {
+            WriterFileSet wfs = seg.dfGroupedSearchableFiles().get(LuceneDataFormat.LUCENE_FORMAT_NAME);
+            if (wfs != null) {
+                baselineFiles.addAll(wfs.files());
+            }
+        }
+        IOException last = null;
+        for (org.apache.lucene.index.IndexCommit commit : org.apache.lucene.index.DirectoryReader.listCommits(directory)) {
+            try {
+                Set<String> commitFiles = new HashSet<>(commit.getFileNames());
+                if (commitFiles.containsAll(baselineFiles)) {
+                    org.apache.lucene.index.SegmentInfos sis = org.apache.lucene.index.SegmentInfos.readCommit(
+                        directory,
+                        commit.getSegmentsFileName()
+                    );
+                    // Exact reader contract: keep only the baseline's segments
+                    // (a covering commit may reference more).
+                    org.apache.lucene.index.SegmentInfos filtered = sis.clone();
+                    filtered.clear();
+                    for (org.apache.lucene.index.SegmentCommitInfo sci : sis) {
+                        if (baselineFiles.containsAll(sci.files())) {
+                            filtered.add(sci);
+                        }
+                    }
+                    return filtered;
+                }
+            } catch (IOException e) {
+                last = e;
+            }
+        }
+        throw new IOException(
+            "mv rollback: no on-disk lucene commit covers the baseline's file set " + baselineFiles + " — retention pin violated?",
+            last
+        );
     }
 
     private static Map<Long, String> buildGenerationToSegmentName(CatalogSnapshot catalogSnapshot, List<LeafReaderContext> leaves) {
@@ -177,7 +281,20 @@ public class LuceneReaderManager implements EngineReaderManager<LuceneReader> {
      * @return {@code true} iff both lists contain the same generations in the same (sorted) order
      */
     private boolean readersAreSame(CatalogSnapshot catalogSnapshot, DirectoryReader reader) {
-        Collection<Long> generationsReferenced = catalogSnapshot.getSegments().stream().map(Segment::generation).sorted().toList();
+        // Only LUCENE-bearing segments have a corresponding leaf in this reader. A
+        // composite/derived catalog may also contain derived-artifact-only segments
+        // (e.g. a materialized-view {@code mv_state} state file published via
+        // {@code publishDerivedArtifact}) whose generation has no Lucene component and
+        // therefore no reader leaf. Comparing against ALL segment generations would then
+        // spuriously report a mismatch on every derived publication. Filter to
+        // Lucene-bearing segments — consistent with {@link #buildGenerationToSegmentName}
+        // and {@link #findBaselineCommit}, which already skip segments with no Lucene fileset.
+        Collection<Long> generationsReferenced = catalogSnapshot.getSegments()
+            .stream()
+            .filter(seg -> seg.dfGroupedSearchableFiles().containsKey(LuceneDataFormat.LUCENE_FORMAT_NAME))
+            .map(Segment::generation)
+            .sorted()
+            .toList();
         return generationsReferenced.equals(collectReferencedGenerations(reader));
     }
 

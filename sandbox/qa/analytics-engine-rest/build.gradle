@@ -38,6 +38,7 @@ dependencies {
     testImplementation project(':sandbox:plugins:dsl-query-executor')
     testImplementation project(':sandbox:plugins:composite-engine')
     testImplementation project(':sandbox:plugins:parquet-data-format')
+    testImplementation project(':sandbox:plugins:mv-data-format')
     // test-ppl-frontend kept available so ExplainApiIT can hit /_analytics/ppl/_explain;
     // its profile/stage-timing output isn't matched by the real opensearch-sql plugin's
     // explain endpoint (returns plain Calcite plan text). All other QA tests use
@@ -66,6 +67,8 @@ def configureAnalyticsCluster = { cluster ->
     cluster.plugin ':sandbox:plugins:analytics-backend-lucene'
     cluster.plugin ':sandbox:plugins:dsl-query-executor'
     cluster.plugin ':sandbox:plugins:parquet-data-format'
+    // MV separate-index track: unified MV plugin handles both source and target formats
+    cluster.plugin ':sandbox:plugins:mv-data-format'
     // Shim — keeps /_analytics/ppl/_explain available for ExplainApiIT, which asserts on
     // the shim's profile/stage-timing output that the real plugin doesn't emit.
     cluster.plugin ':sandbox:plugins:test-ppl-frontend'

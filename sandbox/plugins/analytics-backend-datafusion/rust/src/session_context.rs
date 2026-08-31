@@ -41,6 +41,10 @@ pub struct SessionContextHandle {
     pub ctx: SessionContext,
     pub table_path: ListingTableUrl,
     pub object_metas: Arc<Vec<ObjectMeta>>,
+    /// True when this session has a registered table provider that can produce rows
+    /// independently of `object_metas` (for example, an MV-state MemTable). This keeps
+    /// the empty-parquet-shard optimization explicit instead of fabricating file metadata.
+    pub has_table_data: bool,
     /// Writer generation per object_metas entry (parallel arrays). Sourced from the
     /// Java-side catalog snapshot via `create_reader`. Authoritative for stamping
     /// `SegmentFileInfo.writer_generation`; footer-kv reads are debug-only assertions.
@@ -72,6 +76,10 @@ pub struct SessionContextHandle {
     /// Phantom reservation holding pool capacity for untracked memory.
     /// Dropped when the handle is closed, releasing the capacity.
     pub(crate) phantom_reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
+    /// Materialized-view coverage binding, set during MV-only session creation
+    /// or by `create_mv_only_session_context`. None = no binding =
+    /// today's raw-only plan. See `mv_read` for the prepare-time plan surgery.
+    pub(crate) mv_binding: Option<crate::mv_read::MVBinding>,
 }
 
 /// Configuration for indexed execution with filter delegation, provided by Java.
@@ -404,6 +412,7 @@ pub async unsafe fn create_session_context(
         ctx,
         table_path: shard_view.table_path.clone(),
         object_metas: shard_view.object_metas.clone(),
+        has_table_data: !shard_view.object_metas.is_empty(),
         writer_generations: shard_view.writer_generations.clone(),
         sort_fields: shard_view.sort_fields.clone(),
         sort_orders: shard_view.sort_orders.clone(),
@@ -416,6 +425,7 @@ pub async unsafe fn create_session_context(
         has_topk,
         prepared_plan: None,
         phantom_reservation: phantom,
+        mv_binding: None,
     };
     Ok(Box::into_raw(Box::new(handle)) as i64)
 }
@@ -428,6 +438,334 @@ pub unsafe fn close_session_context(ptr: i64) {
     if ptr != 0 {
         let _ = Box::from_raw(ptr as *mut SessionContextHandle);
     }
+}
+
+/// Eagerly replaces the session's registered table with the MV state data.
+/// Creates a DataFusion SessionContext for MV-only serving with Arrow state files
+/// registered directly as the table. No ShardView or parquet reader needed.
+///
+/// # Safety
+/// `runtime_ptr` must be a valid pointer to a `DataFusionRuntime`.
+pub async unsafe fn create_mv_only_session_context(
+    runtime_ptr: i64,
+    table_name: &str,
+    context_id: i64,
+    has_partial_aggregate: bool,
+    query_config: DatafusionQueryConfig,
+    plan_bytes: &[u8],
+    state_file_paths: &[String],
+    state_fields: &[String],
+) -> Result<i64, DataFusionError> {
+    let runtime = &*(runtime_ptr as *const DataFusionRuntime);
+
+    let global_pool = runtime.runtime_env.memory_pool.clone();
+    let query_context = QueryTrackingContext::new(
+        context_id,
+        global_pool.clone(),
+        crate::query_tracker::QueryType::Shard,
+    );
+    let query_memory_pool = query_context
+        .memory_pool()
+        .map(|p| p as Arc<dyn MemoryPool>);
+
+    let list_file_cache = Arc::new(DefaultListFilesCache::default());
+    let mut runtime_env_builder =
+        crate::query_executor::query_runtime_env_builder(runtime, list_file_cache);
+
+    if let Some(pool) = query_memory_pool {
+        runtime_env_builder = runtime_env_builder.with_memory_pool(pool);
+    }
+
+    let runtime_env = runtime_env_builder.build().map_err(|e| {
+        error!(
+            "create_mv_only_session_context: failed to build runtime env: {}",
+            e
+        );
+        e
+    })?;
+
+    // Register local filesystem for reading Arrow state files.
+    runtime_env.register_object_store(
+        &url::Url::parse("file://").unwrap(),
+        Arc::new(object_store::local::LocalFileSystem::new()),
+    );
+
+    let has_topk = has_partial_aggregate && substrait_has_fetch_rel(plan_bytes);
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.parquet.pushdown_filters =
+        query_config.listing_table_pushdown_filters;
+    if has_topk {
+        config
+            .options_mut()
+            .execution
+            .skip_partial_aggregation_probe_ratio_threshold = 1.0;
+    }
+    config.options_mut().execution.target_partitions = query_config.target_partitions;
+    config.options_mut().execution.batch_size = query_config.batch_size;
+
+    let state_builder = SessionStateBuilder::new()
+        .with_config(config)
+        .with_runtime_env(Arc::from(runtime_env))
+        .with_default_features()
+        .with_physical_optimizer_rules(if has_partial_aggregate {
+            crate::agg_mode::physical_optimizer_rules_without_combine()
+        } else {
+            datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new().rules
+        });
+
+    let state = state_builder.build();
+    let ctx = SessionContext::new_with_state(state);
+
+    // Register UDFs so Substrait consumer can resolve function names.
+    crate::udf::register_all(&ctx);
+    crate::udaf::register_all(&ctx);
+    crate::udwf::register_all(&ctx);
+
+    // Derive the table name from the plan (multi-index alias) or fall back to concrete name.
+    let register_name = if !plan_bytes.is_empty() {
+        crate::api::first_named_table_name(plan_bytes).unwrap_or_else(|| {
+            error!(
+                "create_mv_only_session_context: no table name in plan, falling back to '{}'",
+                table_name
+            );
+            table_name.to_string()
+        })
+    } else {
+        table_name.to_string()
+    };
+
+    // State files contain positional aggregate state. Ordered state_fields metadata is the
+    // logical contract; mapping/plan field order is not stable and physical names are an
+    // implementation detail. Relabel zero-copy and reject any metadata/schema drift.
+    let has_mv_data = !state_file_paths.is_empty();
+    if has_mv_data {
+        use arrow::ipc::reader::FileReader;
+        use std::fs::File;
+
+        let mut physical_batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+        let mut physical_schema: Option<arrow::datatypes::SchemaRef> = None;
+
+        for path in state_file_paths {
+            let file = File::open(path).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "create_mv_only_session_context: failed to open state file '{}': {}",
+                    path, e
+                ))
+            })?;
+            let reader = FileReader::try_new(file, None).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "create_mv_only_session_context: failed to read Arrow IPC '{}': {}",
+                    path, e
+                ))
+            })?;
+            let file_schema = reader.schema();
+            if let Some(expected) = physical_schema.as_ref() {
+                if expected.as_ref() != file_schema.as_ref() {
+                    return Err(DataFusionError::Execution(format!(
+                        "create_mv_only_session_context: state schema mismatch in '{}'",
+                        path
+                    )));
+                }
+            } else {
+                physical_schema = Some(file_schema);
+            }
+            for batch_result in reader {
+                physical_batches.push(batch_result.map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "create_mv_only_session_context: batch read error in '{}': {}",
+                        path, e
+                    ))
+                })?);
+            }
+        }
+
+        let physical_schema = physical_schema.ok_or_else(|| {
+            DataFusionError::Execution(
+                "create_mv_only_session_context: state files had no Arrow schema".to_string(),
+            )
+        })?;
+        let logical_schema = widen_schema_from_plan(
+            &ctx,
+            plan_bytes,
+            &register_name,
+            &Arc::new(arrow::datatypes::Schema::empty()),
+        );
+        let (table_schema, physical_projection) =
+            mv_table_schema(&physical_schema, &logical_schema, state_fields)?;
+
+        let logical_batches = physical_batches
+            .into_iter()
+            .map(|batch| {
+                let columns: Vec<arrow::array::ArrayRef> = physical_projection
+                    .iter()
+                    .map(|proj| {
+                        let col = batch.column(proj.physical_position);
+                        match &proj.cast_to {
+                            None => Ok(Arc::clone(col)),
+                            Some(target_type) => arrow::compute::cast(col, target_type)
+                                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                arrow::record_batch::RecordBatch::try_new(Arc::clone(&table_schema), columns)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let row_count = logical_batches
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(table_schema, vec![logical_batches])?;
+        ctx.register_table(register_name.as_str(), Arc::new(mem_table))?;
+        native_bridge_common::log_info!(
+            "create_mv_only_session_context: registered MV table '{}' from {} state files ({} rows)",
+            register_name,
+            state_file_paths.len(),
+            row_count
+        );
+    } else {
+        let logical_schema = widen_schema_from_plan(
+            &ctx,
+            plan_bytes,
+            &register_name,
+            &Arc::new(arrow::datatypes::Schema::empty()),
+        );
+        let empty_batch = arrow::record_batch::RecordBatch::new_empty(Arc::clone(&logical_schema));
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(logical_schema, vec![vec![empty_batch]])?;
+        ctx.register_table(register_name.as_str(), Arc::new(mem_table))?;
+    }
+
+    let table_path = ListingTableUrl::parse("file:///mv-state-virtual/")
+        .expect("constant ListingTableUrl 'file:///mv-state-virtual/' must parse; this is a compile-time invariant");
+
+    let handle = SessionContextHandle {
+        ctx,
+        table_path,
+        object_metas: Arc::new(vec![]),
+        has_table_data: has_mv_data,
+        writer_generations: Arc::new(vec![]),
+        sort_fields: vec![],
+        sort_orders: vec![],
+        query_context,
+        table_name: register_name.clone(),
+        indexed_config: None,
+        query_config,
+        io_handle: tokio::runtime::Handle::current(),
+        aggregate_mode: crate::agg_mode::Mode::Default,
+        has_topk,
+        prepared_plan: None,
+        phantom_reservation: None,
+        mv_binding: None,
+    };
+    Ok(Box::into_raw(Box::new(handle)) as i64)
+}
+
+/// Describes how a single column in the physical Arrow state maps into the logical MemTable schema.
+#[derive(Debug, Clone, PartialEq)]
+struct MvColumnProjection {
+    /// Index into the physical RecordBatch's columns.
+    physical_position: usize,
+    /// When `Some(target)`, the physical array must be cast to `target` (a lossless widening).
+    /// When `None`, the physical array is used zero-copy (types match exactly).
+    cast_to: Option<arrow::datatypes::DataType>,
+}
+
+/// Returns `true` when `from` can be losslessly widened to `to`.
+///
+/// Only permits same-signedness integer width increases:
+///   - Signed:   Int8 → Int16 → Int32 → Int64
+///   - Unsigned: UInt8 → UInt16 → UInt32 → UInt64
+///
+/// All other conversions (narrowing, signedness change, integer-to-float,
+/// float-to-integer, string, temporal, etc.) are rejected.
+fn is_lossless_integer_widening(
+    from: &arrow::datatypes::DataType,
+    to: &arrow::datatypes::DataType,
+) -> bool {
+    use arrow::datatypes::DataType;
+    match (from, to) {
+        // Signed integer widening: width(from) < width(to)
+        (DataType::Int8, DataType::Int16 | DataType::Int32 | DataType::Int64) => true,
+        (DataType::Int16, DataType::Int32 | DataType::Int64) => true,
+        (DataType::Int32, DataType::Int64) => true,
+        // Unsigned integer widening: width(from) < width(to)
+        (DataType::UInt8, DataType::UInt16 | DataType::UInt32 | DataType::UInt64) => true,
+        (DataType::UInt16, DataType::UInt32 | DataType::UInt64) => true,
+        (DataType::UInt32, DataType::UInt64) => true,
+        _ => false,
+    }
+}
+
+fn mv_table_schema(
+    physical_schema: &arrow::datatypes::SchemaRef,
+    logical_schema: &arrow::datatypes::SchemaRef,
+    state_fields: &[String],
+) -> Result<(arrow::datatypes::SchemaRef, Vec<MvColumnProjection>), DataFusionError> {
+    if state_fields.len() != physical_schema.fields().len() {
+        return Err(DataFusionError::Execution(format!(
+            "MV state field metadata has {} names but the Arrow state has {} columns",
+            state_fields.len(),
+            physical_schema.fields().len()
+        )));
+    }
+    let unique = state_fields
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    if unique.len() != state_fields.len() {
+        return Err(DataFusionError::Execution(
+            "MV state field metadata contains duplicate names".to_string(),
+        ));
+    }
+
+    if logical_schema.fields().len() != state_fields.len() {
+        return Err(DataFusionError::Execution(format!(
+            "MV query schema has {} fields but state metadata has {} names",
+            logical_schema.fields().len(),
+            state_fields.len()
+        )));
+    }
+
+    let physical_projection = logical_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(logical_position, logical)| {
+            let physical_position = state_fields
+                .iter()
+                .position(|name| name == logical.name())
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "MV query field '{}' at position {} is absent from state field metadata {:?}",
+                        logical.name(), logical_position, state_fields
+                    ))
+                })?;
+            let physical = physical_schema.field(physical_position);
+            let cast_to = if logical.data_type() == physical.data_type() {
+                // Exact match → zero-copy projection.
+                None
+            } else if is_lossless_integer_widening(physical.data_type(), logical.data_type()) {
+                // Safe widening (e.g. Int32 → Int64): cast at batch construction time.
+                Some(logical.data_type().clone())
+            } else {
+                // Reject: narrowing, signedness change, or unrelated type conversion.
+                return Err(DataFusionError::Execution(format!(
+                    "MV state field '{}' at physical position {} has type {:?} but query expects {:?}; \
+                     only lossless integer widening (same signedness, larger width) is permitted",
+                    logical.name(),
+                    physical_position,
+                    physical.data_type(),
+                    logical.data_type()
+                )));
+            };
+            Ok(MvColumnProjection {
+                physical_position,
+                cast_to,
+            })
+        })
+        .collect::<Result<Vec<_>, DataFusionError>>()?;
+    Ok((Arc::clone(logical_schema), physical_projection))
 }
 
 /// Creates a SessionContext configured for indexed execution with filter delegation.
@@ -507,6 +845,16 @@ pub async fn prepare_partial_plan(
     )?;
 
     let target_schema = crate::schema_coerce::coerce_inferred_schema(stripped.schema());
+    // MV read path: when the session carries a binding, apply the prepare-time
+    // plan surgery (strict mode on this branch: REPLACE the Partial with the
+    // aliased mv-state scan — the separate-index superset guarantee makes the
+    // whole-fragment substitution exact). Runs BEFORE RelabelExec wrapping so
+    // the substituted plan is what gets relabeled.
+    let stripped = match handle.mv_binding.as_ref() {
+        Some(binding) => crate::mv_read::apply_mv_binding(&handle.ctx, stripped, binding).await?,
+        None => stripped,
+    };
+
     let stripped = crate::relabel_exec::wrap_if_relabel_needed(stripped, target_schema)?;
     handle.prepared_plan = Some(stripped);
     Ok(())
@@ -671,6 +1019,79 @@ mod tests {
     use crate::agg_mode::Mode;
     use crate::query_tracker::QueryTrackingContext;
 
+    #[test]
+    fn test_mv_table_schema_reorders_columns_into_mapping_order() {
+        let physical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int64, false),
+            Field::new("count(Int64(1))[count]", DataType::Int64, false),
+            Field::new("sum(mv_input.AdvEngineID)[sum]", DataType::Int64, true),
+        ]));
+        // Mapping/plan order is intentionally different from Arrow state order.
+        let logical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int64, true),
+            Field::new("adv", DataType::Int64, true),
+            Field::new("cnt", DataType::Int64, true),
+        ]));
+        let state_fields = vec!["RegionID".to_string(), "cnt".to_string(), "adv".to_string()];
+
+        let (table_schema, projection) =
+            mv_table_schema(&physical, &logical, &state_fields).expect("table schema");
+        assert_eq!(
+            table_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["RegionID", "adv", "cnt"]
+        );
+        // Exact types → all projections are zero-copy (cast_to = None).
+        assert_eq!(
+            projection,
+            vec![
+                MvColumnProjection {
+                    physical_position: 0,
+                    cast_to: None
+                },
+                MvColumnProjection {
+                    physical_position: 2,
+                    cast_to: None
+                },
+                MvColumnProjection {
+                    physical_position: 1,
+                    cast_to: None
+                },
+            ]
+        );
+
+        let physical_columns: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![0])),
+            Arc::new(Int64Array::from(vec![100])),
+            Arc::new(Int64Array::from(vec![297])),
+        ];
+        let batch = RecordBatch::try_new(
+            table_schema,
+            projection
+                .iter()
+                .map(|proj| Arc::clone(&physical_columns[proj.physical_position]))
+                .collect(),
+        )
+        .expect("batch");
+        let cnt = batch
+            .column_by_name("cnt")
+            .expect("cnt")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 cnt");
+        let adv = batch
+            .column_by_name("adv")
+            .expect("adv")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 adv");
+        assert_eq!(cnt.value(0), 100);
+        assert_eq!(adv.value(0), 297);
+    }
+
     #[tokio::test]
     async fn test_widen_schema_noop_when_plan_empty() {
         let ctx = SessionContext::new();
@@ -799,6 +1220,7 @@ mod tests {
             ctx,
             table_path,
             object_metas: Arc::new(vec![]),
+            has_table_data: true,
             writer_generations: Arc::new(vec![]),
             sort_fields: vec![],
             sort_orders: vec![],
@@ -811,6 +1233,7 @@ mod tests {
             has_topk: false,
             prepared_plan: None,
             phantom_reservation: None,
+            mv_binding: None,
         };
         (handle, buf)
     }
@@ -1176,5 +1599,286 @@ mod tests {
             !substrait_has_fetch_rel(&bytes),
             "Join rel → false (no TopK in shard fragment with Join)"
         );
+    }
+
+    // ========================================================================
+    // MV physical-to-logical type widening tests
+    // ========================================================================
+
+    /// Regression: physical RegionID is Int32, logical/Substrait expects Int64.
+    /// mv_table_schema must accept this and signal a cast is needed.
+    #[test]
+    fn test_mv_table_schema_int32_physical_widens_to_int64_logical() {
+        use arrow_array::Int32Array;
+
+        let physical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int32, false),
+            Field::new("count(Int64(1))[count]", DataType::Int64, false),
+            Field::new("sum(mv_input.AdvEngineID)[sum]", DataType::Int64, true),
+        ]));
+        let logical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int64, true),
+            Field::new("adv", DataType::Int64, true),
+            Field::new("cnt", DataType::Int64, true),
+        ]));
+        let state_fields = vec!["RegionID".to_string(), "cnt".to_string(), "adv".to_string()];
+
+        let (table_schema, projection) =
+            mv_table_schema(&physical, &logical, &state_fields).expect("schema with widening");
+
+        // RegionID must be flagged for cast Int32→Int64; others are exact.
+        assert_eq!(
+            projection[0],
+            MvColumnProjection {
+                physical_position: 0,
+                cast_to: Some(DataType::Int64),
+            }
+        );
+        assert_eq!(
+            projection[1],
+            MvColumnProjection {
+                physical_position: 2,
+                cast_to: None,
+            }
+        );
+        assert_eq!(
+            projection[2],
+            MvColumnProjection {
+                physical_position: 1,
+                cast_to: None,
+            }
+        );
+
+        // Validate cast preserves values: build a batch the way create_mv_only_session_context does.
+        let physical_columns: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![42i32, i32::MAX, -1])),
+            Arc::new(Int64Array::from(vec![100i64, 200, 300])),
+            Arc::new(Int64Array::from(vec![297i64, 500, 700])),
+        ];
+        let logical_columns: Vec<arrow::array::ArrayRef> = projection
+            .iter()
+            .map(|proj| {
+                let col = &physical_columns[proj.physical_position];
+                match &proj.cast_to {
+                    None => Arc::clone(col),
+                    Some(target) => arrow::compute::cast(col, target).expect("lossless cast"),
+                }
+            })
+            .collect();
+        let batch =
+            RecordBatch::try_new(Arc::clone(&table_schema), logical_columns).expect("batch");
+
+        // RegionID column should now be Int64 with the same values.
+        let region = batch
+            .column_by_name("RegionID")
+            .expect("RegionID")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("must be Int64 after cast");
+        assert_eq!(region.value(0), 42i64);
+        assert_eq!(region.value(1), i32::MAX as i64);
+        assert_eq!(region.value(2), -1i64);
+
+        // Other columns remain correct.
+        let adv = batch
+            .column_by_name("adv")
+            .expect("adv")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 adv");
+        assert_eq!(adv.value(0), 297);
+        let cnt = batch
+            .column_by_name("cnt")
+            .expect("cnt")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 cnt");
+        assert_eq!(cnt.value(0), 100);
+    }
+
+    /// Exact type match still produces zero-copy projection [0,2,1] correctly.
+    #[test]
+    fn test_mv_table_schema_exact_types_still_project_correctly() {
+        let physical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int64, false),
+            Field::new("count(Int64(1))[count]", DataType::Int64, false),
+            Field::new("sum(mv_input.AdvEngineID)[sum]", DataType::Int64, true),
+        ]));
+        let logical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int64, true),
+            Field::new("adv", DataType::Int64, true),
+            Field::new("cnt", DataType::Int64, true),
+        ]));
+        let state_fields = vec!["RegionID".to_string(), "cnt".to_string(), "adv".to_string()];
+
+        let (_schema, projection) =
+            mv_table_schema(&physical, &logical, &state_fields).expect("schema");
+
+        // All zero-copy — no casts needed.
+        for proj in &projection {
+            assert_eq!(proj.cast_to, None, "exact types must be zero-copy");
+        }
+        // Ordinal positions: [RegionID→0, adv→2, cnt→1]
+        assert_eq!(projection[0].physical_position, 0);
+        assert_eq!(projection[1].physical_position, 2);
+        assert_eq!(projection[2].physical_position, 1);
+    }
+
+    /// Narrowing (Int64→Int32) must be rejected.
+    #[test]
+    fn test_mv_table_schema_rejects_narrowing_int64_to_int32() {
+        let physical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int64, false),
+            Field::new("cnt", DataType::Int64, false),
+        ]));
+        let logical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int32, true), // NARROWING
+            Field::new("cnt", DataType::Int64, true),
+        ]));
+        let state_fields = vec!["RegionID".to_string(), "cnt".to_string()];
+
+        let result = mv_table_schema(&physical, &logical, &state_fields);
+        assert!(result.is_err(), "narrowing must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("only lossless integer widening"),
+            "error must explain the constraint: {}",
+            err
+        );
+    }
+
+    /// Incompatible type (Int32→Utf8) must be rejected — not a widening.
+    #[test]
+    fn test_mv_table_schema_rejects_incompatible_type_int_to_string() {
+        let physical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int32, false),
+            Field::new("cnt", DataType::Int64, false),
+        ]));
+        let logical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Utf8, true), // INCOMPATIBLE
+            Field::new("cnt", DataType::Int64, true),
+        ]));
+        let state_fields = vec!["RegionID".to_string(), "cnt".to_string()];
+
+        let result = mv_table_schema(&physical, &logical, &state_fields);
+        assert!(result.is_err(), "int-to-string must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("only lossless integer widening"),
+            "error must explain: {}",
+            err
+        );
+    }
+
+    /// Signedness change (UInt32→Int64) must be rejected.
+    #[test]
+    fn test_mv_table_schema_rejects_signedness_change() {
+        let physical = Arc::new(Schema::new(vec![Field::new("x", DataType::UInt32, false)]));
+        let logical = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let state_fields = vec!["x".to_string()];
+
+        let result = mv_table_schema(&physical, &logical, &state_fields);
+        assert!(result.is_err(), "signedness change must be rejected");
+    }
+
+    /// is_lossless_integer_widening unit tests for coverage of all accepted/rejected pairs.
+    #[test]
+    fn test_is_lossless_integer_widening_accepts_valid() {
+        // Signed widenings
+        assert!(is_lossless_integer_widening(
+            &DataType::Int8,
+            &DataType::Int16
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::Int8,
+            &DataType::Int32
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::Int8,
+            &DataType::Int64
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::Int16,
+            &DataType::Int32
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::Int16,
+            &DataType::Int64
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::Int32,
+            &DataType::Int64
+        ));
+        // Unsigned widenings
+        assert!(is_lossless_integer_widening(
+            &DataType::UInt8,
+            &DataType::UInt16
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::UInt8,
+            &DataType::UInt32
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::UInt8,
+            &DataType::UInt64
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::UInt16,
+            &DataType::UInt32
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::UInt16,
+            &DataType::UInt64
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::UInt32,
+            &DataType::UInt64
+        ));
+    }
+
+    #[test]
+    fn test_is_lossless_integer_widening_rejects_invalid() {
+        // Same type = not a widening
+        assert!(!is_lossless_integer_widening(
+            &DataType::Int32,
+            &DataType::Int32
+        ));
+        // Narrowing
+        assert!(!is_lossless_integer_widening(
+            &DataType::Int64,
+            &DataType::Int32
+        ));
+        assert!(!is_lossless_integer_widening(
+            &DataType::Int32,
+            &DataType::Int16
+        ));
+        // Signedness change
+        assert!(!is_lossless_integer_widening(
+            &DataType::UInt32,
+            &DataType::Int64
+        ));
+        assert!(!is_lossless_integer_widening(
+            &DataType::Int32,
+            &DataType::UInt64
+        ));
+        // Float
+        assert!(!is_lossless_integer_widening(
+            &DataType::Int32,
+            &DataType::Float64
+        ));
+        assert!(!is_lossless_integer_widening(
+            &DataType::Float32,
+            &DataType::Float64
+        ));
+        // String
+        assert!(!is_lossless_integer_widening(
+            &DataType::Int32,
+            &DataType::Utf8
+        ));
+        // Boolean
+        assert!(!is_lossless_integer_widening(
+            &DataType::Boolean,
+            &DataType::Int32
+        ));
     }
 }

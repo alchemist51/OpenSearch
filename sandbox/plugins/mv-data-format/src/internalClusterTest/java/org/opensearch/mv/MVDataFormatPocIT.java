@@ -1,0 +1,196 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+package org.opensearch.mv;
+
+import com.carrotsearch.randomizedtesting.ThreadFilter;
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
+
+import org.opensearch.action.index.IndexResponse;
+import org.opensearch.arrow.allocator.ArrowBasePlugin;
+import org.opensearch.be.datafusion.DataFusionPlugin;
+import org.opensearch.be.lucene.LucenePlugin;
+import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.common.concurrent.GatedCloseable;
+import org.opensearch.common.network.NetworkModule;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.FeatureFlags;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
+import org.opensearch.composite.CompositeDataFormatPlugin;
+import org.opensearch.core.rest.RestStatus;
+import org.opensearch.index.IndexService;
+import org.opensearch.index.engine.DataFormatAwareEngine;
+import org.opensearch.index.engine.exec.Segment;
+import org.opensearch.index.engine.exec.WriterFileSet;
+import org.opensearch.index.engine.exec.coord.CatalogSnapshot;
+import org.opensearch.index.shard.IndexShard;
+import org.opensearch.index.shard.IndexShardTestCase;
+import org.opensearch.indices.IndicesService;
+import org.opensearch.parquet.ParquetDataFormatPlugin;
+import org.opensearch.plugins.Plugin;
+import org.opensearch.test.OpenSearchIntegTestCase;
+import org.opensearch.transport.Netty4ModulePlugin;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Pattern;
+
+/**
+ * POC(mv) end-to-end ingestion test: composite index with parquet primary and
+ * materialized_view secondary; golden dataset; assert the MV state file lands
+ * in the segment's snapshot with correct per-segment counts.
+ */
+@ThreadLeakFilters(filters = MVDataFormatPocIT.NativeThreadFilter.class)
+@OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 1)
+public class MVDataFormatPocIT extends OpenSearchIntegTestCase {
+
+    public static class NativeThreadFilter implements ThreadFilter {
+        private static final Pattern GENERIC = Pattern.compile("^Thread-\\d+$");
+
+        @Override
+        public boolean reject(Thread t) {
+            return GENERIC.matcher(t.getName()).matches();
+        }
+    }
+
+    @Override
+    protected Collection<Class<? extends Plugin>> nodePlugins() {
+        return Arrays.asList(
+            ArrowBasePlugin.class,
+            ParquetDataFormatPlugin.class,
+            CompositeDataFormatPlugin.class,
+            MVDataFormatPlugin.class,
+            LucenePlugin.class,
+            DataFusionPlugin.class,
+            Netty4ModulePlugin.class
+        );
+    }
+
+    @Override
+    protected Settings nodeSettings(int nodeOrdinal) {
+        return Settings.builder()
+            .put(super.nodeSettings(nodeOrdinal))
+            .put(FeatureFlags.PLUGGABLE_DATAFORMAT_EXPERIMENTAL_FLAG, true)
+            .put(NetworkModule.HTTP_TYPE_KEY, Netty4ModulePlugin.NETTY_HTTP_TRANSPORT_NAME)
+            .put(OpenSearchExecutors.NODE_PROCESSORS_SETTING.getKey(), 1)
+            .build();
+    }
+
+    public void testMvStateFileBuiltAtFlush() throws Exception {
+        String index = "payments";
+        client().admin()
+            .indices()
+            .prepareCreate(index)
+            .setSettings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                    .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                    .put("index.pluggable.dataformat.enabled", true)
+                    .put("index.pluggable.dataformat", "composite")
+                    .put("index.composite.primary_data_format", "parquet")
+                    .putList("index.composite.secondary_data_formats", "lucene", "materialized_view")
+                    // POC: merges disabled — keep flush segments pure
+                    .put("index.composite.merge_on_refresh_max_size", "0b")
+            )
+            .setMapping("service", "type=keyword", "status", "type=keyword", "latency_ms", "type=long")
+            .get();
+        ensureGreen(index);
+
+        // Golden segment 1 (5 docs):
+        // (api,200,30) (api,200,50) (web,200,40) (api,500,900) (api,200,25)
+        // -> states: (api,200): cnt=3 sum=105 min=25 max=50; (api,500): 1/900/900/900; (web,200): 1/40/40/40
+        indexDoc(index, "api", "200", 30);
+        indexDoc(index, "api", "200", 50);
+        indexDoc(index, "web", "200", 40);
+        indexDoc(index, "api", "500", 900);
+        indexDoc(index, "api", "200", 25);
+        client().admin().indices().prepareRefresh(index).get();
+
+        // Golden segment 2 (3 docs):
+        // (api,200,10) (web,200,80) (batch,200,60)
+        // -> states: (api,200): 1/10/10/10; (web,200): 1/80/80/80; (batch,200): 1/60/60/60
+        // Cross-segment: (api,200) split across segments; min winner in seg2 (10), max in seg1 (50);
+        // (web,200) max winner in seg2 (80).
+        indexDoc(index, "api", "200", 10);
+        indexDoc(index, "web", "200", 80);
+        indexDoc(index, "batch", "200", 60);
+        client().admin().indices().prepareRefresh(index).get();
+
+        // ---- Assert: every segment carries a materialized_view WriterFileSet ----
+        IndexShard shard = getPrimaryShard(index);
+        DataFormatAwareEngine engine = (DataFormatAwareEngine) IndexShardTestCase.getIndexer(shard);
+        try (GatedCloseable<CatalogSnapshot> ref = engine.acquireSnapshot()) {
+            CatalogSnapshot snapshot = ref.get();
+            List<Segment> segments = snapshot.getSegments();
+            assertTrue("at least the two explicit refresh generations", segments.size() >= 2);
+
+            long totalPrimaryRows = 0;
+            long totalMvRows = 0;
+            for (Segment seg : segments) {
+                Map<String, WriterFileSet> byFormat = seg.dfGroupedSearchableFiles();
+                assertTrue("segment " + seg.generation() + " has parquet", byFormat.containsKey("parquet"));
+                assertTrue("segment " + seg.generation() + " has lucene", byFormat.containsKey("lucene"));
+                assertTrue("segment " + seg.generation() + " has materialized_view", byFormat.containsKey(MVDataFormat.NAME));
+
+                WriterFileSet mv = byFormat.get(MVDataFormat.NAME);
+                assertEquals("one MV state file per segment", 1, mv.files().size());
+                totalPrimaryRows += byFormat.get("parquet").numRows();
+                totalMvRows += mv.numRows();
+
+                // File physically exists in the mv dir
+                Path mvFile = Path.of(mv.directory()).resolve(mv.files().iterator().next());
+                assertTrue("state file exists: " + mvFile, Files.exists(mvFile));
+            }
+            assertEquals("8 raw docs across segments", 8, totalPrimaryRows);
+            assertTrue("state rows must cover at least the four final groups", totalMvRows >= 4);
+            assertTrue("partial state cannot exceed raw rows", totalMvRows <= totalPrimaryRows);
+
+            // ---- HARDCODED SEARCH: always goes to the MV state files ----
+            java.util.List<String> stateFiles = new java.util.ArrayList<>();
+            for (Segment seg : segments) {
+                WriterFileSet mv = seg.dfGroupedSearchableFiles().get(MVDataFormat.NAME);
+                for (String f : mv.files()) {
+                    stateFiles.add(Path.of(mv.directory()).resolve(f).toString());
+                }
+            }
+            String result = MVNativeBridge.searchV2(stateFiles, MVConstants.SEARCH_SQL);
+            // Golden answers (sorted by service, status):
+            // api,200: cnt=4 sum=115 min=10 max=50
+            // api,500: cnt=1 sum=900 min=900 max=900
+            // batch,200: cnt=1 sum=60 min=60 max=60
+            // web,200: cnt=2 sum=120 min=40 max=80
+            assertEquals(
+                "api\t200\t4\t115\t10\t50\n"
+                    + "api\t500\t1\t900\t900\t900\n"
+                    + "batch\t200\t1\t60\t60\t60\n"
+                    + "web\t200\t2\t120\t40\t80\n",
+                result
+            );
+        }
+    }
+
+    private void indexDoc(String index, String service, String status, long latencyMs) {
+        IndexResponse r = client().prepareIndex()
+            .setIndex(index)
+            .setSource("service", service, "status", status, "latency_ms", latencyMs)
+            .get();
+        assertEquals(RestStatus.CREATED, r.status());
+    }
+
+    private IndexShard getPrimaryShard(String indexName) {
+        String nodeId = getClusterState().routingTable().index(indexName).shard(0).primaryShard().currentNodeId();
+        String nodeName = getClusterState().nodes().get(nodeId).getName();
+        IndicesService indicesService = internalCluster().getInstance(IndicesService.class, nodeName);
+        IndexService indexService = indicesService.indexServiceSafe(resolveIndex(indexName));
+        return indexService.getShard(0);
+    }
+}

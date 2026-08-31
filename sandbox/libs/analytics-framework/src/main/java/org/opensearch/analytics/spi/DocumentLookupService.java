@@ -40,6 +40,10 @@ import java.util.Set;
 @ExperimentalApi
 public class DocumentLookupService {
 
+    private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(
+        DocumentLookupService.class
+    );
+
     /**
      * Engine/storage metadata fields excluded from reconstructed {@code _source}, sourced from the mapper
      * registry's built-in metadata mappers rather than a hand-maintained list. {@code _primary_term} (a
@@ -85,13 +89,17 @@ public class DocumentLookupService {
 
         WriterFileSet fileSet = reader.catalogSnapshot().findFileSet(executor.formatName(), metadata.writerGeneration());
         if (fileSet == null) {
-            throw new IllegalStateException(
-                "Resolver located id ["
-                    + id
-                    + "] at writer generation ["
-                    + metadata.writerGeneration()
-                    + "] but no matching file set was found"
+            // The catalog is the source of truth for existence. A resolver hit
+            // whose generation has no file set in the CURRENT catalog is a
+            // deleted doc surviving in a stale lucene reader — legitimate
+            // after an MV sweep/rollback (the lucene writer is not slaved to
+            // the catalog lifecycle). Not-found, not corruption.
+            logger.debug(
+                "id [{}] resolves at generation [{}] absent from the current catalog — treating as not found (swept/rolled back)",
+                id,
+                metadata.writerGeneration()
             );
+            return null;
         }
 
         Map<String, Object> row = executor.executeSingleRow(metadata.rowId(), fileSet);

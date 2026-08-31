@@ -50,6 +50,22 @@ public interface DataFormatPlugin {
     DataFormat getDataFormat();
 
     /**
+     * Returns additional data formats that this plugin handles alongside its
+     * primary format. The primary format is returned by {@link #getDataFormat()};
+     * additional formats (e.g. derived formats like {@code mv_state}) are
+     * registered in the {@link DataFormatRegistry} under this same plugin.
+     *
+     * <p>The default returns an empty list. Override when a single plugin
+     * owns both a storage format and a derived format (e.g. the MV plugin
+     * provides both {@code materialized_view} and {@code mv_state}).
+     *
+     * @return additional data formats, never {@code null}
+     */
+    default java.util.List<DataFormat> getAdditionalDataFormats() {
+        return java.util.List.of();
+    }
+
+    /**
      * Creates the indexing engine for the data format. This should be
      * instantiated per shard.
      */

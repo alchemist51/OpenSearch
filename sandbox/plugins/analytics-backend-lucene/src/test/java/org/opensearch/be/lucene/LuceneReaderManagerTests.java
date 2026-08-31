@@ -277,6 +277,41 @@ public class LuceneReaderManagerTests extends OpenSearchTestCase {
         }
     }
 
+    public void testAfterRefreshIgnoresDerivedOnlySegments() throws IOException {
+        // A composite/derived catalog may contain derived-artifact-only segments (e.g. a
+        // materialized-view mv_state state file) whose generation has NO Lucene component
+        // and therefore no reader leaf. readersAreSame must ignore such segments; otherwise
+        // afterRefresh throws the "readers are same" assertion on every derived publication
+        // (tests run with -ea). Regression for LuceneReaderManager#readersAreSame.
+        addDoc("doc1", 10L);
+        LuceneReaderManager rm = createManager(openReader());
+        CatalogSnapshot snap = stubSnapshotWithDerivedSegment(1, List.of(10L), 99L);
+
+        rm.afterRefresh(true, snap); // must not throw
+        LuceneReader lr = rm.getReader(snap);
+        assertEquals(1, new IndexSearcher(lr.directoryReader()).count(new MatchAllDocsQuery()));
+        assertNotNull("lucene generation must be mapped", lr.generationToSegmentName().get(10L));
+        assertNull("derived-only generation must be absent from lucene map", lr.generationToSegmentName().get(99L));
+        rm.close();
+    }
+
+    /**
+     * Snapshot containing the given Lucene generations PLUS one derived-artifact-only
+     * segment (a non-Lucene {@code mv_state} fileset) at {@code derivedGeneration}.
+     */
+    private CatalogSnapshot stubSnapshotWithDerivedSegment(long generation, List<Long> luceneGenerations, long derivedGeneration) {
+        List<Segment> segs = new java.util.ArrayList<>(buildSegmentsWithFiles(luceneGenerations));
+        WriterFileSet derivedWfs = new WriterFileSet(
+            createTempDir().toString(),
+            derivedGeneration,
+            Set.of("_mv_poc_" + derivedGeneration + ".mv.arrow"),
+            5,
+            0L
+        );
+        segs.add(Segment.builder(derivedGeneration).addSearchableFiles("mv_state", derivedWfs).build());
+        return buildCatalogSnapshot(generation, segs);
+    }
+
     // --- Core lifecycle tests ---
 
     public void testAfterRefreshCreatesReader() throws IOException {

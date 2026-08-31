@@ -76,6 +76,7 @@ import org.opensearch.threadpool.ThreadPool;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -609,6 +610,10 @@ public class DataFormatAwareEngineTests extends OpenSearchTestCase {
             // After refresh, last refreshed checkpoint should be at the processed checkpoint
             assertThat(engine.lastRefreshedCheckpoint(), equalTo((long) numDocs - 1));
             assertThat(engine.lastRefreshedCheckpoint(), equalTo(engine.getProcessedLocalCheckpoint()));
+            try (GatedCloseable<CatalogSnapshot> ref = engine.acquireSnapshot()) {
+                assertEquals(Long.toString(numDocs - 1L), ref.get().getUserData().get(SequenceNumbers.MAX_SEQ_NO));
+                assertEquals(Long.toString(numDocs - 1L), ref.get().getUserData().get(SequenceNumbers.LOCAL_CHECKPOINT_KEY));
+            }
         }
     }
 
@@ -666,6 +671,42 @@ public class DataFormatAwareEngineTests extends OpenSearchTestCase {
         try (DataFormatAwareEngine engine = createDFAEngine(store, createTempDir())) {
             engine.translogManager().recoverFromTranslog(ignore -> 0, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
             engine.flush(false, true);
+        }
+    }
+
+    public void testPublishDerivedArtifactBindsFilesAndProgress() throws Exception {
+        try (DataFormatAwareEngine engine = createDFAEngine(store, createTempDir())) {
+            engine.translogManager().recoverFromTranslog(ignore -> 0, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+
+            long generation = engine.reserveDerivedArtifactGeneration();
+            Path artifactDir = createTempDir();
+            String artifactName = "state-0-10.arrow";
+            Files.writeString(artifactDir.resolve(artifactName), "state");
+            WriterFileSet fileSet = WriterFileSet.builder()
+                .directory(artifactDir)
+                .writerGeneration(generation)
+                .addFile(artifactName)
+                .addNumRows(3L)
+                .build();
+
+            engine.publishDerivedArtifact(mockDataFormat, fileSet, Map.of("mv.watermark", "10", "mv.definition", "v1"));
+
+            try (GatedCloseable<CatalogSnapshot> ref = engine.acquireSnapshot()) {
+                CatalogSnapshot snapshot = ref.get();
+                assertEquals("10", snapshot.getUserData().get("mv.watermark"));
+                assertEquals("v1", snapshot.getUserData().get("mv.definition"));
+                assertEquals(1, snapshot.getSearchableFiles(mockDataFormat.name()).size());
+                WriterFileSet published = snapshot.getSearchableFiles(mockDataFormat.name()).iterator().next();
+                assertEquals(generation, published.writerGeneration());
+                assertEquals(Set.of(artifactName), published.files());
+                assertEquals(3L, published.numRows());
+            }
+
+            assertTrue(engine.reserveDerivedArtifactGeneration() > generation);
+            expectThrows(
+                IllegalArgumentException.class,
+                () -> engine.publishDerivedArtifact(mockDataFormat, fileSet, Map.of("mv.watermark", "20"))
+            );
         }
     }
 

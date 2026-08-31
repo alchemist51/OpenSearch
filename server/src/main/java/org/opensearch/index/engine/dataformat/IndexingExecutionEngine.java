@@ -110,19 +110,140 @@ public interface IndexingExecutionEngine<T extends DataFormat, P extends Documen
     IndexStoreProvider getProvider();
 
     /**
-     * Returns the checksum strategy used by this engine, if any.
+     * Called for every owning-engine refresh, even when there are no active
+     * writers to flush. Derived followers use this visibility rendezvous to
+     * reconcile a target that fell back to its committed cursor after restart.
      *
-     * <p>Engines that pre-compute checksums during write (e.g., Parquet computing CRC32
-     * in the native writer) return their strategy here so it can be wired into the
-     * {@link org.opensearch.index.store.DataFormatAwareStoreDirectory} at shard init time.
-     * This allows the upload path to retrieve pre-computed checksums in O(1) instead of
-     * re-reading the entire file.
+     * @throws IOException to fail the refresh and preserve visibility ordering
+     */
+    default void beforeRefresh() throws IOException {}
+
+    /**
+     * Called by the engine inside its commit section, after the pre-commit
+     * refresh and before commit data is written. A format engine may
+     * contribute namespaced commit user data, such as a derived target's
+     * source cursor. Throwing refuses this index's commit.
      *
-     * @return the checksum strategy, or {@code null} if this engine does not pre-compute checksums
+     * @return extra commit user-data entries; empty map for none
+     * @throws IOException to refuse the commit
+     */
+    default java.util.Map<String, String> beforeCommit() throws IOException {
+        return java.util.Map.of();
+    }
+
+    /**
+     * Called before commit with the exact local checkpoint that will be stored
+     * in commit metadata. The default delegates to the legacy hook.
+     *
+     * @param committedLocalCheckpoint local checkpoint selected for this commit
+     * @return extra commit user-data entries; empty map for none
+     * @throws IOException to refuse the commit
+     */
+    default java.util.Map<String, String> beforeCommit(long committedLocalCheckpoint) throws IOException {
+        return beforeCommit();
+    }
+
+    /**
+     * Called after this engine's catalog commit succeeds. Formats use this to
+     * publish in-memory state that must not be observable as durable before
+     * the commit (for example, a derived target cursor).
+     */
+    default void afterCommit() {}
+
+    /**
+     * Called after commit with the exact local checkpoint stored in that
+     * commit. The default preserves compatibility with format engines that
+     * only implement the parameterless hook.
+     */
+    default void afterCommit(long committedLocalCheckpoint) {
+        afterCommit();
+    }
+
+    /**
+     * Returns whether the current searchable catalog is eligible to become a
+     * durable commit. Returning false cleanly defers the commit without
+     * failing the engine; the owning flush still completes its refresh work.
+     */
+    default boolean commitReady() {
+        return true;
+    }
+
+    /**
+     * Returns whether every segment in a proposed merge is eligible for this
+     * format. Derived formats use this to prevent either background or
+     * refresh-time merges from incorporating state that is searchable but not
+     * yet certified durable.
+     *
+     * @param segments proposed merge inputs
+     * @return true when the merge may proceed
+     */
+    default boolean isMergeEligible(java.util.List<org.opensearch.index.engine.exec.Segment> segments) {
+        return true;
+    }
+
+    /**
+     * Called once when the owning engine opens, after sequence-number state
+     * is recovered from the last commit. A derived source format uses this to
+     * seed its fold checkpoint tracker: operations at or below
+     * {@code localCheckpoint} are represented by authoritative committed
+     * source data and do not replay through the normal writer path.
+     *
+     * @param maxSeqNo        max sequence number from the last commit
+     * @param localCheckpoint local checkpoint from the last commit
+     */
+    default void onEngineOpen(long maxSeqNo, long localCheckpoint) {}
+
+    /**
+     * Called when the owning engine records a no-op for a sequence number
+     * (for example, a failed indexing operation that consumed a sequence
+     * number in the translog). Derived formats must include it in exact source
+     * coverage or the contiguous floor stalls at the first failed operation.
+     *
+     * @param seqNo the no-op sequence number
+     */
+    default void onNoOp(long seqNo) {}
+
+    /**
+     * Provides the format engine a handle to force a translog sync. A derived
+     * source calls it before publishing a state or coverage-only batch, so
+     * every claimed operation is durable in the authoritative source first.
+     *
+     * @param translogSync runnable that synchronously fsyncs the translog
+     */
+    default void bindTranslogSync(java.util.concurrent.Callable<Void> translogSync) {}
+
+    /**
+     * Returns whether a committed catalog snapshot must remain retained for a
+     * format-owned recovery baseline. The writable engine consults this hook
+     * in addition to normal safe-commit and snapshot holds.
+     *
+     * @param snapshot committed snapshot considered for deletion
+     * @return true to retain the snapshot and all files it references
+     */
+    default boolean retainCatalogSnapshot(org.opensearch.index.engine.exec.coord.CatalogSnapshot snapshot) {
+        return false;
+    }
+
+    /**
+     * Returns the checksum strategy used by this engine, if any. Engines that
+     * pre-compute checksums during write expose them through this strategy.
+     *
+     * @return the checksum strategy, or {@code null}
      */
     default FormatChecksumStrategy getChecksumStrategy() {
         return null;
     }
+
+    /**
+     * Provides access to the owning engine's current catalog. Source-refresh
+     * reconciliation queries this authoritative file set instead of physical
+     * directories, so merged outputs and unreferenced inputs are never both
+     * replayed.
+     */
+    default void bindCatalogSnapshotSupplier(
+        java.util.function.Supplier<
+            org.opensearch.common.concurrent.GatedCloseable<org.opensearch.index.engine.exec.coord.CatalogSnapshot>> catalogSnapshotSupplier
+    ) {}
 
     default Map<DataFormat, EngineReaderManager<?>> buildReaderManager(ReaderManagerConfig config) throws IOException {
         return config.registry().getReaderManager(config);

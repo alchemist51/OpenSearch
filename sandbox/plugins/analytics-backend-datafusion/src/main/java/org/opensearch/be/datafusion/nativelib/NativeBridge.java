@@ -135,6 +135,7 @@ public final class NativeBridge {
     private static final MethodHandle CACHE_MANAGER_UPDATE_SIZE_LIMIT;
     private static final MethodHandle CREATE_SESSION_CONTEXT;
     private static final MethodHandle CREATE_SESSION_CONTEXT_INDEXED;
+    private static final MethodHandle CREATE_MV_ONLY_SESSION_CONTEXT;
     private static final MethodHandle CLOSE_SESSION_CONTEXT;
     private static final MethodHandle EXECUTE_WITH_CONTEXT;
     private static final MethodHandle SET_COLUMN_INDEX_CACHE_LIMIT;
@@ -455,6 +456,29 @@ public final class NativeBridge {
                 ValueLayout.JAVA_LONG,   // queryConfigPtr
                 ValueLayout.ADDRESS,     // planBytes (multi-index schema widening)
                 ValueLayout.JAVA_LONG    // planLen
+            )
+        );
+
+        // MV-only session context: no shard_view_ptr required.
+        // i64 df_create_mv_only_session_context(runtime_ptr, table_name_ptr, table_name_len,
+        // context_id, has_partial_aggregate, query_config_ptr, plan_ptr, plan_len,
+        // state_paths_ptr, state_paths_len, state_fields_ptr, state_fields_len)
+        CREATE_MV_ONLY_SESSION_CONTEXT = linker.downcallHandle(
+            lib.find("df_create_mv_only_session_context").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,   // return: handle ptr
+                ValueLayout.JAVA_LONG,   // runtime_ptr
+                ValueLayout.ADDRESS,     // table_name_ptr
+                ValueLayout.JAVA_LONG,   // table_name_len
+                ValueLayout.JAVA_LONG,   // context_id
+                ValueLayout.JAVA_BYTE,   // hasPartialAggregate (0/1)
+                ValueLayout.JAVA_LONG,   // queryConfigPtr
+                ValueLayout.ADDRESS,     // planBytes
+                ValueLayout.JAVA_LONG,   // planLen
+                ValueLayout.ADDRESS,     // state_paths_ptr (newline-separated)
+                ValueLayout.JAVA_LONG,   // state_paths_len
+                ValueLayout.ADDRESS,     // state_fields_ptr (newline-separated, positional)
+                ValueLayout.JAVA_LONG    // state_fields_len
             )
         );
 
@@ -1436,6 +1460,59 @@ public final class NativeBridge {
                 (byte) (hasPartialAggregate ? 1 : 0),
                 planSegment,
                 planLen
+            );
+            return new SessionContextHandle(ptr);
+        }
+    }
+
+    /**
+     * Creates a ready-to-query SessionContext for MV-only serving (no ShardView / parquet reader).
+     * Arrow state files are loaded into a MemTable and projected into the Substrait base schema's
+     * order using the explicit ordered state field contract.
+     *
+     * @param runtimePtr pointer to the DataFusion native runtime
+     * @param tableName logical table name for registration
+     * @param contextId query context ID for memory tracking
+     * @param hasPartialAggregate whether fragment has partial aggregate
+     * @param queryConfigPtr pointer to WireDatafusionQueryConfig
+     * @param planBytes Substrait plan bytes for schema widening
+     * @param stateFilePaths catalog-selected immutable Arrow IPC files
+     * @param stateFields logical names in physical Arrow state-column order
+     */
+    public static SessionContextHandle createMVOnlySessionContext(
+        long runtimePtr,
+        String tableName,
+        long contextId,
+        boolean hasPartialAggregate,
+        long queryConfigPtr,
+        byte[] planBytes,
+        java.util.List<String> stateFilePaths,
+        java.util.List<String> stateFields
+    ) {
+        NativeHandle.validatePointer(runtimePtr, "runtime");
+        String statePathsJoined = String.join("\n", stateFilePaths);
+        String stateFieldsJoined = String.join("\n", stateFields);
+        try (var call = new NativeCall()) {
+            var table = call.str(tableName);
+            var statePaths = call.str(statePathsJoined);
+            var fields = call.str(stateFieldsJoined);
+            boolean hasPlan = planBytes != null && planBytes.length > 0;
+            MemorySegment planSegment = hasPlan ? call.bytes(planBytes) : MemorySegment.NULL;
+            long planLen = hasPlan ? planBytes.length : 0L;
+            long ptr = call.invoke(
+                CREATE_MV_ONLY_SESSION_CONTEXT,
+                runtimePtr,
+                table.segment(),
+                table.len(),
+                contextId,
+                (byte) (hasPartialAggregate ? 1 : 0),
+                queryConfigPtr,
+                planSegment,
+                planLen,
+                statePaths.segment(),
+                statePaths.len(),
+                fields.segment(),
+                fields.len()
             );
             return new SessionContextHandle(ptr);
         }
