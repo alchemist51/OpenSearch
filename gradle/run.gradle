@@ -125,5 +125,16 @@ tasks.register("run", RunTask) {
   description = 'Runs opensearch in the foreground'
   group = 'Verification'
 
+  // Keep Java FFM declarations and the platform-native library in lockstep.
+  // Without this dependency, local runs can reuse a stale .dylib/.so and fail
+  // NativeBridge initialization when newly added symbols are not exported.
+  if (findProperty("installedPlugins")) {
+    def configuredPlugins = findProperty("installedPlugins")
+    def requestedPlugins = configuredPlugins instanceof Collection ? configuredPlugins : Eval.me(configuredPlugins.toString())
+    if (requestedPlugins.any { it == 'analytics-backend-datafusion' || it == 'parquet-data-format' }) {
+      dependsOn ':sandbox:libs:dataformat-native:buildRustLibrary'
+    }
+  }
+
   impliesSubProjects = true
 }
