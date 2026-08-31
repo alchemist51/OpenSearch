@@ -99,6 +99,10 @@ testClusters {
           jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
           jvmArgs '--enable-native-access=ALL-UNNAMED'
         }
+        if (p.equals("analytics-engine")) {
+          // Analytics engine requires stream transport for AnalyticsSearchTransportService
+          systemProperty 'opensearch.experimental.feature.transport.stream.enabled', 'true'
+        }
       }
     }
   }
