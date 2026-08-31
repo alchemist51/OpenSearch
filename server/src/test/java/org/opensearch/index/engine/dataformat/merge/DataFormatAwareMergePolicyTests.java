@@ -123,6 +123,42 @@ public class DataFormatAwareMergePolicyTests extends OpenSearchTestCase {
         assertEquals("Error finding merge candidates", ex.getMessage());
     }
 
+    public void testFindMergeCandidatesFiltersIneligibleGroups() throws IOException {
+        Path tempDir = createTempDir();
+        MockDataFormat fmt = new MockDataFormat("lucene", 100L, Set.of());
+        List<Segment> segments = new ArrayList<>();
+        for (long generation = 1L; generation <= 4L; generation++) {
+            segments.add(
+                Segment.builder(generation)
+                    .addSearchableFiles(fmt, new WriterFileSet(tempDir.toString(), generation, Set.of(), 10, 0L))
+                    .build()
+            );
+        }
+
+        MergePolicy lucenePolicy = mock(MergePolicy.class);
+        when(lucenePolicy.findMerges(any(MergeTrigger.class), any(SegmentInfos.class), any(MergePolicy.MergeContext.class))).thenAnswer(
+            invocation -> {
+                SegmentInfos infos = invocation.getArgument(1);
+                MergePolicy.MergeSpecification specification = new MergePolicy.MergeSpecification();
+                specification.add(new MergePolicy.OneMerge(List.of(infos.info(0), infos.info(1))));
+                specification.add(new MergePolicy.OneMerge(List.of(infos.info(2), infos.info(3))));
+                return specification;
+            }
+        );
+
+        List<List<Long>> evaluated = new ArrayList<>();
+        DataFormatAwareMergePolicy policy = new DataFormatAwareMergePolicy(lucenePolicy, SHARD_ID, group -> {
+            evaluated.add(group.stream().map(Segment::generation).toList());
+            return group.get(0).generation() >= 3L;
+        });
+
+        List<List<Segment>> result = policy.findMergeCandidates(segments);
+
+        assertEquals(List.of(List.of(1L, 2L), List.of(3L, 4L)), evaluated);
+        assertEquals(1, result.size());
+        assertEquals(List.of(3L, 4L), result.get(0).stream().map(Segment::generation).toList());
+    }
+
     // ========== findForceMergeCandidates ==========
 
     @SuppressWarnings("unchecked")
@@ -166,6 +202,32 @@ public class DataFormatAwareMergePolicyTests extends OpenSearchTestCase {
         DataFormatAwareMergePolicy policy = new DataFormatAwareMergePolicy(lucenePolicy, SHARD_ID);
         RuntimeException ex = expectThrows(RuntimeException.class, () -> policy.findForceMergeCandidates(Collections.emptyList(), 1));
         assertEquals("Error finding force merge candidates", ex.getMessage());
+    }
+
+    @SuppressWarnings("unchecked")
+    public void testFindForceMergeCandidatesFiltersIneligibleGroup() throws IOException {
+        Path tempDir = createTempDir();
+        MockDataFormat fmt = new MockDataFormat("lucene", 100L, Set.of());
+        Segment first = Segment.builder(1L).addSearchableFiles(fmt, new WriterFileSet(tempDir.toString(), 1L, Set.of(), 10, 0L)).build();
+        Segment second = Segment.builder(2L).addSearchableFiles(fmt, new WriterFileSet(tempDir.toString(), 2L, Set.of(), 10, 0L)).build();
+
+        MergePolicy lucenePolicy = mock(MergePolicy.class);
+        when(lucenePolicy.findForcedMerges(any(SegmentInfos.class), anyInt(), any(Map.class), any(MergePolicy.MergeContext.class)))
+            .thenAnswer(invocation -> {
+                SegmentInfos infos = invocation.getArgument(0);
+                MergePolicy.MergeSpecification specification = new MergePolicy.MergeSpecification();
+                specification.add(new MergePolicy.OneMerge(List.of(infos.info(0), infos.info(1))));
+                return specification;
+            });
+
+        List<List<Long>> evaluated = new ArrayList<>();
+        DataFormatAwareMergePolicy policy = new DataFormatAwareMergePolicy(lucenePolicy, SHARD_ID, group -> {
+            evaluated.add(group.stream().map(Segment::generation).toList());
+            return false;
+        });
+
+        assertTrue(policy.findForceMergeCandidates(List.of(first, second), 1).isEmpty());
+        assertEquals(List.of(List.of(1L, 2L)), evaluated);
     }
 
     // ========== Complex add/remove/add/remove lifecycle ==========
