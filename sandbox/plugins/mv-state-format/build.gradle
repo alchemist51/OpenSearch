@@ -1,0 +1,28 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+/*
+ * POC: descriptor-only plugin for the mv_state derived format (the separate-
+ * index MV TARGET's fold format). Real nodes load ONE plugin class per
+ * installed plugin; MVStateDataFormatPlugin lives in mv-data-format's jar,
+ * so this plugin exists to give it a descriptor. extendedPlugins puts
+ * mv-data-format's classloader (and transitively composite-engine's) on the
+ * path.
+ */
+opensearchplugin {
+  description = 'POC: mv_state derived format for separate-index MV targets (fold of the shipped state).'
+  classname = 'org.opensearch.mv.state.MVStateFormatShimPlugin'
+  extendedPlugins = ['mv-data-format']
+}
+
+java { sourceCompatibility = JavaVersion.toVersion(25); targetCompatibility = JavaVersion.toVersion(25) }
+
+dependencies {
+  compileOnly project(':sandbox:plugins:mv-data-format')
+  compileOnly project(':sandbox:plugins:composite-engine')
+}

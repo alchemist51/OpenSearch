@@ -16,6 +16,7 @@ import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.Booleans;
+import org.opensearch.common.CheckedSupplier;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.SetOnce;
 import org.opensearch.common.annotation.ExperimentalApi;
@@ -204,6 +205,26 @@ public class DataFormatAwareEngine implements Indexer {
     private final ReentrantLock refreshLock = new ReentrantLock();
     private final ReentrantLock failEngineLock = new ReentrantLock();
 
+    /**
+     * Runs {@code action} with refreshes excluded, in the SAME lock order as
+     * {@link #refresh(String)} and flush (readLock, then refreshLock — both
+     * reentrant), so per-operation indexing inside the action may re-acquire
+     * the read lock safely. Used by derived-state batch replication: a whole
+     * batch applies as one unit relative to refresh, so a published or
+     * committed generation can never contain part of a batch.
+     */
+    protected final <T> T runUnderRefreshExclusion(CheckedSupplier<T, IOException> action) throws IOException {
+        try (ReleasableLock ignored = readLock.acquire()) {
+            ensureOpen();
+            refreshLock.lock();
+            try {
+                return action.get();
+            } finally {
+                refreshLock.unlock();
+            }
+        }
+    }
+
     // Refresh tracker
     private final LastRefreshedCheckpointListener lastRefreshedCheckpointListener;
 
@@ -360,6 +381,14 @@ public class DataFormatAwareEngine implements Indexer {
                 ),
                 registry.format(config().getIndexSettings().pluggableDataFormat())
             );
+            // Seed format-owned recovery coordinates from the selected safe
+            // commit before any source-driven reconciliation can run.
+            indexingExecutionEngine.onEngineOpen(localCheckpointTracker.getMaxSeqNo(), localCheckpointTracker.getProcessedCheckpoint());
+            final TranslogManager translogSyncTarget = translogManagerRef;
+            indexingExecutionEngine.bindTranslogSync(() -> {
+                translogSyncTarget.syncTranslog();
+                return null;
+            });
 
             long maxGenFromCommit = 0L;
             try {
@@ -397,7 +426,8 @@ public class DataFormatAwareEngine implements Indexer {
             CombinedCatalogSnapshotDeletionPolicy combinedPolicy = new CombinedCatalogSnapshotDeletionPolicy(
                 logger,
                 translogDeletionPolicy,
-                translogManager::getLastSyncedGlobalCheckpoint
+                translogManager::getLastSyncedGlobalCheckpoint,
+                indexingExecutionEngine::retainCatalogSnapshot
             );
 
             // 7. Create CatalogSnapshotManager (fully wired)
@@ -421,6 +451,7 @@ public class DataFormatAwareEngine implements Indexer {
             // Bump catalog generation on engine open so uploads from this primary do not collide
             // with a prior primary's uploads for the same shard. See method Javadoc for rationale.
             this.catalogSnapshotManager.bumpGeneration();
+            indexingExecutionEngine.bindCatalogSnapshotSupplier(catalogSnapshotManager::acquireSnapshot);
 
             this.lastRefreshedCheckpointListener = new LastRefreshedCheckpointListener(localCheckpointTracker);
             this.refreshListeners.add(this.lastRefreshedCheckpointListener);
@@ -467,7 +498,8 @@ public class DataFormatAwareEngine implements Indexer {
 
             DataFormatAwareMergePolicy dataFormatAwareMergePolicy = new DataFormatAwareMergePolicy(
                 engineConfig.getIndexSettings().getMergePolicy(true),
-                shardId
+                shardId,
+                indexingExecutionEngine::isMergeEligible
             );
 
             // Merge
@@ -553,11 +585,70 @@ public class DataFormatAwareEngine implements Indexer {
         };
     }
 
+    /**
+     * Whether this engine's catalog is rebuilt from an authoritative source
+     * rather than recovered from a local translog. Derived indices override
+     * this to make their own committed catalog the only local durability
+     * boundary; missing state is reconciled from the source cursor.
+     */
+    protected boolean usesNoOpTranslog() {
+        return false;
+    }
+
     private TranslogManager createTranslogManager(
         String translogUUID,
         TranslogDeletionPolicy deletionPolicy,
         TranslogEventListener translogEventListener
     ) throws IOException {
+        if (usesNoOpTranslog()) {
+            // Derived catalogs do not retain operation payloads locally: the
+            // authoritative source and exact cursor reconciliation are their
+            // recovery log. They still need the empty translog's checkpoint,
+            // however, so every forced target commit advances the persisted
+            // global checkpoint. A fully inert NoOpTranslogManager leaves that
+            // checkpoint stale, causing store recovery to roll a newer target
+            // catalog back to an older safe commit after a hard crash.
+            return new InternalTranslogManager(
+                engineConfig.getTranslogConfig(),
+                engineConfig.getPrimaryTermSupplier(),
+                () -> localCheckpointTracker == null
+                    ? engineConfig.getGlobalCheckpointSupplier().getAsLong()
+                    : localCheckpointTracker.getProcessedCheckpoint(),
+                deletionPolicy,
+                shardId,
+                readLock,
+                () -> localCheckpointTracker,
+                translogUUID,
+                translogEventListener,
+                this,
+                engineConfig.getTranslogFactory(),
+                engineConfig.getStartedPrimarySupplier(),
+                TranslogOperationHelper.create(engineConfig)
+            ) {
+                @Override
+                public Translog.Location add(Translog.Operation operation) {
+                    return new Translog.Location(0, 0, 0);
+                }
+
+                @Override
+                public Translog.Operation readOperation(Translog.Location location) {
+                    return null;
+                }
+
+                @Override
+                public Translog.Snapshot newChangesSnapshot(long fromSeqNo, long toSeqNo, boolean requiredFullRange) {
+                    return Translog.EMPTY_TRANSLOG_SNAPSHOT;
+                }
+
+                @Override
+                public int restoreLocalHistoryFromTranslog(
+                    long processedCheckpoint,
+                    org.opensearch.index.translog.TranslogRecoveryRunner translogRecoveryRunner
+                ) {
+                    return 0;
+                }
+            };
+        }
         return new InternalTranslogManager(
             engineConfig.getTranslogConfig(),
             engineConfig.getPrimaryTermSupplier(),
@@ -842,6 +933,11 @@ public class DataFormatAwareEngine implements Indexer {
             Translog.Location location = translogManager.add(new Translog.NoOp(noOp.seqNo(), noOp.primaryTerm(), noOp.reason()));
             result.setTranslogLocation(location);
         }
+        // Derived formats must durably classify a consumed sequence number
+        // before it can enter the engine's processed checkpoint; otherwise a
+        // concurrent commit could persist the checkpoint without the no-op
+        // provenance required for exact target recovery.
+        indexingExecutionEngine.onNoOp(noOp.seqNo());
         localCheckpointTracker.markSeqNoAsProcessed(noOp.seqNo());
         if (result.getTranslogLocation() == null) {
             localCheckpointTracker.markSeqNoAsPersisted(noOp.seqNo());
@@ -945,6 +1041,12 @@ public class DataFormatAwareEngine implements Indexer {
             ensureOpen();
             ensureNoTragicException();
             refreshLock.lock();
+            try {
+                indexingExecutionEngine.beforeRefresh();
+            } catch (Exception e) {
+                refreshLock.unlock();
+                throw e;
+            }
 
             // refresh only if new segments have been created or force param is true
             notifyRefreshListenersBefore();
@@ -1084,7 +1186,10 @@ public class DataFormatAwareEngine implements Indexer {
                                     + result.refreshedSegments().size();
 
                             final long commitStartNanos = System.nanoTime();
-                            catalogSnapshotManager.commitNewSnapshot(result.refreshedSegments());
+                            Map<String, String> snapshotUserData = new HashMap<>(catalogSnapshot.get().getUserData());
+                            snapshotUserData.put(SequenceNumbers.LOCAL_CHECKPOINT_KEY, Long.toString(localCheckpointBeforeRefresh));
+                            snapshotUserData.put(SequenceNumbers.MAX_SEQ_NO, Long.toString(localCheckpointBeforeRefresh));
+                            catalogSnapshotManager.commitNewSnapshot(result.refreshedSegments(), snapshotUserData);
                             assert rowsToRelease > 0L : "Rows to release from active writes should be greater than 0 but was: "
                                 + rowsToRelease
                                 + " for shard: "
@@ -1181,6 +1286,10 @@ public class DataFormatAwareEngine implements Indexer {
                     final long committedLocalCheckpoint = localCheckpointTracker.getProcessedCheckpoint();
                     // Refresh first to flush buffered data to segments
                     refresh("flush");
+                    if (indexingExecutionEngine.commitReady() == false) {
+                        logger.debug("flush catalog commit deferred by format engine");
+                        return;
+                    }
                     translogManager.rollTranslogGeneration();
                     // Persist the latest catalog snapshot so it survives restart
                     try (GatedConditionalCloseable<CatalogSnapshot> snapshotRef = catalogSnapshotManager.acquireSnapshotForCommit()) {
@@ -1193,7 +1302,13 @@ public class DataFormatAwareEngine implements Indexer {
                             // and available to the deletion policy when onCommit is triggered.
                             translogManager.ensureCanFlush();
                             translogManager.syncTranslog();
-                            Map<String, String> commitData = new HashMap<>();
+                            // Cross-index commit coordination (decision 25):
+                            // format engines may trigger dependent commits and
+                            // contribute commit meta; failure refuses THIS commit.
+                            Map<String, String> participantEntries = indexingExecutionEngine.beforeCommit(committedLocalCheckpoint);
+
+                            Map<String, String> commitData = new HashMap<>(snapshot.getUserData());
+                            commitData.putAll(participantEntries);
                             commitData.put(
                                 CatalogSnapshot.LAST_COMPOSITE_WRITER_GEN_KEY,
                                 Long.toString(snapshot.getLastWriterGeneration())
@@ -1236,6 +1351,7 @@ public class DataFormatAwareEngine implements Indexer {
                                 catalogSnapshotManager.updateLastCommitInfo(commitResult);
                             }
                             snapshotRef.markSuccess();
+                            indexingExecutionEngine.afterCommit(committedLocalCheckpoint);
                             translogManager.trimUnreferencedReaders();
                         }
                     }
@@ -1932,6 +2048,52 @@ public class DataFormatAwareEngine implements Indexer {
     @Override
     public GatedCloseable<CatalogSnapshot> acquireSnapshot() {
         return catalogSnapshotManager.acquireSnapshot();
+    }
+
+    @Override
+    public long reserveDerivedArtifactGeneration() {
+        ensureOpen();
+        return writerGenerationCounter.incrementAndGet();
+    }
+
+    @Override
+    public void publishDerivedArtifact(DataFormat dataFormat, WriterFileSet fileSet, Map<String, String> userDataUpdates)
+        throws IOException {
+        ensureOpen();
+        if (fileSet.writerGeneration() <= 0L) {
+            throw new IllegalArgumentException(
+                "derived artifact writer generation must be positive but was [" + fileSet.writerGeneration() + "]"
+            );
+        }
+        if (fileSet.files().isEmpty()) {
+            throw new IllegalArgumentException("derived artifact must contain at least one file");
+        }
+        if (fileSet.numRows() <= 0L) {
+            throw new IllegalArgumentException("derived artifact row count must be positive but was [" + fileSet.numRows() + "]");
+        }
+
+        writerGenerationCounter.accumulateAndGet(fileSet.writerGeneration(), Math::max);
+        runUnderRefreshExclusion(() -> {
+            try (GatedCloseable<CatalogSnapshot> currentRef = catalogSnapshotManager.acquireSnapshot()) {
+                CatalogSnapshot current = currentRef.get();
+                if (current.getSegments().stream().anyMatch(segment -> segment.generation() == fileSet.writerGeneration())) {
+                    throw new IllegalArgumentException(
+                        "derived artifact generation [" + fileSet.writerGeneration() + "] already exists in catalog"
+                    );
+                }
+                List<Segment> nextSegments = new ArrayList<>(current.getSegments());
+                nextSegments.add(Segment.builder(fileSet.writerGeneration()).addSearchableFiles(dataFormat, fileSet).build());
+                Map<String, String> nextUserData = new HashMap<>(current.getUserData());
+                nextUserData.putAll(Map.copyOf(userDataUpdates));
+                catalogSnapshotManager.commitNewSnapshot(nextSegments, nextUserData);
+            }
+            return null;
+        });
+
+        // Persist the exact catalog snapshot and user data installed above. A crash before
+        // this flush falls back to the prior committed catalog, while a successful return
+        // guarantees the artifact and its progress metadata are durable together.
+        flush(true, true);
     }
 
     @Override

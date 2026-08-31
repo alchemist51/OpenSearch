@@ -150,6 +150,25 @@ public class CombinedCatalogSnapshotDeletionPolicyTests extends OpenSearchTestCa
         assertSame(cs1, toDelete.get(0));
     }
 
+    public void testRecoveryBaselineProtectionPreventsCommitDeletion() throws IOException {
+        AtomicLong globalCP = new AtomicLong(200);
+        java.util.concurrent.atomic.AtomicBoolean retainFirst = new java.util.concurrent.atomic.AtomicBoolean(true);
+        CombinedCatalogSnapshotDeletionPolicy policy = new CombinedCatalogSnapshotDeletionPolicy(
+            logger,
+            new DefaultTranslogDeletionPolicy(-1, -1, 0),
+            globalCP::get,
+            snapshot -> retainFirst.get() && snapshot.getGeneration() == 1
+        );
+
+        CatalogSnapshot cs1 = snapshot(1, 100, 100, "uuid1");
+        CatalogSnapshot cs2 = snapshot(2, 200, 200, "uuid1");
+        List<CatalogSnapshot> commits = new ArrayList<>(List.of(cs1, cs2));
+
+        assertTrue("the recovery baseline must pin its old commit", policy.onInit(commits).isEmpty());
+        retainFirst.set(false);
+        assertEquals(List.of(cs1), policy.onCommit(commits));
+    }
+
     public void testAcquireSafeVsLastCommit() throws IOException {
         AtomicLong globalCP = new AtomicLong(100);
         CombinedCatalogSnapshotDeletionPolicy policy = createPolicy(globalCP);

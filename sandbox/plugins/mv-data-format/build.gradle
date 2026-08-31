@@ -1,0 +1,83 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+opensearchplugin {
+  description = 'POC: materialized-view data format — per-segment aggregate state files derived from the parquet primary.'
+  classname = 'org.opensearch.mv.MVDataFormatPlugin'
+  extendedPlugins = ['arrow-base', 'composite-engine']
+}
+
+java { sourceCompatibility = JavaVersion.toVersion(25); targetCompatibility = JavaVersion.toVersion(25) }
+
+dependencies {
+  compileOnly project(':plugins:arrow-base')
+
+  // dataformat-native must BUNDLE into the plugin zip: NativeLibraryLoader/
+  // NativeCall are used from this plugin's own classloader. NOTE: compileOnly
+  // deps on OTHER PLUGIN projects poison the bundler — everything on their
+  // classpaths is treated as provided and silently excluded from this zip
+  // (that's how dataformat-native + arrow-c-data went missing and real nodes
+  // died with NoClassDefFoundError at first write). Keep plugin-project deps
+  // OUT of the main scope; ITs may depend on them in their own scope.
+  implementation project(':sandbox:libs:dataformat-native')
+
+
+  compileOnly 'org.checkerframework:checker-qual:3.43.0'
+  implementation "org.apache.arrow:arrow-vector:${versions.arrow}"
+  implementation "org.apache.arrow:arrow-memory-core:${versions.arrow}"
+  implementation "org.apache.arrow:arrow-c-data:${versions.arrow}"
+  implementation "org.apache.arrow:arrow-format:${versions.arrow}"
+  implementation "com.google.flatbuffers:flatbuffers-java:${versions.flatbuffers}"
+  implementation "org.slf4j:slf4j-api:${versions.slf4j}"
+}
+
+apply plugin: 'opensearch.internal-cluster-test'
+
+tasks.named('compileInternalClusterTestJava').configure {
+  sourceCompatibility = JavaVersion.toVersion(25)
+  targetCompatibility = JavaVersion.toVersion(25)
+}
+
+dependencies {
+  // IT-scope only (does NOT leak into the plugin zip): the in-JVM test
+  // cluster instantiates the sibling plugins directly.
+  internalClusterTestImplementation project(':sandbox:plugins:analytics-backend-datafusion')
+  internalClusterTestImplementation project(':sandbox:plugins:parquet-data-format')
+  internalClusterTestImplementation project(':sandbox:plugins:composite-engine')
+  internalClusterTestImplementation project(':sandbox:plugins:analytics-backend-datafusion')
+  internalClusterTestImplementation project(':sandbox:plugins:analytics-backend-lucene')
+  internalClusterTestImplementation project(':sandbox:libs:analytics-framework')
+  internalClusterTestImplementation project(':modules:transport-netty4')
+}
+
+tasks.named('internalClusterTest').configure {
+  jvmArgs += [
+    '--add-opens=java.base/java.nio=ALL-UNNAMED',
+    '--enable-native-access=ALL-UNNAMED'
+  ]
+  systemProperty 'io.netty.allocator.numDirectArenas', '1'
+  systemProperty 'io.netty.noUnsafe', 'false'
+  systemProperty 'io.netty.tryUnsafe', 'true'
+  systemProperty 'io.netty.tryReflectionSetAccessible', 'true'
+  systemProperty 'opensearch.set.netty.runtime.available.processors', 'false'
+  systemProperty 'native.lib.path', project(':sandbox:libs:dataformat-native').ext.nativeLibPath.absolutePath
+  dependsOn ':sandbox:libs:dataformat-native:buildRustLibrary'
+}
+
+test {
+  jvmArgs += ['--enable-native-access=ALL-UNNAMED']
+}
+
+// Arrow uses Unsafe internally for aligned off-heap vector buffers. This is the
+// same audited exception used by parquet-data-format.
+tasks.named('thirdPartyAudit').configure {
+  ignoreViolations(
+    'org.apache.arrow.memory.util.MemoryUtil',
+    'org.apache.arrow.memory.util.MemoryUtil$1'
+  )
+}

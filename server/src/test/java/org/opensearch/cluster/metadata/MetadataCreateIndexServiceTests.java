@@ -564,6 +564,188 @@ public class MetadataCreateIndexServiceTests extends OpenSearchTestCase {
         MetadataCreateIndexService.validateCloneIndex(clusterState, "source", "target", targetSettings);
     }
 
+    public void testResizeRejectedForDerivedIndex() {
+        // A derived index (with DerivedIndexBinding) must reject shrink/split/clone
+        int numShards = randomIntBetween(2, 42);
+        Settings derivedSettings = Settings.builder()
+            .put("index.blocks.write", true)
+            .put(DerivedIndexBinding.KEY_SOURCE_NAME, "original_source")
+            .put(DerivedIndexBinding.KEY_SOURCE_UUID, "test-uuid-12345")
+            .put(DerivedIndexBinding.KEY_SOURCE_SHARDS, numShards)
+            .put(DerivedIndexBinding.KEY_SOURCE_ROUTING_SHARDS, numShards)
+            .put(DerivedIndexBinding.KEY_MAPPING_MODE, "IDENTITY")
+            .build();
+        ClusterState state = createClusterState("derived_target", numShards, 0, derivedSettings);
+
+        Settings targetSettings = Settings.builder().put("index.number_of_shards", 1).build();
+
+        // Shrink must be rejected
+        IllegalArgumentException shrinkEx = expectThrows(
+            IllegalArgumentException.class,
+            () -> MetadataCreateIndexService.validateShrinkIndex(state, "derived_target", "shrunk", targetSettings)
+        );
+        assertTrue(shrinkEx.getMessage().contains("derived index"));
+        assertTrue(shrinkEx.getMessage().contains("shrink, split, and clone are not supported"));
+
+        // Split must be rejected
+        Settings splitSettings = Settings.builder().put("index.number_of_shards", numShards * 2).build();
+        IllegalArgumentException splitEx = expectThrows(
+            IllegalArgumentException.class,
+            () -> MetadataCreateIndexService.validateSplitIndex(state, "derived_target", "split", splitSettings)
+        );
+        assertTrue(splitEx.getMessage().contains("derived index"));
+
+        // Clone must be rejected
+        Settings cloneSettings = Settings.builder().put("index.number_of_shards", numShards).build();
+        IllegalArgumentException cloneEx = expectThrows(
+            IllegalArgumentException.class,
+            () -> MetadataCreateIndexService.validateCloneIndex(state, "derived_target", "cloned", cloneSettings)
+        );
+        assertTrue(cloneEx.getMessage().contains("derived index"));
+    }
+
+    // ── Derived index enrichment tests ─────────────────────────────────────
+
+    public void testEnrichDerivedIndexSettingsResolvesSourceBinding() {
+        int numShards = randomIntBetween(1, 10);
+        ClusterState state = createClusterState("my_source", numShards, 0, Settings.EMPTY);
+
+        Settings.Builder builder = Settings.builder()
+            .put(DerivedIndexBinding.KEY_SOURCE_NAME, "my_source")
+            .put(DerivedIndexBinding.KEY_DEFINITION_ID, "test_def")
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, numShards);
+
+        MetadataCreateIndexService.enrichDerivedIndexSettings(state, builder, "my_target");
+
+        Settings enriched = builder.build();
+        IndexMetadata sourceMetadata = state.metadata().index("my_source");
+        assertEquals(sourceMetadata.getIndexUUID(), enriched.get(DerivedIndexBinding.KEY_SOURCE_UUID));
+        assertEquals(String.valueOf(numShards), enriched.get(DerivedIndexBinding.KEY_SOURCE_SHARDS));
+        assertEquals(String.valueOf(sourceMetadata.getRoutingNumShards()), enriched.get(DerivedIndexBinding.KEY_SOURCE_ROUTING_SHARDS));
+        assertEquals("IDENTITY", enriched.get(DerivedIndexBinding.KEY_MAPPING_MODE));
+        assertEquals("my_source", enriched.get(DerivedIndexBinding.KEY_SOURCE_NAME));
+        assertEquals("test_def", enriched.get(DerivedIndexBinding.KEY_DEFINITION_ID));
+        DerivedIndexBinding binding = DerivedIndexBinding.fromSettings(enriched);
+        assertNotNull(binding);
+        assertEquals("my_source", binding.sourceName());
+        assertEquals(sourceMetadata.getIndexUUID(), binding.sourceUuid());
+        assertEquals(numShards, binding.sourceShardCount());
+        assertEquals("test_def", binding.definitionId());
+    }
+
+    public void testEnrichDerivedIndexSettingsRejectsMissingSource() {
+        ClusterState state = createClusterState("existing_index", 1, 0, Settings.EMPTY);
+        Settings.Builder builder = Settings.builder()
+            .put(DerivedIndexBinding.KEY_SOURCE_NAME, "nonexistent_source")
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1);
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> MetadataCreateIndexService.enrichDerivedIndexSettings(state, builder, "my_target")
+        );
+        assertTrue(e.getMessage().contains("does not exist"));
+    }
+
+    public void testEnrichDerivedIndexSettingsRejectsSameSourceTarget() {
+        ClusterState state = createClusterState("same_index", 1, 0, Settings.EMPTY);
+        Settings.Builder builder = Settings.builder()
+            .put(DerivedIndexBinding.KEY_SOURCE_NAME, "same_index")
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1);
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> MetadataCreateIndexService.enrichDerivedIndexSettings(state, builder, "same_index")
+        );
+        assertTrue(e.getMessage().contains("source and target must be different"));
+    }
+
+    public void testEnrichDerivedIndexSettingsRejectsShardCountMismatch() {
+        ClusterState state = createClusterState("my_source", 5, 0, Settings.EMPTY);
+        Settings.Builder builder = Settings.builder()
+            .put(DerivedIndexBinding.KEY_SOURCE_NAME, "my_source")
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 3);
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> MetadataCreateIndexService.enrichDerivedIndexSettings(state, builder, "my_target")
+        );
+        assertTrue(e.getMessage().contains("number_of_shards"));
+        assertTrue(e.getMessage().contains("must equal"));
+    }
+
+    public void testEnrichDerivedIndexSettingsRejectsUserProvidedPrivateUuid() {
+        ClusterState state = createClusterState("my_source", 1, 0, Settings.EMPTY);
+        Settings.Builder builder = Settings.builder()
+            .put(DerivedIndexBinding.KEY_SOURCE_NAME, "my_source")
+            .put(DerivedIndexBinding.KEY_SOURCE_UUID, "spoofed-uuid")
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1);
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> MetadataCreateIndexService.enrichDerivedIndexSettings(state, builder, "my_target")
+        );
+        assertTrue(e.getMessage().contains("server-generated"));
+        assertTrue(e.getMessage().contains(DerivedIndexBinding.KEY_SOURCE_UUID));
+    }
+
+    public void testEnrichDerivedIndexSettingsRejectsUserProvidedPrivateShards() {
+        ClusterState state = createClusterState("my_source", 1, 0, Settings.EMPTY);
+        Settings.Builder builder = Settings.builder()
+            .put(DerivedIndexBinding.KEY_SOURCE_NAME, "my_source")
+            .put(DerivedIndexBinding.KEY_SOURCE_SHARDS, 99)
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1);
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> MetadataCreateIndexService.enrichDerivedIndexSettings(state, builder, "my_target")
+        );
+        assertTrue(e.getMessage().contains("server-generated"));
+    }
+
+    public void testEnrichDerivedIndexSettingsRejectsUserProvidedMappingMode() {
+        ClusterState state = createClusterState("my_source", 1, 0, Settings.EMPTY);
+        Settings.Builder builder = Settings.builder()
+            .put(DerivedIndexBinding.KEY_SOURCE_NAME, "my_source")
+            .put(DerivedIndexBinding.KEY_MAPPING_MODE, "IDENTITY")
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1);
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> MetadataCreateIndexService.enrichDerivedIndexSettings(state, builder, "my_target")
+        );
+        assertTrue(e.getMessage().contains("server-generated"));
+    }
+
+    public void testEnrichDerivedIndexSettingsNoOpForOrdinaryIndex() {
+        ClusterState state = createClusterState("my_source", 1, 0, Settings.EMPTY);
+        Settings.Builder builder = Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1);
+
+        MetadataCreateIndexService.enrichDerivedIndexSettings(state, builder, "my_ordinary_index");
+
+        Settings result = builder.build();
+        assertNull(result.get(DerivedIndexBinding.KEY_SOURCE_UUID));
+        assertNull(result.get(DerivedIndexBinding.KEY_SOURCE_SHARDS));
+    }
+
+    public void testEnrichDerivedIndexSettingsRejectsClosedSource() {
+        ClusterState state = createClusterState("closed_source", 1, 0, Settings.EMPTY);
+        IndexMetadata closedMetadata = IndexMetadata.builder(state.metadata().index("closed_source"))
+            .state(IndexMetadata.State.CLOSE)
+            .build();
+        state = ClusterState.builder(state).metadata(Metadata.builder(state.metadata()).put(closedMetadata, true)).build();
+
+        Settings.Builder builder = Settings.builder()
+            .put(DerivedIndexBinding.KEY_SOURCE_NAME, "closed_source")
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1);
+
+        final ClusterState finalState = state;
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> MetadataCreateIndexService.enrichDerivedIndexSettings(finalState, builder, "my_target")
+        );
+        assertTrue(e.getMessage().contains("closed"));
+    }
+
     public void testPrepareResizeIndexSettings() {
         final List<Version> versions = Arrays.asList(VersionUtils.randomVersion(random()), VersionUtils.randomVersion(random()));
         versions.sort(Comparator.comparingLong(l -> l.id));

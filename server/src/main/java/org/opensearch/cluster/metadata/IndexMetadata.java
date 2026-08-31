@@ -1471,6 +1471,17 @@ public class IndexMetadata implements Diffable<IndexMetadata>, ToXContentFragmen
             : null;
     }
 
+    /**
+     * Returns the derived index binding if this index was created as a
+     * derived target (e.g. MV target), or {@code null} if no binding exists.
+     * The binding is immutable — set once at creation, never updated.
+     *
+     * @see DerivedIndexBinding
+     */
+    public DerivedIndexBinding getDerivedIndexBinding() {
+        return DerivedIndexBinding.fromSettings(settings);
+    }
+
     Map<String, DiffableStringMap> getCustomData() {
         return this.customData;
     }

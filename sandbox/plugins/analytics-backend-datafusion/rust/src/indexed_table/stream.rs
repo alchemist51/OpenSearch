@@ -853,7 +853,7 @@ impl IndexedStream {
 
 impl Stream for IndexedStream {
     type Item = Result<RecordBatch>;
-
+    // 10 > A > 5 OR Text = 'Arpit'
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Manual timer for `elapsed_compute`: total wall time spent
         // inside this poll. Attributed to the operator for EXPLAIN

@@ -276,6 +276,9 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                     // Capture replication checkpoint before uploading the segments as upload can take some time and checkpoint can
                     // move.
                     long lastRefreshedCheckpoint = indexShard.getIndexer().lastRefreshedCheckpoint();
+                    long snapshotBound = Long.parseLong(
+                        catalogSnapshot.getUserData().getOrDefault(SequenceNumbers.MAX_SEQ_NO, Long.toString(lastRefreshedCheckpoint))
+                    );
                     Collection<String> localSegmentsPostRefresh = catalogSnapshot.getFiles(true);
 
                     evictUploadedChecksums(localSegmentsPostRefresh);
@@ -290,7 +293,7 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                             try {
                                 logger.debug("New segments upload successful");
                                 // Start metadata file upload
-                                uploadMetadata(localSegmentsPostRefresh, catalogSnapshot, checkpoint);
+                                uploadMetadata(localSegmentsPostRefresh, catalogSnapshot, checkpoint, snapshotBound);
                                 logger.debug("Metadata upload successful");
                                 clearStaleFilesFromLocalSegmentChecksumMap(localSegmentsPostRefresh);
                                 onSuccessfulSegmentsSync(
@@ -485,13 +488,13 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
     void uploadMetadata(
         Collection<String> localSegmentsPostRefresh,
         CatalogSnapshot catalogSnapshot,
-        ReplicationCheckpoint replicationCheckpoint
+        ReplicationCheckpoint replicationCheckpoint,
+        long snapshotBound
     ) throws IOException {
-        final long maxSeqNo = indexShard.getIndexer().currentOngoingRefreshCheckpoint();
         CatalogSnapshot catalogSnapshotCloned = catalogSnapshot.clone();
         Map<String, String> userData = new HashMap<>(catalogSnapshotCloned.getUserData());
-        userData.put(LOCAL_CHECKPOINT_KEY, String.valueOf(maxSeqNo));
-        userData.put(SequenceNumbers.MAX_SEQ_NO, Long.toString(maxSeqNo));
+        userData.put(LOCAL_CHECKPOINT_KEY, String.valueOf(snapshotBound));
+        userData.put(SequenceNumbers.MAX_SEQ_NO, Long.toString(snapshotBound));
         catalogSnapshotCloned.setUserData(userData, false);
 
         // Pass the serializer from the indexer. For DFA primary it delegates to the

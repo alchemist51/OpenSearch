@@ -31,6 +31,7 @@
 
 package org.opensearch.common.settings;
 
+import org.opensearch.cluster.metadata.DerivedIndexBinding;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MetadataIndexStateService;
 import org.opensearch.cluster.routing.UnassignedInfo;
@@ -308,6 +309,10 @@ public final class IndexScopedSettings extends AbstractScopedSettings {
                 IndexSettings.PLUGGABLE_DATAFORMAT_ENABLED_SETTING,
                 IndexSettings.PLUGGABLE_DATAFORMAT_VALUE_SETTING,
 
+                // Public, Final, IndexScope settings for derived index binding.
+                DerivedIndexBinding.SETTING_SOURCE_NAME,
+                DerivedIndexBinding.SETTING_DEFINITION_ID,
+
                 // Writable warm / tiering settings - always registered so nodes can parse
                 // index metadata even when the feature flag is disabled
                 IndexModule.INDEX_STORE_LOCALITY_SETTING,
@@ -387,6 +392,13 @@ public final class IndexScopedSettings extends AbstractScopedSettings {
                 // we keep this setting for BWC to support indexes created in 1.1.0
                 // this can be removed in OpenSearch 3.0
             case "index.plugins.replication.translog.retention_lease.pruning.enabled":
+                // Derived index source binding — immutable, server-side only.
+                // NOTE: KEY_SOURCE_NAME and KEY_DEFINITION_ID are PUBLIC settings
+                // registered in BUILT_IN_INDEX_SETTINGS above.
+            case DerivedIndexBinding.KEY_SOURCE_UUID:
+            case DerivedIndexBinding.KEY_SOURCE_SHARDS:
+            case DerivedIndexBinding.KEY_SOURCE_ROUTING_SHARDS:
+            case DerivedIndexBinding.KEY_MAPPING_MODE:
                 return true;
             default:
                 return IndexMetadata.INDEX_ROUTING_INITIAL_RECOVERY_GROUP_SETTING.getRawKey().match(key);

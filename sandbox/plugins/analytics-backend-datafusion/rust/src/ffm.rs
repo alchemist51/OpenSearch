@@ -579,6 +579,224 @@ pub unsafe extern "C" fn df_query_registry_top_n_by_current(
     Ok(written as i64)
 }
 
+/// POC(mv) v2 search: Final-fold via a caller-provided SQL template
+/// (placeholder __MV_STATES__ replaced with the UNION ALL of state files).
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_search_v2(
+    files_ptr: *const *const u8,
+    files_lens: *const i64,
+    files_count: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    out_ptr: *mut u8,
+    out_cap: i64,
+    out_len: *mut i64,
+) -> i64 {
+    let mut files = Vec::with_capacity(files_count as usize);
+    for i in 0..files_count as usize {
+        let f_ptr = *files_ptr.add(i);
+        let f_len = *files_lens.add(i);
+        files.push(
+            str_from_raw(f_ptr, f_len)
+                .map_err(|e| format!("df_mv_search_v2: file[{}]: {}", i, e))?
+                .to_string(),
+        );
+    }
+    let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_search_v2: sql: {}", e))?;
+    let text = crate::mv_writer::mv_search_v2(&files, sql)?;
+    write_out_buffer(
+        text.as_bytes(),
+        out_ptr,
+        out_cap,
+        out_len,
+        "mv search v2 result",
+    )?;
+    Ok(0)
+}
+
+/// POC(mv) streaming writer lifecycle — create/feed/finalize/abort.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_create(
+    sql_ptr: *const u8,
+    sql_len: i64,
+    num_group_cols: i64,
+) -> i64 {
+    let sql =
+        str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_writer_create: sql: {}", e))?;
+    Ok(crate::mv_writer::mv_writer_create(sql, num_group_cols))
+}
+
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_feed(writer_id: i64, array_ptr: i64, schema_ptr: i64) -> i64 {
+    use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+    let ffi_array = FFI_ArrowArray::from_raw(array_ptr as *mut FFI_ArrowArray);
+    let ffi_schema = FFI_ArrowSchema::from_raw(schema_ptr as *mut FFI_ArrowSchema);
+    let mut array_data = arrow_array::ffi::from_ffi(ffi_array, &ffi_schema)
+        .map_err(|e| format!("df_mv_writer_feed: import: {}", e))?;
+    array_data.align_buffers();
+    let struct_array = arrow_array::StructArray::from(array_data);
+    let batch = arrow_array::RecordBatch::from(struct_array);
+    crate::mv_writer::mv_writer_feed(writer_id, &batch)?;
+    Ok(0)
+}
+
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_finalize(
+    writer_id: i64,
+    out_ptr: *const u8,
+    out_len: i64,
+) -> i64 {
+    let output =
+        str_from_raw(out_ptr, out_len).map_err(|e| format!("df_mv_writer_finalize: out: {}", e))?;
+    let rows = crate::mv_writer::mv_writer_finalize(writer_id, output)?;
+    Ok(rows)
+}
+
+/// Finalizes the MV writer and exports the sorted state batch via Arrow
+/// C-Data into caller-allocated `FFI_ArrowArray`/`FFI_ArrowSchema` structs
+/// (zero copy — the JVM imports the same buffers; Rust's release callback
+/// frees them when the consumer closes). Returns the state row count.
+///
+/// # Safety
+/// `array_addr` / `schema_addr` must point to caller-allocated, uninitialized
+/// ArrowArray / ArrowSchema C structs that the caller will import exactly once.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_finalize_arrow(
+    writer_id: i64,
+    array_addr: i64,
+    schema_addr: i64,
+) -> i64 {
+    crate::mv_writer::mv_writer_finalize_arrow(writer_id, array_addr, schema_addr)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_abort(writer_id: i64) {
+    crate::mv_writer::mv_writer_abort(writer_id);
+}
+
+/// POC(mv): Final-aggregate over MV state files. Writes result text (svc\tcount lines)
+/// into the caller buffer via write_out_buffer.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_search_poc(
+    files_ptr: *const *const u8,
+    files_lens: *const i64,
+    files_count: i64,
+    group_ptr: *const u8,
+    group_len: i64,
+    state_ptr: *const u8,
+    state_len: i64,
+    out_ptr: *mut u8,
+    out_cap: i64,
+    out_len: *mut i64,
+) -> i64 {
+    let mut files = Vec::with_capacity(files_count as usize);
+    for i in 0..files_count as usize {
+        let f_ptr = *files_ptr.add(i);
+        let f_len = *files_lens.add(i);
+        files.push(
+            str_from_raw(f_ptr, f_len)
+                .map_err(|e| format!("df_mv_search_poc: file[{}]: {}", i, e))?
+                .to_string(),
+        );
+    }
+    let group = str_from_raw(group_ptr, group_len)
+        .map_err(|e| format!("df_mv_search_poc: group: {}", e))?;
+    let state = str_from_raw(state_ptr, state_len)
+        .map_err(|e| format!("df_mv_search_poc: state: {}", e))?;
+    let text = crate::mv_poc::mv_search_poc(&files, group, state)?;
+    write_out_buffer(
+        text.as_bytes(),
+        out_ptr,
+        out_cap,
+        out_len,
+        "mv search result",
+    )?;
+    Ok(0)
+}
+
+/// POC(mv): build the hardcoded MV state file from a primary parquet file.
+/// Blocking; returns state-row count (>=0) on success.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_build_poc(
+    input_ptr: *const u8,
+    input_len: i64,
+    table_ptr: *const u8,
+    table_len: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    output_ptr: *const u8,
+    output_len: i64,
+) -> i64 {
+    let input =
+        str_from_raw(input_ptr, input_len).map_err(|e| format!("df_mv_build_poc: input: {}", e))?;
+    let table =
+        str_from_raw(table_ptr, table_len).map_err(|e| format!("df_mv_build_poc: table: {}", e))?;
+    let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_build_poc: sql: {}", e))?;
+    let output = str_from_raw(output_ptr, output_len)
+        .map_err(|e| format!("df_mv_build_poc: output: {}", e))?;
+    let rows = crate::mv_poc::mv_build_poc(input, table, sql, output)?;
+    Ok(rows)
+}
+
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_build_arrow(
+    input_ptr: *const u8,
+    input_len: i64,
+    table_ptr: *const u8,
+    table_len: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    array_addr: i64,
+    schema_addr: i64,
+) -> i64 {
+    let input = str_from_raw(input_ptr, input_len)
+        .map_err(|e| format!("df_mv_build_arrow: input: {}", e))?;
+    let table = str_from_raw(table_ptr, table_len)
+        .map_err(|e| format!("df_mv_build_arrow: table: {}", e))?;
+    let sql =
+        str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_build_arrow: sql: {}", e))?;
+    let rows = crate::mv_poc::mv_build_arrow(input, table, sql, array_addr, schema_addr)?;
+    Ok(rows)
+}
+
+/// State⊕state merge (code-complete, engine-gated OFF until the orphan
+/// sweep): folds newline-joined state files into one folded state file.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_merge_state(
+    files_ptr: *const u8,
+    files_len: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    output_ptr: *const u8,
+    output_len: i64,
+) -> i64 {
+    let files_joined = str_from_raw(files_ptr, files_len)
+        .map_err(|e| format!("df_mv_merge_state: files: {}", e))?;
+    let sql =
+        str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_merge_state: sql: {}", e))?;
+    let output = str_from_raw(output_ptr, output_len)
+        .map_err(|e| format!("df_mv_merge_state: output: {}", e))?;
+    let files: Vec<String> = files_joined
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if files.is_empty() {
+        return Err("df_mv_merge_state: no input files".to_string());
+    }
+    let rows = crate::mv_poc::mv_merge_state(&files, sql, output)?;
+    Ok(rows)
+}
+
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn df_sql_to_substrait(
@@ -1106,6 +1324,67 @@ pub unsafe extern "C" fn df_create_session_context_indexed(
                 has_partial_aggregate != 0,
                 query_config,
                 plan_bytes,
+            ),
+        ))
+        .map_err(|e| e.to_string())
+}
+
+/// MV-only session context: no ShardView / parquet reader. Creates a DataFusion
+/// SessionContext with catalog-selected Arrow IPC state loaded into a MemTable and
+/// projected into Substrait plan order. The session is ready to serve queries
+/// immediately — the session is ready to serve queries as-is.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_create_mv_only_session_context(
+    runtime_ptr: i64,
+    table_name_ptr: *const u8,
+    table_name_len: i64,
+    context_id: i64,
+    has_partial_aggregate: u8,
+    query_config_ptr: i64,
+    plan_ptr: *const u8,
+    plan_len: i64,
+    state_paths_ptr: *const u8,
+    state_paths_len: i64,
+    state_fields_ptr: *const u8,
+    state_fields_len: i64,
+) -> i64 {
+    crate::search_stats::inc_listing_table_scan();
+    let table_name = str_from_raw(table_name_ptr, table_name_len)
+        .map_err(|e| format!("df_create_mv_only_session_context: table_name: {}", e))?;
+    let state_paths_str = str_from_raw(state_paths_ptr, state_paths_len)
+        .map_err(|e| format!("df_create_mv_only_session_context: state_paths: {}", e))?;
+    let state_file_paths: Vec<String> = state_paths_str
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let state_fields_str = str_from_raw(state_fields_ptr, state_fields_len)
+        .map_err(|e| format!("df_create_mv_only_session_context: state_fields: {}", e))?;
+    let state_fields: Vec<String> = state_fields_str
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let query_config =
+        crate::datafusion_query_config::DatafusionQueryConfig::from_ffm_ptr(query_config_ptr);
+    let plan_bytes: &[u8] = if plan_len > 0 {
+        slice::from_raw_parts(plan_ptr, plan_len as usize)
+    } else {
+        &[]
+    };
+    let mgr = get_rt_manager()?;
+    mgr.io_runtime
+        .block_on(crate::task_monitors::plan_setup_monitor().instrument(
+            crate::session_context::create_mv_only_session_context(
+                runtime_ptr,
+                table_name,
+                context_id,
+                has_partial_aggregate != 0,
+                query_config,
+                plan_bytes,
+                &state_file_paths,
+                &state_fields,
             ),
         ))
         .map_err(|e| e.to_string())

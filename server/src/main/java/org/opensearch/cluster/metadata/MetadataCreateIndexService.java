@@ -1145,6 +1145,11 @@ public class MetadataCreateIndexService {
         updateRemoteStoreSettings(indexSettingsBuilder, currentState, clusterSettings, settings, request.index());
         updatePluggableDataFormatSettings(indexSettingsBuilder, clusterSettings, request.index());
 
+        // Derived index enrichment: resolve source and inject private binding settings
+        if (sourceMetadata == null) {
+            enrichDerivedIndexSettings(currentState, indexSettingsBuilder, request.index());
+        }
+
         if (sourceMetadata != null) {
             assert request.resizeType() != null;
             prepareResizeIndexSettings(
@@ -1379,6 +1384,78 @@ public class MetadataCreateIndexService {
             settingsBuilder.put(
                 IndexSettings.PLUGGABLE_DATAFORMAT_VALUE_SETTING.getKey(),
                 clusterSettings.get(IndicesService.CLUSTER_PLUGGABLE_DATAFORMAT_VALUE_SETTING)
+            );
+        }
+    }
+
+    /**
+     * Enrich a derived index's settings by resolving the source from cluster state.
+     * When the user provides the public {@code index.derived.source.name} setting,
+     * this method validates the source and injects private binding settings.
+     * Normal (non-derived) creates pass through unchanged.
+     */
+    static void enrichDerivedIndexSettings(ClusterState currentState, Settings.Builder indexSettingsBuilder, String targetIndexName) {
+        Settings current = indexSettingsBuilder.build();
+        if (DerivedIndexBinding.hasDerivedSourceDeclaration(current) == false) {
+            return;
+        }
+
+        String sourceName = current.get(DerivedIndexBinding.KEY_SOURCE_NAME);
+
+        // Reject user-provided private binding fields
+        rejectPrivateBindingField(current, DerivedIndexBinding.KEY_SOURCE_UUID, targetIndexName);
+        rejectPrivateBindingField(current, DerivedIndexBinding.KEY_SOURCE_SHARDS, targetIndexName);
+        rejectPrivateBindingField(current, DerivedIndexBinding.KEY_SOURCE_ROUTING_SHARDS, targetIndexName);
+        rejectPrivateBindingField(current, DerivedIndexBinding.KEY_MAPPING_MODE, targetIndexName);
+
+        if (sourceName.equals(targetIndexName)) {
+            throw new IllegalArgumentException(
+                "cannot create derived index [" + targetIndexName + "]: source and target must be different indices"
+            );
+        }
+
+        IndexMetadata sourceMetadata = currentState.metadata().index(sourceName);
+        if (sourceMetadata == null) {
+            throw new IllegalArgumentException(
+                "cannot create derived index [" + targetIndexName + "]: source index [" + sourceName + "] does not exist in cluster state"
+            );
+        }
+
+        if (sourceMetadata.getState() == IndexMetadata.State.CLOSE) {
+            throw new IllegalArgumentException(
+                "cannot create derived index [" + targetIndexName + "]: source index [" + sourceName + "] is closed"
+            );
+        }
+
+        int sourceShards = sourceMetadata.getNumberOfShards();
+        int targetShards = INDEX_NUMBER_OF_SHARDS_SETTING.exists(current) ? INDEX_NUMBER_OF_SHARDS_SETTING.get(current) : -1;
+        if (targetShards != -1 && targetShards != sourceShards) {
+            throw new IllegalArgumentException(
+                "cannot create derived index ["
+                    + targetIndexName
+                    + "]: target number_of_shards ["
+                    + targetShards
+                    + "] must equal source ["
+                    + sourceName
+                    + "] number_of_shards ["
+                    + sourceShards
+                    + "] for IDENTITY shard mapping"
+            );
+        }
+
+        String definitionId = current.get(DerivedIndexBinding.KEY_DEFINITION_ID);
+        DerivedIndexBinding binding = DerivedIndexBinding.create(sourceMetadata, DerivedIndexBinding.MappingMode.IDENTITY, definitionId);
+        indexSettingsBuilder.put(binding.toPrivateSettings());
+    }
+
+    private static void rejectPrivateBindingField(Settings current, String key, String targetIndexName) {
+        if (current.get(key) != null) {
+            throw new IllegalArgumentException(
+                "cannot create derived index ["
+                    + targetIndexName
+                    + "]: setting ["
+                    + key
+                    + "] is server-generated and must not be provided by the user"
             );
         }
     }
@@ -1886,6 +1963,18 @@ public class MetadataCreateIndexService {
         final IndexMetadata sourceMetadata = state.metadata().index(sourceIndex);
         if (sourceMetadata == null) {
             throw new IndexNotFoundException(sourceIndex);
+        }
+
+        // ── Derived-index guard ──────────────────────────────────────────
+        // v1 derived targets use identity-only shard mapping (target N → source N).
+        // Shrink, split, or clone would violate the immutable N:N topology binding.
+        if (DerivedIndexBinding.fromSettings(sourceMetadata.getSettings()) != null) {
+            throw new IllegalArgumentException(
+                "cannot resize index ["
+                    + sourceIndex
+                    + "]: it is a derived index with an immutable "
+                    + "identity shard mapping — shrink, split, and clone are not supported"
+            );
         }
 
         IndexAbstraction source = state.metadata().getIndicesLookup().get(sourceIndex);
