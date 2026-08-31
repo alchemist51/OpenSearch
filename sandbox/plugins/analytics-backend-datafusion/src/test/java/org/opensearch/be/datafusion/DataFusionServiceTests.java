@@ -48,6 +48,8 @@ public class DataFusionServiceTests extends OpenSearchTestCase {
         assertTrue(handle.get() != 0);
 
         service.stop();
+        assertTrue("runtime remains available while node shards close", handle.isOpen());
+        service.close();
         assertFalse(handle.isOpen());
     }
 
@@ -71,6 +73,8 @@ public class DataFusionServiceTests extends OpenSearchTestCase {
         assertTrue(handle.get() != 0);
 
         service.stop();
+        assertTrue("runtime remains available while node shards close", handle.isOpen());
+        service.close();
         assertFalse(handle.isOpen());
     }
 
@@ -124,6 +128,7 @@ public class DataFusionServiceTests extends OpenSearchTestCase {
         service.onFilesDeleted(java.util.List.of());
 
         service.stop();
+        service.close();
     }
 
     public void testServiceWithCacheEnabled() {
@@ -145,6 +150,7 @@ public class DataFusionServiceTests extends OpenSearchTestCase {
         assertTrue(service.getNativeRuntime().isOpen());
 
         service.stop();
+        service.close();
     }
 
     public void testServiceWithoutCacheReturnsNullCacheManager() {
@@ -162,6 +168,7 @@ public class DataFusionServiceTests extends OpenSearchTestCase {
         assertNull(service.getCacheManager());
 
         service.stop();
+        service.close();
     }
 
     public void testPluginRegistersAllCacheSettings() {

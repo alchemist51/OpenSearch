@@ -444,6 +444,23 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
         FunctionMappings.s(LOCAL_OS_COUNT_DISTINCT_OP, "os_count_distinct")
     );
 
+    /**
+     * Standard Calcite operator carrying the same logical semantics as {@code kind},
+     * used to rebind front-end-defined aggregate operators that isthmus can't know.
+     * Returns null for kinds where no drop-in standard operator exists.
+     */
+    private static org.apache.calcite.sql.SqlAggFunction standardOpForKind(org.apache.calcite.sql.SqlKind kind) {
+        return switch (kind) {
+            case SUM -> SqlStdOperatorTable.SUM;
+            case SUM0 -> SqlStdOperatorTable.SUM0;
+            case MIN -> SqlStdOperatorTable.MIN;
+            case MAX -> SqlStdOperatorTable.MAX;
+            case AVG -> SqlStdOperatorTable.AVG;
+            case COUNT -> SqlStdOperatorTable.COUNT;
+            default -> null;
+        };
+    }
+
     private static final List<FunctionMappings.Sig> ADDITIONAL_WINDOW_SIGS = List.of(
         FunctionMappings.s(LOCAL_INTERNAL_PATTERN_WINDOW_OP, "internal_pattern"),
         // Mirror ADDITIONAL_AGGREGATE_SIGS: rename APPROX_COUNT_DISTINCT to DataFusion's `approx_distinct`.
@@ -714,6 +731,34 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
                 Function<RexNode, Expression> rexConverter
             ) {
                 Optional<AggregateFunctionInvocation> bound = super.convert(input, inputType, call, rexConverter);
+                if (bound.isEmpty()) {
+                    // Front-end-defined aggregate operators (e.g. the sql plugin's
+                    // CHECKED_LONG_SUM — reflective UDAF, kind=SUM over BIGINT) have
+                    // no isthmus signature and never can: they aren't on our
+                    // classpath. When the KIND has a standard Calcite operator with
+                    // identical logical semantics, rebind the call through it —
+                    // DataFusion executes the standard function natively (its i64
+                    // sum; the overflow-checked nuance doesn't survive the wire on
+                    // any engine path). Kind-based, so the whole family (checked
+                    // sums, nullable avgs) is covered without naming each operator.
+                    org.apache.calcite.sql.SqlAggFunction std = standardOpForKind(call.getAggregation().getKind());
+                    if (std != null && std != call.getAggregation()) {
+                        AggregateCall rebound = AggregateCall.create(
+                            std,
+                            call.isDistinct(),
+                            call.isApproximate(),
+                            call.ignoreNulls(),
+                            call.rexList,
+                            call.getArgList(),
+                            call.filterArg,
+                            call.distinctKeys,
+                            call.getCollation(),
+                            call.getType(),
+                            call.getName()
+                        );
+                        bound = super.convert(input, inputType, rebound, rexConverter);
+                    }
+                }
                 if (bound.isEmpty()) {
                     return bound;
                 }

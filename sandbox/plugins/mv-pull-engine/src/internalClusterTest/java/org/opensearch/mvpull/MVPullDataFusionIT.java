@@ -150,21 +150,13 @@ public class MVPullDataFusionIT extends OpenSearchIntegTestCase {
                         .put("index.mv.definition", "pull_count_sum")
                         .putList("index.mv.state_fields", "RegionID", "cnt", "adv")
                         .put("index.mv.state_merge_enabled", true)
-                        .put(MVPullSettings.SOURCE_INDEX.getKey(), SOURCE)
                         .put(MVPullSettings.PULL_INTERVAL.getKey(), "100ms")
                         .put("index.mv.serve_state", true)
-                        // ── Durable source binding ───────────────────────
-                        // Capture source identity (UUID, shard count, routing shards)
-                        // into the target's private index.derived.* settings.
-                        // Binding is mandatory for pull targets — the legacy
-                        // name-only fallback has been removed.
-                        .put(
-                            org.opensearch.cluster.metadata.DerivedIndexBinding.create(
-                                getClusterState().metadata().index(SOURCE),
-                                org.opensearch.cluster.metadata.DerivedIndexBinding.MappingMode.IDENTITY,
-                                "pull_count_sum"
-                            ).toSettings()
-                        )
+                        // Public settings only; MetadataCreateIndexService enriches private binding
+                        // (UUID, topology, mapping mode). The deprecated index.mv_pull.source_index
+                        // is NOT set — all pull targets use DerivedIndexBinding exclusively.
+                        .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_SOURCE_NAME, SOURCE)
+                        .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "pull_count_sum")
                 )
                 .setMapping("RegionID", "type=long", "cnt", "type=long", "adv", "type=long")
         );

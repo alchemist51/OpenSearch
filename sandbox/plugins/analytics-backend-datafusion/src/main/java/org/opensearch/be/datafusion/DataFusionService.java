@@ -36,6 +36,15 @@ public class DataFusionService extends AbstractLifecycleComponent {
 
     private static final Logger logger = LogManager.getLogger(DataFusionService.class);
 
+    /**
+     * The Tokio runtime manager is process-global in the native library while this
+     * service is node-scoped. Production has one node per JVM, but internal clusters
+     * host multiple nodes in one JVM; stopping one node must not tear the manager down
+     * underneath runtimes still owned by the remaining nodes.
+     */
+    private static final Object RUNTIME_MANAGER_LOCK = new Object();
+    private static int runtimeManagerUsers;
+
     private final long memoryPoolLimit;
     /**
      * Mirrors the dynamic {@code datafusion.spill_memory_limit_bytes} setting and the
@@ -52,6 +61,9 @@ public class DataFusionService extends AbstractLifecycleComponent {
 
     /** Handle to the native DataFusion global runtime (memory pool + cache). */
     private volatile NativeRuntimeHandle runtimeHandle;
+
+    /** True after this node has acquired one process-global runtime-manager reference. */
+    private boolean runtimeManagerAcquired;
 
     /** Cache manager for pre-warming and managing native caches. */
     private volatile CacheManager cacheManager;
@@ -82,9 +94,9 @@ public class DataFusionService extends AbstractLifecycleComponent {
     @Override
     protected void doStart() {
         logger.debug("Starting DataFusion service");
-        NativeBridge.initTokioRuntimeManager(cpuThreads, datanodeMultiplier, coordinatorMultiplier);
+        acquireRuntimeManager();
         logger.debug(
-            "Tokio runtime manager initialized with {} CPU threads, datanode multiplier {}, coordinator multiplier {}",
+            "Tokio runtime manager acquired with {} CPU threads, datanode multiplier {}, coordinator multiplier {}",
             cpuThreads,
             datanodeMultiplier,
             coordinatorMultiplier
@@ -107,6 +119,7 @@ public class DataFusionService extends AbstractLifecycleComponent {
             if (cacheHandle != null) {
                 cacheHandle.close();
             }
+            releaseRuntimeManager();
             throw e;
         }
 
@@ -119,20 +132,19 @@ public class DataFusionService extends AbstractLifecycleComponent {
 
     @Override
     protected void doStop() {
-        logger.debug("Stopping DataFusion service");
-        try {
-            releaseRuntime();
-        } finally {
-            NativeBridge.shutdownTokioRuntimeManager();
-        }
-
-        logger.debug("DataFusion service stopped");
+        // Node shutdown can still close/flush DFA shards after lifecycle services have
+        // entered STOPPED. Keep the node's runtime alive until doClose so reader refresh
+        // and recovery callbacks cannot observe a half-torn-down DataFusion service.
+        logger.debug("Stopping DataFusion service; deferring native runtime release until close");
     }
 
     @Override
     protected void doClose() throws IOException {
-        releaseRuntime();
-        NativeBridge.shutdownTokioRuntimeManager();
+        try {
+            releaseRuntime();
+        } finally {
+            releaseRuntimeManager();
+        }
     }
 
     /**
@@ -293,6 +305,33 @@ public class DataFusionService extends AbstractLifecycleComponent {
             NativeBridge.cacheManagerRemoveFiles(runtimeHandle.get(), filePaths.toArray(new String[0]));
         } catch (Exception e) {
             logger.warn("Failed to evict deleted files from native cache", e);
+        }
+    }
+
+    private void acquireRuntimeManager() {
+        synchronized (RUNTIME_MANAGER_LOCK) {
+            if (runtimeManagerAcquired) {
+                return;
+            }
+            if (runtimeManagerUsers == 0) {
+                NativeBridge.initTokioRuntimeManager(cpuThreads, datanodeMultiplier, coordinatorMultiplier);
+            }
+            runtimeManagerUsers++;
+            runtimeManagerAcquired = true;
+        }
+    }
+
+    private void releaseRuntimeManager() {
+        synchronized (RUNTIME_MANAGER_LOCK) {
+            if (runtimeManagerAcquired == false) {
+                return;
+            }
+            runtimeManagerAcquired = false;
+            runtimeManagerUsers--;
+            assert runtimeManagerUsers >= 0 : "runtime-manager reference count must not be negative";
+            if (runtimeManagerUsers == 0) {
+                NativeBridge.shutdownTokioRuntimeManager();
+            }
         }
     }
 
