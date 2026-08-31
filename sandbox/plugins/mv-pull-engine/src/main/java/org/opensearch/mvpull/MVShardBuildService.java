@@ -91,16 +91,24 @@ final class MVShardBuildService implements IndexEventListener, Closeable {
             return false;
         }
         String primaryFormat = settings.get("index.composite.primary_data_format");
-        if (MVStateDataFormat.NAME.equals(primaryFormat) == false) {
-            logger.debug(
-                "mv_pull target [{}] must use primary data format [{}] but was [{}]",
-                shard.shardId(),
-                MVStateDataFormat.NAME,
-                primaryFormat
-            );
-            return false;
+        // Accept mv_state primary (legacy) or parquet primary when mv_state
+        // is a secondary format (avoids the COLUMNAR_STORAGE capability gap
+        // that prevents mv_state-only mappings with typed long fields).
+        if (MVStateDataFormat.NAME.equals(primaryFormat)) {
+            return true;
         }
-        return true;
+        String secondaryFormats = settings.get("index.composite.secondary_data_formats", "");
+        if ("parquet".equals(primaryFormat) && secondaryFormats.contains(MVStateDataFormat.NAME)) {
+            return true;
+        }
+        logger.debug(
+            "mv_pull target [{}] requires primary_data_format=[{}] or parquet+mv_state secondary, but was primary=[{}] secondary=[{}]",
+            shard.shardId(),
+            MVStateDataFormat.NAME,
+            primaryFormat,
+            secondaryFormats
+        );
+        return false;
     }
 
     private void stop(ShardId shardId) {
