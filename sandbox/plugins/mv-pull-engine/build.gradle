@@ -18,7 +18,7 @@ opensearchplugin {
   classname = 'org.opensearch.mvpull.MVPullEnginePlugin'
   // MVNativeBridge (DataFusion fold) + arrow classes resolve from
   // mv-data-format's classloader at runtime (mv-state-format pattern).
-  extendedPlugins = ['mv-data-format', 'mv-state-format']
+  extendedPlugins = ['mv-data-format']
 }
 
 apply plugin: 'opensearch.internal-cluster-test'

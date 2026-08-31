@@ -167,6 +167,7 @@ public class DerivedIndexEngine extends DataFormatAwareEngine {
         );
     }
 
+    /** A callable that may throw an {@link java.io.IOException}. */
     @FunctionalInterface
     @ExperimentalApi
     public interface IOCallable<T> {

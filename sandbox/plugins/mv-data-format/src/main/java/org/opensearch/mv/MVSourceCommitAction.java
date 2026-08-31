@@ -27,6 +27,7 @@ public final class MVSourceCommitAction extends ActionType<MVSourceCommitAction.
         super(NAME, Response::new);
     }
 
+    /** Request to commit a materialized view source checkpoint. */
     public static final class Request extends ActionRequest {
         private final String targetIndex;
         private final int targetShard;
@@ -87,6 +88,7 @@ public final class MVSourceCommitAction extends ActionType<MVSourceCommitAction.
         }
     }
 
+    /** Response containing the committed checkpoint. */
     public static final class Response extends ActionResponse {
         private final long committedCheckpoint;
 

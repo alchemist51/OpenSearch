@@ -31,6 +31,7 @@ public final class MVCursorAction extends ActionType<MVCursorAction.Response> {
         super(NAME, Response::new);
     }
 
+    /** Request to fetch the materialized view cursor position. */
     public static class Request extends ActionRequest {
         private final String targetIndex;
         private final int targetShard;
