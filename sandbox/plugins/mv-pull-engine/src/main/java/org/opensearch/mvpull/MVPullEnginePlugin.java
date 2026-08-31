@@ -40,7 +40,13 @@ public class MVPullEnginePlugin extends Plugin {
 
     @Override
     public List<Setting<?>> getSettings() {
-        return List.of(MVPullSettings.SOURCE_INDEX, MVPullSettings.PULL_INTERVAL, MVPullSettings.GROUP_FIELD, MVPullSettings.SUM_FIELD);
+        return List.of(
+            MVPullSettings.SOURCE_INDEX,
+            MVPullSettings.PULL_INTERVAL,
+            MVPullSettings.GROUP_FIELD,
+            MVPullSettings.SUM_FIELD,
+            MVPullSettings.DEFINITION
+        );
     }
 
     @Override

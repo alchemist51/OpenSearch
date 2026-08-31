@@ -62,6 +62,7 @@ public record MVDefinitionSpec(List<Column> columns, int groupKeys, String sql, 
             case "pull_count_sum_userid" -> PULL_COUNT_SUM_USERID;
             case "clickbench_q9" -> CLICKBENCH_Q9;
             case "clickbench_q9_native" -> CLICKBENCH_Q9_NATIVE;
+            case "clickbench_100mv" -> CLICKBENCH_100MV;
             default -> throw new IllegalArgumentException("unknown mv definition [" + name + "]");
         };
     }
@@ -73,6 +74,7 @@ public record MVDefinitionSpec(List<Column> columns, int groupKeys, String sql, 
             case "pull_count_sum_userid" -> PULL_COUNT_SUM_USERID_FOLD;
             case "clickbench_q9" -> CLICKBENCH_Q9_FOLD;
             case "clickbench_q9_native" -> CLICKBENCH_Q9_NATIVE_FOLD;
+            case "clickbench_100mv" -> CLICKBENCH_100MV_FOLD;
             default -> throw new IllegalArgumentException("unknown mv fold definition [" + name + "]");
         };
     }
@@ -214,5 +216,163 @@ public record MVDefinitionSpec(List<Column> columns, int groupKeys, String sql, 
         1,
         "SELECT \"RegionID\", SUM(adv_sum), SUM(cnt), SUM(CAST(avg_cnt AS BIGINT UNSIGNED)), SUM(avg_sum) FROM mv_input GROUP BY \"RegionID\"",
         List.of("RegionID", "adv_sum", "cnt", "avg_cnt", "avg_sum")
+    );
+
+    // ────────────────────────────────────────────────────────────────────
+    //  100-MV catch-up benchmark definition
+    //
+    //  GROUP BY: EventTime (raw), RegionID, OS, CounterID, IsRefresh
+    //  Metrics : SUM / MIN / MAX / COUNT  ×  10 integer fields
+    //            = 40 metric columns  +  5 group keys  = 45 total
+    //
+    //  10 metric fields: AdvEngineID, ResolutionWidth, ResolutionHeight,
+    //  ResolutionDepth, ClientIP, RemoteIP, ConnectTiming, DNSTiming,
+    //  FetchTiming, SendTiming
+    // ────────────────────────────────────────────────────────────────────
+
+    /** Column names for the 10 metric fields used by the 100-MV benchmark. */
+    private static final List<String> METRIC_100MV = List.of(
+        "AdvEngineID", "ResolutionWidth", "ResolutionHeight", "ResolutionDepth", "ClientIP",
+        "RemoteIP", "ConnectTiming", "DNSTiming", "FetchTiming", "SendTiming"
+    );
+
+    /** Column names for the 5 group-by keys. */
+    private static final List<String> GROUP_100MV = List.of(
+        "EventTime", "RegionID", "OS", "CounterID", "IsRefresh"
+    );
+
+    /**
+     * 100-MV catch-up benchmark: wide-column GROUP BY over ClickBench 100M
+     * with 5 group keys and 4 aggregates (SUM/MIN/MAX/COUNT) across 10
+     * integer fields = 45 columns per state row.
+     *
+     * <p>EventTime drives cardinality (~100M expected groups at raw
+     * granularity). Each of the 100 MV targets uses this identical definition
+     * to stress concurrent poller catch-up latency, not distinct analytics.
+     */
+    public static final MVDefinitionSpec CLICKBENCH_100MV = new MVDefinitionSpec(
+        // Columns: 5 group keys + 10 metric fields captured from the source
+        List.of(
+            new Column("EventTime", ColumnType.INT64),
+            new Column("RegionID", ColumnType.INT64),
+            new Column("OS", ColumnType.INT64),
+            new Column("CounterID", ColumnType.INT64),
+            new Column("IsRefresh", ColumnType.INT64),
+            new Column("AdvEngineID", ColumnType.INT64),
+            new Column("ResolutionWidth", ColumnType.INT64),
+            new Column("ResolutionHeight", ColumnType.INT64),
+            new Column("ResolutionDepth", ColumnType.INT64),
+            new Column("ClientIP", ColumnType.INT64),
+            new Column("RemoteIP", ColumnType.INT64),
+            new Column("ConnectTiming", ColumnType.INT64),
+            new Column("DNSTiming", ColumnType.INT64),
+            new Column("FetchTiming", ColumnType.INT64),
+            new Column("SendTiming", ColumnType.INT64)
+        ),
+        5,  // 5 group keys
+        // Source SQL: 5 group keys + COUNT(*) + 4 aggs × 10 fields = 45 output columns
+        "SELECT \"EventTime\", \"RegionID\", \"OS\", \"CounterID\", \"IsRefresh\", "
+            + "COUNT(*), "
+            + "SUM(\"AdvEngineID\"), MIN(\"AdvEngineID\"), MAX(\"AdvEngineID\"), "
+            + "SUM(\"ResolutionWidth\"), MIN(\"ResolutionWidth\"), MAX(\"ResolutionWidth\"), "
+            + "SUM(\"ResolutionHeight\"), MIN(\"ResolutionHeight\"), MAX(\"ResolutionHeight\"), "
+            + "SUM(\"ResolutionDepth\"), MIN(\"ResolutionDepth\"), MAX(\"ResolutionDepth\"), "
+            + "SUM(\"ClientIP\"), MIN(\"ClientIP\"), MAX(\"ClientIP\"), "
+            + "SUM(\"RemoteIP\"), MIN(\"RemoteIP\"), MAX(\"RemoteIP\"), "
+            + "SUM(\"ConnectTiming\"), MIN(\"ConnectTiming\"), MAX(\"ConnectTiming\"), "
+            + "SUM(\"DNSTiming\"), MIN(\"DNSTiming\"), MAX(\"DNSTiming\"), "
+            + "SUM(\"FetchTiming\"), MIN(\"FetchTiming\"), MAX(\"FetchTiming\"), "
+            + "SUM(\"SendTiming\"), MIN(\"SendTiming\"), MAX(\"SendTiming\") "
+            + "FROM mv_input "
+            + "GROUP BY \"EventTime\", \"RegionID\", \"OS\", \"CounterID\", \"IsRefresh\"",
+        // Ship fields: group keys + cnt + 3 × 10 metric aggregates = 45
+        List.of(
+            "EventTime", "RegionID", "OS", "CounterID", "IsRefresh",
+            "cnt",
+            "adv_sum", "adv_min", "adv_max",
+            "resw_sum", "resw_min", "resw_max",
+            "resh_sum", "resh_min", "resh_max",
+            "resd_sum", "resd_min", "resd_max",
+            "cip_sum", "cip_min", "cip_max",
+            "rip_sum", "rip_min", "rip_max",
+            "conn_sum", "conn_min", "conn_max",
+            "dns_sum", "dns_min", "dns_max",
+            "fetch_sum", "fetch_min", "fetch_max",
+            "send_sum", "send_min", "send_max"
+        )
+    );
+
+    /** Fold of {@link #CLICKBENCH_100MV}'s state schema on the MV target. */
+    public static final MVDefinitionSpec CLICKBENCH_100MV_FOLD = new MVDefinitionSpec(
+        // All 45 columns are state columns on the target (keys + aggregates)
+        List.of(
+            new Column("EventTime", ColumnType.INT64),
+            new Column("RegionID", ColumnType.INT64),
+            new Column("OS", ColumnType.INT64),
+            new Column("CounterID", ColumnType.INT64),
+            new Column("IsRefresh", ColumnType.INT64),
+            new Column("cnt", ColumnType.INT64),
+            new Column("adv_sum", ColumnType.INT64),
+            new Column("adv_min", ColumnType.INT64),
+            new Column("adv_max", ColumnType.INT64),
+            new Column("resw_sum", ColumnType.INT64),
+            new Column("resw_min", ColumnType.INT64),
+            new Column("resw_max", ColumnType.INT64),
+            new Column("resh_sum", ColumnType.INT64),
+            new Column("resh_min", ColumnType.INT64),
+            new Column("resh_max", ColumnType.INT64),
+            new Column("resd_sum", ColumnType.INT64),
+            new Column("resd_min", ColumnType.INT64),
+            new Column("resd_max", ColumnType.INT64),
+            new Column("cip_sum", ColumnType.INT64),
+            new Column("cip_min", ColumnType.INT64),
+            new Column("cip_max", ColumnType.INT64),
+            new Column("rip_sum", ColumnType.INT64),
+            new Column("rip_min", ColumnType.INT64),
+            new Column("rip_max", ColumnType.INT64),
+            new Column("conn_sum", ColumnType.INT64),
+            new Column("conn_min", ColumnType.INT64),
+            new Column("conn_max", ColumnType.INT64),
+            new Column("dns_sum", ColumnType.INT64),
+            new Column("dns_min", ColumnType.INT64),
+            new Column("dns_max", ColumnType.INT64),
+            new Column("fetch_sum", ColumnType.INT64),
+            new Column("fetch_min", ColumnType.INT64),
+            new Column("fetch_max", ColumnType.INT64),
+            new Column("send_sum", ColumnType.INT64),
+            new Column("send_min", ColumnType.INT64),
+            new Column("send_max", ColumnType.INT64)
+        ),
+        5,  // 5 group keys
+        // Fold SQL: SUM counts and sums, MIN mins, MAX maxes
+        "SELECT \"EventTime\", \"RegionID\", \"OS\", \"CounterID\", \"IsRefresh\", "
+            + "SUM(cnt), "
+            + "SUM(adv_sum), MIN(adv_min), MAX(adv_max), "
+            + "SUM(resw_sum), MIN(resw_min), MAX(resw_max), "
+            + "SUM(resh_sum), MIN(resh_min), MAX(resh_max), "
+            + "SUM(resd_sum), MIN(resd_min), MAX(resd_max), "
+            + "SUM(cip_sum), MIN(cip_min), MAX(cip_max), "
+            + "SUM(rip_sum), MIN(rip_min), MAX(rip_max), "
+            + "SUM(conn_sum), MIN(conn_min), MAX(conn_max), "
+            + "SUM(dns_sum), MIN(dns_min), MAX(dns_max), "
+            + "SUM(fetch_sum), MIN(fetch_min), MAX(fetch_max), "
+            + "SUM(send_sum), MIN(send_min), MAX(send_max) "
+            + "FROM mv_input "
+            + "GROUP BY \"EventTime\", \"RegionID\", \"OS\", \"CounterID\", \"IsRefresh\"",
+        // Same ship fields
+        List.of(
+            "EventTime", "RegionID", "OS", "CounterID", "IsRefresh",
+            "cnt",
+            "adv_sum", "adv_min", "adv_max",
+            "resw_sum", "resw_min", "resw_max",
+            "resh_sum", "resh_min", "resh_max",
+            "resd_sum", "resd_min", "resd_max",
+            "cip_sum", "cip_min", "cip_max",
+            "rip_sum", "rip_min", "rip_max",
+            "conn_sum", "conn_min", "conn_max",
+            "dns_sum", "dns_min", "dns_max",
+            "fetch_sum", "fetch_min", "fetch_max",
+            "send_sum", "send_min", "send_max"
+        )
     );
 }

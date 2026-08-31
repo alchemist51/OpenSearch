@@ -45,7 +45,7 @@ public final class MVPullSettings {
         Setting.Property.Final
     );
 
-    /** Numeric group-by field present in the source mapping. */
+    /** Numeric group-by field present in the source mapping. Legacy single-key setting; ignored when DEFINITION is set. */
     public static final Setting<String> GROUP_FIELD = Setting.simpleString(
         "index.mv_pull.group_field",
         "RegionID",
@@ -53,10 +53,22 @@ public final class MVPullSettings {
         Setting.Property.Final
     );
 
-    /** Numeric field summed by the definition. */
+    /** Numeric field summed by the definition. Legacy single-key setting; ignored when DEFINITION is set. */
     public static final Setting<String> SUM_FIELD = Setting.simpleString(
         "index.mv_pull.sum_field",
         "AdvEngineID",
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
+    /**
+     * Named definition for definition-driven pull (e.g. "clickbench_100mv").
+     * When set, the poller generates SQL from the MVDefinitionSpec instead of
+     * the legacy group_field/sum_field pair.
+     */
+    public static final Setting<String> DEFINITION = Setting.simpleString(
+        "index.mv_pull.definition",
+        "",
         Setting.Property.IndexScope,
         Setting.Property.Final
     );

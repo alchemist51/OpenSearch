@@ -158,6 +158,89 @@ final class MVDataFusionReadEngine implements Closeable {
         }
     }
 
+    /**
+     * Definition-driven delta coverage check: runs a lightweight COUNT(*) + MAX(_seq_no)
+     * query over the source parquet for the given seq_no range to verify coverage integrity.
+     * Does NOT compute the full aggregate — the artifact writer does that via buildStateFile.
+     * Returns only observedMaxSeqNo and totalRows; groups map is empty.
+     */
+    Delta searchDeltaByDefinition(
+        List<Path> parquetFiles,
+        String definitionName,
+        long fromExclusive,
+        long toInclusive,
+        long infosVersion
+    ) throws IOException {
+        Path staged = stagingRoot.resolve("gen-" + infosVersion);
+        if (Files.exists(staged) == false) {
+            Files.createDirectories(staged);
+            int i = 0;
+            for (Path file : parquetFiles) {
+                Files.createSymbolicLink(staged.resolve(String.format(Locale.ROOT, "%06d.parquet", i++)), file.toAbsolutePath());
+            }
+        }
+        // Lightweight coverage-only query: just COUNT(*) and MAX(_seq_no) for the range.
+        // This avoids computing the full 45-column aggregate just for the coverage guard.
+        String sql = String.format(
+            Locale.ROOT,
+            "SELECT COUNT(*), MAX(\"_seq_no\") FROM (SELECT * FROM %s WHERE \"_seq_no\" > %d AND \"_seq_no\" <= %d) AS %s",
+            INPUT_TABLE,
+            fromExclusive,
+            toInclusive,
+            INPUT_TABLE
+        );
+        try (org.apache.arrow.memory.RootAllocator allocator = new org.apache.arrow.memory.RootAllocator()) {
+            try (
+                org.apache.arrow.c.ArrowArray array = org.apache.arrow.c.ArrowArray.allocateNew(allocator);
+                org.apache.arrow.c.ArrowSchema schema = org.apache.arrow.c.ArrowSchema.allocateNew(allocator)
+            ) {
+                long rows;
+                try {
+                    rows = org.opensearch.mv.MVNativeBridge.buildArrow(
+                        staged.toString(),
+                        INPUT_TABLE,
+                        sql,
+                        array.memoryAddress(),
+                        schema.memoryAddress()
+                    );
+                } catch (RuntimeException noRows) {
+                    if (noRows.getMessage() != null && noRows.getMessage().contains("partial produced no batches")) {
+                        cleanupStaged(staged);
+                        return new Delta(new HashMap<>(), -1L, 0L);
+                    }
+                    throw noRows;
+                }
+                try (
+                    org.apache.arrow.vector.VectorSchemaRoot batch = org.apache.arrow.c.Data.importVectorSchemaRoot(
+                        allocator,
+                        array,
+                        schema,
+                        null
+                    )
+                ) {
+                    List<org.apache.arrow.vector.FieldVector> vectors = batch.getFieldVectors();
+                    if (batch.getRowCount() == 0) {
+                        return new Delta(new HashMap<>(), -1L, 0L);
+                    }
+                    long totalRowCount = ((Number) vectors.get(0).getObject(0)).longValue();
+                    Object maxSeq = vectors.get(1).getObject(0);
+                    long observedMax = maxSeq == null ? -1L : ((Number) maxSeq).longValue();
+                    logger.debug(
+                        "mv_pull definition [{}] coverage check range=({}, {}] totalRows={} observedMax={}",
+                        definitionName,
+                        fromExclusive,
+                        toInclusive,
+                        totalRowCount,
+                        observedMax
+                    );
+                    return new Delta(new HashMap<>(), observedMax, totalRowCount);
+                }
+            }
+        } finally {
+            cleanupStaged(staged);
+        }
+    }
+
     Path stageParquetFiles(List<Path> parquetFiles, long generation) throws IOException {
         Path staged = stagingRoot.resolve("artifact-" + generation);
         Files.createDirectories(staged);

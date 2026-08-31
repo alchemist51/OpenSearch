@@ -16,6 +16,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.engine.exec.coord.CatalogSnapshot;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.mv.MVConstants;
+import org.opensearch.mv.MVDefinitionSpec;
 import org.opensearch.mv.MVStateArtifactWriter;
 import org.opensearch.mv.MVStateDataFormat;
 import org.opensearch.threadpool.ThreadPool;
@@ -43,8 +44,12 @@ final class MVArtifactPoller implements Runnable, Closeable {
     private final IndexShard targetShard;
     private final MVPullSettings.Services services;
     private final MVRemoteSource source;
+    /** Legacy single-key group field; null when definition-driven. */
     private final String groupField;
+    /** Legacy single-key sum field; null when definition-driven. */
     private final String sumField;
+    /** Named definition for multi-key multi-metric pull; null for legacy mode. */
+    private final String definition;
     private final TimeValue interval;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Path workingPath;
@@ -61,15 +66,23 @@ final class MVArtifactPoller implements Runnable, Closeable {
         String sourceIndexName = MVPullSettings.SOURCE_INDEX.get(settings);
         int sourceShardId = targetShard.shardId().id();
         this.source = new MVRemoteSource(services, sourceIndexName, sourceShardId);
-        this.groupField = MVPullSettings.GROUP_FIELD.get(settings);
-        this.sumField = MVPullSettings.SUM_FIELD.get(settings);
+        String defName = MVPullSettings.DEFINITION.get(settings);
+        if (defName != null && defName.isEmpty() == false) {
+            this.definition = defName;
+            this.groupField = null;
+            this.sumField = null;
+        } else {
+            this.definition = null;
+            this.groupField = MVPullSettings.GROUP_FIELD.get(settings);
+            this.sumField = MVPullSettings.SUM_FIELD.get(settings);
+        }
         this.interval = MVPullSettings.PULL_INTERVAL.get(settings);
         this.watermark = recoveredWatermark(targetShard, sourceShardId);
         this.workingPath = targetShard.shardPath().getDataPath().resolve("mv_pull_work");
         Files.createDirectories(workingPath);
         this.workingDirectory = new NIOFSDirectory(workingPath);
         this.coverageReader = new MVDataFusionReadEngine(workingPath);
-        logger.info("mv_pull artifact poller starting shard={} from {}", targetShard.shardId(), watermark);
+        logger.info("mv_pull artifact poller starting shard={} from {} definition={}", targetShard.shardId(), watermark, definition);
     }
 
     void start() {
@@ -131,14 +144,9 @@ final class MVArtifactPoller implements Runnable, Closeable {
             return;
         }
 
-        MVDataFusionReadEngine.Delta coverage = coverageReader.searchDelta(
-            parquet,
-            groupField,
-            sumField,
-            current.seqNo(),
-            advert.maxSeqNo(),
-            advert.infosVersion()
-        );
+        MVDataFusionReadEngine.Delta coverage = definition != null
+            ? coverageReader.searchDeltaByDefinition(parquet, definition, current.seqNo(), advert.maxSeqNo(), advert.infosVersion())
+            : coverageReader.searchDelta(parquet, groupField, sumField, current.seqNo(), advert.maxSeqNo(), advert.infosVersion());
         if (coverage.observedMaxSeqNo() < 0L) {
             return;
         }
@@ -174,7 +182,9 @@ final class MVArtifactPoller implements Runnable, Closeable {
 
         long generation = targetShard.reserveDerivedArtifactGeneration();
         Path stagedParquet = coverageReader.stageParquetFiles(parquet, generation);
-        String filteredSql = partialSql(groupField, sumField, current.seqNo(), appliedThrough);
+        String filteredSql = definition != null
+            ? definitionPartialSql(definition, current.seqNo(), appliedThrough)
+            : partialSql(groupField, sumField, current.seqNo(), appliedThrough);
         MVStateArtifactWriter.Artifact artifact = artifactWriter.build(
             stagedParquet,
             MVConstants.INPUT_TABLE,
@@ -239,6 +249,29 @@ final class MVArtifactPoller implements Runnable, Closeable {
             MVConstants.INPUT_TABLE,
             groupField
         );
+    }
+
+    /**
+     * Generates the range-filtered partial SQL from a named MVDefinitionSpec.
+     * Wraps the definition's source SQL with a seq_no range filter subquery,
+     * supporting arbitrary GROUP BY keys and aggregate columns.
+     */
+    static String definitionPartialSql(String definitionName, long fromExclusive, long toInclusive) {
+        MVDefinitionSpec spec = MVDefinitionSpec.source(definitionName);
+        // The spec.sql() is the full definition SQL over mv_input.
+        // We need to inject the _seq_no range filter. The spec SQL is of the form:
+        //   SELECT ... FROM mv_input GROUP BY ...
+        // We replace "FROM mv_input" with "FROM (SELECT * FROM mv_input WHERE _seq_no > X AND _seq_no <= Y) AS mv_input"
+        String sql = spec.sql();
+        String filteredTable = String.format(
+            Locale.ROOT,
+            "(SELECT * FROM %s WHERE \"_seq_no\" > %d AND \"_seq_no\" <= %d) AS %s",
+            MVConstants.INPUT_TABLE,
+            fromExclusive,
+            toInclusive,
+            MVConstants.INPUT_TABLE
+        );
+        return sql.replace("FROM " + MVConstants.INPUT_TABLE, "FROM " + filteredTable);
     }
 
     private static MVWatermark recoveredWatermark(IndexShard shard, int sourceShardId) throws IOException {
