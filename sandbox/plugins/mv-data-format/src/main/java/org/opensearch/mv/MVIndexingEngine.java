@@ -142,6 +142,43 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
         boolean stateMergeEnabled,
         java.util.function.Supplier<TargetRoutingSnapshot> routingSnapshotSupplier
     ) {
+        this(
+            shardPath,
+            indexName,
+            spec,
+            format,
+            definitionName,
+            shipTargets,
+            clientSupplier,
+            clusterServiceSupplier,
+            stateMergeEnabled,
+            routingSnapshotSupplier,
+            null
+        );
+    }
+
+    /**
+     * Stage 4: primary constructor. {@code mergeDefinition} is the compiled MV
+     * definition resolved by the shared {@link MVDefinitionResolver} (persisted
+     * descriptor first, else legacy {@code compiledFor}). The plugin resolves it
+     * from the target's settings and passes it here so the target-side state
+     * merge honors a persisted descriptor. When {@code null} (legacy/test
+     * callers), the engine falls back to {@link MVCompiledDefinition#compiledFor}
+     * on {@code definitionName}, preserving prior behavior.
+     */
+    public MVIndexingEngine(
+        ShardPath shardPath,
+        String indexName,
+        MVDefinitionSpec spec,
+        org.opensearch.index.engine.dataformat.DataFormat format,
+        String definitionName,
+        java.util.List<String> shipTargets,
+        java.util.function.Supplier<org.opensearch.transport.client.Client> clientSupplier,
+        java.util.function.Supplier<org.opensearch.cluster.service.ClusterService> clusterServiceSupplier,
+        boolean stateMergeEnabled,
+        java.util.function.Supplier<TargetRoutingSnapshot> routingSnapshotSupplier,
+        MVCompiledDefinition mergeDefinition
+    ) {
         this.spec = spec;
         this.format = format;
         this.definitionName = definitionName;
@@ -156,24 +193,30 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
         if (this.shipTargets.isEmpty() == false) {
             mergeStrategy = new NoOpMVMergeStrategy();
         } else if (stateMergeEnabled && MVStateDataFormat.NAME.equals(format.name())) {
-            // Stage 4: compile the MV definition to extract ordering contract
-            // and per-column fold metadata for the streaming k-way merge
-            // engine. Compilation is now required — the legacy SQL merge path
-            // has been removed. If compilation fails, the merge strategy
-            // cannot be constructed and the engine falls back to no-op merge
-            // (no state merge for this shard until the definition is fixed).
-            MVCompiledDefinition compiledDef;
-            try {
-                compiledDef = MVCompiledDefinition.compiledFor(definitionName);
-            } catch (Exception e) {
-                org.apache.logging.log4j.LogManager.getLogger(MVIndexingEngine.class)
-                    .error(
-                        "mv merge: compiled definition unavailable for [{}]; "
-                            + "Stage 4 requires a compiled definition — state merge disabled for this shard",
-                        definitionName,
-                        e
-                    );
-                compiledDef = null;
+            // Stage 4: the streaming k-way merge engine needs the compiled MV
+            // definition (ordering contract + per-column fold metadata). Prefer
+            // the definition resolved by the shared MVDefinitionResolver
+            // (persisted descriptor first, else legacy compiledFor), passed in
+            // by the plugin from the target's settings. When absent (legacy /
+            // test callers), fall back to compiledFor(definitionName). If no
+            // definition can be obtained (e.g. a tampered/oversize descriptor
+            // caused the resolver to throw and the plugin passed null), the
+            // engine disables state merge for this shard (fail closed — never
+            // merge with incorrect fold semantics).
+            MVCompiledDefinition compiledDef = mergeDefinition;
+            if (compiledDef == null) {
+                try {
+                    compiledDef = MVCompiledDefinition.compiledFor(definitionName);
+                } catch (Exception e) {
+                    org.apache.logging.log4j.LogManager.getLogger(MVIndexingEngine.class)
+                        .error(
+                            "mv merge: compiled definition unavailable for [{}]; "
+                                + "Stage 4 requires a compiled definition — state merge disabled for this shard",
+                            definitionName,
+                            e
+                        );
+                    compiledDef = null;
+                }
             }
             if (compiledDef != null) {
                 // Stage 4: streaming merge with full ordering/accumulator metadata.

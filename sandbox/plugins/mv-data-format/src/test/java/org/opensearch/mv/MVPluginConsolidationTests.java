@@ -134,6 +134,7 @@ public class MVPluginConsolidationTests extends OpenSearchTestCase {
         }
         assertTrue("must register pull interval", settingKeys.contains("index.mv_pull.interval"));
         assertTrue("must register definition hash", settingKeys.contains("index.mv_pull.definition_hash"));
+        assertTrue("must register persisted MV descriptor setting", settingKeys.contains("index.mv.descriptor"));
     }
 
     // ── Format singletons are stable ──────────────────────────────────────

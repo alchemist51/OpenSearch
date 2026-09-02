@@ -887,12 +887,387 @@ pub(crate) async fn plan_partial_then_sort(
     Ok(Arc::new(SortExec::new(sort_exprs, partial)) as Arc<dyn ExecutionPlan>)
 }
 
+// ── Stage 3: Native schema cross-check (definition validation) ───────────
+//
+// A candidate MV definition is compiled on the Java side into a canonical
+// partial SQL + ordering contract + expected state-field layout. Before the
+// definition is accepted, we must confirm that the DataFusion engine will
+// *physically* produce exactly the state schema Java derived — otherwise a
+// drifted definition (wrong source column type, unknown column, a bad time
+// bucket expression, …) would only surface at ingest time, after the target
+// index is created. `validate_definition` plans (but never executes) the
+// partial+sort against the REAL source Arrow schema and returns the engine's
+// ACTUAL Partial-stage state schema plus the three deterministic hashes so
+// Java can fail closed on any disagreement.
+
+/// The outcome of a definition cross-check: the engine's ACTUAL Partial-stage
+/// state schema (ordered `(field_name, arrow_type_token)` pairs) plus the three
+/// deterministic hashes that Java also computes for cross-language comparison.
+#[derive(Debug, Clone)]
+pub struct DefinitionValidation {
+    /// Ordered `(field_name, arrow_type_token)` for each Partial-stage state
+    /// column, in physical output order.
+    pub state_fields: Vec<(String, String)>,
+    /// FNV-128 (lower-64) hash of the actual Partial-stage Arrow schema.
+    pub schema_hash: u64,
+    /// FNV-128 (lower-64) hash of the ordering-contract identity (matches
+    /// `MVGroupByOrdering.orderingIdentityHash()` on the Java side).
+    pub ordering_identity_hash: u64,
+    /// FNV-128 (lower-64) hash of the ordering-contract definition
+    /// (matches `MVGroupByOrdering.definitionIdentityHash()` on the Java side).
+    pub definition_hash: u64,
+}
+
+/// Map a canonical arrow type token to an Arrow [`DataType`] for building the
+/// source schema. The token set is the closed vocabulary the parquet
+/// data-format produces for OpenSearch mapping types (see
+/// `ArrowSchemaBuilder`/`*ParquetField.getArrowType()`), plus the temporal and
+/// binary types those fields can emit.
+pub fn arrow_token_to_type(token: &str) -> Result<arrow_schema::DataType, String> {
+    use arrow_schema::{DataType, TimeUnit};
+    Ok(match token {
+        "int8" => DataType::Int8,
+        "int16" => DataType::Int16,
+        "int32" => DataType::Int32,
+        "int64" => DataType::Int64,
+        "uint8" => DataType::UInt8,
+        "uint16" => DataType::UInt16,
+        "uint32" => DataType::UInt32,
+        "uint64" => DataType::UInt64,
+        "float16" => DataType::Float16,
+        "float32" => DataType::Float32,
+        "float64" => DataType::Float64,
+        "utf8" => DataType::Utf8,
+        "bool" | "boolean" => DataType::Boolean,
+        "timestamp_ms" => DataType::Timestamp(TimeUnit::Millisecond, None),
+        "date32" => DataType::Date32,
+        "date64" => DataType::Date64,
+        "binary" => DataType::Binary,
+        other => return Err(format!("unknown arrow type token '{other}'")),
+    })
+}
+
+/// Map an Arrow [`DataType`] back to a canonical token string for the result.
+/// Utf8/LargeUtf8/Utf8View collapse to `utf8`; Binary/LargeBinary to `binary`.
+/// Any type outside the closed vocabulary falls back to its lower-cased
+/// `Debug` rendering so callers still get a stable, comparable string.
+pub fn arrow_type_to_token(dt: &arrow_schema::DataType) -> String {
+    use arrow_schema::{DataType, TimeUnit};
+    match dt {
+        DataType::Int8 => "int8".to_string(),
+        DataType::Int16 => "int16".to_string(),
+        DataType::Int32 => "int32".to_string(),
+        DataType::Int64 => "int64".to_string(),
+        DataType::UInt8 => "uint8".to_string(),
+        DataType::UInt16 => "uint16".to_string(),
+        DataType::UInt32 => "uint32".to_string(),
+        DataType::UInt64 => "uint64".to_string(),
+        DataType::Float16 => "float16".to_string(),
+        DataType::Float32 => "float32".to_string(),
+        DataType::Float64 => "float64".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "utf8".to_string(),
+        DataType::Boolean => "bool".to_string(),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => "timestamp_ms".to_string(),
+        DataType::Timestamp(TimeUnit::Second, _) => "timestamp_s".to_string(),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => "timestamp_us".to_string(),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => "timestamp_ns".to_string(),
+        DataType::Date32 => "date32".to_string(),
+        DataType::Date64 => "date64".to_string(),
+        DataType::Binary | DataType::LargeBinary => "binary".to_string(),
+        other => format!("{other:?}").to_lowercase(),
+    }
+}
+
+/// Parse the source-schema wire encoding into an Arrow schema.
+///
+/// Wire format (chosen for determinism + zero extra deps, mirroring the
+/// existing newline-delimited `state_fields`/`state_paths` FFI convention in
+/// `df_create_mv_only_session_context`): newline-separated records, each
+/// `field_name \t arrow_type_token`. Blank lines are ignored. All fields are
+/// built nullable (Partial-stage grouping/aggregation is null-tolerant and the
+/// source parquet fields are themselves nullable).
+fn parse_source_schema(encoded: &str) -> Result<SchemaRef, String> {
+    use arrow_schema::{Field, Schema};
+    let mut fields = Vec::new();
+    for (lineno, line) in encoded.split('\n').enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, '\t');
+        let name = parts
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("source schema line {lineno}: missing field name"))?;
+        let token = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                format!("source schema line {lineno}: field '{name}' missing arrow type token")
+            })?;
+        let dt = arrow_token_to_type(token)
+            .map_err(|e| format!("source schema field '{name}': {e}"))?;
+        fields.push(Field::new(name, dt, true));
+    }
+    if fields.is_empty() {
+        return Err("source schema is empty".to_string());
+    }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Stage 3 native cross-check: plan the candidate definition's partial+sort
+/// against the REAL source Arrow schema and return the engine's ACTUAL
+/// Partial-stage state schema + hashes WITHOUT executing.
+///
+/// The source schema is registered as an EMPTY in-memory table (no rows), so
+/// planning binds column references and aggregate/expression output types
+/// exactly as it would over the real parquet source, but nothing is executed.
+/// Planning reuses [`plan_partial_then_sort`] — the single production planner —
+/// so the state schema returned here is byte-for-byte what the ingest path
+/// would physically produce.
+///
+/// Precise, non-panicking errors are returned for the failure modes a bad
+/// definition exhibits: unknown source column, unparseable SQL, and aggregate/
+/// expression type mismatches. The SQL text is echoed into planning errors so
+/// the offending column is always named.
+pub fn validate_definition(
+    source_schema_encoded: &str,
+    table_name: &str,
+    sql: &str,
+    ordering: &OrderingContract,
+) -> Result<DefinitionValidation, String> {
+    let schema = parse_source_schema(source_schema_encoded)?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("mv_validate_definition runtime: {e}"))?;
+
+    rt.block_on(async {
+        // Same session shape as the production build path (partial kept separate
+        // from final so `find_partial` inside `plan_partial_then_sort` resolves
+        // the Partial-stage node), minus the shared DataFusionRuntime — nothing
+        // executes, so no memory pool / disk manager is required.
+        let config = SessionConfig::new().with_target_partitions(1);
+        let state = SessionStateBuilder::new()
+            .with_config(config)
+            .with_default_features()
+            .with_physical_optimizer_rules(
+                crate::agg_mode::physical_optimizer_rules_without_combine(),
+            )
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        // Register the same UDF/UDAF surface the data-node session exposes so a
+        // definition using a custom function is not falsely rejected as unknown.
+        crate::udf::register_all(&ctx);
+        crate::udaf::register_all(&ctx);
+
+        let mem = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
+            .map_err(|e| format!("mv_validate_definition memtable: {e}"))?;
+        ctx.register_table(table_name, Arc::new(mem))
+            .map_err(|e| format!("mv_validate_definition register_table({table_name}): {e}"))?;
+
+        // Reuse the production planner — do NOT duplicate planning logic.
+        let sort_exec = plan_partial_then_sort(&ctx, sql, ordering)
+            .await
+            .map_err(|e| format!("mv_validate_definition: planning failed for SQL [{sql}]: {e}"))?;
+
+        let out_schema = sort_exec.schema();
+        let state_fields: Vec<(String, String)> = out_schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), arrow_type_to_token(f.data_type())))
+            .collect();
+
+        Ok(DefinitionValidation {
+            state_fields,
+            schema_hash: compute_schema_hash_u64(&out_schema),
+            ordering_identity_hash: compute_ordering_hash_u64(ordering),
+            definition_hash: compute_definition_hash_u64(ordering),
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{Int32Array, Int64Array, StringArray, UInt32Array, UInt64Array};
     use std::sync::Arc;
+
+    // ── Stage 3: validate_definition (native schema cross-check) tests ────
+
+    /// A valid multi-key / multi-aggregate definition plans cleanly and the
+    /// engine's ACTUAL Partial-stage state schema is returned in physical
+    /// order. Group-key columns keep their SELECT aliases; aggregate columns
+    /// carry whatever physical name the Partial aggregate assigns (asserted by
+    /// position + type, not by internal name). SUM/MIN/MAX/COUNT over Int64 all
+    /// stay Int64.
+    #[test]
+    fn test_validate_definition_valid_multi_key_multi_agg() {
+        let schema_enc = "event_bucket\tint64\nURL\tutf8\nUserID\tint64\nm0\tint64";
+        let sql = "SELECT \"event_bucket\", \"URL\", \"UserID\", \
+             SUM(\"m0\") AS m0_sum, MIN(\"m0\") AS m0_min, MAX(\"m0\") AS m0_max, \
+             COUNT(\"m0\") AS m0_cnt \
+             FROM mv_input GROUP BY \"event_bucket\", \"URL\", \"UserID\"";
+        let ordering = OrderingContract::from_parallel_arrays(&[0, 1, 2], &[0, 0, 0], &[0, 0, 0]);
+        let v = validate_definition(schema_enc, "mv_input", sql, &ordering).unwrap();
+
+        // 3 group keys + 4 aggregate state columns = 7 physical state fields.
+        assert_eq!(
+            v.state_fields.len(),
+            7,
+            "expected 7 state fields, got {:?}",
+            v.state_fields
+        );
+
+        // Group-key columns lead the layout with their aliases and source types.
+        assert_eq!(v.state_fields[0].0, "event_bucket");
+        assert_eq!(v.state_fields[0].1, "int64");
+        assert_eq!(v.state_fields[1].0, "URL");
+        assert_eq!(v.state_fields[1].1, "utf8");
+        assert_eq!(v.state_fields[2].0, "UserID");
+        assert_eq!(v.state_fields[2].1, "int64");
+
+        // Aggregate state columns: SUM/MIN/MAX/COUNT over Int64 → Int64.
+        for i in 3..7 {
+            assert_eq!(
+                v.state_fields[i].1, "int64",
+                "aggregate state field {} ({}) should be int64",
+                i, v.state_fields[i].0
+            );
+        }
+
+        assert_ne!(v.schema_hash, 0);
+        assert_eq!(v.ordering_identity_hash, compute_ordering_hash_u64(&ordering));
+        assert_eq!(v.definition_hash, compute_definition_hash_u64(&ordering));
+    }
+
+    /// An unknown source column is rejected with a precise, non-panicking error
+    /// that names the missing column.
+    #[test]
+    fn test_validate_definition_unknown_column() {
+        let schema_enc = "k0\tint64\nm0\tint64";
+        let sql =
+            "SELECT \"k0\", SUM(\"DoesNotExist\") AS s FROM mv_input GROUP BY \"k0\"";
+        let ordering = OrderingContract::from_parallel_arrays(&[0], &[0], &[0]);
+        let err = validate_definition(schema_enc, "mv_input", sql, &ordering)
+            .expect_err("unknown column must be rejected");
+        assert!(
+            err.contains("DoesNotExist"),
+            "error must name the unknown column, got: {err}"
+        );
+    }
+
+    /// DE7 date-bug regression: EventTime declared as `utf8` in the source but
+    /// used in a numeric bucket division. Planning fails closed with a precise
+    /// error that names the offending column.
+    #[test]
+    fn test_validate_definition_type_mismatch_de7_eventtime_utf8() {
+        let schema_enc = "EventTime\tutf8\nUserID\tint64";
+        // 5-minute bucket via numeric division on EventTime (which is Utf8 here).
+        let sql = "SELECT \"EventTime\" / 300000 AS event_bucket, COUNT(*) AS cnt \
+             FROM mv_input GROUP BY \"EventTime\" / 300000";
+        let ordering = OrderingContract::from_parallel_arrays(&[0], &[0], &[0]);
+        let err = validate_definition(schema_enc, "mv_input", sql, &ordering)
+            .expect_err("EventTime-as-utf8 numeric division must be rejected");
+        assert!(
+            err.contains("EventTime"),
+            "DE7 regression: error must name the EventTime column, got: {err}"
+        );
+    }
+
+    /// Hashes are deterministic across two independent calls for the same
+    /// definition + source schema.
+    #[test]
+    fn test_validate_definition_deterministic_hashes() {
+        let schema_enc = "k0\tint64\nk1\tutf8\nm0\tint64";
+        let sql = "SELECT \"k0\", \"k1\", SUM(\"m0\") AS s, COUNT(*) AS cnt \
+             FROM mv_input GROUP BY \"k0\", \"k1\"";
+        let ordering = OrderingContract::from_parallel_arrays(&[0, 1], &[0, 0], &[0, 0]);
+        let a = validate_definition(schema_enc, "mv_input", sql, &ordering).unwrap();
+        let b = validate_definition(schema_enc, "mv_input", sql, &ordering).unwrap();
+        assert_eq!(a.schema_hash, b.schema_hash, "schema hash deterministic");
+        assert_eq!(
+            a.ordering_identity_hash, b.ordering_identity_hash,
+            "ordering identity hash deterministic"
+        );
+        assert_eq!(
+            a.definition_hash, b.definition_hash,
+            "definition hash deterministic"
+        );
+        assert_eq!(
+            a.state_fields, b.state_fields,
+            "state fields deterministic"
+        );
+    }
+
+    /// Malformed SQL is rejected without panicking.
+    #[test]
+    fn test_validate_definition_malformed_sql() {
+        let schema_enc = "k0\tint64";
+        let sql = "SELECT SELECT FROM WHERE GROUP";
+        let ordering = OrderingContract::from_parallel_arrays(&[0], &[0], &[0]);
+        let err = validate_definition(schema_enc, "mv_input", sql, &ordering)
+            .expect_err("malformed SQL must be rejected");
+        assert!(!err.is_empty(), "error message must not be empty");
+    }
+
+    /// MIN/MAX preserve the source integer width: MIN over an Int16 source
+    /// column yields an Int16 state column. This documents the legitimate
+    /// integer-widening reality that motivates the Java-side type-FAMILY
+    /// comparison (rather than exact-width) in MVDefinitionValidator.
+    #[test]
+    fn test_validate_definition_min_preserves_int16_width() {
+        let schema_enc = "k0\tint64\nm0\tint16";
+        let sql = "SELECT \"k0\", MIN(\"m0\") AS m0_min, MAX(\"m0\") AS m0_max, COUNT(*) AS cnt \
+             FROM mv_input GROUP BY \"k0\"";
+        let ordering = OrderingContract::from_parallel_arrays(&[0], &[0], &[0]);
+        let v = validate_definition(schema_enc, "mv_input", sql, &ordering).unwrap();
+        // Find the MIN/MAX state columns by position: [k0, min, max, cnt].
+        assert_eq!(v.state_fields.len(), 4, "got {:?}", v.state_fields);
+        assert_eq!(v.state_fields[0].1, "int64", "group key k0 is int64");
+        assert_eq!(
+            v.state_fields[1].1, "int16",
+            "MIN over Int16 source preserves Int16 width, got {:?}",
+            v.state_fields
+        );
+        assert_eq!(
+            v.state_fields[2].1, "int16",
+            "MAX over Int16 source preserves Int16 width, got {:?}",
+            v.state_fields
+        );
+        assert_eq!(v.state_fields[3].1, "int64", "COUNT(*) is int64");
+    }
+
+    // ── arrow token mapping round-trip ───────────────────────────────────
+
+    #[test]
+    fn test_arrow_token_roundtrip() {
+        for token in [
+            "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float16",
+            "float32", "float64", "utf8", "bool", "timestamp_ms", "date32", "date64", "binary",
+        ] {
+            let dt = arrow_token_to_type(token).unwrap();
+            let back = arrow_type_to_token(&dt);
+            // "bool"/"boolean" both parse; canonical token is "bool".
+            let expected = if token == "boolean" { "bool" } else { token };
+            assert_eq!(back, expected, "round-trip for token {token}");
+        }
+    }
+
+    #[test]
+    fn test_arrow_token_unknown_rejected() {
+        let err = arrow_token_to_type("blahblah").expect_err("unknown token must error");
+        assert!(err.contains("blahblah"), "error must name the token, got: {err}");
+    }
+
+    #[test]
+    fn test_parse_source_schema_empty_rejected() {
+        let err = parse_source_schema("   \n  \n").expect_err("empty schema must be rejected");
+        assert!(err.contains("empty"), "got: {err}");
+    }
 
     #[test]
     fn test_ordering_contract_from_parallel_arrays() {

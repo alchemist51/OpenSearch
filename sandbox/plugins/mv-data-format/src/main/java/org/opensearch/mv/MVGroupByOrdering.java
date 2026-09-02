@@ -317,6 +317,49 @@ public final class MVGroupByOrdering {
     }
 
     /**
+     * Compute a deterministic u64 hash of the ordering-contract definition,
+     * matching the Rust {@code compute_definition_hash_u64()} function exactly.
+     *
+     * <p>Serialization format (byte-for-byte matching Rust):
+     * <ul>
+     *   <li>For each key, in order: {@code field_index} as u32 little-endian
+     *       (4 bytes), {@code direction} wire token as u32 little-endian
+     *       (4 bytes), {@code nullPlacement} wire token as u32 little-endian
+     *       (4 bytes)</li>
+     *   <li><b>No</b> trailing key count (unlike
+     *       {@link #orderingIdentityHash()})</li>
+     * </ul>
+     * Hashed with FNV-1a 128-bit, returns lower 64 bits.
+     *
+     * <p>This is the Java mirror of the {@code definition_hash} field returned
+     * by the native {@code df_mv_validate_definition} cross-check, so
+     * {@link MVDefinitionValidator} can fail closed on any disagreement between
+     * the descriptor-derived contract and what the engine physically produces.
+     *
+     * @return the u64 definition identity hash matching the native computation
+     */
+    public long definitionIdentityHash() {
+        // 12 bytes per key (three u32 LE), no trailer.
+        byte[] bytes = new byte[keys.size() * 12];
+        int pos = 0;
+        for (Key key : keys) {
+            pos = putIntLE(bytes, pos, key.stateFieldIndex());
+            pos = putIntLE(bytes, pos, key.direction().wireToken());
+            pos = putIntLE(bytes, pos, key.nullPlacement().wireToken());
+        }
+        return stableFnv1a128Lower64(bytes);
+    }
+
+    /** Write {@code v} as a little-endian u32 at {@code pos}; return the next position. */
+    private static int putIntLE(byte[] b, int pos, int v) {
+        b[pos] = (byte) (v);
+        b[pos + 1] = (byte) (v >>> 8);
+        b[pos + 2] = (byte) (v >>> 16);
+        b[pos + 3] = (byte) (v >>> 24);
+        return pos + 4;
+    }
+
+    /**
      * FNV-1a 128-bit hash returning the lower 64 bits. Matches the Rust
      * {@code stable_hash_u64()} function exactly (same offset basis and prime).
      */

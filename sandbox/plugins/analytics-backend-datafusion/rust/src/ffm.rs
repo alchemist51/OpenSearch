@@ -1026,6 +1026,114 @@ pub unsafe extern "C" fn df_mv_build_arrow_managed(
     Ok(rows)
 }
 
+/// Stage 3 native schema cross-check: plan (never execute) a candidate MV
+/// definition's partial+sort against the REAL source Arrow schema and write the
+/// engine's ACTUAL Partial-stage state schema + deterministic hashes into the
+/// caller buffer.
+///
+/// # Wire encoding
+///
+/// - `schema_ptr/len`: source schema as newline-separated `name \t arrow_token`
+///   records (the closed arrow-token vocabulary produced by the parquet
+///   data-format; see `arrow_token_to_type`). Mirrors the existing
+///   newline-delimited `state_fields` FFI convention.
+/// - `sql_ptr/len`: canonical partial SQL over `table_name`.
+/// - `ordering_*`: parallel int arrays (field index / direction / null
+///   placement) — the same wire format as `df_mv_build_managed`.
+///
+/// # Result (written to `out_ptr`, byte count into `out_len`)
+///
+/// Newline-separated records:
+/// ```text
+/// schema_hash\t<u64 decimal>
+/// ordering_identity_hash\t<u64 decimal>
+/// definition_hash\t<u64 decimal>
+/// field\t<name>\t<arrow_token>      (one per state column, in physical order)
+/// ```
+///
+/// Returns 0 on success. On a rejected definition (unknown column, unparseable
+/// SQL, type mismatch, malformed schema) returns the standard `#[ffm_safe]`
+/// negated error pointer with a precise, column-naming message; it never
+/// panics across the FFI boundary.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_validate_definition(
+    schema_ptr: *const u8,
+    schema_len: i64,
+    table_ptr: *const u8,
+    table_len: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    ordering_indices_ptr: *const i32,
+    ordering_dirs_ptr: *const i32,
+    ordering_nulls_ptr: *const i32,
+    ordering_len: i32,
+    out_ptr: *mut u8,
+    out_cap: i64,
+    out_len: *mut i64,
+) -> i64 {
+    let schema = str_from_raw(schema_ptr, schema_len)
+        .map_err(|e| format!("df_mv_validate_definition: schema: {}", e))?;
+    let table = str_from_raw(table_ptr, table_len)
+        .map_err(|e| format!("df_mv_validate_definition: table: {}", e))?;
+    let sql = str_from_raw(sql_ptr, sql_len)
+        .map_err(|e| format!("df_mv_validate_definition: sql: {}", e))?;
+
+    if ordering_len < 0 {
+        return Err(format!(
+            "df_mv_validate_definition: negative ordering_len {}",
+            ordering_len
+        ));
+    }
+    let len = ordering_len as usize;
+    if len > 0
+        && (ordering_indices_ptr.is_null()
+            || ordering_dirs_ptr.is_null()
+            || ordering_nulls_ptr.is_null())
+    {
+        return Err("df_mv_validate_definition: null ordering array".to_string());
+    }
+    let indices = if len == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(ordering_indices_ptr, len)
+    };
+    let dirs = if len == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(ordering_dirs_ptr, len)
+    };
+    let nulls = if len == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(ordering_nulls_ptr, len)
+    };
+    let ordering =
+        crate::mv_build_managed::OrderingContract::from_parallel_arrays(indices, dirs, nulls);
+
+    let validation = crate::mv_build_managed::validate_definition(schema, table, sql, &ordering)?;
+
+    let mut text = String::new();
+    text.push_str(&format!("schema_hash\t{}\n", validation.schema_hash));
+    text.push_str(&format!(
+        "ordering_identity_hash\t{}\n",
+        validation.ordering_identity_hash
+    ));
+    text.push_str(&format!("definition_hash\t{}\n", validation.definition_hash));
+    for (name, token) in &validation.state_fields {
+        text.push_str(&format!("field\t{}\t{}\n", name, token));
+    }
+
+    write_out_buffer(
+        text.as_bytes(),
+        out_ptr,
+        out_cap,
+        out_len,
+        "mv validate definition result",
+    )?;
+    Ok(0)
+}
+
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn df_sql_to_substrait(

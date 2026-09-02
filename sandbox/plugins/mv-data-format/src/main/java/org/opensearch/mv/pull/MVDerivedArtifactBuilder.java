@@ -22,6 +22,7 @@ import org.opensearch.index.engine.exec.WriterFileSet;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.mv.MVCompiledDefinition;
 import org.opensearch.mv.MVConstants;
+import org.opensearch.mv.MVDefinitionResolver;
 import org.opensearch.mv.MVGroupByOrdering;
 import org.opensearch.mv.MVStateDataFormat;
 
@@ -69,13 +70,17 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
 
         // Build compiled definition from settings
         Settings settings = indexSettings.getSettings();
-        String configuredDefinition = settings.get(MVConstants.DEFINITION_SETTING, "payments");
-        this.definitionName = configuredDefinition;
 
-        // Build from the single authoritative compiler (MVCompiledDefinition.compiledFor).
-        // Legacy group_field/sum_field fallback is removed — all pull builds
-        // use a named definition compiled via MVCompiledDefinition.buildPartialSql().
-        this.compiledDefinition = MVCompiledDefinition.compiledFor(configuredDefinition);
+        // Stage 4: resolve the authoritative definition through the single
+        // shared resolver — persisted descriptor FIRST (integrity-checked, fail
+        // closed), else the legacy named compiledFor() fallback. A tampered /
+        // oversize / unparseable / disagreeing descriptor throws here; because
+        // this constructor runs inside the DerivedShardPoller constructor (which
+        // NodeDerivedPullService wraps in a try/catch), a throw means the poller
+        // is never registered and never starts — definition identity is
+        // fail-closed across restarts.
+        this.definitionName = MVDefinitionResolver.definitionLabel(settings);
+        this.compiledDefinition = MVDefinitionResolver.resolve(settings);
 
         // Derive the ordering contract ONCE (immutable, thread-safe).
         this.ordering = compiledDefinition.groupByOrdering();

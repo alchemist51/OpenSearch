@@ -117,6 +117,28 @@ public final class MVConstants {
     /** Index setting naming the MV definition (POC named-spec registry). */
     public static final String DEFINITION_SETTING = "index.mv.definition";
 
+    /**
+     * Target index setting carrying the persisted, self-contained MV
+     * definition descriptor as compact JSON (Stage&nbsp;4). When present it is
+     * the authoritative definition source resolved FIRST by
+     * {@link MVDefinitionResolver}; {@link #DEFINITION_SETTING} /
+     * {@code index.derived.definition_id} remain a legacy named fallback.
+     *
+     * <p>The JSON is produced by
+     * {@link MVDefinitionDescriptor#toXContent} (which embeds the integrity
+     * {@code definition_hash}) and rebuilt via
+     * {@link MVCompiledDefinition#fromDescriptor}. A target created with this
+     * setting is self-contained across restarts and does not depend on the
+     * hardcoded {@link MVCompiledDefinition#compiledFor(String)} switch.
+     *
+     * <p>Registered as a PUBLIC, {@code Final}, {@code IndexScope} setting so
+     * the MV control plane (MVViewsService today; the Stage&nbsp;5 REST create
+     * endpoint next) can submit it directly in the create request — exactly
+     * like {@code index.derived.definition_id}. Private settings submitted via
+     * a client create request are rejected, so this cannot be private.
+     */
+    public static final String DESCRIPTOR_SETTING = "index.mv.descriptor";
+
     /** Marks a target as a first-class derived index with replication-only writes and no active translog. */
     public static final String DERIVED_INDEX_SETTING = org.opensearch.index.engine.DerivedIndexEngine.DERIVED_INDEX_SETTING;
     /**

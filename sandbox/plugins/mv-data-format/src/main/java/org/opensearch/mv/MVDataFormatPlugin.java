@@ -179,6 +179,10 @@ public class MVDataFormatPlugin extends Plugin
                 "payments",
                 org.opensearch.common.settings.Setting.Property.IndexScope
             ),
+            // Stage 4: persisted, self-contained MV definition descriptor JSON.
+            // Public + Final + IndexScope so the MV control plane can submit it
+            // in the create request (like index.derived.definition_id).
+            MVDefinitionResolver.DESCRIPTOR_SETTING,
             org.opensearch.common.settings.Setting.boolSetting(
                 MVConstants.DERIVED_INDEX_SETTING,
                 false,
@@ -245,8 +249,30 @@ public class MVDataFormatPlugin extends Plugin
         return java.util.List.of(
             new ActionHandler<>(MVShipStateAction.INSTANCE, MVShipStateTransportHandler.class),
             new ActionHandler<>(MVCursorAction.INSTANCE, MVCursorTransportHandler.class),
-            new ActionHandler<>(MVSourceCommitAction.INSTANCE, MVSourceCommitTransportHandler.class)
+            new ActionHandler<>(MVSourceCommitAction.INSTANCE, MVSourceCommitTransportHandler.class),
+            // Stage 5: MV definition control plane (validate + view CRUD).
+            new ActionHandler<>(MVValidateAction.INSTANCE, TransportMVValidateAction.class),
+            new ActionHandler<>(MVCreateViewAction.INSTANCE, TransportMVCreateViewAction.class),
+            new ActionHandler<>(MVGetViewAction.INSTANCE, TransportMVGetViewAction.class)
         );
+    }
+
+    /**
+     * Stage 5: REST endpoints for the MV definition control plane.
+     * {@code POST /_mv/_validate} (dry-run compile + validate) and
+     * {@code PUT/GET/DELETE /_mv/views/{name}} (view CRUD).
+     */
+    @Override
+    public java.util.List<org.opensearch.rest.RestHandler> getRestHandlers(
+        org.opensearch.common.settings.Settings settings,
+        org.opensearch.rest.RestController restController,
+        org.opensearch.common.settings.ClusterSettings clusterSettings,
+        org.opensearch.common.settings.IndexScopedSettings indexScopedSettings,
+        org.opensearch.common.settings.SettingsFilter settingsFilter,
+        org.opensearch.cluster.metadata.IndexNameExpressionResolver indexNameExpressionResolver,
+        java.util.function.Supplier<org.opensearch.cluster.node.DiscoveryNodes> nodesInCluster
+    ) {
+        return java.util.List.of(new RestMVValidateAction(), new RestMVViewAction());
     }
 
     @Override
@@ -290,6 +316,27 @@ public class MVDataFormatPlugin extends Plugin
             format = MVDataFormat.INSTANCE;
         }
 
+        // Stage 4: resolve the target-side merge definition through the shared
+        // MVDefinitionResolver (persisted descriptor first, else legacy
+        // compiledFor). A tampered / oversize / unparseable / disagreeing
+        // descriptor throws — we fail closed to a null merge definition so the
+        // engine disables state merge rather than merging with wrong fold
+        // semantics. Only consulted on the target-merge branch.
+        MVCompiledDefinition mergeDefinition = null;
+        if (isMvStateTarget && (shipTargets == null || shipTargets.isEmpty())) {
+            try {
+                mergeDefinition = MVDefinitionResolver.resolve(config.indexSettings().getSettings());
+            } catch (RuntimeException e) {
+                org.apache.logging.log4j.LogManager.getLogger(MVDataFormatPlugin.class)
+                    .error(
+                        "mv merge: definition resolution failed for target [{}]; state merge disabled for its shards",
+                        config.indexSettings().getIndex().getName(),
+                        e
+                    );
+                mergeDefinition = null;
+            }
+        }
+
         return new MVIndexingEngine(
             config.store().shardPath(),
             config.indexSettings().getIndex().getName(),
@@ -300,7 +347,8 @@ public class MVDataFormatPlugin extends Plugin
             () -> client,
             () -> clusterService,
             config.indexSettings().getSettings().getAsBoolean(MVConstants.STATE_MERGE_SETTING, false),
-            routingSnapshotService != null ? routingSnapshotService::current : () -> TargetRoutingSnapshot.EMPTY
+            routingSnapshotService != null ? routingSnapshotService::current : () -> TargetRoutingSnapshot.EMPTY,
+            mergeDefinition
         );
     }
 

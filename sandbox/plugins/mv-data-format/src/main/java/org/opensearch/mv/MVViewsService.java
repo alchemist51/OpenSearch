@@ -144,42 +144,39 @@ public final class MVViewsService {
         private void createTarget(IndexMetadata sourceMetadata, View view) {
             String source = sourceMetadata.getIndex().getName();
             int sourceShards = sourceMetadata.getNumberOfShards();
+
+            // Stage 4: compile the definition once and persist its self-contained
+            // descriptor (embeds the integrity definition_hash) so the target is
+            // resolvable across restarts without the compiledFor() switch. The
+            // descriptor is derived from the SAME compiledFor(definition) the
+            // target mapping is built from, so definition_id and descriptor agree
+            // by construction; validateCreation re-checks that agreement (and the
+            // size guard) fail-closed before the create request is submitted.
+            MVCompiledDefinition compiledDef = MVCompiledDefinition.compiledFor(view.definition());
+            String descriptorJson = MVDefinitionResolver.serialize(compiledDef.toDescriptor());
+
             // Submit only public settings; MetadataCreateIndexService enriches private binding.
-            CreateIndexRequest request = new CreateIndexRequest(view.targetIndex()).settings(
-                Settings.builder()
-                    .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_SOURCE_NAME, source)
-                    .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, view.definition())
-                    .put("index.number_of_shards", sourceShards)
-                    .put("index.number_of_replicas", 0)
-                    // Target search visibility is source-refresh-driven. The
-                    // ship handler explicitly refreshes after staging one
-                    // complete atomic batch; no scheduled target refresh may
-                    // publish rows independently of their source checkpoint.
-                    .put("index.refresh_interval", "-1")
-                    // First-class derived index: only the replication-owned
-                    // shard entry point may write. Its translog carries no
-                    // operation payloads; it persists only the checkpoint
-                    // required to select the newest safe target catalog.
-                    // Source parquet + cursor reconciliation is its data
-                    // recovery log.
-                    .put(MVConstants.DERIVED_INDEX_SETTING, true)
-                    .put("index.append_only.enabled", true)
-                    .put("index.pluggable.dataformat.enabled", true)
-                    .put("index.pluggable.dataformat", "composite")
-                    // Parquet stores the replicated rows; Lucene remains a
-                    // physical query-capability projection. The materialized-view
-                    // state artifact (mv_state) is NOT a secondary format — it is
-                    // owned by the derived category declared below and injected
-                    // into the composite store by the category resolution.
-                    .put("index.composite.primary_data_format", "parquet")
-                    .putList("index.composite.secondary_data_formats", "lucene")
-                    // Canonical DERIVED DATA-FORMAT CATEGORY: the single, immutable
-                    // declaration that this is a materialized-view derived target.
-                    .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DATA_FORMAT, MVDataFormat.NAME)
-                    .put(MVConstants.DEFINITION_SETTING, view.definition())
-                    .putList(MVConstants.STATE_FIELDS_SETTING, MVDefinitionSpec.source(view.definition()).shipFields())
-                    .put(MVConstants.COLOCATE_WITH_SETTING, source)
-            ).mapping(targetMapping(view.definition()));
+            // The common target contract (source binding, shards/replicas, refresh,
+            // derived category, composite parquet+lucene, colocation) is assembled by
+            // the shared MVViewCreation helper so the auto-creation path and the
+            // Stage 5 REST create path (PUT /_mv/views/{name}) are byte-identical.
+            // This (legacy named) path additionally carries the definition id/name for
+            // BWC; the REST path is descriptor-only and self-contained.
+            Settings targetSettings = MVViewCreation.commonTargetSettings(source, sourceShards)
+                .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, view.definition())
+                .put(MVConstants.DEFINITION_SETTING, view.definition())
+                // Stage 4: persisted self-contained descriptor (authoritative,
+                // resolved first by MVDefinitionResolver).
+                .put(MVConstants.DESCRIPTOR_SETTING, descriptorJson)
+                .putList(MVConstants.STATE_FIELDS_SETTING, MVDefinitionSpec.source(view.definition()).shipFields())
+                .build();
+
+            // Fail closed BEFORE submitting: descriptor is parseable, within the
+            // size guard, its integrity hash holds, and it agrees with definition_id.
+            MVDefinitionResolver.validateCreation(targetSettings);
+
+            CreateIndexRequest request = new CreateIndexRequest(view.targetIndex()).settings(targetSettings)
+                .mapping(targetMapping(view.definition()));
             client.admin().indices().create(request, ActionListener.wrap(r -> {
                 logger.info("mv views: created target [{}] for source [{}] (definition={})", view.targetIndex(), source, view.definition());
             }, e -> {
@@ -203,46 +200,10 @@ public final class MVViewsService {
         static String targetMapping(String definition) {
             // Single authoritative compiler — same instance shape the pull-side
             // artifact builder uses, so mapping, projection, hash, and SQL agree.
+            // Serialization is delegated to the shared MVViewCreation helper so the
+            // auto-creation and REST create paths emit an identical mapping.
             MVCompiledDefinition compiledDef = MVCompiledDefinition.compiledFor(definition);
-            MVMappingGenerator generator = new MVMappingGenerator();
-            java.util.Map<String, Object> mapping = generator.generateMapping(compiledDef);
-
-            // Serialize to JSON with dynamic:false and provenance field
-            @SuppressWarnings("unchecked")
-            java.util.Map<String, Object> properties = (java.util.Map<String, Object>) mapping.get("properties");
-            // Add provenance field
-            java.util.Map<String, Object> provenance = new java.util.LinkedHashMap<>();
-            provenance.put("type", "long");
-            provenance.put("index", false);
-            properties.put("_mv_source_generation", provenance);
-
-            StringBuilder sb = new StringBuilder("{\"dynamic\":\"false\",\"_field_names\":{\"enabled\":false},\"properties\":{");
-            boolean first = true;
-            for (java.util.Map.Entry<String, Object> entry : properties.entrySet()) {
-                if (first == false) {
-                    sb.append(",");
-                }
-                first = false;
-                @SuppressWarnings("unchecked")
-                java.util.Map<String, Object> fieldMap = (java.util.Map<String, Object>) entry.getValue();
-                sb.append("\"").append(entry.getKey()).append("\":{");
-                boolean firstField = true;
-                for (java.util.Map.Entry<String, Object> fe : fieldMap.entrySet()) {
-                    if (firstField == false) {
-                        sb.append(",");
-                    }
-                    firstField = false;
-                    sb.append("\"").append(fe.getKey()).append("\":");
-                    if (fe.getValue() instanceof Boolean) {
-                        sb.append(fe.getValue());
-                    } else {
-                        sb.append("\"").append(fe.getValue()).append("\"");
-                    }
-                }
-                sb.append("}");
-            }
-            sb.append("}}");
-            return sb.toString();
+            return MVViewCreation.targetMapping(compiledDef);
         }
     }
 }

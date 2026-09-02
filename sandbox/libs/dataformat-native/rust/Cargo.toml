@@ -84,11 +84,23 @@ opensearch-repository-azure = { path = "../../../plugins/native-repository-azure
 opensearch-repository-fs = { path = "../../../plugins/native-repository-fs/src/main/rust" }
 
 [profile.release]
+# Default: fast iteration builds (lto off) for dev, tests, and local nodes.
+# Benchmark/production artifacts MUST use the committed `bench-lto` profile
+# below (cargo build --profile bench-lto; output in target/bench-lto/) and be
+# verified by SHA-256 + inode in /proc/<pid>/maps before any performance run.
+lto = false
+codegen-units = 16
+incremental = true
+debug = "line-tables-only"
+strip = false
+
+# Full-LTO profile for benchmark and production artifacts. No env overrides —
+# select it explicitly with: cargo build --profile bench-lto
+[profile.bench-lto]
+inherits = "release"
 lto = true
 codegen-units = 1
 incremental = false
-debug = "line-tables-only"
-strip = false
 
 [profile.dev]
 opt-level = 1

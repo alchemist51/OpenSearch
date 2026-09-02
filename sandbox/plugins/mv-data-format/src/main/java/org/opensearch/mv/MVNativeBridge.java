@@ -49,6 +49,7 @@ public final class MVNativeBridge {
     private static final MethodHandle MV_BUILD_RESULT_ABI_VERSION;
     private static final MethodHandle MV_CREATE_GLOBAL_RUNTIME;
     private static final MethodHandle MV_CLOSE_GLOBAL_RUNTIME;
+    private static final MethodHandle MV_VALIDATE_DEFINITION;
 
     static {
         Linker linker = Linker.nativeLinker();
@@ -327,6 +328,30 @@ public final class MVNativeBridge {
         MV_CLOSE_GLOBAL_RUNTIME = linker.downcallHandle(
             lib.find("df_close_global_runtime").orElseThrow(() -> new IllegalStateException("df_close_global_runtime not found")),
             FunctionDescriptor.ofVoid(ValueLayout.JAVA_LONG)
+        );
+        // Stage 3: native schema cross-check for a candidate MV definition.
+        // i64 df_mv_validate_definition(schema_ptr, schema_len, table_ptr, table_len,
+        //   sql_ptr, sql_len, ordering_indices_ptr, ordering_dirs_ptr, ordering_nulls_ptr,
+        //   ordering_len, out_ptr, out_cap, out_len)
+        MV_VALIDATE_DEFINITION = linker.downcallHandle(
+            lib.find("df_mv_validate_definition")
+                .orElseThrow(() -> new IllegalStateException("df_mv_validate_definition not found")),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,          // schema_ptr (newline/tab source schema)
+                ValueLayout.JAVA_LONG,        // schema_len
+                ValueLayout.ADDRESS,          // table_ptr
+                ValueLayout.JAVA_LONG,        // table_len
+                ValueLayout.ADDRESS,          // sql_ptr
+                ValueLayout.JAVA_LONG,        // sql_len
+                ValueLayout.ADDRESS,          // ordering_indices_ptr (int[])
+                ValueLayout.ADDRESS,          // ordering_dirs_ptr (int[])
+                ValueLayout.ADDRESS,          // ordering_nulls_ptr (int[])
+                ValueLayout.JAVA_INT,         // ordering_len
+                ValueLayout.ADDRESS,          // out_ptr
+                ValueLayout.JAVA_LONG,        // out_cap
+                ValueLayout.ADDRESS           // out_len
+            )
         );
     }
 
@@ -913,6 +938,77 @@ public final class MVNativeBridge {
                 spillFileCountLimit,
                 outResultBuf
             );
+        }
+    }
+
+    // ── Stage 3: Native schema cross-check (definition validation) ───────
+
+    /**
+     * Stage 3 native cross-check: plan (never execute) a candidate MV
+     * definition's canonical partial SQL + ordering contract against the REAL
+     * source Arrow schema and return the engine's ACTUAL Partial-stage state
+     * schema + deterministic hashes as a small text document.
+     *
+     * <p>This is the thin FFI binding; the fail-closed comparison against the
+     * descriptor-derived expectation lives in
+     * {@link MVDefinitionValidator}. The returned text is parsed there.</p>
+     *
+     * <p>Wire encodings (see {@code df_mv_validate_definition}):</p>
+     * <ul>
+     *   <li><b>Input</b> {@code sourceSchema}: newline-separated
+     *       {@code name\tarrow_token} records.</li>
+     *   <li><b>Output</b> (returned string): newline-separated records —
+     *       {@code schema_hash\t<u64>}, {@code ordering_identity_hash\t<u64>},
+     *       {@code definition_hash\t<u64>}, then one
+     *       {@code field\t<name>\t<arrow_token>} per state column in physical
+     *       order.</li>
+     * </ul>
+     *
+     * @param sourceSchema     newline/tab-encoded source schema (arrow tokens)
+     * @param tableName        DataFusion table name the SQL is written against
+     *                         (canonically {@link MVConstants#INPUT_TABLE})
+     * @param sql              canonical partial SQL
+     * @param orderingIndices  state-field indices for the sort key
+     * @param orderingDirs     direction wire tokens (0=ASC)
+     * @param orderingNulls    null-placement wire tokens (0=NULLS_FIRST)
+     * @return the native result text (see above)
+     * @throws RuntimeException if the definition is rejected (unknown column,
+     *                          unparseable SQL, type mismatch, bad schema) —
+     *                          the message is the precise native error
+     */
+    public static String validateDefinition(
+        String sourceSchema,
+        String tableName,
+        String sql,
+        int[] orderingIndices,
+        int[] orderingDirs,
+        int[] orderingNulls
+    ) {
+        try (var call = new NativeCall()) {
+            var schema = call.str(sourceSchema);
+            var table = call.str(tableName);
+            var query = call.str(sql);
+            var indices = call.intArray(orderingIndices);
+            var dirs = call.intArray(orderingDirs);
+            var nulls = call.intArray(orderingNulls);
+            var out = call.outBuffer(256 * 1024);
+            call.invoke(
+                MV_VALIDATE_DEFINITION,
+                schema.segment(),
+                schema.len(),
+                table.segment(),
+                table.len(),
+                query.segment(),
+                query.len(),
+                indices.segment(),
+                dirs.segment(),
+                nulls.segment(),
+                orderingIndices.length,
+                out.data(),
+                (long) out.capacity(),
+                out.lenOut()
+            );
+            return new String(out.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
         }
     }
 }

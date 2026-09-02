@@ -103,6 +103,53 @@ public final class MVCompiledDefinition {
         return new MVCompiledDefinition(groupKeys, aggregates);
     }
 
+    // ── Descriptor round-trip ─────────────────────────────────────────────
+
+    /**
+     * Build a compiled definition from a versioned, serializable
+     * {@link MVDefinitionDescriptor}. This is the language-agnostic entry point
+     * that replaces the hardcoded {@link #compiledFor(String)} switch: a
+     * definition compiled from PPL (Stage&nbsp;2) is persisted as a descriptor
+     * and rebuilt here, going through the exact same
+     * {@code (GroupKey, AggregateSpec)} constructor path as the typed builders,
+     * so partial SQL, fold SQL, {@code state_fields}/projection order, target
+     * mapping, ordering identity, and hash are all recomputed identically.
+     *
+     * <p>If the descriptor carries an optional integrity
+     * {@link MVDefinitionDescriptor#definitionHash()}, it is validated against
+     * the recomputed hash and the load <b>fails closed</b> on mismatch.</p>
+     *
+     * @throws IllegalArgumentException if the descriptor is invalid or its
+     *                                  integrity hash does not match the
+     *                                  recomputed definition hash
+     */
+    public static MVCompiledDefinition fromDescriptor(MVDefinitionDescriptor descriptor) {
+        Objects.requireNonNull(descriptor, "descriptor");
+        MVCompiledDefinition def = new MVCompiledDefinition(descriptor.toGroupKeys(), descriptor.toAggregateSpecs());
+        descriptor.definitionHash().ifPresent(expected -> {
+            if (expected.equals(def.definitionHash) == false) {
+                throw new IllegalArgumentException(
+                    String.format(
+                        Locale.ROOT,
+                        "MV descriptor integrity check failed: descriptor hash [%s] does not match recomputed definition hash [%s]",
+                        expected,
+                        def.definitionHash
+                    )
+                );
+            }
+        });
+        return def;
+    }
+
+    /**
+     * Export this compiled definition to a versioned, serializable descriptor
+     * (with its integrity hash embedded). Lets existing named definitions be
+     * persisted/transported and rebuilt via {@link #fromDescriptor}.
+     */
+    public MVDefinitionDescriptor toDescriptor() {
+        return MVDefinitionDescriptor.fromCompiled(this);
+    }
+
     // ── Authoritative compiler ────────────────────────────────────────────
 
     /**
