@@ -194,8 +194,13 @@ public final class MVDefinitionValidator {
         for (int i = 0; i < n; i++) {
             StateField nf = nr.fields.get(i);
 
-            // 2. Group-key name + order (aggregate names are engine-internal).
-            if (i < numGroupKeys && expectedNames.get(i).equals(nf.name()) == false) {
+            // 2. Group-key name + order — ONLY for plain-column keys. A DERIVED
+            //    (expression) group key is named by the engine after its
+            //    Partial-stage expression (e.g. "mv_input.EventTime / Int64(300000)"),
+            //    NOT the user-visible SELECT alias — exactly like aggregate state
+            //    columns. Its name is therefore engine-internal and intentionally
+            //    not name-compared; its position and type family still are.
+            if (i < numGroupKeys && def.groupKeys().get(i).isPlainColumn() && expectedNames.get(i).equals(nf.name()) == false) {
                 mismatches.add(
                     String.format(
                         Locale.ROOT,
