@@ -17,6 +17,7 @@ import org.opensearch.index.engine.derived.pull.spi.DerivedArtifactBuilder;
 import org.opensearch.index.engine.derived.pull.spi.DerivedPullFormat;
 import org.opensearch.index.engine.derived.pull.spi.DerivedSourceReader;
 import org.opensearch.index.engine.derived.pull.spi.DerivedSourceSnapshot;
+import org.opensearch.index.engine.derived.pull.spi.PollRoundStats;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -25,7 +26,11 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 
 /**
@@ -57,6 +62,15 @@ public final class DerivedShardPoller implements Runnable, Closeable {
     private final Path workingDir;
 
     private volatile long currentWatermark;
+
+    // ── Cumulative stage metrics (thread-safe) ──────────────────────────
+    private final AtomicLong roundCount = new AtomicLong();
+    private final AtomicLong successCount = new AtomicLong();
+    private final AtomicLong failureCount = new AtomicLong();
+    private final Map<String, StageAccumulator> cumulativeStages = new HashMap<>();
+    /** Per-round samples, bounded to the last 256 rounds. */
+    private final ConcurrentLinkedDeque<PollRoundStats> roundSamples = new ConcurrentLinkedDeque<>();
+    private static final int MAX_SAMPLES = 256;
 
     /**
      * Creates a new poller for the given target shard.
@@ -132,6 +146,9 @@ public final class DerivedShardPoller implements Runnable, Closeable {
     }
 
     private void pollRound() throws IOException {
+        roundCount.incrementAndGet();
+        PollRoundStats.Builder statsBuilder = new PollRoundStats.Builder().startRound();
+
         // Check we're still a primary
         if (targetShard.routingEntry().primary() == false) {
             logger.info("derived_pull [{}] shard [{}] is no longer primary; closing poller", formatId, targetShard.shardId());
@@ -140,7 +157,9 @@ public final class DerivedShardPoller implements Runnable, Closeable {
         }
 
         // Step 1: Fetch snapshot from remote source
+        long t0 = System.nanoTime();
         DerivedSourceSnapshot snapshot = reader.fetchSnapshot(targetShard.routingEntry(), currentWatermark);
+        statsBuilder.stage("fetch_snapshot", System.nanoTime() - t0);
         if (snapshot == null) {
             return; // No new data
         }
@@ -151,33 +170,87 @@ public final class DerivedShardPoller implements Runnable, Closeable {
         // Step 2: Download to staging directory
         Path stageDir = workingDir.resolve("stage-" + snapshot.watermark());
         Files.createDirectories(stageDir);
+        BuildResult result = null;
         try {
+            long t1 = System.nanoTime();
             reader.downloadToStage(snapshot, stageDir);
+            statsBuilder.stage("download", System.nanoTime() - t1);
 
             // Step 3: Build artifact
-            BuildResult result = builder.build(snapshot, stageDir, targetShard);
-            if (result.success()) {
-                long previousWatermark = currentWatermark;
-                currentWatermark = snapshot.watermark();
-                logger.info(
-                    "derived_pull [{}] shard [{}] published artifact={} watermark {} -> {} stats={}",
-                    formatId,
-                    targetShard.shardId(),
-                    result.artifactId(),
-                    previousWatermark,
-                    currentWatermark,
-                    result.stats()
-                );
-            } else {
-                logger.warn(
-                    "derived_pull [{}] shard [{}] build failed for watermark {}; will retry",
-                    formatId,
-                    targetShard.shardId(),
-                    snapshot.watermark()
-                );
+            long t2 = System.nanoTime();
+            result = builder.build(snapshot, stageDir, targetShard);
+            statsBuilder.stage("build", System.nanoTime() - t2);
+
+            // Merge build-specific sub-stage stats: entries whose key ends
+            // with "_nanos" are treated as stage durations and get full
+            // cumulative count/total/mean/max tracking via StageAccumulator;
+            // everything else is recorded as a simple counter.
+            if (result != null) {
+                result.stats().forEach((k, v) -> {
+                    if (v instanceof Number) {
+                        if (k.endsWith("_nanos")) {
+                            statsBuilder.stage(k, ((Number) v).longValue());
+                        } else {
+                            statsBuilder.counter(k, ((Number) v).longValue());
+                        }
+                    }
+                });
             }
         } finally {
+            long t3 = System.nanoTime();
             cleanupStageDir(stageDir);
+            statsBuilder.stage("cleanup", System.nanoTime() - t3);
+        }
+
+        if (result != null && result.success()) {
+            successCount.incrementAndGet();
+            long previousWatermark = currentWatermark;
+            currentWatermark = snapshot.watermark();
+            statsBuilder.counter("source_watermark", snapshot.watermark());
+            statsBuilder.counter("target_watermark", currentWatermark);
+            statsBuilder.counter("lag", Math.max(0L, snapshot.watermark() - currentWatermark));
+            statsBuilder.counter("round_success", 1L);
+
+            // Finalize only after outcome/watermark counters are recorded.
+            PollRoundStats roundStats = statsBuilder.build();
+            recordRoundStats(roundStats);
+            logger.info(
+                "derived_pull [{}] shard [{}] published artifact={} watermark {} -> {} stats={}",
+                formatId,
+                targetShard.shardId(),
+                result.artifactId(),
+                previousWatermark,
+                currentWatermark,
+                roundStats
+            );
+        } else {
+            failureCount.incrementAndGet();
+            statsBuilder.counter("source_watermark", snapshot.watermark());
+            statsBuilder.counter("target_watermark", currentWatermark);
+            statsBuilder.counter("lag", Math.max(0L, snapshot.watermark() - currentWatermark));
+            statsBuilder.counter("round_success", 0L);
+
+            PollRoundStats roundStats = statsBuilder.build();
+            recordRoundStats(roundStats);
+            logger.warn(
+                "derived_pull [{}] shard [{}] build failed for watermark {}; will retry. stats={}",
+                formatId,
+                targetShard.shardId(),
+                snapshot.watermark(),
+                roundStats
+            );
+        }
+    }
+
+    private void recordRoundStats(PollRoundStats stats) {
+        roundSamples.addLast(stats);
+        while (roundSamples.size() > MAX_SAMPLES) {
+            roundSamples.pollFirst();
+        }
+        // Accumulate each named stage plus the total round duration.
+        synchronized (cumulativeStages) {
+            stats.stageNanos().forEach((stage, nanos) -> cumulativeStages.computeIfAbsent(stage, k -> new StageAccumulator()).add(nanos));
+            cumulativeStages.computeIfAbsent("total_round", k -> new StageAccumulator()).add(stats.totalNanos());
         }
     }
 
@@ -212,6 +285,82 @@ public final class DerivedShardPoller implements Runnable, Closeable {
     /** Returns whether this poller has been closed. */
     public boolean isClosed() {
         return closed.get();
+    }
+
+    /** Returns the total number of poll rounds attempted. */
+    public long roundCount() {
+        return roundCount.get();
+    }
+
+    /** Returns the number of successful build rounds. */
+    public long successCount() {
+        return successCount.get();
+    }
+
+    /** Returns the number of failed build rounds. */
+    public long failureCount() {
+        return failureCount.get();
+    }
+
+    /** Returns cumulative stage metrics (count/total/mean/max per stage). */
+    public Map<String, StageAccumulator> cumulativeStages() {
+        synchronized (cumulativeStages) {
+            return new HashMap<>(cumulativeStages);
+        }
+    }
+
+    /** Returns the per-round samples (most recent up to 256 rounds). */
+    public java.util.List<PollRoundStats> roundSamples() {
+        return java.util.List.copyOf(roundSamples);
+    }
+
+    /**
+     * Cumulative stage timing accumulator: count, total nanos, max nanos.
+     * Mean is computed as total/count. Suitable for offline p50/p90/p95/p99
+     * when combined with per-round samples.
+     *
+     * @opensearch.experimental
+     */
+    @ExperimentalApi
+    public static final class StageAccumulator {
+        private long count;
+        private long totalNanos;
+        private long maxNanos;
+
+        void add(long nanos) {
+            count++;
+            totalNanos += nanos;
+            maxNanos = Math.max(maxNanos, nanos);
+        }
+
+        public long count() {
+            return count;
+        }
+
+        public long totalNanos() {
+            return totalNanos;
+        }
+
+        public long maxNanos() {
+            return maxNanos;
+        }
+
+        public long meanNanos() {
+            return count > 0 ? totalNanos / count : 0;
+        }
+
+        @Override
+        public String toString() {
+            return "count="
+                + count
+                + " total="
+                + (totalNanos / 1_000_000)
+                + "ms mean="
+                + (meanNanos() / 1_000_000)
+                + "ms max="
+                + (maxNanos / 1_000_000)
+                + "ms";
+        }
     }
 
     @Override

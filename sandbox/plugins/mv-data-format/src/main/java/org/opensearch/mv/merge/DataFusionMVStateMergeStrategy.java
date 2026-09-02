@@ -16,6 +16,7 @@ import org.opensearch.index.engine.dataformat.MergeResult;
 import org.opensearch.index.engine.exec.MonoFileWriterSet;
 import org.opensearch.index.engine.exec.WriterFileSet;
 import org.opensearch.index.shard.ShardPath;
+import org.opensearch.mv.MVCompiledDefinition;
 import org.opensearch.mv.MVConstants;
 import org.opensearch.mv.MVNativeBridge;
 
@@ -33,6 +34,14 @@ import java.util.Map;
  * <p>The generic data-format merge framework selects candidates and schedules
  * the merge. This strategy only defines the format operation:
  * {@code STATE + STATE -> STATE}.
+ *
+ * <p><b>Stage 4:</b> Merges always use the {@code merge_state_streams} FFI
+ * which carries the full ordering contract and accumulator metadata across
+ * the boundary. The Rust side validates that all inputs share the expected
+ * ordering and applies the correct per-column fold function (SUM-fold for
+ * SUM/COUNT, MIN-fold for MIN, MAX-fold for MAX). The legacy SQL-based
+ * {@code df_mv_merge_state} path has been removed — all merge callers now
+ * go through the streaming engine with typed metadata.
  */
 public final class DataFusionMVStateMergeStrategy implements MVMergeStrategy {
 
@@ -40,18 +49,89 @@ public final class DataFusionMVStateMergeStrategy implements MVMergeStrategy {
 
     private final DataFormat dataFormat;
     private final ShardPath shardPath;
+    /**
+     * @deprecated Retained only for API compatibility with callers that still
+     *             pass fold SQL. The streaming merge engine ignores this field
+     *             entirely — fold semantics are derived from the compiled
+     *             definition's accumulator metadata.
+     */
+    @Deprecated(forRemoval = true)
     private final String foldSql;
-    private final StateFileMerger stateFileMerger;
+    private final MVCompiledDefinition compiledDefinition;
+    private final StreamingMerger streamingMerger;
 
-    public DataFusionMVStateMergeStrategy(DataFormat dataFormat, ShardPath shardPath, String foldSql) {
-        this(dataFormat, shardPath, foldSql, MVNativeBridge::mergeStateFiles);
+    /**
+     * Stage 4: Primary constructor with compiled definition for streaming merge.
+     *
+     * @param dataFormat         the MV data format
+     * @param shardPath          shard data path
+     * @param foldSql            fold SQL template (retained for API compatibility;
+     *                           ignored by the streaming merge engine)
+     * @param compiledDefinition compiled MV definition (carries ordering +
+     *                           aggregate metadata); must not be null
+     * @param runtimePtr         retained for API compatibility; no longer
+     *                           consulted by the merge gate
+     * @throws IllegalArgumentException if compiledDefinition is null
+     */
+    public DataFusionMVStateMergeStrategy(
+        DataFormat dataFormat,
+        ShardPath shardPath,
+        String foldSql,
+        MVCompiledDefinition compiledDefinition,
+        long runtimePtr
+    ) {
+        this(dataFormat, shardPath, foldSql, compiledDefinition, MVNativeBridge::mergeStateStreams);
     }
 
-    DataFusionMVStateMergeStrategy(DataFormat dataFormat, ShardPath shardPath, String foldSql, StateFileMerger stateFileMerger) {
+    /**
+     * Test-injectable constructor for unit tests that want to capture the FFI
+     * parameters without invoking the native library.
+     */
+    DataFusionMVStateMergeStrategy(
+        DataFormat dataFormat,
+        ShardPath shardPath,
+        String foldSql,
+        MVCompiledDefinition compiledDefinition,
+        StreamingMerger streamingMerger
+    ) {
+        if (compiledDefinition == null) {
+            throw new IllegalArgumentException(
+                "Stage 4: compiledDefinition is required — the legacy SQL merge path has been removed. "
+                    + "Ensure MVCompiledDefinition.compiledFor(definitionName) succeeds before constructing the merge strategy."
+            );
+        }
         this.dataFormat = dataFormat;
         this.shardPath = shardPath;
         this.foldSql = foldSql;
-        this.stateFileMerger = stateFileMerger;
+        this.compiledDefinition = compiledDefinition;
+        this.streamingMerger = streamingMerger;
+    }
+
+    /**
+     * Legacy constructor without compiled definition.
+     *
+     * @deprecated Stage 4: The legacy SQL merge path has been removed. Use the
+     *             constructor that accepts a {@link MVCompiledDefinition}.
+     *             This constructor now throws {@link IllegalArgumentException}.
+     */
+    @Deprecated(forRemoval = true)
+    public DataFusionMVStateMergeStrategy(DataFormat dataFormat, ShardPath shardPath, String foldSql) {
+        throw new IllegalArgumentException(
+            "Stage 4: The legacy SQL merge path has been removed. Use the constructor "
+                + "that accepts an MVCompiledDefinition for streaming merge with full metadata."
+        );
+    }
+
+    /**
+     * @deprecated Stage 4: Use the test-injectable constructor that accepts
+     *             a {@link StreamingMerger} and {@link MVCompiledDefinition}.
+     */
+    @Deprecated(forRemoval = true)
+    DataFusionMVStateMergeStrategy(DataFormat dataFormat, ShardPath shardPath, String foldSql, StateFileMerger stateFileMerger) {
+        throw new IllegalArgumentException(
+            "Stage 4: The legacy StateFileMerger interface has been replaced by StreamingMerger. "
+                + "Use the constructor that accepts MVCompiledDefinition and StreamingMerger."
+        );
     }
 
     @Override
@@ -85,7 +165,9 @@ public final class DataFusionMVStateMergeStrategy implements MVMergeStrategy {
         Path outputFile = outputDirectory.resolve(MVConstants.mvFileName(writerGeneration));
 
         try {
-            long rows = stateFileMerger.merge(stateFiles.stream().map(Path::toString).toList(), foldSql, outputFile.toString());
+            List<String> inputPaths = stateFiles.stream().map(Path::toString).toList();
+            long rows = mergeWithStreaming(inputPaths, outputFile.toString());
+
             MonoFileWriterSet mergedFiles = MonoFileWriterSet.of(
                 outputDirectory,
                 writerGeneration,
@@ -110,8 +192,67 @@ public final class DataFusionMVStateMergeStrategy implements MVMergeStrategy {
         }
     }
 
+    /**
+     * Stage 4: Merge through the streaming FFI with ordering and accumulator
+     * metadata. Uses the compiled definition's
+     * {@link MVCompiledDefinition.MergeCallParams} to resolve all FFI
+     * parameters in one call.
+     */
+    private long mergeWithStreaming(List<String> inputPaths, String outputPath) {
+        MVCompiledDefinition.MergeCallParams params = compiledDefinition.buildMergeCallParams();
+
+        // Validate ordering identity before merge — catches schema drift early
+        String expectedIdentity = compiledDefinition.groupByOrdering().orderingIdentity();
+        if (expectedIdentity.equals(params.orderingIdentity()) == false) {
+            throw new IllegalStateException(
+                "MV merge ordering identity mismatch: compiled definition says ["
+                    + expectedIdentity
+                    + "] but MergeCallParams says ["
+                    + params.orderingIdentity()
+                    + "]"
+            );
+        }
+
+        logger.debug(
+            "mv_merge streaming: {} inputs, {} ordering keys, {} total columns, identity=[{}]",
+            inputPaths.size(),
+            params.orderingIndices().length,
+            params.foldOps().length,
+            params.orderingIdentity()
+        );
+
+        return streamingMerger.merge(inputPaths, outputPath, params);
+    }
+
+    /** Compiled definition accessor for test validation. */
+    MVCompiledDefinition compiledDefinition() {
+        return compiledDefinition;
+    }
+
+    /**
+     * Stage 4: Functional interface for the streaming merge engine. Replaces
+     * the legacy {@link StateFileMerger} with a typed interface that carries
+     * the full {@link MVCompiledDefinition.MergeCallParams}.
+     */
+    @FunctionalInterface
+    interface StreamingMerger {
+        long merge(List<String> stateFiles, String outputFile, MVCompiledDefinition.MergeCallParams params);
+    }
+
+    /**
+     * @deprecated Stage 4: Replaced by {@link StreamingMerger}. This interface
+     *             carried fold SQL for the legacy {@code df_mv_merge_state}
+     *             path. All merge callers now use the streaming engine with
+     *             typed metadata from {@link MVCompiledDefinition.MergeCallParams}.
+     */
+    @Deprecated(forRemoval = true)
     @FunctionalInterface
     interface StateFileMerger {
         long merge(List<String> stateFiles, String foldSql, String outputFile) throws Exception;
+    }
+
+    /** Bridge from the new StreamingMerger to the underlying FFI call. */
+    private static long mergeStateStreams(List<String> stateFiles, String outputFile, MVCompiledDefinition.MergeCallParams params) {
+        return MVNativeBridge.mergeStateStreams(stateFiles, outputFile, params);
     }
 }

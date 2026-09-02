@@ -289,6 +289,11 @@ pub extern "C" fn native_jemalloc_heap_prof_deactivate() -> i64 {
 /// FFI: Dumps a heap profile to the given path. Path must be a null-terminated C string.
 /// Returns 0 on success, negative error pointer on failure.
 /// Called from Java when the cluster setting `native.jemalloc.heap_prof_dump_path` is updated.
+///
+/// # Safety
+///
+/// `path` must be a valid, non-null pointer to a null-terminated C string that
+/// remains valid for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn native_jemalloc_heap_prof_dump(path: *const std::ffi::c_char) -> i64 {
     ffm_wrap("native_jemalloc_heap_prof_dump", || {

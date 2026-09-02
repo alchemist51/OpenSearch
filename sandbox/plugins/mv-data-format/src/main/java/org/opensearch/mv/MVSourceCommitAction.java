@@ -27,6 +27,7 @@ public final class MVSourceCommitAction extends ActionType<MVSourceCommitAction.
         super(NAME, Response::new);
     }
 
+    /** Transport request carrying committed-checkpoint metadata for source-commit. */
     public static final class Request extends ActionRequest {
         private final String targetIndex;
         private final int targetShard;
@@ -87,6 +88,7 @@ public final class MVSourceCommitAction extends ActionType<MVSourceCommitAction.
         }
     }
 
+    /** Transport response carrying the committed-checkpoint acknowledgement. */
     public static final class Response extends ActionResponse {
         private final long committedCheckpoint;
 

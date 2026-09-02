@@ -270,6 +270,7 @@ pub unsafe extern "C" fn foyer_update_persist_interval(ptr: i64, new_secs: u64) 
 /// - `prefix_ptr` must point to `prefix_len` consecutive valid UTF-8 bytes.
 #[ffm_safe]
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn foyer_evict_prefix(ptr: i64, prefix_ptr: *const u8, prefix_len: u64) -> i64 {
     if ptr <= 0 {
         return Err("foyer_evict_prefix: invalid ptr".to_string());

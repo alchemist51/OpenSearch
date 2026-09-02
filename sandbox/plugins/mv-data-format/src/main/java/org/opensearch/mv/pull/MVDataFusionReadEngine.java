@@ -143,6 +143,99 @@ final class MVDataFusionReadEngine implements Closeable {
         }
     }
 
+    /**
+     * Runs a lightweight, definition-independent coverage query over the
+     * requested sequence-number range. DataFusion may return one partial
+     * COUNT/MAX row per partition, so every row must be reduced.
+     */
+    Delta searchDeltaByDefinition(List<Path> parquetFiles, String definitionName, long fromExclusive, long toInclusive, long infosVersion)
+        throws IOException {
+        Path staged = stagingRoot.resolve("gen-" + infosVersion);
+        if (Files.exists(staged) == false) {
+            Files.createDirectories(staged);
+            int i = 0;
+            for (Path file : parquetFiles) {
+                Files.createSymbolicLink(staged.resolve(String.format(Locale.ROOT, "%06d.parquet", i++)), file.toAbsolutePath());
+            }
+        }
+        String sql = String.format(
+            Locale.ROOT,
+            "SELECT COUNT(*), MAX(\"_seq_no\") FROM (SELECT * FROM %s WHERE \"_seq_no\" > %d AND \"_seq_no\" <= %d) AS %s",
+            INPUT_TABLE,
+            fromExclusive,
+            toInclusive,
+            INPUT_TABLE
+        );
+        try (org.apache.arrow.memory.RootAllocator allocator = new org.apache.arrow.memory.RootAllocator()) {
+            try (
+                org.apache.arrow.c.ArrowArray array = org.apache.arrow.c.ArrowArray.allocateNew(allocator);
+                org.apache.arrow.c.ArrowSchema schema = org.apache.arrow.c.ArrowSchema.allocateNew(allocator)
+            ) {
+                try {
+                    MVNativeBridge.buildArrow(staged.toString(), INPUT_TABLE, sql, array.memoryAddress(), schema.memoryAddress());
+                } catch (RuntimeException noRows) {
+                    if (noRows.getMessage() != null && noRows.getMessage().contains("partial produced no batches")) {
+                        return new Delta(new HashMap<>(), -1L, 0L);
+                    }
+                    throw noRows;
+                }
+                try (
+                    org.apache.arrow.vector.VectorSchemaRoot batch = org.apache.arrow.c.Data.importVectorSchemaRoot(
+                        allocator,
+                        array,
+                        schema,
+                        null
+                    )
+                ) {
+                    List<org.apache.arrow.vector.FieldVector> vectors = batch.getFieldVectors();
+                    CoverageTotals coverage = reduceCoverageRows(
+                        batch.getRowCount(),
+                        row -> vectors.get(0).getObject(row),
+                        row -> vectors.get(1).getObject(row)
+                    );
+                    logger.debug(
+                        "mv_pull definition [{}] coverage range=({}, {}] partialRows={} totalRows={} observedMax={}",
+                        definitionName,
+                        fromExclusive,
+                        toInclusive,
+                        batch.getRowCount(),
+                        coverage.totalRows(),
+                        coverage.observedMaxSeqNo()
+                    );
+                    return new Delta(new HashMap<>(), coverage.observedMaxSeqNo(), coverage.totalRows());
+                }
+            }
+        } finally {
+            cleanupStaged(staged);
+        }
+    }
+
+    record CoverageTotals(long totalRows, long observedMaxSeqNo) {
+    }
+
+    static CoverageTotals reduceCoverageRows(
+        int rowCount,
+        java.util.function.IntFunction<Object> countAt,
+        java.util.function.IntFunction<Object> maxSeqNoAt
+    ) {
+        if (rowCount == 0) {
+            return new CoverageTotals(0L, -1L);
+        }
+        long totalRows = 0L;
+        long observedMaxSeqNo = -1L;
+        for (int row = 0; row < rowCount; row++) {
+            Object count = countAt.apply(row);
+            if (count != null) {
+                totalRows = Math.addExact(totalRows, ((Number) count).longValue());
+            }
+            Object maxSeqNo = maxSeqNoAt.apply(row);
+            if (maxSeqNo != null) {
+                observedMaxSeqNo = Math.max(observedMaxSeqNo, ((Number) maxSeqNo).longValue());
+            }
+        }
+        return new CoverageTotals(totalRows, observedMaxSeqNo);
+    }
+
     private void cleanupStaged(Path staged) {
         try {
             if (Files.exists(staged)) {

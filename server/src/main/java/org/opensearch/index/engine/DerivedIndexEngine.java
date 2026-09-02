@@ -167,6 +167,10 @@ public class DerivedIndexEngine extends DataFormatAwareEngine {
         );
     }
 
+    /**
+     * A callable that may throw {@link IOException}.
+     * @param <T> the result type
+     */
     @FunctionalInterface
     @ExperimentalApi
     public interface IOCallable<T> {

@@ -86,7 +86,7 @@ opensearch-repository-fs = { path = "../../../plugins/native-repository-fs/src/m
 [profile.release]
 lto = true
 codegen-units = 1
-incremental = true
+incremental = false
 debug = "line-tables-only"
 strip = false
 

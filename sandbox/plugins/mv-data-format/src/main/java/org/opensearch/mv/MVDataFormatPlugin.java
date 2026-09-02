@@ -21,6 +21,7 @@ import org.opensearch.index.engine.derived.pull.NodeDerivedPullService;
 import org.opensearch.index.engine.exec.EngineReaderManager;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.store.checksum.GenericCRC32ChecksumHandler;
+import org.opensearch.mv.pull.MVBuildRuntime;
 import org.opensearch.mv.pull.MVDerivedPullFormat;
 import org.opensearch.mv.pull.MVPullSettings;
 import org.opensearch.plugins.ActionPlugin.ActionHandler;
@@ -54,13 +55,28 @@ public class MVDataFormatPlugin extends Plugin
         SearchBackEndPlugin<MVReaderManager.MVReader>,
         org.opensearch.plugins.ClusterPlugin,
         org.opensearch.plugins.ActionPlugin,
-        org.opensearch.plugins.ExtensiblePlugin {
+        org.opensearch.plugins.ExtensiblePlugin,
+        org.opensearch.plugins.CircuitBreakerPlugin {
 
     private volatile org.opensearch.transport.client.Client client;
     private volatile org.opensearch.cluster.service.ClusterService clusterService;
     private volatile org.opensearch.action.support.ActionFilter derivedIndexActionFilter;
     private volatile NodeDerivedPullService pullService;
     private volatile NodeRoutingSnapshotService routingSnapshotService;
+    /** Stage 2: native DataFusionRuntime pointer within MV's classloader. */
+    private volatile long mvNativeRuntimePtr;
+    /** Stage 5: circuit breaker for MV pull build memory accounting. */
+    private volatile org.opensearch.core.common.breaker.CircuitBreaker mvPullBreaker;
+
+    /** Stage 5: node-scope limit for the MV pull circuit breaker. */
+    public static final org.opensearch.common.settings.Setting<Long> MV_PULL_BREAKER_LIMIT = org.opensearch.common.settings.Setting
+        .longSetting(
+            "mv_pull.breaker.limit_bytes",
+            128L * 1024 * 1024,
+            0L,
+            org.opensearch.common.settings.Setting.Property.NodeScope,
+            org.opensearch.common.settings.Setting.Property.Dynamic
+        );
 
     public MVDataFormatPlugin() {}
 
@@ -97,7 +113,37 @@ public class MVDataFormatPlugin extends Plugin
         // DerivedPullFormat implementation. The generic service owns one poller
         // per eligible local target primary shard — no MV-specific orchestration
         // code is needed.
-        MVPullSettings.Services mvServices = new MVPullSettings.Services(clusterService, threadPool, repositoriesServiceSupplier);
+
+        // Stage 2: create a shared DataFusionRuntime within this plugin's
+        // native instance for managed MV builds. The MV classloader has its
+        // own native globals (separate from the DF plugin), so we must
+        // initialize the runtime manager and create a runtime here.
+        // The runtime is shared across all MV builds on this node.
+        long mvRuntimePtr = 0L;
+        try {
+            MVNativeBridge.initRuntime(Runtime.getRuntime().availableProcessors());
+            // Use conservative defaults: 256MB pool, empty spill dir (disabled),
+            // 0 spill limit. Operators tune via index-scoped settings on
+            // MVBuildRuntime.MV_SPILL_BUDGET_BYTES per MV index.
+            long mvPoolLimit = Runtime.getRuntime().maxMemory() / 8;
+            mvRuntimePtr = MVNativeBridge.createGlobalRuntime(mvPoolLimit, "", 0L);
+        } catch (Exception e) {
+            // Non-fatal: fall back to 0 (MVBuildRuntime creation will fail
+            // gracefully at build time with a clear error).
+            org.apache.logging.log4j.LogManager.getLogger(MVDataFormatPlugin.class)
+                .warn("mv_pull: failed to create managed DataFusion runtime, builds will fail", e);
+        }
+        this.mvNativeRuntimePtr = mvRuntimePtr;
+
+        // Stage 5: wire the actual MV pull circuit breaker (set by the
+        // framework via setCircuitBreaker before createComponents runs).
+        MVPullSettings.Services mvServices = new MVPullSettings.Services(
+            clusterService,
+            threadPool,
+            repositoriesServiceSupplier,
+            mvRuntimePtr,
+            mvPullBreaker
+        );
         MVDerivedPullFormat mvFormat = new MVDerivedPullFormat(mvServices);
         this.pullService = new NodeDerivedPullService(threadPool, java.util.List.of(mvFormat));
         this.pullService.start();
@@ -117,7 +163,7 @@ public class MVDataFormatPlugin extends Plugin
     @SuppressWarnings("deprecation") // SOURCE_INDEX registered for BWC only
     @Override
     public java.util.List<org.opensearch.common.settings.Setting<?>> getSettings() {
-        return java.util.List.of(
+        java.util.List<org.opensearch.common.settings.Setting<?>> base = java.util.List.of(
             org.opensearch.common.settings.Setting.listSetting(
                 MVConstants.SHIP_TARGETS_SETTING,
                 java.util.List.of(),
@@ -166,8 +212,17 @@ public class MVDataFormatPlugin extends Plugin
             // Pull-model settings (BWC registration only)
             MVPullSettings.SOURCE_INDEX,
             MVPullSettings.PULL_INTERVAL,
-            MVPullSettings.DEFINITION_HASH
+            MVPullSettings.DEFINITION_HASH,
+            // Stage 2: managed build runtime settings
+            MVBuildRuntime.MV_SPILL_BUDGET_BYTES,
+            MVBuildRuntime.MV_SPILL_FILE_COUNT_LIMIT,
+            MVBuildRuntime.MV_BUILD_MEMORY_ESTIMATE,
+            // Stage 5: circuit breaker limit
+            MV_PULL_BREAKER_LIMIT
         );
+        java.util.List<org.opensearch.common.settings.Setting<?>> all = new java.util.ArrayList<>(base);
+        all.addAll(MVPullSettings.admissionSettings());
+        return java.util.Collections.unmodifiableList(all);
     }
 
     @Override
@@ -286,5 +341,40 @@ public class MVDataFormatPlugin extends Plugin
     /** Accessor for integration tests that verify poller lifecycle. */
     public NodeDerivedPullService pullService() {
         return pullService;
+    }
+
+    // ---- CircuitBreakerPlugin (Stage 5) ----
+
+    @Override
+    public org.opensearch.indices.breaker.BreakerSettings getCircuitBreaker(org.opensearch.common.settings.Settings settings) {
+        long limit = MV_PULL_BREAKER_LIMIT.get(settings);
+        return new org.opensearch.indices.breaker.BreakerSettings(
+            "mv_pull",
+            limit,
+            1.0,
+            org.opensearch.core.common.breaker.CircuitBreaker.Type.MEMORY,
+            org.opensearch.core.common.breaker.CircuitBreaker.Durability.TRANSIENT,
+            null
+        );
+    }
+
+    @Override
+    public void setCircuitBreaker(org.opensearch.core.common.breaker.CircuitBreaker circuitBreaker) {
+        this.mvPullBreaker = circuitBreaker;
+    }
+
+    @Override
+    public void close() throws java.io.IOException {
+        // Stage 2: release the managed DataFusion native runtime
+        long ptr = mvNativeRuntimePtr;
+        if (ptr != 0) {
+            mvNativeRuntimePtr = 0;
+            try {
+                MVNativeBridge.closeGlobalRuntime(ptr);
+            } catch (Exception e) {
+                org.apache.logging.log4j.LogManager.getLogger(MVDataFormatPlugin.class)
+                    .warn("mv_pull: failed to close managed DataFusion runtime", e);
+            }
+        }
     }
 }

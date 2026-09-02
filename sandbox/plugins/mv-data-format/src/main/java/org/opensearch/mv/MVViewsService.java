@@ -32,11 +32,10 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <ul>
  *   <li>{@link Provider} (an {@link IndexSettingProvider}) expands the views
- *       list at source-creation time into the full derived settings: the
- *       {@code materialized_view} secondary format and the ship-target list.
- *       Merge order is provider &lt; template &lt; request, so a user who
- *       explicitly sets the composite formats keeps their value — with a
- *       loud warning if it omits the MV format.</li>
+ *       list at source-creation time into pull-only source storage settings:
+ *       Parquet primary plus Lucene secondary. The source publishes ordinary
+ *       remote Parquet snapshots and never runs an MV indexing engine or ships
+ *       state to targets.</li>
  *   <li>{@link TargetCreator} (a {@link ClusterStateListener}, elected
  *       cluster-manager only) creates each missing target index with the
  *       fully derived settings and mapping (state schema from the definition
@@ -51,9 +50,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>RESOLVED (was "the mapping gap"): the composite plugin's own
  * IndexSettingProvider used to contribute cluster-default formats for every
  * new index; provider iteration order is undefined, so on losing orders its
- * empty secondary list overwrote this provider's derived formats (breaking
- * inline mappings deterministically-ish and shard recovery seed-dependently).
- * The composite provider now defers when `index.mv.views` is declared.
+ * empty secondary list overwrote this provider's pull-only source formats
+ * (breaking inline mappings and Parquet publication). The composite provider
+ * now defers when `index.mv.views` is declared.
  *
  * <p>Names (decision 23): {@code definition:name} uses {@code name} as the
  * target index; a bare {@code definition} generates
@@ -99,25 +98,13 @@ public final class MVViewsService {
                 // path — deferred until definitions are real metadata.
                 throw new IllegalArgumentException(MVConstants.VIEWS_SETTING + " (POC): all views on one source must share the definition");
             }
-            Settings explicit = templateAndRequestSettings.filter(k -> k.startsWith("index.composite.") || k.equals("index.mv.definition"));
-            if (explicit.hasValue("index.composite.secondary_data_formats")
-                && templateAndRequestSettings.getAsList("index.composite.secondary_data_formats").contains("materialized_view") == false) {
-                logger.warn(
-                    "[{}] {} is set but the explicit secondary_data_formats omit 'materialized_view' — "
-                        + "the request wins over derived settings; the MV will NOT be maintained",
-                    indexName,
-                    MVConstants.VIEWS_SETTING
-                );
-            }
             List<String> targets = views.stream().map(View::targetIndex).toList();
-            logger.info("[{}] mv views declared: deriving source settings, targets={}", indexName, targets);
+            logger.info("[{}] mv views declared: deriving pull-only source settings, targets={}", indexName, targets);
             return Settings.builder()
                 .put("index.pluggable.dataformat.enabled", true)
                 .put("index.pluggable.dataformat", "composite")
                 .put("index.composite.primary_data_format", "parquet")
-                .putList("index.composite.secondary_data_formats", "lucene", "materialized_view")
-                .put(MVConstants.DEFINITION_SETTING, views.get(0).definition())
-                .putList(MVConstants.SHIP_TARGETS_SETTING, targets)
+                .putList("index.composite.secondary_data_formats", "lucene")
                 .build();
         }
     }
@@ -214,23 +201,9 @@ public final class MVViewsService {
          * apply path cannot do dynamic mapping updates.
          */
         static String targetMapping(String definition) {
-            // Build compiled definition from the named spec
-            MVDefinitionSpec spec = MVDefinitionSpec.source(definition);
-            java.util.List<GroupKey> keys = new java.util.ArrayList<>();
-            for (int i = 0; i < spec.groupKeys(); i++) {
-                MVDefinitionSpec.Column col = spec.columns().get(i);
-                GroupKey.ColumnType type = col.type() == MVDefinitionSpec.ColumnType.UTF8
-                    ? GroupKey.ColumnType.KEYWORD
-                    : GroupKey.ColumnType.LONG;
-                keys.add(GroupKey.of(col.name(), type));
-            }
-            java.util.List<AggregateSpec> aggs = new java.util.ArrayList<>();
-            aggs.add(AggregateSpec.count("cnt"));
-            for (int i = spec.groupKeys(); i < spec.columns().size(); i++) {
-                MVDefinitionSpec.Column col = spec.columns().get(i);
-                aggs.add(AggregateSpec.sum(col.name(), "sum_" + col.name()));
-            }
-            MVCompiledDefinition compiledDef = MVCompiledDefinition.of(keys, aggs);
+            // Single authoritative compiler — same instance shape the pull-side
+            // artifact builder uses, so mapping, projection, hash, and SQL agree.
+            MVCompiledDefinition compiledDef = MVCompiledDefinition.compiledFor(definition);
             MVMappingGenerator generator = new MVMappingGenerator();
             java.util.Map<String, Object> mapping = generator.generateMapping(compiledDef);
 

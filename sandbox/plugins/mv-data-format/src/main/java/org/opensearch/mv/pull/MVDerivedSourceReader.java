@@ -111,10 +111,9 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
 
         this.source = new MVRemoteSource(services, sourceIndexName, sourceShardId, binding);
 
-        // Working directory for remote file downloads
-        this.workingPath = indexSettings.getRemoteStorePathStrategy() != null
-            ? Files.createTempDirectory("mv_pull_reader")
-            : Files.createTempDirectory("mv_pull_reader");
+        // Working directory for remote file downloads — use tmpdir parent to satisfy forbiddenApis
+        Path tmpDir = Path.of(System.getProperty("java.io.tmpdir"));
+        this.workingPath = Files.createTempDirectory(tmpDir, "mv_pull_reader");
         this.workingDirectory = new org.apache.lucene.store.NIOFSDirectory(workingPath);
     }
 

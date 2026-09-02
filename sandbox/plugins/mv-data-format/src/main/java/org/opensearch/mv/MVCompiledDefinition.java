@@ -42,12 +42,17 @@ public final class MVCompiledDefinition {
     private final List<GroupKey> groupKeys;
     private final List<AggregateSpec> aggregates;
     private final Map<String, String> targetMapping;
+    private final MVGroupByOrdering groupByOrdering;
 
     private MVCompiledDefinition(List<GroupKey> groupKeys, List<AggregateSpec> aggregates) {
         this.groupKeys = List.copyOf(groupKeys);
         this.aggregates = List.copyOf(aggregates);
         this.targetMapping = buildTargetMapping(this.groupKeys, this.aggregates);
         this.definitionHash = computeHash(this.groupKeys, this.aggregates);
+        // Derive the complete physical GROUP BY ordering contract once, here.
+        // This is the single derivation point — no caller may re-derive ordering
+        // from groupKeys() or SQL (see MVGroupByOrdering).
+        this.groupByOrdering = MVGroupByOrdering.fromGroupKeys(this.groupKeys);
     }
 
     // ── Programmatic builders ─────────────────────────────────────────────
@@ -98,6 +103,244 @@ public final class MVCompiledDefinition {
         return new MVCompiledDefinition(groupKeys, aggregates);
     }
 
+    // ── Authoritative compiler ────────────────────────────────────────────
+
+    /**
+     * The single authoritative entry point that turns a definition name into
+     * a fully compiled definition. Both the pull-side artifact builder and the
+     * target-index creator call this, so pull SQL, target mapping, definition
+     * hash, {@code state_fields}/projection order, fold SQL, and search schema
+     * all derive from the same {@link MVCompiledDefinition}. There is exactly
+     * one place where a definition's shape is constructed.
+     *
+     * <p>Definitions authored against the typed compiled model (full
+     * {@code SUM/MIN/MAX/COUNT} quad per metric, expression-capable group
+     * keys) are dispatched directly. All other named definitions are compiled
+     * from their legacy {@link MVDefinitionSpec} via
+     * {@link #fromLegacySpec(MVDefinitionSpec)}, preserving their exact prior
+     * SQL, mapping, projection, and hash.</p>
+     */
+    public static MVCompiledDefinition compiledFor(String definitionName) {
+        Objects.requireNonNull(definitionName, "definitionName");
+        return switch (definitionName) {
+            case "clickbench_100m" -> clickbench100m();
+            case "heavy_l1" -> heavyL1();
+            case "heavy_l2" -> heavyL2();
+            case "heavy_l3" -> heavyL3();
+            case "clickbench_5m_url" -> clickbench5mUrl();
+            default -> fromLegacySpec(MVDefinitionSpec.source(definitionName));
+        };
+    }
+
+    /**
+     * Compile a legacy {@link MVDefinitionSpec} into the count/sum-per-metric
+     * shape that prior definitions have always used: the leading
+     * {@code groupKeys()} columns become plain group keys, and each remaining
+     * captured column becomes a {@code SUM} aggregate, preceded by a single
+     * {@code COUNT(*)} alias {@code cnt}. This is the exact logic that was
+     * previously duplicated in {@code MVDerivedArtifactBuilder.buildFromSpec}
+     * and {@code MVViewsService.targetMapping}.
+     */
+    public static MVCompiledDefinition fromLegacySpec(MVDefinitionSpec spec) {
+        Objects.requireNonNull(spec, "spec");
+        List<GroupKey> keys = new ArrayList<>();
+        for (int i = 0; i < spec.groupKeys(); i++) {
+            MVDefinitionSpec.Column col = spec.columns().get(i);
+            GroupKey.ColumnType type = col.type() == MVDefinitionSpec.ColumnType.UTF8
+                ? GroupKey.ColumnType.KEYWORD
+                : GroupKey.ColumnType.LONG;
+            keys.add(GroupKey.of(col.name(), type));
+        }
+        List<AggregateSpec> aggs = new ArrayList<>();
+        aggs.add(AggregateSpec.count("cnt"));
+        for (int i = spec.groupKeys(); i < spec.columns().size(); i++) {
+            MVDefinitionSpec.Column col = spec.columns().get(i);
+            aggs.add(AggregateSpec.sum(col.name(), "sum_" + col.name()));
+        }
+        return new MVCompiledDefinition(keys, aggs);
+    }
+
+    /**
+     * The {@code clickbench_5m_url} definition: GROUP BY an integer 5-minute
+     * {@code EventTime} bucket, {@code URL}, and {@code UserID}, with the
+     * full {@code SUM/MIN/MAX/COUNT} quad over ten numeric ClickBench fields
+     * (40 aggregate outputs → 43 projection columns total).
+     *
+     * <p><b>EventTime units:</b> the ClickBench {@code EventTime} field is
+     * epoch <em>milliseconds</em> (mapping type {@code date} with
+     * {@code epoch_millis}; sample values are 13-digit, e.g.
+     * {@code 1401805406823}). A 5-minute window is therefore
+     * {@code 5 * 60 * 1000 = 300000} ms, so the bucket ordinal is
+     * {@code CAST("EventTime" AS BIGINT) / 300000}.</p>
+     */
+    public static MVCompiledDefinition clickbench5mUrl() {
+        List<GroupKey> keys = List.of(
+            GroupKey.ofExpression("event_bucket", GroupKey.ColumnType.LONG, "CAST(\"EventTime\" AS BIGINT) / 300000", "EventTime"),
+            GroupKey.of("URL", GroupKey.ColumnType.KEYWORD),
+            GroupKey.of("UserID", GroupKey.ColumnType.LONG)
+        );
+        // (sourceField, alias prefix) in stable projection order.
+        String[][] metrics = {
+            { "AdvEngineID", "adv" },
+            { "ResolutionWidth", "resw" },
+            { "ResolutionHeight", "resh" },
+            { "ResolutionDepth", "resd" },
+            { "ClientIP", "cip" },
+            { "RemoteIP", "rip" },
+            { "ConnectTiming", "conn" },
+            { "DNSTiming", "dns" },
+            { "FetchTiming", "fetch" },
+            { "SendTiming", "send" } };
+        List<AggregateSpec> aggs = new ArrayList<>();
+        for (String[] m : metrics) {
+            String field = m[0];
+            String prefix = m[1];
+            aggs.add(AggregateSpec.sum(field, prefix + "_sum"));
+            aggs.add(AggregateSpec.min(field, prefix + "_min"));
+            aggs.add(AggregateSpec.max(field, prefix + "_max"));
+            aggs.add(AggregateSpec.countField(field, prefix + "_cnt"));
+        }
+        return new MVCompiledDefinition(keys, aggs);
+    }
+
+    // ── Heavy-MV saturation ladder compiled definitions ──────────────────
+    // Each rung produces the FULL SUM/MIN/MAX/COUNT quad per metric field.
+    // The typed descriptor is shared by partial SQL, fold SQL, state_fields,
+    // target mapping, projection, hash, search, and merge — one immutable
+    // contract, never parsed from SQL strings.
+
+    /**
+     * Shared builder for rung definitions: emits full SUM/MIN/MAX/COUNT(field)
+     * per metric, with typed group keys. The aliases follow the convention
+     * {@code prefix_sum}, {@code prefix_min}, {@code prefix_max},
+     * {@code prefix_cnt}.
+     */
+    private static MVCompiledDefinition buildLadderDefinition(List<GroupKey> keys, List<String[]> metrics) {
+        List<AggregateSpec> aggs = new ArrayList<>();
+        for (String[] m : metrics) {
+            String field = m[0];
+            String prefix = m[1];
+            aggs.add(AggregateSpec.sum(field, prefix + "_sum"));
+            aggs.add(AggregateSpec.min(field, prefix + "_min"));
+            aggs.add(AggregateSpec.max(field, prefix + "_max"));
+            aggs.add(AggregateSpec.countField(field, prefix + "_cnt"));
+        }
+        return new MVCompiledDefinition(keys, aggs);
+    }
+
+    // ── metric descriptor lists (sourceField, aliasPrefix) ──────────────
+
+    /** L0/L1 metrics: 10 numeric ClickBench fields. */
+    private static final List<String[]> LADDER_METRICS_10 = List.of(
+        new String[] { "AdvEngineID", "adv" },
+        new String[] { "ResolutionWidth", "resw" },
+        new String[] { "ResolutionHeight", "resh" },
+        new String[] { "ResolutionDepth", "resd" },
+        new String[] { "ClientIP", "cip" },
+        new String[] { "RemoteIP", "rip" },
+        new String[] { "ConnectTiming", "conn" },
+        new String[] { "DNSTiming", "dns" },
+        new String[] { "FetchTiming", "fetch" },
+        new String[] { "SendTiming", "send" }
+    );
+
+    /** L2: +10 more numeric columns = 20 total. */
+    private static final List<String[]> LADDER_METRICS_20;
+    static {
+        var m = new ArrayList<>(LADDER_METRICS_10);
+        m.add(new String[] { "ResponseStartTiming", "rsstart" });
+        m.add(new String[] { "ResponseEndTiming", "rsend" });
+        m.add(new String[] { "Age", "age" });
+        m.add(new String[] { "HID", "hid" });
+        m.add(new String[] { "CodeVersion", "codv" });
+        m.add(new String[] { "IPNetworkID", "ipnet" });
+        m.add(new String[] { "SilverlightVersion3", "sl3" });
+        m.add(new String[] { "WindowName", "wnam" });
+        m.add(new String[] { "URLHash", "urlh" });
+        m.add(new String[] { "RefererHash", "refh" });
+        LADDER_METRICS_20 = List.copyOf(m);
+    }
+
+    /** L3: +10 more = 30 total. */
+    private static final List<String[]> LADDER_METRICS_30;
+    static {
+        var m = new ArrayList<>(LADDER_METRICS_20);
+        m.add(new String[] { "ParamPrice", "pprice" });
+        m.add(new String[] { "UserAgent", "uagent" });
+        m.add(new String[] { "UserAgentMajor", "uamaj" });
+        m.add(new String[] { "WindowClientWidth", "wcw" });
+        m.add(new String[] { "WindowClientHeight", "wch" });
+        m.add(new String[] { "Sex", "sex" });
+        m.add(new String[] { "Robotness", "robot" });
+        m.add(new String[] { "Income", "income" });
+        m.add(new String[] { "HistoryLength", "histl" });
+        m.add(new String[] { "OpenerName", "opener" });
+        LADDER_METRICS_30 = List.copyOf(m);
+    }
+
+    // ── group key lists ─────────────────────────────────────────────────
+
+    /** L0: 5 INT64 group keys. */
+    private static final List<GroupKey> LADDER_GK_5 = List.of(
+        GroupKey.of("EventTime", GroupKey.ColumnType.LONG),
+        GroupKey.of("RegionID", GroupKey.ColumnType.LONG),
+        GroupKey.of("OS", GroupKey.ColumnType.LONG),
+        GroupKey.of("CounterID", GroupKey.ColumnType.LONG),
+        GroupKey.of("IsRefresh", GroupKey.ColumnType.LONG)
+    );
+
+    /** L1/L2: 8 INT64 group keys. */
+    private static final List<GroupKey> LADDER_GK_8;
+    static {
+        var g = new ArrayList<>(LADDER_GK_5);
+        g.add(GroupKey.of("UserID", GroupKey.ColumnType.LONG));
+        g.add(GroupKey.of("WatchID", GroupKey.ColumnType.LONG));
+        g.add(GroupKey.of("FUniqID", GroupKey.ColumnType.LONG));
+        LADDER_GK_8 = List.copyOf(g);
+    }
+
+    /** L3: 10 group keys (8 INT64 + 2 KEYWORD/UTF8). */
+    private static final List<GroupKey> LADDER_GK_10;
+    static {
+        var g = new ArrayList<>(LADDER_GK_8);
+        g.add(GroupKey.of("URL", GroupKey.ColumnType.KEYWORD));
+        g.add(GroupKey.of("Referer", GroupKey.ColumnType.KEYWORD));
+        LADDER_GK_10 = List.copyOf(g);
+    }
+
+    /**
+     * L0 ({@code clickbench_100m}): 5 INT64 group keys + full
+     * SUM/MIN/MAX/COUNT quad over 10 numeric ClickBench fields = 45 output
+     * columns.
+     */
+    public static MVCompiledDefinition clickbench100m() {
+        return buildLadderDefinition(LADDER_GK_5, LADDER_METRICS_10);
+    }
+
+    /**
+     * L1 ({@code heavy_l1}): 8 INT64 group keys (+UserID, WatchID, FUniqID)
+     * + full SUM/MIN/MAX/COUNT quad over 10 metrics = 48 output columns.
+     */
+    public static MVCompiledDefinition heavyL1() {
+        return buildLadderDefinition(LADDER_GK_8, LADDER_METRICS_10);
+    }
+
+    /**
+     * L2 ({@code heavy_l2}): 8 INT64 group keys + full SUM/MIN/MAX/COUNT
+     * quad over 20 metrics = 88 output columns.
+     */
+    public static MVCompiledDefinition heavyL2() {
+        return buildLadderDefinition(LADDER_GK_8, LADDER_METRICS_20);
+    }
+
+    /**
+     * L3 ({@code heavy_l3}): 10 group keys (8 INT64 + 2 KEYWORD) + full
+     * SUM/MIN/MAX/COUNT quad over 30 metrics = 130 output columns.
+     */
+    public static MVCompiledDefinition heavyL3() {
+        return buildLadderDefinition(LADDER_GK_10, LADDER_METRICS_30);
+    }
+
     // ── Accessors ─────────────────────────────────────────────────────────
 
     /** Stable definition hash (SHA-256 hex). */
@@ -118,6 +361,238 @@ public final class MVCompiledDefinition {
     /** Target mapping: fieldName → OpenSearch type. Unmodifiable. */
     public Map<String, String> targetMapping() {
         return targetMapping;
+    }
+
+    /**
+     * The authoritative, complete physical GROUP BY ordering contract for this
+     * definition: every group key, in state-field order, each ASC with NULLS
+     * FIRST placement. This is the single source of truth for how MV state rows
+     * must be sorted; the native build and merge paths (Stage&nbsp;3/4) will
+     * consume {@link MVGroupByOrdering#stateFieldIndices()} and
+     * {@link MVGroupByOrdering#columnNames()} to replace their current
+     * column-0-only sort/advertisement.
+     *
+     * <p>Never re-derive ordering from {@link #groupKeys()} or the generated SQL
+     * — always use this contract so the derivation exists in exactly one place.</p>
+     */
+    public MVGroupByOrdering groupByOrdering() {
+        return groupByOrdering;
+    }
+
+    // ── Stage 4: FFI metadata for ordering + aggregates ──────────────────
+
+    /**
+     * Stage 4: Returns the ordering metadata as parallel FFI-ready arrays
+     * suitable for passing across the native boundary. This is the merge-side
+     * companion to the build-side ordering serialization — the merge path
+     * needs the same ordering contract to validate that merged output
+     * preserves the sort invariant.
+     *
+     * @return FFI-serialized ordering metadata
+     */
+    public OrderingFFIMetadata orderingFFIMetadata() {
+        return OrderingFFIMetadata.from(groupByOrdering);
+    }
+
+    /**
+     * Stage 4: Returns the aggregate accumulator type metadata as parallel
+     * FFI-ready arrays. The Rust merge_state_streams FFI uses these to
+     * determine the correct fold function per state column (SUM-fold for
+     * SUM/COUNT accumulators, MIN-fold for MIN, MAX-fold for MAX).
+     *
+     * <p>The arrays are ordered to match the state-column layout: group keys
+     * are omitted (they are handled by the ordering metadata), and each
+     * aggregate's state columns appear in definition order.</p>
+     *
+     * @return FFI-serialized aggregate accumulator metadata
+     */
+    public AggregateFFIMetadata aggregateFFIMetadata() {
+        return AggregateFFIMetadata.from(aggregates);
+    }
+
+    /**
+     * Stage 4: Convenience bundle that collects all FFI metadata needed by the
+     * merge path in one call: ordering, accumulator types, column names, and
+     * the ordering identity for validation. The merge caller destructures
+     * this once and feeds the pieces to {@code MVNativeBridge.mergeStateStreams}.
+     *
+     * @return immutable bundle of all merge FFI metadata
+     */
+    public MergeFFIBundle mergeFFIBundle() {
+        return MergeFFIBundle.from(this);
+    }
+
+    /**
+     * Convenience bundle for the merge path's FFI call. Collects ordering
+     * metadata, aggregate accumulator metadata, and the ordering identity
+     * so the caller need not destructure each piece separately.
+     */
+    public record MergeFFIBundle(
+        OrderingFFIMetadata ordering,
+        AggregateFFIMetadata aggregates,
+        String orderingIdentity,
+        int totalStateColumns
+    ) {
+        /** Build from a compiled definition. */
+        public static MergeFFIBundle from(MVCompiledDefinition def) {
+            OrderingFFIMetadata o = def.orderingFFIMetadata();
+            AggregateFFIMetadata a = def.aggregateFFIMetadata();
+            return new MergeFFIBundle(o, a, def.groupByOrdering().orderingIdentity(), o.length() + a.length());
+        }
+    }
+
+    /**
+     * Stage 4: Pre-built merge call parameters ready for direct use with
+     * {@link MVNativeBridge#mergeStateStreams}. This eliminates the need for
+     * callers to destructure the {@link MergeFFIBundle} and manually build
+     * the {@code foldOps} byte array and boolean arrays.
+     *
+     * <p>Usage:
+     * <pre>{@code
+     * MVCompiledDefinition.MergeCallParams p = def.buildMergeCallParams();
+     * long rows = MVNativeBridge.mergeStateStreams(
+     *     inputPaths, outputPath,
+     *     p.orderingIndices(), p.orderingAsc(), p.orderingNullsFirst(),
+     *     p.foldOps(), p.aggColumnNames(), p.orderingIdentity()
+     * );
+     * }</pre>
+     */
+    public MergeCallParams buildMergeCallParams() {
+        return MergeCallParams.from(this);
+    }
+
+    /**
+     * Stage 4: Fully resolved FFI parameters for
+     * {@link MVNativeBridge#mergeStateStreams}. All arrays are freshly allocated
+     * and owned by the caller.
+     *
+     * @param orderingIndices    column indices forming the sort key
+     * @param orderingAsc        per-key direction (true = ASC)
+     * @param orderingNullsFirst per-key null placement (true = NULLS_FIRST)
+     * @param foldOps            per-column fold operation byte (0=GROUP_KEY,
+     *                           1=SUM, 2=MIN, 3=MAX)
+     * @param aggColumnNames     state column names for aggregate columns
+     * @param orderingIdentity   deterministic ordering identity for validation
+     */
+    public record MergeCallParams(
+        int[] orderingIndices,
+        boolean[] orderingAsc,
+        boolean[] orderingNullsFirst,
+        byte[] foldOps,
+        String[] aggColumnNames,
+        String orderingIdentity
+    ) {
+
+        /** Build from a compiled definition. */
+        public static MergeCallParams from(MVCompiledDefinition def) {
+            MVGroupByOrdering ordering = def.groupByOrdering();
+            List<MVGroupByOrdering.Key> keys = ordering.keys();
+            int numGroupKeys = keys.size();
+
+            int[] indices = new int[numGroupKeys];
+            boolean[] asc = new boolean[numGroupKeys];
+            boolean[] nullsFirst = new boolean[numGroupKeys];
+            for (int i = 0; i < numGroupKeys; i++) {
+                MVGroupByOrdering.Key key = keys.get(i);
+                indices[i] = key.stateFieldIndex();
+                asc[i] = key.direction() == MVGroupByOrdering.Direction.ASCENDING;
+                nullsFirst[i] = key.nullPlacement().nullsFirst();
+            }
+
+            AggregateFFIMetadata aggMeta = def.aggregateFFIMetadata();
+            int numCols = numGroupKeys + aggMeta.length();
+            byte[] foldOps = new byte[numCols];
+            for (int i = 0; i < numGroupKeys; i++) {
+                foldOps[i] = (byte) 0; // GROUP_KEY
+            }
+            for (int i = 0; i < aggMeta.length(); i++) {
+                // ACC_SUM(0) → fold(1), ACC_MIN(1) → fold(2), ACC_MAX(2) → fold(3)
+                foldOps[numGroupKeys + i] = (byte) (aggMeta.accumulatorTypes()[i] + 1);
+            }
+
+            return new MergeCallParams(
+                indices,
+                asc,
+                nullsFirst,
+                foldOps,
+                aggMeta.stateColumnNames(),
+                ordering.orderingIdentity()
+            );
+        }
+    }
+
+    /**
+     * FFI-serialized ordering metadata: parallel arrays of field indices,
+     * direction tokens, and null-placement tokens. Used by both the build
+     * and merge paths to cross the Java/Rust FFI boundary.
+     */
+    public record OrderingFFIMetadata(int[] fieldIndices, int[] directionTokens, int[] nullPlacementTokens, int length) {
+
+        /** Derive from an {@link MVGroupByOrdering}. */
+        public static OrderingFFIMetadata from(MVGroupByOrdering ordering) {
+            int size = ordering.size();
+            int[] indices = new int[size];
+            int[] dirs = new int[size];
+            int[] nulls = new int[size];
+            for (int i = 0; i < size; i++) {
+                MVGroupByOrdering.Key key = ordering.keys().get(i);
+                indices[i] = key.stateFieldIndex();
+                dirs[i] = key.direction().wireToken();
+                nulls[i] = key.nullPlacement().wireToken();
+            }
+            return new OrderingFFIMetadata(indices, dirs, nulls, size);
+        }
+    }
+
+    /**
+     * FFI-serialized aggregate accumulator metadata. Each state column maps
+     * to an accumulator type token that tells the Rust merge to apply the
+     * correct fold function:
+     * <ul>
+     *   <li>{@code 0} = SUM-fold (used by SUM accumulators and COUNT accumulators)</li>
+     *   <li>{@code 1} = MIN-fold</li>
+     *   <li>{@code 2} = MAX-fold</li>
+     * </ul>
+     *
+     * <p>The arrays are in state-column order (skipping group keys, which
+     * are not aggregated). The {@code stateColumnNames} parallel array
+     * carries the stable column names for validation on the Rust side.</p>
+     */
+    public record AggregateFFIMetadata(int[] accumulatorTypes, String[] stateColumnNames, int length) {
+
+        /** SUM-fold accumulator (also used for COUNT, which folds via SUM). */
+        public static final int ACC_SUM = 0;
+        /** MIN-fold accumulator. */
+        public static final int ACC_MIN = 1;
+        /** MAX-fold accumulator. */
+        public static final int ACC_MAX = 2;
+
+        /** Derive from the definition's aggregate specs. */
+        public static AggregateFFIMetadata from(List<AggregateSpec> aggregates) {
+            // Count total state columns across all aggregates
+            int totalStateCols = 0;
+            for (AggregateSpec agg : aggregates) {
+                totalStateCols += agg.stateColumns().size();
+            }
+            int[] types = new int[totalStateCols];
+            String[] names = new String[totalStateCols];
+            int idx = 0;
+            for (AggregateSpec agg : aggregates) {
+                int accType = switch (agg.function()) {
+                    case COUNT -> ACC_SUM;  // COUNT folds via SUM
+                    case SUM -> ACC_SUM;
+                    case MIN -> ACC_MIN;
+                    case MAX -> ACC_MAX;
+                    case AVG -> ACC_SUM;    // AVG decomposes to count+sum, both SUM-folded
+                };
+                for (AggregateSpec.StateColumn sc : agg.stateColumns()) {
+                    types[idx] = accType;
+                    names[idx] = sc.name();
+                    idx++;
+                }
+            }
+            return new AggregateFFIMetadata(types, names, totalStateCols);
+        }
     }
 
     // ── Schema validation ─────────────────────────────────────────────────
@@ -163,15 +638,29 @@ public final class MVCompiledDefinition {
     public String buildPartialSql(String tableName) {
         Objects.requireNonNull(tableName, "tableName");
         StringBuilder sb = new StringBuilder("SELECT ");
-        // Group keys
-        sb.append(groupKeys.stream().map(k -> "\"" + k.name() + "\"").collect(Collectors.joining(", ")));
+        // Group keys: plain columns emit "name"; derived keys emit <expr> AS "name".
+        sb.append(groupKeys.stream().map(MVCompiledDefinition::partialSelectExpr).collect(Collectors.joining(", ")));
         // Aggregate fragments
         for (AggregateSpec agg : aggregates) {
             sb.append(", ").append(agg.partialSqlFragment());
         }
         sb.append(" FROM ").append(tableName);
-        sb.append(" GROUP BY ").append(groupKeys.stream().map(k -> "\"" + k.name() + "\"").collect(Collectors.joining(", ")));
+        // GROUP BY repeats the key expression (== "name" for plain columns).
+        sb.append(" GROUP BY ").append(groupKeys.stream().map(GroupKey::sqlExpression).collect(Collectors.joining(", ")));
         return sb.toString();
+    }
+
+    /**
+     * SELECT-list fragment for a group key. Plain column keys emit
+     * {@code "name"} unchanged (byte-identical to legacy output); derived
+     * keys emit {@code <expr> AS "name"} so the materialized column carries
+     * the stable alias.
+     */
+    private static String partialSelectExpr(GroupKey key) {
+        if (key.isPlainColumn()) {
+            return "\"" + key.name() + "\"";
+        }
+        return key.sqlExpression() + " AS \"" + key.name() + "\"";
     }
 
     /**
@@ -199,9 +688,15 @@ public final class MVCompiledDefinition {
     }
 
     /**
-     * Ordered projection column names for search results. Group keys first,
-     * then state columns in definition order. This is the deterministic
+     * Ordered projection column names for search results. Group keys first (in
+     * their full group-by order — <em>all</em> of them, not just the leading
+     * key), then state columns in definition order. This is the deterministic
      * column ordering contract for all readers.
+     *
+     * <p>Row ordering within that layout is governed separately by
+     * {@link #groupByOrdering()}, which sorts by the complete group-key tuple
+     * (state-field indices {@code 0..groupKeys().size()-1}), not by column 0
+     * alone.</p>
      */
     public List<String> projectionOrder() {
         List<String> columns = new ArrayList<>();
@@ -218,7 +713,9 @@ public final class MVCompiledDefinition {
 
     /**
      * Returns the ordered list of all state column names (group keys + all
-     * aggregate state columns), matching the physical layout.
+     * aggregate state columns), matching the physical layout. The leading
+     * {@code groupKeys().size()} entries are the ordering columns described by
+     * {@link #groupByOrdering()}.
      */
     public List<String> stateColumnNames() {
         return projectionOrder();
@@ -249,7 +746,14 @@ public final class MVCompiledDefinition {
         StringBuilder canonical = new StringBuilder();
         canonical.append("groups:");
         for (GroupKey k : keys) {
-            canonical.append(k.name()).append("|").append(k.columnType().name()).append("|").append(k.osFieldPath()).append(";");
+            canonical.append(k.name()).append("|").append(k.columnType().name()).append("|").append(k.osFieldPath());
+            // Only derived (non-plain) keys append their expression, so plain-column
+            // definitions keep a canonical form byte-identical to prior releases and
+            // their persisted hashes never change.
+            if (k.isPlainColumn() == false) {
+                canonical.append("|expr=").append(k.sqlExpression());
+            }
+            canonical.append(";");
         }
         canonical.append("aggs:");
         for (AggregateSpec a : aggs) {

@@ -172,7 +172,7 @@ pub extern "C" fn ts_destroy_tiered_object_store(ptr: i64) -> i64 {
 // File registry operations via TieredObjectStore pointer
 // ---------------------------------------------------------------------------
 
-/// Register a file in the TieredObjectStore's registry.
+// Register a file in the TieredObjectStore's registry.
 // TODO (writable warm): add ts_register_file for single-file registration (afterSyncToRemote).
 
 /// Batch register files in the TieredObjectStore's registry.
@@ -184,6 +184,7 @@ pub extern "C" fn ts_destroy_tiered_object_store(ptr: i64) -> i64 {
 /// `location`: 0=Local, 1=Remote — applied to all files in the batch.
 #[ffm_safe]
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn ts_register_files(
     store_ptr: i64,
     entries_ptr: *const u8,
@@ -237,6 +238,7 @@ pub extern "C" fn ts_register_files(
 /// Remove a file from the registry.
 #[ffm_safe]
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn ts_remove_file(store_ptr: i64, path_ptr: *const u8, path_len: i64) -> i64 {
     let store = unsafe { arc_from_ptr(store_ptr) }?;
     let path = unsafe { str_from_raw(path_ptr, path_len) }

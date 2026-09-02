@@ -537,53 +537,25 @@ pub async unsafe fn create_mv_only_session_context(
     // State files contain positional aggregate state. Ordered state_fields metadata is the
     // logical contract; mapping/plan field order is not stable and physical names are an
     // implementation detail. Relabel zero-copy and reject any metadata/schema drift.
+    //
+    // STREAMING PATH (MvStateTableProvider): Only the first file's schema header is read
+    // at registration time. No record batches are loaded until query execution. Each file
+    // becomes a separate partition in the ExecutionPlan, opened lazily and streamed batch-
+    // by-batch with projection/cast/null-fill applied per batch. Peak memory is O(batch ×
+    // partitions-executing), not O(total data). This replaced the eager MemTable that
+    // pre-loaded all files (~23 GB at 122 files) and triggered the circuit breaker.
     let has_mv_data = !state_file_paths.is_empty();
     if has_mv_data {
-        use arrow::ipc::reader::FileReader;
-        use std::fs::File;
+        // Read only the first file's schema header (~few KB). O(1) memory.
+        let physical_schema =
+            crate::mv_state_table_provider::read_schema_from_first_file(state_file_paths)?
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "create_mv_only_session_context: state files had no Arrow schema"
+                            .to_string(),
+                    )
+                })?;
 
-        let mut physical_batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
-        let mut physical_schema: Option<arrow::datatypes::SchemaRef> = None;
-
-        for path in state_file_paths {
-            let file = File::open(path).map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "create_mv_only_session_context: failed to open state file '{}': {}",
-                    path, e
-                ))
-            })?;
-            let reader = FileReader::try_new(file, None).map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "create_mv_only_session_context: failed to read Arrow IPC '{}': {}",
-                    path, e
-                ))
-            })?;
-            let file_schema = reader.schema();
-            if let Some(expected) = physical_schema.as_ref() {
-                if expected.as_ref() != file_schema.as_ref() {
-                    return Err(DataFusionError::Execution(format!(
-                        "create_mv_only_session_context: state schema mismatch in '{}'",
-                        path
-                    )));
-                }
-            } else {
-                physical_schema = Some(file_schema);
-            }
-            for batch_result in reader {
-                physical_batches.push(batch_result.map_err(|e| {
-                    DataFusionError::Execution(format!(
-                        "create_mv_only_session_context: batch read error in '{}': {}",
-                        path, e
-                    ))
-                })?);
-            }
-        }
-
-        let physical_schema = physical_schema.ok_or_else(|| {
-            DataFusionError::Execution(
-                "create_mv_only_session_context: state files had no Arrow schema".to_string(),
-            )
-        })?;
         let logical_schema = widen_schema_from_plan(
             &ctx,
             plan_bytes,
@@ -593,36 +565,19 @@ pub async unsafe fn create_mv_only_session_context(
         let (table_schema, physical_projection) =
             mv_table_schema(&physical_schema, &logical_schema, state_fields)?;
 
-        let logical_batches = physical_batches
-            .into_iter()
-            .map(|batch| {
-                let columns: Vec<arrow::array::ArrayRef> = physical_projection
-                    .iter()
-                    .map(|proj| {
-                        let col = batch.column(proj.physical_position);
-                        match &proj.cast_to {
-                            None => Ok(Arc::clone(col)),
-                            Some(target_type) => arrow::compute::cast(col, target_type)
-                                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                arrow::record_batch::RecordBatch::try_new(Arc::clone(&table_schema), columns)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let row_count = logical_batches
-            .iter()
-            .map(|batch| batch.num_rows())
-            .sum::<usize>();
-        let mem_table =
-            datafusion::datasource::MemTable::try_new(table_schema, vec![logical_batches])?;
-        ctx.register_table(register_name.as_str(), Arc::new(mem_table))?;
+        let file_paths: Vec<String> = state_file_paths.iter().map(|s| s.to_string()).collect();
+
+        let provider = crate::mv_state_table_provider::MvStateTableProvider::new(
+            Arc::clone(&table_schema),
+            file_paths.clone(),
+            physical_projection,
+            Arc::clone(&physical_schema),
+        );
+        ctx.register_table(register_name.as_str(), Arc::new(provider))?;
         native_bridge_common::log_info!(
-            "create_mv_only_session_context: registered MV table '{}' from {} state files ({} rows)",
+            "create_mv_only_session_context: registered streaming MV table '{}' from {} state files (lazy, no batches loaded)",
             register_name,
-            state_file_paths.len(),
-            row_count
+            file_paths.len()
         );
     } else {
         let logical_schema = widen_schema_from_plan(
@@ -664,23 +619,35 @@ pub async unsafe fn create_mv_only_session_context(
 
 /// Describes how a single column in the physical Arrow state maps into the logical MemTable schema.
 #[derive(Debug, Clone, PartialEq)]
-struct MvColumnProjection {
-    /// Index into the physical RecordBatch's columns.
-    physical_position: usize,
+pub(crate) struct MvColumnProjection {
+    /// Index into the physical RecordBatch's columns. Ignored when `null_fill` is true.
+    pub physical_position: usize,
     /// When `Some(target)`, the physical array must be cast to `target` (a lossless widening).
+    /// When `null_fill` is true, this carries the data type for the null array.
     /// When `None`, the physical array is used zero-copy (types match exactly).
-    cast_to: Option<arrow::datatypes::DataType>,
+    pub cast_to: Option<arrow::datatypes::DataType>,
+    /// When true, the logical column has no physical counterpart in the Arrow state file.
+    /// A null array of the type in `cast_to` is produced instead. Used for logical mapping
+    /// fields (e.g. `_mv_source_generation`) absent from older state files.
+    pub null_fill: bool,
 }
 
-/// Returns `true` when `from` can be losslessly widened to `to`.
+/// Returns `true` when `from` can be losslessly widened/reinterpreted to `to`.
 ///
-/// Only permits same-signedness integer width increases:
-///   - Signed:   Int8 → Int16 → Int32 → Int64
-///   - Unsigned: UInt8 → UInt16 → UInt32 → UInt64
+/// Permits:
+///   - Same-signedness integer width increases:
+///     - Signed:   Int8 → Int16 → Int32 → Int64
+///     - Unsigned: UInt8 → UInt16 → UInt32 → UInt64
+///   - Timestamp(any unit, any tz) → Int64: Arrow Timestamps are physically
+///     i64 (epoch value in the given unit), so reinterpretation is lossless.
+///     This arises when a `date`-typed source field (stored as
+///     `Timestamp(Millisecond, None)` in Parquet/Arrow) is used as a plain
+///     GROUP BY key — DataFusion preserves the Timestamp type in the partial
+///     aggregate state file, but the MV target mapping declares it as `long`.
 ///
 /// All other conversions (narrowing, signedness change, integer-to-float,
-/// float-to-integer, string, temporal, etc.) are rejected.
-fn is_lossless_integer_widening(
+/// float-to-integer, string, etc.) are rejected.
+pub(crate) fn is_lossless_integer_widening(
     from: &arrow::datatypes::DataType,
     to: &arrow::datatypes::DataType,
 ) -> bool {
@@ -694,6 +661,10 @@ fn is_lossless_integer_widening(
         (DataType::UInt8, DataType::UInt16 | DataType::UInt32 | DataType::UInt64) => true,
         (DataType::UInt16, DataType::UInt32 | DataType::UInt64) => true,
         (DataType::UInt32, DataType::UInt64) => true,
+        // Timestamp → Int64: physically identical (i64 epoch). Covers all
+        // Arrow TimeUnit variants (Second, Millisecond, Microsecond, Nanosecond)
+        // and all timezone annotations (Some/None).
+        (DataType::Timestamp(_, _), DataType::Int64) => true,
         _ => false,
     }
 }
@@ -703,12 +674,32 @@ fn mv_table_schema(
     logical_schema: &arrow::datatypes::SchemaRef,
     state_fields: &[String],
 ) -> Result<(arrow::datatypes::SchemaRef, Vec<MvColumnProjection>), DataFusionError> {
-    if state_fields.len() != physical_schema.fields().len() {
+    // state_fields may be equal to OR larger than the physical schema.  The first
+    // `physical_schema.fields().len()` entries in state_fields map 1:1 to physical
+    // Arrow columns (label overlay).  Any state_fields beyond that count are
+    // metadata-only names that have no physical Arrow column — they will be
+    // null-filled if the query plan references them.
+    //
+    // The derived-engine path writes ALL shipFields (e.g. 45 for the wide
+    // benchmark) into index.mv.state_fields, but DataFusion's partial-aggregate
+    // fold may materialize fewer physical columns (e.g. 16) because MIN/MAX/COUNT
+    // are collapsed into SUM+COUNT in the partial state.
+    let physical_count = physical_schema.fields().len();
+    if state_fields.len() < physical_count {
         return Err(DataFusionError::Execution(format!(
-            "MV state field metadata has {} names but the Arrow state has {} columns",
+            "MV state field metadata has {} names but the Arrow state has {} columns; \
+             metadata must have at least as many entries as physical columns",
             state_fields.len(),
-            physical_schema.fields().len()
+            physical_count,
         )));
+    }
+    if state_fields.len() > physical_count {
+        native_bridge_common::log_info!(
+            "mv_table_schema: state_fields ({}) > physical columns ({}); \
+             entries beyond physical count will be null-filled if referenced by the query plan",
+            state_fields.len(),
+            physical_count
+        );
     }
     let unique = state_fields
         .iter()
@@ -719,14 +710,10 @@ fn mv_table_schema(
         ));
     }
 
-    if logical_schema.fields().len() != state_fields.len() {
-        return Err(DataFusionError::Execution(format!(
-            "MV query schema has {} fields but state metadata has {} names",
-            logical_schema.fields().len(),
-            state_fields.len()
-        )));
-    }
-
+    // Allow logical schema to have MORE fields than physical (null-fill for absent columns).
+    // Physical fields must be a subset of logical fields by name.
+    // When a logical field matches a state_fields entry at position >= physical_count,
+    // it is treated as absent from the Arrow data (null-filled).
     let physical_projection = logical_schema
         .fields()
         .iter()
@@ -734,35 +721,62 @@ fn mv_table_schema(
         .map(|(logical_position, logical)| {
             let physical_position = state_fields
                 .iter()
-                .position(|name| name == logical.name())
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "MV query field '{}' at position {} is absent from state field metadata {:?}",
-                        logical.name(), logical_position, state_fields
-                    ))
-                })?;
-            let physical = physical_schema.field(physical_position);
-            let cast_to = if logical.data_type() == physical.data_type() {
-                // Exact match → zero-copy projection.
-                None
-            } else if is_lossless_integer_widening(physical.data_type(), logical.data_type()) {
-                // Safe widening (e.g. Int32 → Int64): cast at batch construction time.
-                Some(logical.data_type().clone())
-            } else {
-                // Reject: narrowing, signedness change, or unrelated type conversion.
-                return Err(DataFusionError::Execution(format!(
-                    "MV state field '{}' at physical position {} has type {:?} but query expects {:?}; \
-                     only lossless integer widening (same signedness, larger width) is permitted",
-                    logical.name(),
-                    physical_position,
-                    physical.data_type(),
-                    logical.data_type()
-                )));
-            };
-            Ok(MvColumnProjection {
-                physical_position,
-                cast_to,
-            })
+                .position(|name| name == logical.name());
+
+            match physical_position {
+                Some(pos) if pos < physical_count => {
+                    let physical = physical_schema.field(pos);
+                    let cast_to = if logical.data_type() == physical.data_type() {
+                        None
+                    } else if is_lossless_integer_widening(physical.data_type(), logical.data_type()) {
+                        Some(logical.data_type().clone())
+                    } else {
+                        return Err(DataFusionError::Execution(format!(
+                            "MV state field '{}' at physical position {} has type {:?} but query expects {:?}; \
+                             only lossless integer widening (same signedness, larger width) is permitted",
+                            logical.name(),
+                            pos,
+                            physical.data_type(),
+                            logical.data_type()
+                        )));
+                    };
+                    Ok(MvColumnProjection {
+                        physical_position: pos,
+                        cast_to,
+                        null_fill: false,
+                    })
+                }
+                Some(pos) => {
+                    // state_fields entry exists beyond physical column range → null-fill.
+                    native_bridge_common::log_info!(
+                        "mv_table_schema: logical field '{}' matched state_fields[{}] which is beyond \
+                         physical column count ({}); null-filling as {:?}",
+                        logical.name(),
+                        pos,
+                        physical_count,
+                        logical.data_type()
+                    );
+                    Ok(MvColumnProjection {
+                        physical_position: 0, // unused placeholder
+                        cast_to: Some(logical.data_type().clone()),
+                        null_fill: true,
+                    })
+                }
+                None => {
+                    // Logical field absent from physical state → null-fill.
+                    native_bridge_common::log_info!(
+                        "mv_table_schema: logical field '{}' at position {} absent from physical state; null-filling as {:?}",
+                        logical.name(),
+                        logical_position,
+                        logical.data_type()
+                    );
+                    Ok(MvColumnProjection {
+                        physical_position: 0, // unused placeholder
+                        cast_to: Some(logical.data_type().clone()),
+                        null_fill: true,
+                    })
+                }
+            }
         })
         .collect::<Result<Vec<_>, DataFusionError>>()?;
     Ok((Arc::clone(logical_schema), physical_projection))
@@ -1050,15 +1064,18 @@ mod tests {
             vec![
                 MvColumnProjection {
                     physical_position: 0,
-                    cast_to: None
+                    cast_to: None,
+                    null_fill: false,
                 },
                 MvColumnProjection {
                     physical_position: 2,
-                    cast_to: None
+                    cast_to: None,
+                    null_fill: false,
                 },
                 MvColumnProjection {
                     physical_position: 1,
-                    cast_to: None
+                    cast_to: None,
+                    null_fill: false,
                 },
             ]
         );
@@ -1632,6 +1649,7 @@ mod tests {
             MvColumnProjection {
                 physical_position: 0,
                 cast_to: Some(DataType::Int64),
+                null_fill: false,
             }
         );
         assert_eq!(
@@ -1639,6 +1657,7 @@ mod tests {
             MvColumnProjection {
                 physical_position: 2,
                 cast_to: None,
+                null_fill: false,
             }
         );
         assert_eq!(
@@ -1646,6 +1665,7 @@ mod tests {
             MvColumnProjection {
                 physical_position: 1,
                 cast_to: None,
+                null_fill: false,
             }
         );
 
@@ -1781,6 +1801,70 @@ mod tests {
         assert!(result.is_err(), "signedness change must be rejected");
     }
 
+    /// state_fields may have MORE entries than physical columns (derived-engine
+    /// writes all shipFields but DataFusion partial-aggregate fold may materialize
+    /// fewer physical columns).  Entries beyond physical count are null-filled.
+    #[test]
+    fn test_mv_table_schema_state_fields_superset_of_physical() {
+        // Physical Arrow has 2 columns: RegionID (Int64) + cnt (Int64).
+        let physical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int64, false),
+            Field::new("count(Int64(1))[count]", DataType::Int64, false),
+        ]));
+        // state_fields has 4 names: 2 physical + 2 metadata-only.
+        let state_fields = vec![
+            "RegionID".to_string(),
+            "cnt".to_string(),
+            "adv_min".to_string(),
+            "adv_max".to_string(),
+        ];
+        // Logical schema (from query plan) references all 4.
+        let logical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int64, true),
+            Field::new("cnt", DataType::Int64, true),
+            Field::new("adv_min", DataType::Int64, true),
+            Field::new("adv_max", DataType::Int64, true),
+        ]));
+
+        let (schema, projections) =
+            mv_table_schema(&physical, &logical, &state_fields).expect("should accept superset");
+        assert_eq!(schema.fields().len(), 4);
+        assert_eq!(projections.len(), 4);
+
+        // First two should map to physical columns.
+        assert!(!projections[0].null_fill);
+        assert_eq!(projections[0].physical_position, 0);
+        assert!(!projections[1].null_fill);
+        assert_eq!(projections[1].physical_position, 1);
+
+        // Last two (beyond physical count) should be null-filled.
+        assert!(projections[2].null_fill);
+        assert_eq!(projections[2].cast_to, Some(DataType::Int64));
+        assert!(projections[3].null_fill);
+        assert_eq!(projections[3].cast_to, Some(DataType::Int64));
+    }
+
+    /// Fewer state_fields than physical columns must still be rejected.
+    #[test]
+    fn test_mv_table_schema_rejects_fewer_state_fields_than_physical() {
+        let physical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int64, false),
+            Field::new("cnt", DataType::Int64, false),
+            Field::new("adv", DataType::Int64, false),
+        ]));
+        let state_fields = vec!["RegionID".to_string(), "cnt".to_string()]; // only 2, physical has 3
+        let logical = Arc::new(Schema::new(vec![
+            Field::new("RegionID", DataType::Int64, true),
+            Field::new("cnt", DataType::Int64, true),
+        ]));
+
+        let result = mv_table_schema(&physical, &logical, &state_fields);
+        assert!(
+            result.is_err(),
+            "fewer state_fields than physical columns must be rejected"
+        );
+    }
+
     /// is_lossless_integer_widening unit tests for coverage of all accepted/rejected pairs.
     #[test]
     fn test_is_lossless_integer_widening_accepts_valid() {
@@ -1834,6 +1918,28 @@ mod tests {
             &DataType::UInt32,
             &DataType::UInt64
         ));
+        // Timestamp → Int64 (all TimeUnit variants, with and without timezone)
+        use arrow::datatypes::TimeUnit;
+        assert!(is_lossless_integer_widening(
+            &DataType::Timestamp(TimeUnit::Millisecond, None),
+            &DataType::Int64
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::Timestamp(TimeUnit::Second, None),
+            &DataType::Int64
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            &DataType::Int64
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::Timestamp(TimeUnit::Nanosecond, None),
+            &DataType::Int64
+        ));
+        assert!(is_lossless_integer_widening(
+            &DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            &DataType::Int64
+        ));
     }
 
     #[test]
@@ -1879,6 +1985,21 @@ mod tests {
         assert!(!is_lossless_integer_widening(
             &DataType::Boolean,
             &DataType::Int32
+        ));
+        // Timestamp → non-Int64 is rejected
+        use arrow::datatypes::TimeUnit;
+        assert!(!is_lossless_integer_widening(
+            &DataType::Timestamp(TimeUnit::Millisecond, None),
+            &DataType::Int32
+        ));
+        assert!(!is_lossless_integer_widening(
+            &DataType::Timestamp(TimeUnit::Millisecond, None),
+            &DataType::Utf8
+        ));
+        // Int64 → Timestamp is rejected (reverse direction)
+        assert!(!is_lossless_integer_widening(
+            &DataType::Int64,
+            &DataType::Timestamp(TimeUnit::Millisecond, None)
         ));
     }
 }

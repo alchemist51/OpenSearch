@@ -77,6 +77,25 @@ public record AggregateSpec(AggFunction function, String sourceField, String use
         );
     }
 
+    /**
+     * {@code COUNT(field)} → one state column of type {@code long}, folded as
+     * {@code SUM(alias)}. Unlike {@link #count(String)} (which counts rows via
+     * {@code COUNT(*)}), this counts non-null values of a specific source
+     * field and is distinguished by carrying a non-null {@link #sourceField()}.
+     */
+    public static AggregateSpec countField(String sourceField, String alias) {
+        Objects.requireNonNull(sourceField, "sourceField");
+        return new AggregateSpec(
+            AggFunction.COUNT,
+            sourceField,
+            alias,
+            List.of(new StateColumn(alias, "long")),
+            String.format(Locale.ROOT, "COUNT(\"%s\")", sourceField),
+            String.format(Locale.ROOT, "SUM(\"%s\")", alias),
+            "long"
+        );
+    }
+
     /** {@code SUM(field)} → one state column of type {@code long}. */
     public static AggregateSpec sum(String sourceField, String alias) {
         Objects.requireNonNull(sourceField, "sourceField");

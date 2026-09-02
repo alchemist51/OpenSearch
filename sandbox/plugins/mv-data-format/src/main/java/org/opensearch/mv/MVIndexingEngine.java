@@ -156,7 +156,37 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
         if (this.shipTargets.isEmpty() == false) {
             mergeStrategy = new NoOpMVMergeStrategy();
         } else if (stateMergeEnabled && MVStateDataFormat.NAME.equals(format.name())) {
-            mergeStrategy = new DataFusionMVStateMergeStrategy(format, shardPath, spec.sql());
+            // Stage 4: compile the MV definition to extract ordering contract
+            // and per-column fold metadata for the streaming k-way merge
+            // engine. Compilation is now required — the legacy SQL merge path
+            // has been removed. If compilation fails, the merge strategy
+            // cannot be constructed and the engine falls back to no-op merge
+            // (no state merge for this shard until the definition is fixed).
+            MVCompiledDefinition compiledDef;
+            try {
+                compiledDef = MVCompiledDefinition.compiledFor(definitionName);
+            } catch (Exception e) {
+                org.apache.logging.log4j.LogManager.getLogger(MVIndexingEngine.class)
+                    .error(
+                        "mv merge: compiled definition unavailable for [{}]; "
+                            + "Stage 4 requires a compiled definition — state merge disabled for this shard",
+                        definitionName,
+                        e
+                    );
+                compiledDef = null;
+            }
+            if (compiledDef != null) {
+                // Stage 4: streaming merge with full ordering/accumulator metadata.
+                // runtimePtr=0 is fine: the streaming merge engine is self-contained
+                // and does not need the shared DataFusionRuntime.
+                mergeStrategy = new DataFusionMVStateMergeStrategy(format, shardPath, spec.sql(), compiledDef, 0L);
+            } else {
+                // Stage 4: compiled definition is required. Without it, disable
+                // merge rather than silently producing incorrect results.
+                org.apache.logging.log4j.LogManager.getLogger(MVIndexingEngine.class)
+                    .error("mv merge: disabling state merge for [{}] — compiled definition required", definitionName);
+                mergeStrategy = new NoOpMVMergeStrategy();
+            }
         } else {
             mergeStrategy = new DataFusionMVRecomputeMergeStrategy(format, shardPath, spec.sql());
         }

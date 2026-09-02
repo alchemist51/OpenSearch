@@ -362,6 +362,9 @@ public final class DerivedIndexBinding {
         return ValidationResult.OK;
     }
 
+    /**
+     * Result of a derived-index binding validation, carrying a pass/fail flag and optional reason.
+     */
     @org.opensearch.common.annotation.ExperimentalApi
     public static final class ValidationResult {
         public static final ValidationResult OK = new ValidationResult(true, null);

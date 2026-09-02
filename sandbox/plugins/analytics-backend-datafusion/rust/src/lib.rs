@@ -34,9 +34,13 @@ pub mod indexed_table;
 pub mod local_executor;
 pub mod memory;
 pub mod memory_guard;
+pub mod mv_build_managed;
 pub mod mv_fold;
+pub mod mv_merge_engine;
 pub mod mv_poc;
+pub mod mv_pull_metadata;
 pub mod mv_read;
+pub mod mv_state_table_provider;
 pub mod mv_writer;
 pub mod native_error;
 pub mod partition_stream;
@@ -71,6 +75,14 @@ pub use cache::statistics_cache;
 
 #[cfg(test)]
 mod spill_e2e_test;
+
+// Stage 3 streaming MV build regression tests (multi-key sort, NULLS FIRST
+// ordering, IPC roundtrip, schema/definition hash, structural plan shape,
+// forced-spill observation). Declared under `cfg(test)` so it only compiles
+// for the test build; without this declaration the file is orphaned and its
+// tests never run.
+#[cfg(test)]
+mod mv_build_stage3_tests;
 
 // End-to-end TieredObjectStore + TieredBlockCache integration tests. Located here
 // (not in the lower-level `opensearch-tiered-storage` crate) because they drive a

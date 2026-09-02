@@ -13,21 +13,20 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Node-level services and index settings for the pull-model MV engine POC.
+ * Node-level services and index settings for the pull-model MV engine.
  *
- * <p>Track A scope: single-shard source and MV, numeric group/sum fields,
- * append-only source, definition = {@code SELECT group, COUNT(*), SUM(sum)
- * GROUP BY group}. The engine is selected for any index that declares a
- * {@link DerivedIndexBinding} (via the public
- * {@link DerivedIndexBinding#KEY_SOURCE_NAME} setting) and uses
- * {@code mv_state} as a secondary data format (with {@code parquet} as
- * primary).
+ * <p><b>Stage 2:</b> {@link Services} now carries the shared DataFusion
+ * runtime pointer and the OpenSearch parent circuit breaker, so
+ * {@link MVBuildRuntime} can route builds through the managed runtime and
+ * account memory against the breaker.
  */
 public final class MVPullSettings {
 
@@ -35,13 +34,6 @@ public final class MVPullSettings {
 
     /**
      * <b>Deprecated.</b> Retained for BWC setting registration only.
-     * <p>Do NOT use this setting to gate engine selection or identify the
-     * source index at runtime. All pull targets use
-     * {@link DerivedIndexBinding} exclusively — the source identity is
-     * resolved from the public {@code index.derived.source.name} setting
-     * and enriched with private UUID/topology by
-     * {@link org.opensearch.cluster.metadata.MetadataCreateIndexService}
-     * at creation time.
      *
      * @deprecated Use {@link DerivedIndexBinding#KEY_SOURCE_NAME} instead.
      */
@@ -73,8 +65,98 @@ public final class MVPullSettings {
         Setting.Property.Final
     );
 
-    /** Node services captured by the plugin, handed to engine instances. */
-    public record Services(ClusterService clusterService, ThreadPool threadPool, Supplier<RepositoriesService> repositoriesService) {
+    // ── Pull-round admission settings (Stage 5, criteria H) ─────────────
+
+    /**
+     * Maximum total source bytes (sum of staged parquet file sizes) per pull
+     * round. Rounds whose staged input exceeds this limit are rejected with
+     * a safe fail-open result (the poller retries next interval). Use
+     * {@link Long#MAX_VALUE} (default) to disable.
+     */
+    public static final Setting<Long> MAX_SOURCE_BYTES_PER_ROUND = Setting.longSetting(
+        "index.mv_pull.admission.max_source_bytes",
+        Long.MAX_VALUE,
+        0L,
+        Setting.Property.IndexScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Maximum estimated operations (row count in the source range) per pull
+     * round. Provides a coarse cardinality guard that avoids builds whose
+     * result set would OOM the fold. Default {@link Long#MAX_VALUE} (no-op).
+     */
+    public static final Setting<Long> MAX_OPS_ESTIMATE_PER_ROUND = Setting.longSetting(
+        "index.mv_pull.admission.max_ops_estimate",
+        Long.MAX_VALUE,
+        0L,
+        Setting.Property.IndexScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Maximum cardinality estimate (distinct group keys expected in the
+     * output) per pull round. Limits memory used by the HashAggregate
+     * during partial fold. Default {@link Long#MAX_VALUE} (no-op).
+     */
+    public static final Setting<Long> MAX_CARDINALITY_ESTIMATE_PER_ROUND = Setting.longSetting(
+        "index.mv_pull.admission.max_cardinality_estimate",
+        Long.MAX_VALUE,
+        0L,
+        Setting.Property.IndexScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Maximum native-memory pressure (RSS fraction 0.0–1.0) at which new
+     * pull rounds are admitted. When jemalloc RSS exceeds this fraction of
+     * the node's native-memory budget, the round is rejected to protect
+     * running builds. Default 1.0 (no-op / disabled).
+     */
+    public static final Setting<Double> MAX_NATIVE_PRESSURE_FRACTION = Setting.doubleSetting(
+        "index.mv_pull.admission.max_native_pressure",
+        1.0,
+        0.0,
+        1.0,
+        Setting.Property.IndexScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Returns all admission-related settings for use in plugin registration.
+     */
+    public static List<Setting<?>> admissionSettings() {
+        return List.of(
+            MAX_SOURCE_BYTES_PER_ROUND,
+            MAX_OPS_ESTIMATE_PER_ROUND,
+            MAX_CARDINALITY_ESTIMATE_PER_ROUND,
+            MAX_NATIVE_PRESSURE_FRACTION
+        );
+    }
+
+    /**
+     * Node services captured by the plugin, handed to engine instances.
+     *
+     * <p><b>Stage 2 additions:</b>
+     * <ul>
+     *   <li>{@link #dataFusionRuntimePtr()} — the shared DataFusionRuntime
+     *       native pointer for managed MV builds (replaces the POC's per-call
+     *       unbounded SessionContext).</li>
+     *   <li>{@link #parentCircuitBreaker()} — the OpenSearch parent circuit
+     *       breaker for MV build memory accounting. May be null if the breaker
+     *       service is not available (e.g. in unit tests).</li>
+     * </ul>
+     */
+    public record Services(ClusterService clusterService, ThreadPool threadPool, Supplier<RepositoriesService> repositoriesService,
+        long dataFusionRuntimePtr, CircuitBreaker parentCircuitBreaker) {
+        /**
+         * Backward-compatible constructor without Stage 2 services.
+         * Used by tests and legacy code paths that don't need managed builds.
+         */
+        public Services(ClusterService clusterService, ThreadPool threadPool, Supplier<RepositoriesService> repositoriesService) {
+            this(clusterService, threadPool, repositoriesService, 0L, null);
+        }
+
         /** The node's fixed segments path prefix — MUST match what the source's own uploads use. */
         public String segmentsPathFixedPrefix() {
             return org.opensearch.indices.RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENTS_PATH_PREFIX.get(clusterService.getSettings());
@@ -91,11 +173,6 @@ public final class MVPullSettings {
         /**
          * Resolve and validate the source index against a durable binding.
          * Fails closed on UUID mismatch or topology change.
-         *
-         * <p><b>Thread safety:</b> this method calls
-         * {@link ClusterService#state()} and must NOT be invoked from the
-         * cluster-applier thread. It is safe to call from GENERIC, poller
-         * threads, or any non-applier context.
          */
         public IndexMetadata resolveAndValidateSource(DerivedIndexBinding binding) {
             IndexMetadata md = clusterService.state().metadata().index(binding.sourceName());
@@ -104,6 +181,23 @@ public final class MVPullSettings {
                 throw new IllegalStateException("mv_pull: " + result.reason());
             }
             return md;
+        }
+
+        /**
+         * Returns the shared DataFusionRuntime pointer for managed MV builds.
+         * Returns 0 if the DataFusion service is not available (graceful degradation
+         * to POC path).
+         */
+        public long dataFusionRuntimePtr() {
+            return dataFusionRuntimePtr;
+        }
+
+        /**
+         * Returns the OpenSearch parent circuit breaker for MV build memory
+         * accounting. May be null if the circuit breaker service is not available.
+         */
+        public CircuitBreaker parentCircuitBreaker() {
+            return parentCircuitBreaker;
         }
     }
 }

@@ -110,9 +110,15 @@ public final class NodeDerivedPullService extends AbstractLifecycleComponent imp
 
     // ── IndexEventListener callbacks (cluster-applier thread) ────────────
 
+    /**
+     * Fires once the shard reaches STARTED — the definitive signal that the
+     * shard is eligible.  Always forces a fresh reconcile even if a prior
+     * intermediate-state reconcile already ran and found the shard
+     * not-yet-STARTED.
+     */
     @Override
     public void afterIndexShardStarted(IndexShard indexShard) {
-        enqueueReconcile(indexShard);
+        enqueueReconcile(indexShard, true);
     }
 
     @Override
@@ -122,7 +128,11 @@ public final class NodeDerivedPullService extends AbstractLifecycleComponent imp
         IndexShardState currentState,
         @Nullable String reason
     ) {
-        enqueueReconcile(indexShard);
+        // Only reconcile for terminal states; intermediate transitions
+        // (RECOVERING, POST_RECOVERY) are covered by afterIndexShardStarted.
+        if (currentState == IndexShardState.STARTED || currentState == IndexShardState.CLOSED) {
+            enqueueReconcile(indexShard, false);
+        }
     }
 
     @Override
@@ -131,7 +141,7 @@ public final class NodeDerivedPullService extends AbstractLifecycleComponent imp
         @Nullable org.opensearch.cluster.routing.ShardRouting oldRouting,
         org.opensearch.cluster.routing.ShardRouting newRouting
     ) {
-        enqueueReconcile(indexShard);
+        enqueueReconcile(indexShard, false);
     }
 
     @Override
@@ -144,12 +154,22 @@ public final class NodeDerivedPullService extends AbstractLifecycleComponent imp
 
     // ── Async reconciliation ─────────────────────────────────────────────
 
-    private void enqueueReconcile(IndexShard shard) {
+    /**
+     * Enqueue a reconcile task onto GENERIC.
+     *
+     * @param force when true, bypass the dedup guard so that a fresh
+     *              reconcile runs even if a prior (possibly stale) one
+     *              is already queued.  Used by {@code afterIndexShardStarted}
+     *              to guarantee the definitive STARTED state is seen.
+     */
+    private void enqueueReconcile(IndexShard shard, boolean force) {
         synchronized (this) {
             if (closed) {
                 return;
             }
-            if (pendingReconcile.add(shard.shardId()) == false) {
+            if (force) {
+                pendingReconcile.add(shard.shardId());   // always (re-)mark pending
+            } else if (pendingReconcile.add(shard.shardId()) == false) {
                 return; // already queued
             }
         }
@@ -177,9 +197,15 @@ public final class NodeDerivedPullService extends AbstractLifecycleComponent imp
             return;
         }
 
-        // Already running?
-        if (pollers.containsKey(shard.shardId())) {
-            return;
+        // Already running and healthy?
+        DerivedShardPoller existing = pollers.get(shard.shardId());
+        if (existing != null) {
+            if (existing.isClosed() == false) {
+                return; // healthy poller already active
+            }
+            // Stale/closed poller — clean it up and start a fresh one
+            pollers.remove(shard.shardId());
+            logger.info("derived_pull replaced stale closed poller for shard [{}]", shard.shardId());
         }
 
         DerivedPullFormat format = formatRegistry.get(formatId);

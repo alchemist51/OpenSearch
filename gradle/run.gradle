@@ -38,6 +38,10 @@ def numZones = findProperty('numZones') as Integer ?: 1
 testClusters {
   runTask {
     testDistribution = 'archive'
+    // Disable seccomp BPF filter — JDK 25 uses syscalls (likely statx via
+    // glibc 2.28+) in Files.newDirectoryStream that are not in OpenSearch's
+    // allowlist, causing "Function not implemented" on FsBlobContainer listing.
+    setting 'bootstrap.system_call_filter', 'false'
     if (numZones > 1) numberOfZones = numZones
     if (numNodes > 1) numberOfNodes = numNodes
     if (findProperty("installedPlugins")) {
@@ -90,14 +94,33 @@ testClusters {
           systemProperty 'io.netty.tryUnsafe', 'true'
           systemProperty 'io.netty.tryReflectionSetAccessible', 'true'
         }
+        if (p.equals("analytics-engine")) {
+          // Analytics engine requires stream transport feature flag
+          systemProperty 'opensearch.experimental.feature.transport.stream.enabled', 'true'
+        }
         if (p.equals("parquet-data-format") || p.equals("analytics-backend-datafusion")) {
           // Composite engine / DataFusion requires pluggable dataformat feature flag
           systemProperty 'opensearch.experimental.feature.pluggable.dataformat.enabled', 'true'
+          // Enable composite merges (Lucene → Parquet); off by default
+          systemProperty 'opensearch.pluggable.dataformat.merge.enabled', 'true'
           // Native lib path for DataFusion FFM bridge
           def nativeLibDir = new File(project(':sandbox:libs:dataformat-native').projectDir, 'rust/target/release').absolutePath
           systemProperty 'java.library.path', nativeLibDir
           jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
           jvmArgs '--enable-native-access=ALL-UNNAMED'
+        }
+        if (p.equals("mv-data-format")) {
+          // MV pull path requires remote segment store on the source index.
+          // Configure a local FS-based remote store for the testcluster.
+          // Place inside repo/ so FsRepository.validateLocation passes (must be under path.repo).
+          def repoDir = new File(project.buildDir, 'testclusters/runTask-0/repo/remote-store')
+          repoDir.mkdirs()
+          def repoName = 'mv-e2e-repo'
+          setting 'node.attr.remote_store.segment.repository', repoName
+          setting "node.attr.remote_store.repository.${repoName}.type", 'fs'
+          setting "node.attr.remote_store.repository.${repoName}.settings.location", repoDir.absolutePath
+          setting 'node.attr.remote_store.translog.repository', repoName
+          setting 'node.attr.remote_store.state.repository', repoName
         }
       }
     }

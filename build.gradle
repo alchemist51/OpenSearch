@@ -418,7 +418,6 @@ gradle.projectsEvaluated {
     project.tasks.withType(Test) { task ->
       if (task != null) {
         task.jvmArgs += [
-            "--add-modules=jdk.incubator.vector",
             "--add-exports=java.base/com.sun.crypto.provider=ALL-UNNAMED",
             "--enable-native-access=ALL-UNNAMED",
             // Disable ByteBuddy's Unsafe-based class injection path to avoid
@@ -426,6 +425,11 @@ gradle.projectsEvaluated {
             // ByteBuddy still falls back to Lookup/Reflection injection strategies.
             "-Dnet.bytebuddy.safe=true"
         ]
+        // JDK 25 graduated the Vector API from incubator to java.base;
+        // --add-modules=jdk.incubator.vector fails with "Module not found" on 25+.
+        if (!JavaVersion.current().isCompatibleWith(JavaVersion.toVersion(25))) {
+          task.jvmArgs += ["--add-modules=jdk.incubator.vector"]
+        }
 
         // Add Java Agent for security sandboxing
         if (!(project.path in [':build-tools', ":libs:agent-sm:bootstrap", ":libs:agent-sm:agent"])) {
