@@ -18,20 +18,20 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import java.io.IOException;
 
 /**
- * Cold-start request: target → source. When a target shard has an empty
- * mailbox and has NOT been seeded (first round after creation/restart),
- * it sends a request to the source primary asking for a full advert
- * (same payload as a push). This eliminates the expensive remote-store
- * listing on cold start (up to 257s observed in production).
+ * Request-driven checkpoint action: target → source. Every poll round where
+ * the target's mailbox is empty, it sends a checkpoint request to the source
+ * primary carrying the target's current watermark. The source handler reads
+ * its local catalog, filters files and noops to the (watermark, advertMax]
+ * range, and replies with a scoped {@link MVReplicationCheckpoint}.
  *
- * <p>Flow: target sends request → source handler reads local catalog
- * snapshot → replies with full {@link MVReplicationCheckpoint} → target
- * delivers into mailbox → proceeds as MAILBOX_HIT.
+ * <p>This is the primary data flow. The push path (mailbox) is a documented
+ * latency optimization that may be re-enabled in the future.
  *
  * <p>On RPC failure, the poller returns null and retries on the next round
  * (covered by the poller's existing backoff).
  *
- * <p>Logs: COLD_START_REQUEST on send, COLD_START_REPLY on response.
+ * <p>Logs: CHECKPOINT_REQUEST on send, CHECKPOINT_REPLY / CHECKPOINT_NOTHING_NEW
+ * on response.
  */
 public final class MVCheckpointRequestAction extends ActionType<MVCheckpointRequestAction.Response> {
 
@@ -43,20 +43,23 @@ public final class MVCheckpointRequestAction extends ActionType<MVCheckpointRequ
     }
 
     /**
-     * Request from target to source: "give me your current catalog snapshot
-     * for this source shard so I can bootstrap my mailbox."
+     * Request from target to source: "give me files and noops above my
+     * current watermark for this source shard."
      */
     public static final class Request extends ActionRequest {
         private final String sourceIndex;
         private final int sourceShard;
         private final String targetIndex;
         private final int targetShard;
+        /** Target's current watermark — source filters to (watermark, advertMax]. */
+        private final long targetWatermark;
 
-        public Request(String sourceIndex, int sourceShard, String targetIndex, int targetShard) {
+        public Request(String sourceIndex, int sourceShard, String targetIndex, int targetShard, long targetWatermark) {
             this.sourceIndex = sourceIndex;
             this.sourceShard = sourceShard;
             this.targetIndex = targetIndex;
             this.targetShard = targetShard;
+            this.targetWatermark = targetWatermark;
         }
 
         public Request(StreamInput in) throws IOException {
@@ -65,6 +68,7 @@ public final class MVCheckpointRequestAction extends ActionType<MVCheckpointRequ
             this.sourceShard = in.readVInt();
             this.targetIndex = in.readString();
             this.targetShard = in.readVInt();
+            this.targetWatermark = in.readZLong();
         }
 
         @Override
@@ -74,12 +78,14 @@ public final class MVCheckpointRequestAction extends ActionType<MVCheckpointRequ
             out.writeVInt(sourceShard);
             out.writeString(targetIndex);
             out.writeVInt(targetShard);
+            out.writeZLong(targetWatermark);
         }
 
         public String sourceIndex() { return sourceIndex; }
         public int sourceShard() { return sourceShard; }
         public String targetIndex() { return targetIndex; }
         public int targetShard() { return targetShard; }
+        public long targetWatermark() { return targetWatermark; }
 
         @Override
         public ActionRequestValidationException validate() {
@@ -89,7 +95,7 @@ public final class MVCheckpointRequestAction extends ActionType<MVCheckpointRequ
 
     /**
      * Response from source: carries an {@link MVReplicationCheckpoint}.
-     * {@code available} is false if the source has no data yet.
+     * {@code available} is false if the source has no new data (nothing-new).
      */
     public static final class Response extends ActionResponse {
         private final boolean available;
@@ -101,7 +107,7 @@ public final class MVCheckpointRequestAction extends ActionType<MVCheckpointRequ
             this.checkpoint = checkpoint;
         }
 
-        /** Source has no data yet. */
+        /** Source has no new data (nothing-new). */
         public static Response unavailable() {
             return new Response(false, null);
         }

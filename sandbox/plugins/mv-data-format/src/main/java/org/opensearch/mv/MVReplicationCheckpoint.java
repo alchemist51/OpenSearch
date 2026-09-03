@@ -54,6 +54,16 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
     private final long infosVersion;
     private final Map<String, MVFileMetadata> fileMetadata;
     private final long createdTimeStampMillis;
+    /**
+     * Defect 13: seqNos in (targetWatermark, maxSeqNo] that consumed a sequence
+     * number but produced no parquet row (failed index ops, deletes). Sorted
+     * ascending. Delta-encoded on the wire (VLong deltas from previous value).
+     * Empty array when no noops exist in the range — the common case.
+     *
+     * <p>The target's coverage check uses this to adjust the expected row count:
+     * {@code expected = rangeSize - noopCount}.</p>
+     */
+    private final long[] noopSeqNos;
 
     /**
      * Full constructor.
@@ -67,6 +77,22 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
         Map<String, MVFileMetadata> fileMetadata,
         long createdTimeStampMillis
     ) {
+        this(sourceIndex, sourceShard, primaryTerm, maxSeqNo, infosVersion, fileMetadata, createdTimeStampMillis, EMPTY_NOOPS);
+    }
+
+    /**
+     * Full constructor with noop seqNos.
+     */
+    public MVReplicationCheckpoint(
+        String sourceIndex,
+        int sourceShard,
+        long primaryTerm,
+        long maxSeqNo,
+        long infosVersion,
+        Map<String, MVFileMetadata> fileMetadata,
+        long createdTimeStampMillis,
+        long[] noopSeqNos
+    ) {
         this.sourceIndex = sourceIndex;
         this.sourceShard = sourceShard;
         this.primaryTerm = primaryTerm;
@@ -74,7 +100,10 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
         this.infosVersion = infosVersion;
         this.fileMetadata = fileMetadata == null ? Collections.emptyMap() : Map.copyOf(fileMetadata);
         this.createdTimeStampMillis = createdTimeStampMillis;
+        this.noopSeqNos = noopSeqNos == null || noopSeqNos.length == 0 ? EMPTY_NOOPS : noopSeqNos.clone();
     }
+
+    private static final long[] EMPTY_NOOPS = new long[0];
 
     /**
      * Creates an EMPTY sentinel checkpoint for the given source shard.
@@ -82,7 +111,7 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
      */
     public static MVReplicationCheckpoint empty(String sourceIndex, int sourceShard) {
         return new MVReplicationCheckpoint(
-            sourceIndex, sourceShard, 0L, -1L, -1L, Collections.emptyMap(), System.currentTimeMillis()
+            sourceIndex, sourceShard, 0L, -1L, -1L, Collections.emptyMap(), System.currentTimeMillis(), EMPTY_NOOPS
         );
     }
 
@@ -112,6 +141,18 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
             this.fileMetadata = Collections.unmodifiableMap(map);
         }
         this.createdTimeStampMillis = in.readZLong();
+        // Defect 13: delta-encoded noop seqNos (usually empty)
+        int noopCount = in.readVInt();
+        if (noopCount == 0) {
+            this.noopSeqNos = EMPTY_NOOPS;
+        } else {
+            this.noopSeqNos = new long[noopCount];
+            long prev = 0;
+            for (int i = 0; i < noopCount; i++) {
+                prev += in.readVLong();
+                this.noopSeqNos[i] = prev;
+            }
+        }
     }
 
     @Override
@@ -127,6 +168,13 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
             entry.getValue().writeTo(out);
         }
         out.writeZLong(createdTimeStampMillis);
+        // Defect 13: delta-encoded noop seqNos
+        out.writeVInt(noopSeqNos.length);
+        long prev = 0;
+        for (long seqNo : noopSeqNos) {
+            out.writeVLong(seqNo - prev);
+            prev = seqNo;
+        }
     }
 
     // ── Ordering ─────────────────────────────────────────────────────────
@@ -219,6 +267,14 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
         return createdTimeStampMillis;
     }
 
+    /**
+     * Sorted array of noop seqNos in this checkpoint's advertised range.
+     * Empty when no noops exist — the common case.
+     */
+    public long[] noopSeqNos() {
+        return noopSeqNos;
+    }
+
     @Override
     public String toString() {
         return "MVReplicationCheckpoint{"
@@ -227,6 +283,7 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
             + ", maxSeqNo=" + maxSeqNo
             + ", infosVersion=" + infosVersion
             + ", files=" + fileMetadata.size()
+            + ", noops=" + noopSeqNos.length
             + ", ts=" + createdTimeStampMillis
             + '}';
     }

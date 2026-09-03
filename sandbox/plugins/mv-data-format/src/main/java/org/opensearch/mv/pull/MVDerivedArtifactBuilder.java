@@ -276,15 +276,35 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
 
         // Coverage integrity guard
         long expectedRows = appliedThrough - current.seqNo();
-        if (MVWatermark.hasCompleteCoverage(current.seqNo(), appliedThrough, coverage.totalRows()) == false) {
+        // Defect 13: count noops in the round range to adjust expected rows.
+        // Noops are seqNos that consumed a sequence number but produced no
+        // parquet row (failed index ops, deletes).
+        long[] noopSeqNos = mvSnapshot.noopSeqNos();
+        int noopsInRange = MVWatermark.countNoopsInRange(noopSeqNos, current.seqNo(), appliedThrough);
+        long adjustedExpected = expectedRows - noopsInRange;
+        if (MVWatermark.hasCompleteCoverage(current.seqNo(), appliedThrough, coverage.totalRows(), noopsInRange) == false) {
             logger.warn(
-                "mv_pull coverage mismatch: range=({}, {}] expected={} but found={}",
+                "mv_pull coverage mismatch: range=({}, {}] expected={} (adjusted={}, noops={}) but found={}",
                 current.seqNo(),
                 appliedThrough,
                 expectedRows,
+                adjustedExpected,
+                noopsInRange,
                 coverage.totalRows()
             );
             return new MVBuildResult(false, "coverage-mismatch", Map.of());
+        }
+        if (noopsInRange > 0) {
+            logger.info(
+                "mv_pull COVERAGE shard=[{}] range=({}, {}] expected={} noops={} adjusted={} found={}",
+                shard.shardId(),
+                current.seqNo(),
+                appliedThrough,
+                expectedRows,
+                noopsInRange,
+                adjustedExpected,
+                coverage.totalRows()
+            );
         }
 
         // Build artifact through the MANAGED runtime (Stage 2)

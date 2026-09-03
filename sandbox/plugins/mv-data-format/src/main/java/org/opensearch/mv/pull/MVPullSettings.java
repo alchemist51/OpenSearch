@@ -204,7 +204,7 @@ public final class MVPullSettings {
         }
 
         /**
-         * Constructor without client — for existing call sites that don't need cold-start RPC.
+         * Constructor without client — for existing call sites that don't need checkpoint request RPC.
          */
         public Services(ClusterService clusterService, ThreadPool threadPool, Supplier<RepositoriesService> repositoriesService,
             long dataFusionRuntimePtr, CircuitBreaker parentCircuitBreaker) {
@@ -255,7 +255,7 @@ public final class MVPullSettings {
         }
 
         /**
-         * Returns the transport client for cold-start RPC (checkpoint request
+         * Returns the transport client for checkpoint request RPC (checkpoint request
          * action). May be null in unit tests — callers must null-check.
          */
         public org.opensearch.transport.client.Client client() {

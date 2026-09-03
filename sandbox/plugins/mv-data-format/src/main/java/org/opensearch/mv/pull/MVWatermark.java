@@ -55,7 +55,54 @@ public record MVWatermark(long primaryTerm, long seqNo, long generation) {
      * {@code (currentSeqNo, appliedThrough]} is their difference.
      */
     public static boolean hasCompleteCoverage(long currentSeqNo, long appliedThrough, long totalRows) {
-        return appliedThrough >= currentSeqNo && totalRows == appliedThrough - currentSeqNo;
+        return hasCompleteCoverage(currentSeqNo, appliedThrough, totalRows, 0);
+    }
+
+    /**
+     * Defect 13: noop-aware coverage check. Expected row count is reduced by the
+     * number of noop seqNos in the range (seqNos that consumed a sequence number
+     * but did not produce a parquet row — failed index ops, deletes).
+     *
+     * @param noopsInRange count of noop seqNos in (currentSeqNo, appliedThrough]
+     */
+    public static boolean hasCompleteCoverage(long currentSeqNo, long appliedThrough, long totalRows, int noopsInRange) {
+        long rangeSize = appliedThrough - currentSeqNo;
+        long expected = rangeSize - noopsInRange;
+        return appliedThrough >= currentSeqNo && totalRows == expected;
+    }
+
+    /**
+     * Defect 13: Counts noop seqNos in the half-open range (fromExclusive, toInclusive].
+     * The input array must be sorted ascending (from the checkpoint). Uses binary
+     * search for O(log n) performance.
+     */
+    public static int countNoopsInRange(long[] sortedNoops, long fromExclusive, long toInclusive) {
+        if (sortedNoops == null || sortedNoops.length == 0) {
+            return 0;
+        }
+        int lo = lowerBound(sortedNoops, fromExclusive + 1);
+        int hi = upperBound(sortedNoops, toInclusive);
+        return Math.max(0, hi - lo);
+    }
+
+    private static int lowerBound(long[] arr, long target) {
+        int lo = 0, hi = arr.length;
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (arr[mid] < target) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    private static int upperBound(long[] arr, long target) {
+        int lo = 0, hi = arr.length;
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (arr[mid] <= target) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
     }
 
     @Override

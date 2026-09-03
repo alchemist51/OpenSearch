@@ -69,6 +69,8 @@ public class MVDataFormatPlugin extends Plugin
     private volatile long mvNativeRuntimePtr;
     /** Stage 5: circuit breaker for MV pull build memory accounting. */
     private volatile org.opensearch.core.common.breaker.CircuitBreaker mvPullBreaker;
+    /** Defect 13: per-shard noop seqNo tracker for coverage correction. */
+    private volatile MVNoopTracker noopTracker;
 
     /** Stage 5: node-scope limit for the MV pull circuit breaker. */
     public static final org.opensearch.common.settings.Setting<Long> MV_PULL_BREAKER_LIMIT = org.opensearch.common.settings.Setting
@@ -145,10 +147,6 @@ public class MVDataFormatPlugin extends Plugin
         // per eligible local target primary shard — no MV-specific orchestration
         // code is needed.
 
-        // Initialize node-global checkpoint mailbox for push-based pull path.
-        org.opensearch.mv.pull.MVCheckpointMailbox checkpointMailbox = new org.opensearch.mv.pull.MVCheckpointMailbox();
-        org.opensearch.mv.pull.MVCheckpointMailbox.setInstance(checkpointMailbox);
-
         // Stage 2: create a shared DataFusionRuntime within this plugin's
         // native instance for managed MV builds. The MV classloader has its
         // own native globals (separate from the DF plugin), so we must
@@ -201,18 +199,15 @@ public class MVDataFormatPlugin extends Plugin
         this.pullService = new NodeDerivedPullService(threadPool, java.util.List.of(mvFormat));
         this.pullService.start();
 
-        // ── Checkpoint replication service (external observer) ────────────
-        // Replaces the old in-engine checkpoint publishing. Source engines are
-        // never modified; this service samples their processedLocalCheckpoint
-        // on a scheduled tick and pushes adverts to bound MV target shards.
-        org.opensearch.common.unit.TimeValue publishInterval = MVReplicationService.CHECKPOINT_PUBLISH_INTERVAL.get(
-            environment.settings()
-        );
-        this.replicationService = new MVReplicationService(client, routingSnapshotService, threadPool, publishInterval);
-        this.replicationService.start();
-        this.replicationService.bindForReconciliation(clusterService);
+        // ── Noop tracking service (request-driven model) ───────────────────
+        // In the request-driven model, the TARGET drives checkpoint acquisition
+        // by sending MVCheckpointRequestAction to the source primary every poll
+        // round. This service only owns the noop tracker and cleans up on shard
+        // close. The checkpoint request handler does the full scoped construction.
+        this.noopTracker = new MVNoopTracker();
+        this.replicationService = new MVReplicationService(noopTracker);
 
-        return java.util.List.of(pullService);
+        return java.util.List.of(pullService, noopTracker);
     }
 
     @Override
@@ -227,6 +222,17 @@ public class MVDataFormatPlugin extends Plugin
         MVReplicationService replService = replicationService;
         if (replService != null) {
             indexModule.addIndexEventListener(replService);
+        }
+        // Defect 13: register the noop indexing listener on ALL indices.
+        // On source indices, the listener records seqNos for failed index ops
+        // and all delete ops — these consume seqNos without producing parquet
+        // rows and would otherwise cause permanent coverage gate failure.
+        // On non-source indices the listener fires but noops are never
+        // queried (the tracker is keyed by shardId and only source shards
+        // are checked during checkpoint construction).
+        MVNoopTracker tracker = noopTracker;
+        if (tracker != null) {
+            indexModule.addIndexOperationListener(new MVNoopIndexingListener(tracker));
         }
     }
 
@@ -296,9 +302,7 @@ public class MVDataFormatPlugin extends Plugin
             // Bench pre-flight: managed native runtime sizing + always-on spill
             MV_NATIVE_POOL_LIMIT,
             MV_SPILL_DIRECTORY,
-            MV_SPILL_DISK_LIMIT,
-            // Checkpoint replication service interval
-            MVReplicationService.CHECKPOINT_PUBLISH_INTERVAL
+            MV_SPILL_DISK_LIMIT
         );
         java.util.List<org.opensearch.common.settings.Setting<?>> all = new java.util.ArrayList<>(base);
         all.addAll(MVPullSettings.admissionSettings());
@@ -326,9 +330,7 @@ public class MVDataFormatPlugin extends Plugin
             new ActionHandler<>(MVShipStateAction.INSTANCE, MVShipStateTransportHandler.class),
             new ActionHandler<>(MVCursorAction.INSTANCE, MVCursorTransportHandler.class),
             new ActionHandler<>(MVSourceCommitAction.INSTANCE, MVSourceCommitTransportHandler.class),
-            // Checkpoint publish: source-pushed advert for pull-path targets.
-            new ActionHandler<>(MVCheckpointPublishAction.INSTANCE, MVCheckpointPublishTransportHandler.class),
-            // Checkpoint request: target cold-start request to source.
+            // Checkpoint request: target request-driven checkpoint fetch from source.
             new ActionHandler<>(MVCheckpointRequestAction.INSTANCE, MVCheckpointRequestTransportHandler.class),
             // Stage 5: MV definition control plane (validate + view CRUD).
             new ActionHandler<>(MVValidateAction.INSTANCE, TransportMVValidateAction.class),
