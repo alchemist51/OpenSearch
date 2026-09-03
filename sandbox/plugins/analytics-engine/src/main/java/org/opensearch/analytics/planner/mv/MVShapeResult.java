@@ -89,7 +89,9 @@ public final class MVShapeResult {
         /** 32-bit (or narrower) integer column. */
         INTEGER,
         /** Floating-point column. */
-        DOUBLE
+        DOUBLE,
+        /** Timestamp column — date_bin/span group key output. */
+        TIMESTAMP
     }
 
     /** Aggregate function token — mirrors {@code MVDefinitionDescriptor.AggFunctionToken}. */
@@ -111,20 +113,31 @@ public final class MVShapeResult {
     /**
      * One extracted group key.
      *
-     * @param name         stable output alias / materialized column name
-     * @param type         mapped column type
-     * @param expression   DataFusion-compatible SQL expression for a derived key, else {@code null}
-     * @param sourceColumn OpenSearch source field the key reads from, or {@code null} when it equals {@link #name}
+     * @param name           stable output alias / materialized column name
+     * @param type           mapped column type
+     * @param expression     DataFusion-compatible SQL expression for a derived key, else {@code null}
+     * @param sourceColumn   OpenSearch source field the key reads from, or {@code null} when it equals {@link #name}
+     * @param spanIntervalMs bucket width in milliseconds for span (date_bin) keys, or -1
      */
-    public record GroupKey(String name, ColumnType type, String expression, String sourceColumn) {
+    public record GroupKey(String name, ColumnType type, String expression, String sourceColumn, long spanIntervalMs) {
         public GroupKey {
             Objects.requireNonNull(name, "name");
             Objects.requireNonNull(type, "type");
         }
 
+        /** Convenience constructor without span interval (backward compatible). */
+        public GroupKey(String name, ColumnType type, String expression, String sourceColumn) {
+            this(name, type, expression, sourceColumn, -1);
+        }
+
         /** True when this key is a derived (expression) key. */
         public boolean isExpression() {
             return expression != null;
+        }
+
+        /** True when this key is a span (date_bin) key. */
+        public boolean isSpan() {
+            return spanIntervalMs > 0;
         }
     }
 

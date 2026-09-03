@@ -170,11 +170,11 @@ public class MVGroupByOrderingTests extends OpenSearchTestCase {
     }
 
     public void testExpressionKeyCarriesAliasAndExpression() {
-        // clickbench_5m_url leads with a derived expression key (event_bucket).
+        // clickbench_5m_url leads with a span (date_bin) key (event_bucket).
         MVGroupByOrdering ordering = MVCompiledDefinition.clickbench5mUrl().groupByOrdering();
         MVGroupByOrdering.Key first = ordering.keys().get(0);
         assertEquals("event_bucket", first.column());
-        assertEquals("CAST(\"EventTime\" AS BIGINT) / 300000", first.sqlExpression());
+        assertEquals("date_bin(INTERVAL '5 minutes', \"EventTime\")", first.sqlExpression());
         assertEquals(0, first.stateFieldIndex());
         // The materialized ordering column is the alias, never the raw expression.
         assertEquals("event_bucket", ordering.columnNames().get(0));

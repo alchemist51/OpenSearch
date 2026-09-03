@@ -208,21 +208,21 @@ public final class MVCompiledDefinition {
     }
 
     /**
-     * The {@code clickbench_5m_url} definition: GROUP BY an integer 5-minute
-     * {@code EventTime} bucket, {@code URL}, and {@code UserID}, with the
-     * full {@code SUM/MIN/MAX/COUNT} quad over ten numeric ClickBench fields
-     * (40 aggregate outputs → 43 projection columns total).
+     * The {@code clickbench_5m_url} definition: GROUP BY a date-aware 5-minute
+     * {@code EventTime} bucket (via {@code date_bin}), {@code URL}, and
+     * {@code UserID}, with the full {@code SUM/MIN/MAX/COUNT} quad over ten
+     * numeric ClickBench fields (40 aggregate outputs → 43 projection columns
+     * total).
      *
-     * <p><b>EventTime units:</b> the ClickBench {@code EventTime} field is
-     * epoch <em>milliseconds</em> (mapping type {@code date} with
-     * {@code epoch_millis}; sample values are 13-digit, e.g.
-     * {@code 1401805406823}). A 5-minute window is therefore
-     * {@code 5 * 60 * 1000 = 300000} ms, so the bucket ordinal is
-     * {@code CAST("EventTime" AS BIGINT) / 300000}.</p>
+     * <p><b>EventTime bucketing:</b> uses {@code date_bin(INTERVAL '5 minutes',
+     * "EventTime")} — a date-aware time window that works correctly with
+     * timestamp-typed sources (mapping type {@code date} with
+     * {@code yyyy-MM-dd HH:mm:ss||epoch_millis}). The state column is a
+     * Timestamp, not an integer epoch ordinal.</p>
      */
     public static MVCompiledDefinition clickbench5mUrl() {
         List<GroupKey> keys = List.of(
-            GroupKey.ofExpression("event_bucket", GroupKey.ColumnType.LONG, "CAST(\"EventTime\" AS BIGINT) / 300000", "EventTime"),
+            GroupKey.ofSpan("event_bucket", 300_000L, "EventTime"),
             GroupKey.of("URL", GroupKey.ColumnType.KEYWORD),
             GroupKey.of("UserID", GroupKey.ColumnType.LONG)
         );

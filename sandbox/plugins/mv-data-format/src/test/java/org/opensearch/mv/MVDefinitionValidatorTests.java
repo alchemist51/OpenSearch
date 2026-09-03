@@ -330,4 +330,70 @@ public class MVDefinitionValidatorTests extends OpenSearchTestCase {
         assertEquals(ORD_HASH_THREE_KEY, ordering.orderingIdentityHash());
         assertEquals(DEF_HASH_THREE_KEY, ordering.definitionIdentityHash());
     }
+
+    // ── Span key type mapping ────────────────────────────────────────────
+
+    public void testSpanKeyExpectedArrowTokenIsTimestamp() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(GroupKey.ofSpan("bucket", 300_000L, "EventTime")),
+            List.of(AggregateSpec.count("cnt"))
+        );
+        List<String> tokens = MVDefinitionValidator.expectedArrowTokens(def);
+        assertEquals("timestamp_ms", tokens.get(0));
+        assertEquals("int64", tokens.get(1)); // cnt
+    }
+
+    public void testSpanKeyValidatesAgainstTimestampNativeField() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(GroupKey.ofSpan("bucket", 300_000L, "EventTime")),
+            List.of(AggregateSpec.count("cnt"))
+        );
+        // Engine produces timestamp for the bucket column: should agree (temporal family).
+        List<String[]> fields = List.of(
+            new String[] { "bucket", "timestamp_ms" },
+            new String[] { "count(mv_input)[count]", "int64" }
+        );
+        String text = nativeText(
+            1L,
+            def.groupByOrdering().orderingIdentityHash(),
+            def.groupByOrdering().definitionIdentityHash(),
+            fields
+        );
+        MVDefinitionValidator.ValidationResult r = MVDefinitionValidator.compare(def, text);
+        assertTrue("span key with temporal type must agree, mismatches=" + r.mismatches(), r.ok());
+    }
+
+    public void testSpanKeyRejectsIntegerNativeField() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(GroupKey.ofSpan("bucket", 300_000L, "EventTime")),
+            List.of(AggregateSpec.count("cnt"))
+        );
+        // Engine produces int64 instead of timestamp — cross-family mismatch.
+        List<String[]> fields = List.of(
+            new String[] { "bucket", "int64" },
+            new String[] { "count(mv_input)[count]", "int64" }
+        );
+        String text = nativeText(
+            1L,
+            def.groupByOrdering().orderingIdentityHash(),
+            def.groupByOrdering().definitionIdentityHash(),
+            fields
+        );
+        MVDefinitionValidator.ValidationResult r = MVDefinitionValidator.compare(def, text);
+        assertFalse("span key against integer native field must fail", r.ok());
+        assertTrue(
+            "mismatch must report temporal vs integer: " + r.mismatches(),
+            r.mismatches().stream().anyMatch(m -> m.contains("temporal") && m.contains("integer"))
+        );
+    }
+
+    public void testOsTypeToArrowTokenDateIsTimestamp() {
+        assertEquals("timestamp_ms", MVDefinitionValidator.osTypeToArrowToken("date"));
+        assertEquals("timestamp_ms", MVDefinitionValidator.osTypeToArrowToken("date_nanos"));
+    }
+
+    public void testArrowFamilyTimestampIsTemporal() {
+        assertEquals("temporal", MVDefinitionValidator.arrowFamily("timestamp_ms"));
+        assertEquals("temporal", MVDefinitionValidator.arrowFamily("timestamp_ns"));
+    }
 }

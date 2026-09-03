@@ -293,4 +293,99 @@ public class MVCompiledDefinitionTests extends OpenSearchTestCase {
             assertFalse("mapping field must not contain DataFusion internals: " + field, field.contains("[sum]"));
         }
     }
+
+    // ── Span (date_bin) key support ────────────────────────────────────────
+
+    public void testSpanKeyEmitsDateBinInPartialSql() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(
+                GroupKey.ofSpan("event_bucket", 300_000L, "EventTime"),
+                GroupKey.of("URL", GroupKey.ColumnType.KEYWORD)
+            ),
+            List.of(AggregateSpec.count("cnt"))
+        );
+
+        String sql = def.buildPartialSql("mv_input");
+        assertTrue("partial SQL must contain date_bin: " + sql, sql.contains("date_bin(INTERVAL '5 minutes', \"EventTime\")"));
+        assertTrue("partial SQL must alias the span key: " + sql, sql.contains("AS \"event_bucket\""));
+    }
+
+    public void testSpanKeyFoldSqlGroupsByAlias() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(GroupKey.ofSpan("event_bucket", 300_000L, "EventTime")),
+            List.of(AggregateSpec.count("cnt"))
+        );
+
+        String foldSql = def.buildFoldSql("state_table");
+        // Fold SQL groups by the materialized alias, NOT by the date_bin expression.
+        assertTrue("fold SQL must group by alias: " + foldSql, foldSql.contains("GROUP BY \"event_bucket\""));
+        assertFalse("fold SQL must NOT contain date_bin: " + foldSql, foldSql.contains("date_bin"));
+    }
+
+    public void testSpanKeyTargetMappingIsDate() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(GroupKey.ofSpan("event_bucket", 300_000L, "EventTime")),
+            List.of(AggregateSpec.count("cnt"))
+        );
+
+        assertEquals("date", def.targetMapping().get("event_bucket"));
+    }
+
+    public void testSpanKeyTypeIsTimestamp() {
+        GroupKey key = GroupKey.ofSpan("bucket", 60_000L, "ts");
+        assertEquals(GroupKey.ColumnType.TIMESTAMP, key.columnType());
+        assertTrue(key.isSpanKey());
+        assertEquals(60_000L, key.spanIntervalMs());
+        assertFalse(key.isPlainColumn());
+    }
+
+    public void testSpanKeyIntervalFormats() {
+        assertEquals("5 minutes", GroupKey.formatIntervalSql(300_000L));
+        assertEquals("1 hours", GroupKey.formatIntervalSql(3_600_000L));
+        assertEquals("30 seconds", GroupKey.formatIntervalSql(30_000L));
+        assertEquals("500 milliseconds", GroupKey.formatIntervalSql(500L));
+    }
+
+    public void testSpanKeyOrdering() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(
+                GroupKey.ofSpan("event_bucket", 300_000L, "EventTime"),
+                GroupKey.of("RegionID", GroupKey.ColumnType.LONG)
+            ),
+            List.of(AggregateSpec.count("cnt"))
+        );
+
+        MVGroupByOrdering ordering = def.groupByOrdering();
+        assertEquals(2, ordering.size());
+        assertEquals("event_bucket", ordering.keys().get(0).column());
+        assertEquals("RegionID", ordering.keys().get(1).column());
+    }
+
+    public void testSpanKeyHashDiffersFromEpochArithmetic() {
+        // Span key vs the old epoch arithmetic key — different hash because different expression.
+        MVCompiledDefinition spanDef = MVCompiledDefinition.of(
+            List.of(GroupKey.ofSpan("event_bucket", 300_000L, "EventTime")),
+            List.of(AggregateSpec.count("cnt"))
+        );
+        MVCompiledDefinition epochDef = MVCompiledDefinition.of(
+            List.of(GroupKey.ofExpression("event_bucket", GroupKey.ColumnType.LONG, "CAST(\"EventTime\" AS BIGINT) / 300000", "EventTime")),
+            List.of(AggregateSpec.count("cnt"))
+        );
+        assertNotEquals("span vs epoch arithmetic must produce different hashes", spanDef.hash(), epochDef.hash());
+    }
+
+    public void testClickbench5mUrlUsesSpanKey() {
+        MVCompiledDefinition def = MVCompiledDefinition.clickbench5mUrl();
+        GroupKey bucket = def.groupKeys().get(0);
+        assertEquals("event_bucket", bucket.name());
+        assertEquals(GroupKey.ColumnType.TIMESTAMP, bucket.columnType());
+        assertTrue("clickbench_5m_url event_bucket must be a span key", bucket.isSpanKey());
+        assertEquals(300_000L, bucket.spanIntervalMs());
+        assertTrue(bucket.sqlExpression().contains("date_bin"));
+    }
+
+    public void testSpanKeyRejectsNonPositiveInterval() {
+        expectThrows(IllegalArgumentException.class, () -> GroupKey.ofSpan("bucket", 0, "EventTime"));
+        expectThrows(IllegalArgumentException.class, () -> GroupKey.ofSpan("bucket", -1, "EventTime"));
+    }
 }

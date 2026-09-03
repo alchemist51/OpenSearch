@@ -74,6 +74,7 @@ public final class MVDefinitionDescriptor implements ToXContentObject {
     static final String F_GK_COLUMN_TYPE = "column_type";
     static final String F_GK_EXPRESSION = "expression";
     static final String F_GK_SOURCE_COLUMN = "source_column";
+    static final String F_GK_SPAN_INTERVAL_MS = "span_interval_ms";
 
     static final String F_AGG_FUNCTION = "function";
     static final String F_AGG_FIELD = "field";
@@ -373,15 +374,19 @@ public final class MVDefinitionDescriptor implements ToXContentObject {
      * from. A plain key whose OpenSearch field path differs from its output
      * name also carries {@link #sourceColumn} (with no expression).
      *
-     * @param name         stable output alias / materialized column name
-     * @param columnType   physical/logical column type
-     * @param expression   SQL expression for a derived key, else {@code null}
-     * @param sourceColumn OpenSearch source field path, or {@code null} when it
-     *                     equals {@link #name}
+     * <p>A <b>span key</b> carries {@link #spanIntervalMs} — the bucket width
+     * in milliseconds — and is reconstructed via {@link GroupKey#ofSpan}. The
+     * SQL expression is derived from the interval, not stored literally.</p>
+     *
+     * @param name             stable output alias / materialized column name
+     * @param columnType       physical/logical column type
+     * @param expression       SQL expression for a derived key, else {@code null}
+     * @param sourceColumn     OpenSearch source field path, or {@code null} when it
+     *                         equals {@link #name}
+     * @param spanIntervalMs   bucket width in milliseconds for span keys, or -1
      */
-    public record GroupKeyDescriptor(String name, GroupKey.ColumnType columnType, String expression, String sourceColumn)
-        implements
-            ToXContentObject {
+    public record GroupKeyDescriptor(String name, GroupKey.ColumnType columnType, String expression, String sourceColumn,
+        long spanIntervalMs) implements ToXContentObject {
 
         public GroupKeyDescriptor {
             if (name == null || name.isBlank()) {
@@ -391,32 +396,59 @@ public final class MVDefinitionDescriptor implements ToXContentObject {
             if (expression != null && expression.isBlank()) {
                 throw new IllegalArgumentException(String.format(Locale.ROOT, "group key [%s] expression must not be blank", name));
             }
+            if (spanIntervalMs > 0 && columnType != GroupKey.ColumnType.TIMESTAMP) {
+                throw new IllegalArgumentException(
+                    String.format(Locale.ROOT, "span key [%s] must have TIMESTAMP column type, got [%s]", name, columnType)
+                );
+            }
         }
 
         /** Plain-column key convenience factory (source column == name). */
         public static GroupKeyDescriptor plain(String name, GroupKey.ColumnType columnType) {
-            return new GroupKeyDescriptor(name, columnType, null, null);
+            return new GroupKeyDescriptor(name, columnType, null, null, -1);
         }
 
         /** Derived (expression) key factory. */
         public static GroupKeyDescriptor expression(String name, GroupKey.ColumnType columnType, String expression, String sourceColumn) {
             Objects.requireNonNull(expression, "expression");
             Objects.requireNonNull(sourceColumn, "sourceColumn");
-            return new GroupKeyDescriptor(name, columnType, expression, sourceColumn);
+            return new GroupKeyDescriptor(name, columnType, expression, sourceColumn, -1);
+        }
+
+        /** Span (date_bin time-bucket) key factory. */
+        public static GroupKeyDescriptor span(String name, long intervalMs, String sourceColumn) {
+            Objects.requireNonNull(sourceColumn, "sourceColumn");
+            if (intervalMs <= 0) {
+                throw new IllegalArgumentException("span interval must be positive, got " + intervalMs);
+            }
+            return new GroupKeyDescriptor(name, GroupKey.ColumnType.TIMESTAMP, null, sourceColumn, intervalMs);
+        }
+
+        /** True when this is a span (date_bin) key. */
+        public boolean isSpan() {
+            return spanIntervalMs > 0;
         }
 
         /** Map an existing compiled {@link GroupKey} to its descriptor form. */
         static GroupKeyDescriptor fromGroupKey(GroupKey gk) {
+            // Span keys are recognized by their isSpanKey() flag.
+            if (gk.isSpanKey()) {
+                long intervalMs = gk.spanIntervalMs();
+                return new GroupKeyDescriptor(gk.name(), gk.columnType(), null, gk.osFieldPath(), intervalMs);
+            }
             if (gk.isPlainColumn()) {
                 // Only carry the source column when it differs from the output name.
                 String src = gk.osFieldPath().equals(gk.name()) ? null : gk.osFieldPath();
-                return new GroupKeyDescriptor(gk.name(), gk.columnType(), null, src);
+                return new GroupKeyDescriptor(gk.name(), gk.columnType(), null, src, -1);
             }
-            return new GroupKeyDescriptor(gk.name(), gk.columnType(), gk.sqlExpression(), gk.osFieldPath());
+            return new GroupKeyDescriptor(gk.name(), gk.columnType(), gk.sqlExpression(), gk.osFieldPath(), -1);
         }
 
         /** Rebuild the compiled {@link GroupKey} via the same factory path used by the typed builders. */
         GroupKey toGroupKey() {
+            if (spanIntervalMs > 0) {
+                return GroupKey.ofSpan(name, spanIntervalMs, sourceColumn != null ? sourceColumn : name);
+            }
             if (expression != null) {
                 return GroupKey.ofExpression(name, columnType, expression, sourceColumn != null ? sourceColumn : name);
             }
@@ -438,6 +470,9 @@ public final class MVDefinitionDescriptor implements ToXContentObject {
             if (sourceColumn != null) {
                 builder.field(F_GK_SOURCE_COLUMN, sourceColumn);
             }
+            if (spanIntervalMs > 0) {
+                builder.field(F_GK_SPAN_INTERVAL_MS, spanIntervalMs);
+            }
             builder.endObject();
             return builder;
         }
@@ -450,6 +485,7 @@ public final class MVDefinitionDescriptor implements ToXContentObject {
             GroupKey.ColumnType columnType = null;
             String expression = null;
             String sourceColumn = null;
+            long spanIntervalMs = -1;
             String fieldName = null;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
@@ -462,6 +498,7 @@ public final class MVDefinitionDescriptor implements ToXContentObject {
                     case F_GK_COLUMN_TYPE -> columnType = parseColumnType(parser.text());
                     case F_GK_EXPRESSION -> expression = parser.text();
                     case F_GK_SOURCE_COLUMN -> sourceColumn = parser.text();
+                    case F_GK_SPAN_INTERVAL_MS -> spanIntervalMs = parser.longValue();
                     default -> throw new IllegalArgumentException("unknown field [" + fieldName + "] in group key descriptor");
                 }
             }
@@ -471,7 +508,7 @@ public final class MVDefinitionDescriptor implements ToXContentObject {
             if (columnType == null) {
                 throw new IllegalArgumentException("group key [" + name + "] is missing required field [" + F_GK_COLUMN_TYPE + "]");
             }
-            return new GroupKeyDescriptor(name, columnType, expression, sourceColumn);
+            return new GroupKeyDescriptor(name, columnType, expression, sourceColumn, spanIntervalMs);
         }
 
         private static GroupKey.ColumnType parseColumnType(String raw) {

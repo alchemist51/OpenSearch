@@ -37,7 +37,15 @@ public record GroupKey(String name, ColumnType columnType, String osFieldPath, S
         KEYWORD("keyword"),
         LONG("long"),
         INTEGER("integer"),
-        DOUBLE("double");
+        DOUBLE("double"),
+        /**
+         * Timestamp column type — maps to OpenSearch {@code date} and Arrow
+         * {@code Timestamp(Millisecond, None)}. Used by span/date_bin group
+         * keys that bucket a date-typed source field into time windows.
+         * The state column stores the bucket boundary as a timestamp, not an
+         * integer epoch ordinal.
+         */
+        TIMESTAMP("date");
 
         private final String osType;
 
@@ -82,6 +90,87 @@ public record GroupKey(String name, ColumnType columnType, String osFieldPath, S
      */
     public static GroupKey ofExpression(String name, ColumnType columnType, String sqlExpression, String osFieldPath) {
         return new GroupKey(name, columnType, osFieldPath, sqlExpression);
+    }
+
+    /**
+     * Factory for a date-aware span (time-bucket) key: emits
+     * {@code date_bin(INTERVAL '<interval>', "<sourceColumn>")} as the SQL
+     * expression. The output type is always {@link ColumnType#TIMESTAMP}
+     * because {@code date_bin} returns a Timestamp, not an integer ordinal.
+     *
+     * @param name            stable output alias (e.g. {@code "event_bucket"})
+     * @param intervalMs      bucket width in milliseconds (e.g. 300000 for 5 min)
+     * @param sourceColumn    the date-typed source column to bucket
+     */
+    public static GroupKey ofSpan(String name, long intervalMs, String sourceColumn) {
+        Objects.requireNonNull(name, "name");
+        Objects.requireNonNull(sourceColumn, "sourceColumn");
+        if (intervalMs <= 0) {
+            throw new IllegalArgumentException("span interval must be positive, got " + intervalMs);
+        }
+        String intervalSql = formatIntervalSql(intervalMs);
+        String sql = "date_bin(INTERVAL '" + intervalSql + "', \"" + sourceColumn + "\")";
+        return new GroupKey(name, ColumnType.TIMESTAMP, sourceColumn, sql);
+    }
+
+    /** True when this key was created via {@link #ofSpan}. */
+    public boolean isSpanKey() {
+        return columnType == ColumnType.TIMESTAMP && sqlExpression.startsWith("date_bin(");
+    }
+
+    /**
+     * Extract the span interval in milliseconds from a span key's SQL expression.
+     * Returns -1 if this is not a span key.
+     */
+    public long spanIntervalMs() {
+        if (isSpanKey() == false) {
+            return -1;
+        }
+        return parseIntervalMs(sqlExpression);
+    }
+
+    /**
+     * Format an interval in milliseconds to the most human-readable SQL
+     * INTERVAL literal (e.g. {@code "5 minutes"}, {@code "1 hours"},
+     * {@code "500 milliseconds"}).
+     */
+    static String formatIntervalSql(long ms) {
+        if (ms % (3600_000L) == 0) {
+            return (ms / 3600_000L) + " hours";
+        }
+        if (ms % 60_000L == 0) {
+            return (ms / 60_000L) + " minutes";
+        }
+        if (ms % 1000L == 0) {
+            return (ms / 1000L) + " seconds";
+        }
+        return ms + " milliseconds";
+    }
+
+    /**
+     * Parse the interval back from the SQL expression produced by
+     * {@link #formatIntervalSql}. Returns the interval in milliseconds.
+     */
+    static long parseIntervalMs(String sql) {
+        // Extract the interval string from: date_bin(INTERVAL '<value>', ...)
+        int start = sql.indexOf("INTERVAL '") + "INTERVAL '".length();
+        int end = sql.indexOf("'", start);
+        if (start < "INTERVAL '".length() || end < 0) {
+            return -1;
+        }
+        String interval = sql.substring(start, end).trim();
+        String[] parts = interval.split("\\s+", 2);
+        if (parts.length != 2) {
+            return -1;
+        }
+        long value = Long.parseLong(parts[0]);
+        return switch (parts[1].toLowerCase(java.util.Locale.ROOT)) {
+            case "hours", "hour" -> value * 3600_000L;
+            case "minutes", "minute" -> value * 60_000L;
+            case "seconds", "second" -> value * 1000L;
+            case "milliseconds", "millisecond" -> value;
+            default -> -1;
+        };
     }
 
     /** True when this key is a plain column reference (expression == quoted name). */

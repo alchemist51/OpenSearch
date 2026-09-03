@@ -101,7 +101,7 @@ public class MVClickbench5mUrlTests extends OpenSearchTestCase {
         MVCompiledDefinition def = MVCompiledDefinition.clickbench5mUrl();
         assertEquals(3, def.groupKeys().size());
         assertEquals("event_bucket", def.groupKeys().get(0).name());
-        assertEquals(GroupKey.ColumnType.LONG, def.groupKeys().get(0).columnType());
+        assertEquals(GroupKey.ColumnType.TIMESTAMP, def.groupKeys().get(0).columnType());
         assertFalse(def.groupKeys().get(0).isPlainColumn());
         assertEquals("URL", def.groupKeys().get(1).name());
         assertEquals(GroupKey.ColumnType.KEYWORD, def.groupKeys().get(1).columnType());
@@ -155,19 +155,19 @@ public class MVClickbench5mUrlTests extends OpenSearchTestCase {
 
     public void testPartialSqlBucketAliasAndGroupBy() {
         String sql = MVCompiledDefinition.clickbench5mUrl().buildPartialSql("mv_input");
-        assertTrue(sql, sql.startsWith("SELECT CAST(\"EventTime\" AS BIGINT) / 300000 AS \"event_bucket\", \"URL\", \"UserID\", "));
-        assertTrue(sql, sql.endsWith(" FROM mv_input GROUP BY CAST(\"EventTime\" AS BIGINT) / 300000, \"URL\", \"UserID\""));
+        assertTrue(sql, sql.startsWith("SELECT date_bin(INTERVAL '5 minutes', \"EventTime\") AS \"event_bucket\", \"URL\", \"UserID\", "));
+        assertTrue(sql, sql.endsWith(" FROM mv_input GROUP BY date_bin(INTERVAL '5 minutes', \"EventTime\"), \"URL\", \"UserID\""));
         // First and last metric blocks exactly.
         assertTrue(sql, sql.contains("SUM(\"AdvEngineID\"), MIN(\"AdvEngineID\"), MAX(\"AdvEngineID\"), COUNT(\"AdvEngineID\")"));
         assertTrue(sql, sql.contains("SUM(\"SendTiming\"), MIN(\"SendTiming\"), MAX(\"SendTiming\"), COUNT(\"SendTiming\")"));
     }
 
-    public void testPartialSqlUses300000MillisecondDivisor() {
-        // EventTime is epoch milliseconds (ClickBench mapping: date/epoch_millis,
-        // 13-digit sample values). A 5-minute window = 300000 ms.
+    public void testPartialSqlUsesDateBin5Minutes() {
+        // EventTime is a date field. date_bin produces a timestamp bucket, not an
+        // integer epoch ordinal — the key lesson from the date-type source bug.
         String sql = MVCompiledDefinition.clickbench5mUrl().buildPartialSql("mv_input");
-        assertTrue(sql, sql.contains("/ 300000"));
-        assertFalse("must not use a seconds divisor", sql.contains("/ 300 "));
+        assertTrue("must use date_bin", sql.contains("date_bin(INTERVAL '5 minutes', \"EventTime\")"));
+        assertFalse("must NOT use epoch arithmetic", sql.contains("/ 300000"));
     }
 
     public void testPartialSqlSelectHas43Columns() {
@@ -189,7 +189,7 @@ public class MVClickbench5mUrlTests extends OpenSearchTestCase {
         String sql = MVCompiledDefinition.clickbench5mUrl().buildFoldSql("mv_input");
         assertTrue(sql, sql.startsWith("SELECT \"event_bucket\", \"URL\", \"UserID\", "));
         assertTrue(sql, sql.endsWith(" FROM mv_input GROUP BY \"event_bucket\", \"URL\", \"UserID\""));
-        assertFalse("fold must not re-evaluate the bucket expression", sql.contains("CAST("));
+        assertFalse("fold must not re-evaluate the bucket expression", sql.contains("date_bin("));
         assertFalse("fold must not alias", sql.contains(" AS "));
         assertTrue(sql, sql.contains("SUM(\"adv_sum\"), MIN(\"adv_min\"), MAX(\"adv_max\"), SUM(\"adv_cnt\")"));
         assertTrue(sql, sql.contains("SUM(\"send_sum\"), MIN(\"send_min\"), MAX(\"send_max\"), SUM(\"send_cnt\")"));
@@ -208,7 +208,7 @@ public class MVClickbench5mUrlTests extends OpenSearchTestCase {
     public void testCompiledTargetMappingTypes() {
         Map<String, String> mapping = MVCompiledDefinition.clickbench5mUrl().targetMapping();
         assertEquals(43, mapping.size());
-        assertEquals("long", mapping.get("event_bucket"));
+        assertEquals("date", mapping.get("event_bucket"));
         assertEquals("keyword", mapping.get("URL"));
         assertEquals("long", mapping.get("UserID"));
         for (String p : PREFIXES) {
@@ -223,7 +223,7 @@ public class MVClickbench5mUrlTests extends OpenSearchTestCase {
         String json = MVViewsService.TargetCreator.targetMapping("clickbench_5m_url");
         assertTrue(json, json.contains("\"dynamic\":\"false\""));
         assertTrue(json, json.contains("\"_field_names\":{\"enabled\":false}"));
-        assertTrue(json, json.contains("\"event_bucket\":{\"type\":\"long\"}"));
+        assertTrue(json, json.contains("\"event_bucket\":{\"type\":\"date\"}"));
         assertTrue(json, json.contains("\"URL\":{\"type\":\"keyword\"}"));
         assertTrue(json, json.contains("\"UserID\":{\"type\":\"long\"}"));
         assertTrue(json, json.contains("\"send_cnt\":{\"type\":\"long\"}"));

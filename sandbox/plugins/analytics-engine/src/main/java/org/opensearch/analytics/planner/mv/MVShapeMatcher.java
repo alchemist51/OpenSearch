@@ -381,7 +381,47 @@ public final class MVShapeMatcher {
         }
         String os = scanRowType.getFieldList().get(refs.iterator().next()).getName();
         String sql = renderSql(expr, scanRowType);
-        return new MVShapeResult.GroupKey(alias, type, sql, os);
+
+        // Detect date_bin/date_trunc patterns for span key extraction.
+        long spanMs = extractSpanIntervalMs(expr);
+        if (spanMs > 0) {
+            return new MVShapeResult.GroupKey(alias, ColumnType.TIMESTAMP, sql, os, spanMs);
+        }
+        return new MVShapeResult.GroupKey(alias, type, sql, os, -1);
+    }
+
+    /**
+     * Try to extract a span interval in milliseconds from a date_bin/date_trunc
+     * RexCall. Returns -1 if the expression is not a recognized span pattern.
+     */
+    private static long extractSpanIntervalMs(RexNode expr) {
+        if (expr instanceof RexCall spanCall
+            && spanCall.getKind() == SqlKind.OTHER_FUNCTION) {
+            String fn = spanCall.getOperator().getName().toUpperCase(java.util.Locale.ROOT);
+            if ("DATE_BIN".equals(fn) || "DATE_TRUNC".equals(fn)) {
+                if (spanCall.getOperands().isEmpty() == false) {
+                    RexNode intervalOp = unwrapAnnotations(spanCall.getOperands().get(0));
+                    if (intervalOp instanceof RexLiteral lit) {
+                        return intervalLiteralToMs(lit);
+                    }
+                }
+            }
+        }
+        return -1;
+    }
+
+    /** Convert a Calcite interval literal to milliseconds, returning -1 on failure. */
+    private static long intervalLiteralToMs(RexLiteral lit) {
+        SqlTypeName tn = lit.getTypeName();
+        // Calcite represents INTERVAL 'N MINUTES' as a BigDecimal of milliseconds for
+        // INTERVAL_DAY_SECOND types, or months for INTERVAL_YEAR_MONTH types.
+        if (tn.getFamily() == org.apache.calcite.sql.type.SqlTypeFamily.INTERVAL_DAY_TIME) {
+            BigDecimal ms = lit.getValueAs(BigDecimal.class);
+            if (ms != null) {
+                return ms.longValueExact();
+            }
+        }
+        return -1;
     }
 
     private static void checkDeterministic(RexNode expr) {
@@ -408,6 +448,17 @@ public final class MVShapeMatcher {
                         checkKeyExprWhitelist(unwrapAnnotations(operand));
                     }
                     return;
+                }
+                case OTHER_FUNCTION -> {
+                    // Allow date_trunc, date_bin and similar time-bucketing functions.
+                    String fnName = call.getOperator().getName().toUpperCase(java.util.Locale.ROOT);
+                    if ("DATE_TRUNC".equals(fnName) || "DATE_BIN".equals(fnName)) {
+                        return;
+                    }
+                    throw new Reject(
+                        Reason.UNSUPPORTED_KEY_EXPR,
+                        "group-key expression uses unsupported function [" + call.getOperator().getName() + "]"
+                    );
                 }
                 default -> throw new Reject(
                     Reason.UNSUPPORTED_KEY_EXPR,
@@ -437,6 +488,7 @@ public final class MVShapeMatcher {
             case MINUS -> binary(ops, "-", scanRowType);
             case TIMES -> binary(ops, "*", scanRowType);
             case DIVIDE -> binary(ops, "/", scanRowType);
+            case OTHER_FUNCTION -> renderFunction(call, scanRowType);
             default -> throw new Reject(
                 Reason.UNSUPPORTED_KEY_EXPR,
                 "group-key expression uses unsupported operator [" + call.getOperator().getName() + "]"
@@ -444,11 +496,37 @@ public final class MVShapeMatcher {
         };
     }
 
+    /**
+     * Render a whitelisted function call (date_bin, date_trunc) to DataFusion SQL.
+     * Preserves the function name and renders all operands.
+     */
+    private static String renderFunction(RexCall call, RelDataType scanRowType) {
+        String fnName = call.getOperator().getName();
+        StringBuilder sb = new StringBuilder(fnName).append("(");
+        for (int i = 0; i < call.getOperands().size(); i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(renderSql(unwrapAnnotations(call.getOperands().get(i)), scanRowType));
+        }
+        sb.append(")");
+        return sb.toString();
+    }
+
     private static String binary(List<RexNode> ops, String op, RelDataType scanRowType) {
         return renderSql(unwrapAnnotations(ops.get(0)), scanRowType) + " " + op + " " + renderSql(unwrapAnnotations(ops.get(1)), scanRowType);
     }
 
     private static String renderLiteral(RexLiteral lit) {
+        // Interval literals: render as INTERVAL 'N unit' for DataFusion compatibility.
+        SqlTypeName tn = lit.getTypeName();
+        if (tn.getFamily() == org.apache.calcite.sql.type.SqlTypeFamily.INTERVAL_DAY_TIME) {
+            BigDecimal ms = lit.getValueAs(BigDecimal.class);
+            if (ms != null) {
+                return "INTERVAL '" + formatIntervalMs(ms.longValueExact()) + "'";
+            }
+        }
+
         Object v = lit.getValue2();
         if (v == null) {
             return "NULL";
@@ -465,6 +543,20 @@ public final class MVShapeMatcher {
         return v.toString();
     }
 
+    /** Format milliseconds to a human-readable SQL INTERVAL value string. */
+    private static String formatIntervalMs(long ms) {
+        if (ms % 3600_000L == 0) {
+            return (ms / 3600_000L) + " hours";
+        }
+        if (ms % 60_000L == 0) {
+            return (ms / 60_000L) + " minutes";
+        }
+        if (ms % 1000L == 0) {
+            return (ms / 1000L) + " seconds";
+        }
+        return ms + " milliseconds";
+    }
+
     // ── Type mapping ────────────────────────────────────────────────────
 
     private static ColumnType mapType(RelDataType type) {
@@ -474,6 +566,7 @@ public final class MVShapeMatcher {
             case BIGINT -> ColumnType.LONG;
             case INTEGER, SMALLINT, TINYINT -> ColumnType.INTEGER;
             case DOUBLE, FLOAT, REAL, DECIMAL -> ColumnType.DOUBLE;
+            case TIMESTAMP, TIMESTAMP_WITH_LOCAL_TIME_ZONE, DATE, TIME -> ColumnType.TIMESTAMP;
             default -> throw new Reject(Reason.UNSUPPORTED_TYPE, "unsupported group-key type [" + t + "]");
         };
     }
@@ -580,6 +673,9 @@ public final class MVShapeMatcher {
                 }
                 if (k.sourceColumn() != null) {
                     b.field("source_column", k.sourceColumn());
+                }
+                if (k.spanIntervalMs() > 0) {
+                    b.field("span_interval_ms", k.spanIntervalMs());
                 }
                 b.endObject();
             }

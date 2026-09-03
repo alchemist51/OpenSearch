@@ -252,10 +252,21 @@ public class MVShapeMatcherTests extends BasePlannerRulesTests {
 
     public void testReject_unsupportedType() {
         RelNode scan = stubScan(
+            mockTable("hits", new String[] { "d", "val" }, new SqlTypeName[] { SqlTypeName.BINARY, SqlTypeName.INTEGER })
+        );
+        RelNode agg = makeAggregate(scan, countStarCall(scan)); // group {0} = d (BINARY, unmapped)
+        assertRejected(MVShapeMatcher.match(agg), Reason.UNSUPPORTED_TYPE);
+    }
+
+    /** DATE type is now accepted as TIMESTAMP for span/date_bin keys. */
+    public void testAccept_dateTypeGroupKeyMapsToTimestamp() {
+        RelNode scan = stubScan(
             mockTable("hits", new String[] { "d", "val" }, new SqlTypeName[] { SqlTypeName.DATE, SqlTypeName.INTEGER })
         );
-        RelNode agg = makeAggregate(scan, countStarCall(scan)); // group {0} = d (DATE, unmapped)
-        assertRejected(MVShapeMatcher.match(agg), Reason.UNSUPPORTED_TYPE);
+        RelNode agg = makeAggregate(scan, countStarCall(scan)); // group {0} = d (DATE)
+        MVShapeResult r = MVShapeMatcher.match(agg);
+        assertTrue(r.toString(), r.isMatched());
+        assertEquals(ColumnType.TIMESTAMP, r.groupKeys().get(0).type());
     }
 
     // ─────────────────────────── SQL-driven smoke tests ───────────────────────────

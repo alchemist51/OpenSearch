@@ -328,6 +328,7 @@ public final class MVDefinitionValidator {
             case INTEGER -> "int32";
             case DOUBLE -> "float64";
             case KEYWORD -> "utf8";
+            case TIMESTAMP -> "timestamp_ms";
         };
     }
 

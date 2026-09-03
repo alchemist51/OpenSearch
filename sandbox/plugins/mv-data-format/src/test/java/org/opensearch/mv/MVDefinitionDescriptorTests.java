@@ -318,20 +318,64 @@ public class MVDefinitionDescriptorTests extends OpenSearchTestCase {
         assertEquals(MVCompiledDefinition.compiledFor("pull_count_sum").hash(), rebuilt.hash());
     }
 
-    // ── Expression group key is faithfully described ────────────────────────
+    // ── Span group key is faithfully described ────────────────────────────
 
-    public void testExpressionGroupKeyCarriesExpressionAndSourceColumn() {
+    public void testSpanGroupKeyCarriesIntervalAndSourceColumn() {
         MVDefinitionDescriptor d = MVCompiledDefinition.compiledFor("clickbench_5m_url").toDescriptor();
         GroupKeyDescriptor bucket = d.groupKeys().get(0);
         assertEquals("event_bucket", bucket.name());
-        assertEquals(GroupKey.ColumnType.LONG, bucket.columnType());
-        assertEquals("CAST(\"EventTime\" AS BIGINT) / 300000", bucket.expression());
+        assertEquals(GroupKey.ColumnType.TIMESTAMP, bucket.columnType());
+        assertNull("span key must carry no raw expression", bucket.expression());
         assertEquals("EventTime", bucket.sourceColumn());
+        assertTrue("span key must carry span interval", bucket.isSpan());
+        assertEquals(300_000L, bucket.spanIntervalMs());
 
         GroupKeyDescriptor plain = d.groupKeys().get(1); // URL
         assertEquals("URL", plain.name());
         assertNull("plain key must carry no expression", plain.expression());
         assertNull("plain key with matching path must carry no source column", plain.sourceColumn());
+        assertFalse("plain key must not be span", plain.isSpan());
+    }
+
+    public void testSpanDescriptorRoundTrip() throws IOException {
+        MVDefinitionDescriptor original = MVDefinitionDescriptor.of(
+            List.of(GroupKeyDescriptor.span("bucket", 300_000L, "EventTime")),
+            List.of(AggregateDescriptor.count("cnt"))
+        );
+        MVDefinitionDescriptor parsed = parse(toJson(original));
+        assertEquals(original, parsed);
+        assertTrue(parsed.groupKeys().get(0).isSpan());
+        assertEquals(300_000L, parsed.groupKeys().get(0).spanIntervalMs());
+    }
+
+    public void testSpanDescriptorRebuildsToSameDefinition() throws IOException {
+        MVCompiledDefinition original = MVCompiledDefinition.of(
+            List.of(GroupKey.ofSpan("bucket", 60_000L, "ts")),
+            List.of(AggregateSpec.count("cnt"))
+        );
+        MVDefinitionDescriptor descriptor = original.toDescriptor();
+        MVDefinitionDescriptor parsed = parse(toJson(descriptor));
+        MVCompiledDefinition rebuilt = MVCompiledDefinition.fromDescriptor(parsed);
+        assertEquals(original.hash(), rebuilt.hash());
+        assertEquals(original.buildPartialSql("mv_input"), rebuilt.buildPartialSql("mv_input"));
+        assertEquals(original.buildFoldSql("state"), rebuilt.buildFoldSql("state"));
+    }
+
+    // ── Expression (non-span) group key round-trips ──────────────────────
+
+    public void testExpressionGroupKeyRoundTrips() throws IOException {
+        MVCompiledDefinition original = MVCompiledDefinition.of(
+            List.of(GroupKey.ofExpression("bucket", GroupKey.ColumnType.LONG, "CAST(\"EventTime\" AS BIGINT) / 300000", "EventTime")),
+            List.of(AggregateSpec.count("cnt"))
+        );
+        MVDefinitionDescriptor d = original.toDescriptor();
+        GroupKeyDescriptor bucket = d.groupKeys().get(0);
+        assertEquals("CAST(\"EventTime\" AS BIGINT) / 300000", bucket.expression());
+        assertEquals("EventTime", bucket.sourceColumn());
+        assertFalse("non-span expression key must not be span", bucket.isSpan());
+
+        MVCompiledDefinition rebuilt = MVCompiledDefinition.fromDescriptor(parse(toJson(d)));
+        assertEquals(original.hash(), rebuilt.hash());
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
