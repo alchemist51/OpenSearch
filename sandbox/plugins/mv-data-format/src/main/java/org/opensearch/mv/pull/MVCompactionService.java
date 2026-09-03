@@ -389,13 +389,30 @@ public final class MVCompactionService implements Closeable {
         // Sort by generation ascending (oldest first)
         all.sort(Comparator.comparingLong(c -> c.generation));
 
-        // Keep the last 2 (most recent) untouched — compact everything else
+        // Keep the last 2 (most recent) untouched — they may belong to the
+        // current in-flight round or its immediate predecessor.
         int keep = 2;
-        int compactCount = all.size() - keep;
-        if (compactCount < 2) {
+        int eligible = all.size() - keep;
+        if (eligible < 2) {
             return List.of();
         }
-        return all.subList(0, compactCount);
+
+        // PAIRWISE COMPACTION: merge exactly 2 segments per pass, never K.
+        // Bounds native merge memory to 2 cursors and keeps each step small,
+        // restartable, and interleaved with live rounds (Lucene-style bounded
+        // fan-in; repeated passes converge the catalog). Pick the pair of
+        // ADJACENT generations with the smallest combined size so folds stay
+        // cheap and sortedness-by-generation is preserved for recursive merges.
+        int bestIdx = 0;
+        long bestSize = Long.MAX_VALUE;
+        for (int i = 0; i + 1 < eligible; i++) {
+            long pairSize = all.get(i).sizeBytes + all.get(i + 1).sizeBytes;
+            if (pairSize < bestSize) {
+                bestSize = pairSize;
+                bestIdx = i;
+            }
+        }
+        return List.of(all.get(bestIdx), all.get(bestIdx + 1));
     }
 
     private static int countMvStateSegments(CatalogSnapshot catalog) {

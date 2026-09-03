@@ -54,8 +54,9 @@ public class MVCompactionServiceTests extends OpenSearchTestCase {
         MVCompactionService service = new MVCompactionService(null, null);
         List<MVCompactionService.CompactCandidate> candidates = service.selectCandidates(catalog, 8);
 
-        // 12 segments, keep last 2 = 10 candidates
-        assertEquals("should select all but last 2", 10, candidates.size());
+        // 12 segments over threshold: pairwise policy selects exactly 2
+        // (the adjacent pair with the smallest combined size, never K)
+        assertEquals("pairwise compaction selects exactly 2", 2, candidates.size());
 
         // Verify they're sorted by generation ascending (oldest first)
         for (int i = 1; i < candidates.size(); i++) {
@@ -122,7 +123,7 @@ public class MVCompactionServiceTests extends OpenSearchTestCase {
 
         MVCompactionService service = new MVCompactionService(null, null);
         List<MVCompactionService.CompactCandidate> candidates = service.selectCandidates(catalog, 4);
-        assertEquals("10 - 2 = 8 candidates", 8, candidates.size());
+        assertEquals("pairwise: exactly 2 per pass", 2, candidates.size());
     }
 
     /**
@@ -142,7 +143,7 @@ public class MVCompactionServiceTests extends OpenSearchTestCase {
         MVCompactionService service = new MVCompactionService(null, null);
         // threshold=3, 6 segments -> compact 4 (keep last 2)
         List<MVCompactionService.CompactCandidate> candidates = service.selectCandidates(catalog, 3);
-        assertEquals(4, candidates.size());
+        assertEquals("pairwise: exactly 2 per pass", 2, candidates.size());
         // Sizes should all be 0 since files don't exist
         for (MVCompactionService.CompactCandidate c : candidates) {
             assertEquals(0L, c.sizeBytes());
