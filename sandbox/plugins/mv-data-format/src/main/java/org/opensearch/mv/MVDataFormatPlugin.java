@@ -78,6 +78,35 @@ public class MVDataFormatPlugin extends Plugin
             org.opensearch.common.settings.Setting.Property.Dynamic
         );
 
+    /**
+     * Node-scope byte limit for the MV managed DataFusion memory pool.
+     * {@code 0b} (default) means heap/4, giving the streaming build's
+     * aggregation and external sort real headroom before spilling.
+     */
+    public static final org.opensearch.common.settings.Setting<org.opensearch.core.common.unit.ByteSizeValue> MV_NATIVE_POOL_LIMIT =
+        org.opensearch.common.settings.Setting.byteSizeSetting(
+            "mv_pull.native_pool_limit_bytes",
+            org.opensearch.core.common.unit.ByteSizeValue.ZERO,
+            org.opensearch.common.settings.Setting.Property.NodeScope
+        );
+
+    /**
+     * Node-scope spill directory for MV managed builds. Empty (default) means
+     * {@code <first data path>/mv-spill}, created at startup — spill is ALWAYS
+     * enabled so large builds spill to disk instead of failing at the pool
+     * ceiling (the DE7 saturation failure mode).
+     */
+    public static final org.opensearch.common.settings.Setting<String> MV_SPILL_DIRECTORY = org.opensearch.common.settings.Setting
+        .simpleString("mv_pull.spill_directory", "", org.opensearch.common.settings.Setting.Property.NodeScope);
+
+    /** Node-scope disk budget for MV spill. {@code 0b} = DataFusion default sizing. */
+    public static final org.opensearch.common.settings.Setting<org.opensearch.core.common.unit.ByteSizeValue> MV_SPILL_DISK_LIMIT =
+        org.opensearch.common.settings.Setting.byteSizeSetting(
+            "mv_pull.spill_disk_limit_bytes",
+            org.opensearch.core.common.unit.ByteSizeValue.ZERO,
+            org.opensearch.common.settings.Setting.Property.NodeScope
+        );
+
     public MVDataFormatPlugin() {}
 
     @SuppressWarnings("deprecation") // SOURCE_INDEX registered for BWC only
@@ -122,11 +151,28 @@ public class MVDataFormatPlugin extends Plugin
         long mvRuntimePtr = 0L;
         try {
             MVNativeBridge.initRuntime(Runtime.getRuntime().availableProcessors());
-            // Use conservative defaults: 256MB pool, empty spill dir (disabled),
-            // 0 spill limit. Operators tune via index-scoped settings on
-            // MVBuildRuntime.MV_SPILL_BUDGET_BYTES per MV index.
-            long mvPoolLimit = Runtime.getRuntime().maxMemory() / 8;
-            mvRuntimePtr = MVNativeBridge.createGlobalRuntime(mvPoolLimit, "", 0L);
+            // Node-scoped settings (committed defaults, no env overrides):
+            // pool = mv_pull.native_pool_limit_bytes (default heap/4 so the
+            // streaming build's aggregation + external sort have headroom);
+            // spill dir = mv_pull.spill_directory (default <data path>/mv-spill)
+            // so large builds SPILL to disk instead of failing at the pool
+            // ceiling — the DE7 saturation failure mode.
+            long mvPoolLimit = MV_NATIVE_POOL_LIMIT.get(environment.settings()).getBytes();
+            if (mvPoolLimit <= 0L) {
+                mvPoolLimit = Runtime.getRuntime().maxMemory() / 4;
+            }
+            String spillDir = MV_SPILL_DIRECTORY.get(environment.settings());
+            if (spillDir == null || spillDir.isEmpty()) {
+                java.nio.file.Path p = environment.dataFiles()[0].resolve("mv-spill");
+                java.nio.file.Files.createDirectories(p);
+                spillDir = p.toAbsolutePath().toString();
+            } else {
+                java.nio.file.Files.createDirectories(java.nio.file.Path.of(spillDir));
+            }
+            long spillLimit = MV_SPILL_DISK_LIMIT.get(environment.settings()).getBytes();
+            mvRuntimePtr = MVNativeBridge.createGlobalRuntime(mvPoolLimit, spillDir, spillLimit);
+            org.apache.logging.log4j.LogManager.getLogger(MVDataFormatPlugin.class)
+                .info("mv_pull: managed runtime pool={} bytes spill_dir=[{}] spill_limit={} bytes", mvPoolLimit, spillDir, spillLimit);
         } catch (Exception e) {
             // Non-fatal: fall back to 0 (MVBuildRuntime creation will fail
             // gracefully at build time with a clear error).
@@ -222,7 +268,11 @@ public class MVDataFormatPlugin extends Plugin
             MVBuildRuntime.MV_SPILL_FILE_COUNT_LIMIT,
             MVBuildRuntime.MV_BUILD_MEMORY_ESTIMATE,
             // Stage 5: circuit breaker limit
-            MV_PULL_BREAKER_LIMIT
+            MV_PULL_BREAKER_LIMIT,
+            // Bench pre-flight: managed native runtime sizing + always-on spill
+            MV_NATIVE_POOL_LIMIT,
+            MV_SPILL_DIRECTORY,
+            MV_SPILL_DISK_LIMIT
         );
         java.util.List<org.opensearch.common.settings.Setting<?>> all = new java.util.ArrayList<>(base);
         all.addAll(MVPullSettings.admissionSettings());
