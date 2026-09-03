@@ -40,6 +40,13 @@ public final class MVCheckpointMailbox {
     private final AtomicLong pushCount = new AtomicLong();
     private final AtomicLong consumeCount = new AtomicLong();
     private final AtomicLong fallbackCount = new AtomicLong();
+    /**
+     * Per-slot last consumed maxSeqNo — the target's effective watermark as
+     * seen by the mailbox. Updated on every {@link #consume} call. Key format
+     * matches {@link #slotKey}. Returned to the source via the publish response
+     * to enable source-side file scoping.
+     */
+    private final ConcurrentMap<String, AtomicLong> lastConsumedWatermarks = new ConcurrentHashMap<>();
 
     /** Pushed source advert carrying the metadata the poller needs. */
     public record PushedAdvert(
@@ -51,8 +58,31 @@ public final class MVCheckpointMailbox {
         long infosVersion,
         List<String> parquetFiles,
         List<Long> fileSizes,
+        List<Long> fileMinSeqNos,
+        List<Long> fileMaxSeqNos,
         long receivedAtNanos
-    ) {}
+    ) {
+        /**
+         * Legacy constructor: no per-file seq ranges (all -1).
+         */
+        public PushedAdvert(
+            String sourceIndex,
+            String sourceUuid,
+            int sourceShard,
+            long maxSeqNo,
+            long primaryTerm,
+            long infosVersion,
+            List<String> parquetFiles,
+            List<Long> fileSizes,
+            long receivedAtNanos
+        ) {
+            this(sourceIndex, sourceUuid, sourceShard, maxSeqNo, primaryTerm, infosVersion,
+                parquetFiles, fileSizes,
+                parquetFiles.stream().map(f -> -1L).toList(),
+                parquetFiles.stream().map(f -> -1L).toList(),
+                receivedAtNanos);
+        }
+    }
 
     public MVCheckpointMailbox() {}
 
@@ -103,6 +133,12 @@ public final class MVCheckpointMailbox {
         PushedAdvert advert = slots.remove(key);
         if (advert != null) {
             consumeCount.incrementAndGet();
+            // Track the last consumed maxSeqNo as the target's effective watermark
+            lastConsumedWatermarks.compute(key, (k, existing) -> {
+                if (existing == null) return new AtomicLong(advert.maxSeqNo());
+                existing.accumulateAndGet(advert.maxSeqNo(), Math::max);
+                return existing;
+            });
             logger.debug(
                 "MAILBOX_HIT target=[{}][{}] source=[{}][{}] maxSeqNo={} infosVersion={} age_ms={}",
                 targetIndex,
@@ -128,6 +164,18 @@ public final class MVCheckpointMailbox {
     /** Records a pull fallback for observability. */
     public void recordFallback() {
         fallbackCount.incrementAndGet();
+    }
+
+    /**
+     * Returns the last consumed maxSeqNo for a given target/source slot — the
+     * target's effective watermark as seen by this mailbox. Returns -1 if the
+     * slot has never been consumed (target poller hasn't run yet, or no adverts
+     * have been delivered for this slot). Used by the transport handler to
+     * populate the publish response.
+     */
+    public long lastConsumedWatermark(String targetIndex, int targetShard, String sourceIndex, int sourceShard) {
+        AtomicLong wm = lastConsumedWatermarks.get(slotKey(targetIndex, targetShard, sourceIndex, sourceShard));
+        return wm != null ? wm.get() : -1L;
     }
 
     public long pushCount() {

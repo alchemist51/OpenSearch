@@ -18,8 +18,10 @@ import org.opensearch.index.engine.dataformat.WriteResult;
 import org.opensearch.index.engine.dataformat.Writer;
 import org.opensearch.index.engine.dataformat.WriterState;
 import org.opensearch.index.engine.exec.MonoFileWriterSet;
+import org.opensearch.index.engine.exec.WriterFileSet;
 import org.opensearch.index.store.FileMetadata;
 import org.opensearch.index.store.FormatChecksumStrategy;
+import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.parquet.ParquetDataFormatPlugin;
 import org.opensearch.parquet.ParquetSettings;
 import org.opensearch.parquet.bridge.ParquetFileMetadata;
@@ -46,6 +48,10 @@ import java.util.function.Supplier;
  *
  * <p>The returned {@link FileInfos} from {@link #flush(FlushInput)} contains the file path, writer
  * generation, and row count for downstream commit tracking.
+ *
+ * <p>Tracks running min/max {@code _seq_no} across all documents written into this generation
+ * so that the sealed {@link MonoFileWriterSet} carries per-fileset seq ranges for source-side
+ * checkpoint scoping.
  */
 public class ParquetWriter implements Writer<ParquetDocumentInput> {
 
@@ -61,6 +67,10 @@ public class ParquetWriter implements Writer<ParquetDocumentInput> {
     private volatile long mappingVersion;
     private volatile WriterState state = WriterState.ACTIVE;
     private long acceptedRows = 0L;
+    /** Running minimum _seq_no across all docs written into this generation. */
+    private long trackedMinSeqNo = WriterFileSet.UNKNOWN_SEQ_NO;
+    /** Running maximum _seq_no across all docs written into this generation. */
+    private long trackedMaxSeqNo = WriterFileSet.UNKNOWN_SEQ_NO;
 
     /**
      * Creates a new ParquetWriter.
@@ -157,8 +167,34 @@ public class ParquetWriter implements Writer<ParquetDocumentInput> {
             }
             acceptedRows++;
             stats.addDocsIndexed(1);
+            // Track running min/max _seq_no for per-fileset seq-range scoping.
+            // The engine adds _seq_no as a FieldValuePair in every document; extract cheaply.
+            trackSeqNo(d);
             return new WriteResult.Success(1L, 1L, 1L);
         }, stats::addIndexTimeMillis);
+    }
+
+    /**
+     * Extracts {@code _seq_no} from the document input and updates running min/max.
+     * Iterates the field list (typically 5-15 entries) — O(N) per doc but negligible
+     * relative to the Parquet write cost. Only tracks on successful admission.
+     */
+    private void trackSeqNo(ParquetDocumentInput d) {
+        for (FieldValuePair fvp : d.getFinalInput()) {
+            if (SeqNoFieldMapper.NAME.equals(fvp.getFieldType().name())) {
+                Object val = fvp.getValue();
+                if (val instanceof Number num) {
+                    long seqNo = num.longValue();
+                    if (trackedMinSeqNo == WriterFileSet.UNKNOWN_SEQ_NO || seqNo < trackedMinSeqNo) {
+                        trackedMinSeqNo = seqNo;
+                    }
+                    if (trackedMaxSeqNo == WriterFileSet.UNKNOWN_SEQ_NO || seqNo > trackedMaxSeqNo) {
+                        trackedMaxSeqNo = seqNo;
+                    }
+                }
+                return; // Found the _seq_no field, stop scanning
+            }
+        }
     }
 
     @Override
@@ -206,7 +242,9 @@ public class ParquetWriter implements Writer<ParquetDocumentInput> {
             writerGeneration,
             fileName,
             metadata.numRows(),
-            ParquetDataFormatPlugin.PARQUET_FORMAT_VERSION
+            ParquetDataFormatPlugin.PARQUET_FORMAT_VERSION,
+            trackedMinSeqNo,
+            trackedMaxSeqNo
         );
         return FileInfos.builder().putWriterFileSet(dataFormat, monoFileSet).rowIdMapping(vsrManager.getRowIdMapping()).build();
     }

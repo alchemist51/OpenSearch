@@ -40,18 +40,39 @@ import java.util.Set;
 @ExperimentalApi
 public sealed class WriterFileSet implements Writeable permits MonoFileWriterSet {
 
+    /** Sentinel value indicating that seq-range information is unavailable (legacy / unknown). */
+    public static final long UNKNOWN_SEQ_NO = -1L;
+
     private final String directory;
     private final long writerGeneration;
     private final Set<String> files;
     private final long numRows;
     private final long formatVersion;
+    /** Minimum _seq_no of documents written into this generation, or {@link #UNKNOWN_SEQ_NO} if unavailable. */
+    private final long minSeqNo;
+    /** Maximum _seq_no of documents written into this generation, or {@link #UNKNOWN_SEQ_NO} if unavailable. */
+    private final long maxSeqNo;
 
     public WriterFileSet(String directory, long writerGeneration, Set<String> files, long numRows, long formatVersion) {
+        this(directory, writerGeneration, files, numRows, formatVersion, UNKNOWN_SEQ_NO, UNKNOWN_SEQ_NO);
+    }
+
+    public WriterFileSet(
+        String directory,
+        long writerGeneration,
+        Set<String> files,
+        long numRows,
+        long formatVersion,
+        long minSeqNo,
+        long maxSeqNo
+    ) {
         this.directory = directory;
         this.writerGeneration = writerGeneration;
         this.files = Set.copyOf(files);
         this.numRows = numRows;
         this.formatVersion = formatVersion;
+        this.minSeqNo = minSeqNo;
+        this.maxSeqNo = maxSeqNo;
     }
 
     /**
@@ -60,6 +81,13 @@ public sealed class WriterFileSet implements Writeable permits MonoFileWriterSet
      * The DFA subsystem is {@link ExperimentalApi} and gated behind
      * {@code FeatureFlags.PLUGGABLE_DATAFORMAT_EXPERIMENTAL_FLAG}; it first ships in 3.7.
      * No pre-3.7 wire format exists, so no version gate is needed here.
+     * <p>
+     * Seq-range fields ({@code minSeqNo}, {@code maxSeqNo}) were added after the initial
+     * release and are appended at the end of the stream. Streams from older serializers
+     * that do not carry these fields will read {@link #UNKNOWN_SEQ_NO} via the
+     * {@code available() > 0} guard — safe because the WriterFileSet is always the last
+     * element written per-entry in its containing {@code Segment} or
+     * {@code DataformatAwareCatalogSnapshot} stream.
      */
     public WriterFileSet(StreamInput in, String directory, long version) throws IOException {
         this.directory = directory;
@@ -69,6 +97,14 @@ public sealed class WriterFileSet implements Writeable permits MonoFileWriterSet
         this.formatVersion = version == DataformatAwareCatalogSnapshot.SERIALIZATION_VERSION_ONE
             ? in.readLong()
             : LuceneVersionConverter.encode(Version.LATEST);
+        // Seq-range fields: appended by new serializers, absent in legacy streams.
+        if (in.available() > 0) {
+            this.minSeqNo = in.readZLong();
+            this.maxSeqNo = in.readZLong();
+        } else {
+            this.minSeqNo = UNKNOWN_SEQ_NO;
+            this.maxSeqNo = UNKNOWN_SEQ_NO;
+        }
     }
 
     public String directory() {
@@ -91,6 +127,22 @@ public sealed class WriterFileSet implements Writeable permits MonoFileWriterSet
         return formatVersion;
     }
 
+    /**
+     * Returns the minimum {@code _seq_no} of documents in this generation,
+     * or {@link #UNKNOWN_SEQ_NO} if the data predates seq-range tracking.
+     */
+    public long minSeqNo() {
+        return minSeqNo;
+    }
+
+    /**
+     * Returns the maximum {@code _seq_no} of documents in this generation,
+     * or {@link #UNKNOWN_SEQ_NO} if the data predates seq-range tracking.
+     */
+    public long maxSeqNo() {
+        return maxSeqNo;
+    }
+
     public long getTotalSize() {
         return files.stream().mapToLong(file -> {
             try {
@@ -111,6 +163,10 @@ public sealed class WriterFileSet implements Writeable permits MonoFileWriterSet
             + files
             + ", formatVersion="
             + formatVersion
+            + ", minSeqNo="
+            + minSeqNo
+            + ", maxSeqNo="
+            + maxSeqNo
             + '}';
     }
 
@@ -120,6 +176,8 @@ public sealed class WriterFileSet implements Writeable permits MonoFileWriterSet
         out.writeStringCollection(files);
         out.writeLong(numRows);
         out.writeLong(formatVersion);
+        out.writeZLong(minSeqNo);
+        out.writeZLong(maxSeqNo);
     }
 
     @Override
@@ -159,6 +217,8 @@ public sealed class WriterFileSet implements Writeable permits MonoFileWriterSet
         private Long writerGeneration;
         private long numRows;
         private long formatVersion = 0L;
+        private long minSeqNo = UNKNOWN_SEQ_NO;
+        private long maxSeqNo = UNKNOWN_SEQ_NO;
         private final Set<String> files = new HashSet<>();
 
         public Builder directory(Path directory) {
@@ -191,6 +251,16 @@ public sealed class WriterFileSet implements Writeable permits MonoFileWriterSet
             return this;
         }
 
+        public Builder minSeqNo(long minSeqNo) {
+            this.minSeqNo = minSeqNo;
+            return this;
+        }
+
+        public Builder maxSeqNo(long maxSeqNo) {
+            this.maxSeqNo = maxSeqNo;
+            return this;
+        }
+
         public WriterFileSet build() {
             if (directory == null) {
                 throw new IllegalStateException("directory must be set");
@@ -200,7 +270,7 @@ public sealed class WriterFileSet implements Writeable permits MonoFileWriterSet
                 throw new IllegalStateException("writerGeneration must be set");
             }
 
-            return new WriterFileSet(directory.toString(), writerGeneration, files, numRows, formatVersion);
+            return new WriterFileSet(directory.toString(), writerGeneration, files, numRows, formatVersion, minSeqNo, maxSeqNo);
         }
     }
 }

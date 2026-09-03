@@ -65,6 +65,58 @@ public class WriterFileSetTests extends OpenSearchTestCase {
         assertEquals(0L, wfs.formatVersion());
     }
 
+    public void testSeqRangeFieldsDefaultToUnknown() {
+        WriterFileSet wfs = new WriterFileSet("/tmp/dir", 1L, Set.of("a.dat"), 10, 0L);
+        assertEquals(WriterFileSet.UNKNOWN_SEQ_NO, wfs.minSeqNo());
+        assertEquals(WriterFileSet.UNKNOWN_SEQ_NO, wfs.maxSeqNo());
+    }
+
+    public void testSeqRangeFieldsExplicit() {
+        WriterFileSet wfs = new WriterFileSet("/tmp/dir", 1L, Set.of("a.dat"), 10, 0L, 50L, 200L);
+        assertEquals(50L, wfs.minSeqNo());
+        assertEquals(200L, wfs.maxSeqNo());
+    }
+
+    public void testStreamRoundTripWithSeqRange() throws Exception {
+        WriterFileSet original = new WriterFileSet("/tmp/dir", 7L, Set.of("gen7.parquet"), 100, 0L, 42L, 999L);
+        WriterFileSet copy = copyWriteable(
+            original,
+            new NamedWriteableRegistry(Collections.emptyList()),
+            in -> new WriterFileSet(in, "/tmp/dir", DataformatAwareCatalogSnapshot.CURRENT_SERIALIZATION_VERSION)
+        );
+        assertEquals(42L, copy.minSeqNo());
+        assertEquals(999L, copy.maxSeqNo());
+        assertEquals(original.writerGeneration(), copy.writerGeneration());
+        assertEquals(original.numRows(), copy.numRows());
+    }
+
+    public void testStreamRoundTripLegacyReadsUnknown() throws Exception {
+        // Simulate a legacy WriterFileSet that was serialized WITHOUT seq ranges.
+        // Build a WriterFileSet with default (-1) seq ranges — the round trip should preserve -1.
+        WriterFileSet original = new WriterFileSet("/tmp/dir", 1L, Set.of("a.dat"), 10, 0L);
+        WriterFileSet copy = copyWriteable(
+            original,
+            new NamedWriteableRegistry(Collections.emptyList()),
+            in -> new WriterFileSet(in, "/tmp/dir", DataformatAwareCatalogSnapshot.CURRENT_SERIALIZATION_VERSION)
+        );
+        // New serializers write UNKNOWN_SEQ_NO; new deserializers read it back as UNKNOWN_SEQ_NO.
+        assertEquals(WriterFileSet.UNKNOWN_SEQ_NO, copy.minSeqNo());
+        assertEquals(WriterFileSet.UNKNOWN_SEQ_NO, copy.maxSeqNo());
+    }
+
+    public void testBuilderWithSeqRange() {
+        WriterFileSet wfs = WriterFileSet.builder()
+            .directory(java.nio.file.Path.of("/tmp/test"))
+            .writerGeneration(5L)
+            .addFile("data.parquet")
+            .addNumRows(100)
+            .minSeqNo(10L)
+            .maxSeqNo(500L)
+            .build();
+        assertEquals(10L, wfs.minSeqNo());
+        assertEquals(500L, wfs.maxSeqNo());
+    }
+
     // --- helpers ---
 
     private WriterFileSet randomWriterFileSet() {

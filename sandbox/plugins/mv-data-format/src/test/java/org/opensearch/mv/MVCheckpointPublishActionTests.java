@@ -139,4 +139,48 @@ public class MVCheckpointPublishActionTests extends OpenSearchTestCase {
 
         assertEquals(List.of(-1L, -1L), deserialized.fileSizes());
     }
+
+    public void testRequestRoundTripWithSeqRanges() throws IOException {
+        List<String> files = List.of("gen-1_0.parquet", "gen-1_1.parquet", "gen-1_2.parquet");
+        List<Long> sizes = List.of(1024L, 2048L, 512L);
+        List<Long> minSeqs = List.of(0L, 100L, 200L);
+        List<Long> maxSeqs = List.of(99L, 199L, 250L);
+        MVCheckpointPublishAction.Request original = new MVCheckpointPublishAction.Request(
+            "mv-target", 0, "source-idx", "uuid-1", 0,
+            250L, 1L, 10L,
+            files, sizes, minSeqs, maxSeqs
+        );
+
+        BytesStreamOutput out = new BytesStreamOutput();
+        original.writeTo(out);
+        StreamInput in = out.bytes().streamInput();
+        MVCheckpointPublishAction.Request deserialized = new MVCheckpointPublishAction.Request(in);
+
+        assertEquals(files, deserialized.parquetFiles());
+        assertEquals(sizes, deserialized.fileSizes());
+        assertEquals(minSeqs, deserialized.fileMinSeqNos());
+        assertEquals(maxSeqs, deserialized.fileMaxSeqNos());
+    }
+
+    public void testRequestLegacyCompatNoSeqRanges() throws IOException {
+        // Using the 10-arg constructor (legacy) — seq ranges should default to -1
+        MVCheckpointPublishAction.Request original = new MVCheckpointPublishAction.Request(
+            "target", 0, "source", "uuid", 0,
+            100L, 1L, 5L,
+            List.of("a.parquet", "b.parquet"),
+            List.of(1024L, 2048L)
+        );
+
+        assertEquals(List.of(-1L, -1L), original.fileMinSeqNos());
+        assertEquals(List.of(-1L, -1L), original.fileMaxSeqNos());
+
+        // Round-trip should preserve the -1 defaults
+        BytesStreamOutput out = new BytesStreamOutput();
+        original.writeTo(out);
+        StreamInput in = out.bytes().streamInput();
+        MVCheckpointPublishAction.Request deserialized = new MVCheckpointPublishAction.Request(in);
+
+        assertEquals(List.of(-1L, -1L), deserialized.fileMinSeqNos());
+        assertEquals(List.of(-1L, -1L), deserialized.fileMaxSeqNos());
+    }
 }

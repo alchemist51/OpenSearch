@@ -64,6 +64,7 @@ public class MVDataFormatPlugin extends Plugin
     private volatile org.opensearch.action.support.ActionFilter derivedIndexActionFilter;
     private volatile NodeDerivedPullService pullService;
     private volatile NodeRoutingSnapshotService routingSnapshotService;
+    private volatile MVReplicationService replicationService;
     /** Stage 2: native DataFusionRuntime pointer within MV's classloader. */
     private volatile long mvNativeRuntimePtr;
     /** Stage 5: circuit breaker for MV pull build memory accounting. */
@@ -199,6 +200,16 @@ public class MVDataFormatPlugin extends Plugin
         this.pullService = new NodeDerivedPullService(threadPool, java.util.List.of(mvFormat));
         this.pullService.start();
 
+        // ── Checkpoint replication service (external observer) ────────────
+        // Replaces the old in-engine checkpoint publishing. Source engines are
+        // never modified; this service samples their processedLocalCheckpoint
+        // on a scheduled tick and pushes adverts to bound MV target shards.
+        org.opensearch.common.unit.TimeValue publishInterval = MVReplicationService.CHECKPOINT_PUBLISH_INTERVAL.get(
+            environment.settings()
+        );
+        this.replicationService = new MVReplicationService(client, routingSnapshotService, threadPool, publishInterval);
+        this.replicationService.start();
+
         return java.util.List.of(pullService);
     }
 
@@ -209,6 +220,12 @@ public class MVDataFormatPlugin extends Plugin
             throw new IllegalStateException("mv_pull: pull service is not initialized");
         }
         indexModule.addIndexEventListener(service);
+        // Register the replication service as an event listener so it can
+        // track source shard starts/closes without modifying the engine.
+        MVReplicationService replService = replicationService;
+        if (replService != null) {
+            indexModule.addIndexEventListener(replService);
+        }
     }
 
     @SuppressWarnings("deprecation") // SOURCE_INDEX registered for BWC only
@@ -277,7 +294,9 @@ public class MVDataFormatPlugin extends Plugin
             // Bench pre-flight: managed native runtime sizing + always-on spill
             MV_NATIVE_POOL_LIMIT,
             MV_SPILL_DIRECTORY,
-            MV_SPILL_DISK_LIMIT
+            MV_SPILL_DISK_LIMIT,
+            // Checkpoint replication service interval
+            MVReplicationService.CHECKPOINT_PUBLISH_INTERVAL
         );
         java.util.List<org.opensearch.common.settings.Setting<?>> all = new java.util.ArrayList<>(base);
         all.addAll(MVPullSettings.admissionSettings());
@@ -405,8 +424,7 @@ public class MVDataFormatPlugin extends Plugin
             () -> clusterService,
             config.indexSettings().getSettings().getAsBoolean(MVConstants.STATE_MERGE_SETTING, false),
             routingSnapshotService != null ? routingSnapshotService::current : () -> TargetRoutingSnapshot.EMPTY,
-            mergeDefinition,
-            routingSnapshotService
+            mergeDefinition
         );
     }
 
@@ -475,6 +493,11 @@ public class MVDataFormatPlugin extends Plugin
 
     @Override
     public void close() throws java.io.IOException {
+        // Close the checkpoint replication service before releasing native resources
+        MVReplicationService replService = replicationService;
+        if (replService != null) {
+            replService.close();
+        }
         // Stage 2: release the managed DataFusion native runtime
         long ptr = mvNativeRuntimePtr;
         if (ptr != 0) {

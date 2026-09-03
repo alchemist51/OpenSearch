@@ -13,7 +13,9 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.transport.client.Client;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -26,6 +28,12 @@ import java.util.concurrent.atomic.AtomicLong;
  * value (coalesce). Fire-and-forget: publish failures are logged but do not
  * block the source refresh. The target's poller fallback to pull mode handles
  * missed pushes.
+ *
+ * <p>Maintains per-target-shard watermark state learned from publish responses
+ * ({@link MVCheckpointPublishAction.Response#targetWatermark()}). When building
+ * adverts, files whose seq range falls entirely at or below the target's
+ * watermark are excluded — the target already has that data. Legacy files
+ * (unknown seq range) are always included (fail-open).
  *
  * <p>SAFETY: never calls clusterService.state() — all routing data comes from
  * the lock-free {@link NodeRoutingSnapshotService} maintained by a
@@ -45,8 +53,16 @@ public final class MVCheckpointPublisher {
     /** Last maxSeqNo that was successfully published — coalesce throttle. */
     private final AtomicLong lastPublishedSeqNo = new AtomicLong(-1L);
 
+    /**
+     * Per-target-shard last-known watermark, updated from publish responses.
+     * Key: "targetIndex:targetShard". Value: highest watermark seen from that target.
+     * Used for source-side file filtering — files fully below the watermark are excluded.
+     */
+    private final ConcurrentHashMap<String, AtomicLong> targetWatermarks = new ConcurrentHashMap<>();
+
     private final AtomicLong publishCount = new AtomicLong();
     private final AtomicLong publishFailures = new AtomicLong();
+    private final AtomicLong filesFilteredCount = new AtomicLong();
 
     public MVCheckpointPublisher(
         Client client,
@@ -66,13 +82,23 @@ public final class MVCheckpointPublisher {
      * Publishes a checkpoint to all bound target shards. Called after the
      * source shard's refresh completes and parquet files are uploaded.
      *
-     * @param maxSeqNo      the maximum sequence number in the published generation
-     * @param primaryTerm   the source shard's primary term
-     * @param infosVersion  the segment infos version of the published generation
-     * @param parquetFiles  the parquet file names in this generation
-     * @param fileSizes     per-file byte sizes (parallel to parquetFiles, -1 if unknown)
+     * @param maxSeqNo        the maximum sequence number in the published generation
+     * @param primaryTerm     the source shard's primary term
+     * @param infosVersion    the segment infos version of the published generation
+     * @param parquetFiles    the parquet file names in this generation
+     * @param fileSizes       per-file byte sizes (parallel to parquetFiles, -1 if unknown)
+     * @param fileMinSeqNos   per-file minimum _seq_no (parallel to parquetFiles, -1 if unknown)
+     * @param fileMaxSeqNos   per-file maximum _seq_no (parallel to parquetFiles, -1 if unknown)
      */
-    public void publish(long maxSeqNo, long primaryTerm, long infosVersion, List<String> parquetFiles, List<Long> fileSizes) {
+    public void publish(
+        long maxSeqNo,
+        long primaryTerm,
+        long infosVersion,
+        List<String> parquetFiles,
+        List<Long> fileSizes,
+        List<Long> fileMinSeqNos,
+        List<Long> fileMaxSeqNos
+    ) {
         // Coalesce: skip if maxSeqNo hasn't advanced
         long last = lastPublishedSeqNo.get();
         if (maxSeqNo <= last) {
@@ -103,6 +129,50 @@ public final class MVCheckpointPublisher {
             // Resolve target shard via modular mapping (same as ship path)
             int targetShardId = target.targetShards() > 0 ? sourceShard % target.targetShards() : 0;
 
+            // Source-side seq-scoped file filtering: exclude files the target already has.
+            String watermarkKey = target.targetIndex() + ":" + targetShardId;
+            long watermark = getLastKnownWatermark(watermarkKey);
+
+            List<String> scopedFiles;
+            List<Long> scopedSizes;
+            List<Long> scopedMinSeqNos;
+            List<Long> scopedMaxSeqNos;
+            if (watermark == -1L || parquetFiles.isEmpty()) {
+                // Unknown watermark: send full list (fail-open)
+                scopedFiles = parquetFiles;
+                scopedSizes = fileSizes;
+                scopedMinSeqNos = fileMinSeqNos;
+                scopedMaxSeqNos = fileMaxSeqNos;
+            } else {
+                scopedFiles = new ArrayList<>();
+                scopedSizes = new ArrayList<>();
+                scopedMinSeqNos = new ArrayList<>();
+                scopedMaxSeqNos = new ArrayList<>();
+                int totalFiles = parquetFiles.size();
+                for (int i = 0; i < totalFiles; i++) {
+                    long fMax = i < fileMaxSeqNos.size() ? fileMaxSeqNos.get(i) : -1L;
+                    long fMin = i < fileMinSeqNos.size() ? fileMinSeqNos.get(i) : -1L;
+                    if (includeFile(fMin, fMax, watermark, maxSeqNo)) {
+                        scopedFiles.add(parquetFiles.get(i));
+                        scopedSizes.add(i < fileSizes.size() ? fileSizes.get(i) : -1L);
+                        scopedMinSeqNos.add(fMin);
+                        scopedMaxSeqNos.add(fMax);
+                    }
+                }
+                int filtered = totalFiles - scopedFiles.size();
+                if (filtered > 0) {
+                    filesFilteredCount.addAndGet(filtered);
+                    logger.debug(
+                        "ADVERT_SCOPED target=[{}][{}] files_total={} files_sent={} watermark_used={}",
+                        target.targetIndex(),
+                        targetShardId,
+                        totalFiles,
+                        scopedFiles.size(),
+                        watermark
+                    );
+                }
+            }
+
             MVCheckpointPublishAction.Request request = new MVCheckpointPublishAction.Request(
                 target.targetIndex(),
                 targetShardId,
@@ -112,19 +182,24 @@ public final class MVCheckpointPublisher {
                 maxSeqNo,
                 primaryTerm,
                 infosVersion,
-                parquetFiles,
-                fileSizes
+                scopedFiles,
+                scopedSizes,
+                scopedMinSeqNos,
+                scopedMaxSeqNos
             );
 
             publishCount.incrementAndGet();
             // Fire-and-forget: do not block the source refresh
             client.execute(MVCheckpointPublishAction.INSTANCE, request, ActionListener.wrap(response -> {
                 if (response.accepted()) {
+                    // Update per-target watermark from response (CAS to max)
+                    updateTargetWatermark(watermarkKey, response.targetWatermark());
                     logger.debug(
-                        "checkpoint_publish: target [{}][{}] accepted maxSeqNo={}",
+                        "checkpoint_publish: target [{}][{}] accepted maxSeqNo={} targetWatermark={}",
                         target.targetIndex(),
                         targetShardId,
-                        maxSeqNo
+                        maxSeqNo,
+                        response.targetWatermark()
                     );
                 } else {
                     logger.debug(
@@ -147,11 +222,74 @@ public final class MVCheckpointPublisher {
         }
     }
 
+    /**
+     * Legacy overload: publishes without per-file seq ranges.
+     */
+    public void publish(long maxSeqNo, long primaryTerm, long infosVersion, List<String> parquetFiles, List<Long> fileSizes) {
+        publish(maxSeqNo, primaryTerm, infosVersion, parquetFiles, fileSizes,
+            parquetFiles.stream().map(f -> -1L).toList(),
+            parquetFiles.stream().map(f -> -1L).toList());
+    }
+
+    /**
+     * Determines whether a file should be included in the advert for a target.
+     * A file is included if:
+     * <ul>
+     *   <li>Its maxSeqNo is unknown (-1) — legacy/fail-open, always include</li>
+     *   <li>Its [minSeqNo, maxSeqNo] range intersects (watermark, sourceMaxSeqNo]</li>
+     * </ul>
+     * A file is excluded only when its entire seq range is at or below the watermark.
+     */
+    static boolean includeFile(long fileMinSeqNo, long fileMaxSeqNo, long targetWatermark, long sourceMaxSeqNo) {
+        // Legacy file: unknown seq range → always include
+        if (fileMaxSeqNo == -1L) {
+            return true;
+        }
+        // File's entire range is at or below the target's watermark → target already has this data
+        if (fileMaxSeqNo <= targetWatermark) {
+            return false;
+        }
+        // File has data above the watermark → include
+        return true;
+    }
+
+    /**
+     * Updates the per-target watermark from a publish response using CAS-to-max.
+     */
+    void updateTargetWatermark(String key, long reportedWatermark) {
+        if (reportedWatermark < 0) return; // Unknown watermark, don't update
+        targetWatermarks.compute(key, (k, existing) -> {
+            if (existing == null) {
+                return new AtomicLong(reportedWatermark);
+            }
+            // CAS to max: only advance, never regress
+            existing.accumulateAndGet(reportedWatermark, Math::max);
+            return existing;
+        });
+    }
+
+    /**
+     * Returns the last known watermark for a target shard, or -1 if unknown.
+     */
+    long getLastKnownWatermark(String key) {
+        AtomicLong wm = targetWatermarks.get(key);
+        return wm != null ? wm.get() : -1L;
+    }
+
     public long publishCount() {
         return publishCount.get();
     }
 
     public long publishFailures() {
         return publishFailures.get();
+    }
+
+    public long filesFilteredCount() {
+        return filesFilteredCount.get();
+    }
+
+    /** Exposed for testing. */
+    ConcurrentHashMap<String, AtomicLong> targetWatermarks() {
+        return targetWatermarks;
     }
 }

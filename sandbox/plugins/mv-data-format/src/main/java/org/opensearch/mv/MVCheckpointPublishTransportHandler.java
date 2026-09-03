@@ -71,12 +71,27 @@ public final class MVCheckpointPublishTransportHandler extends HandledTransportA
                 request.infosVersion(),
                 request.parquetFiles(),
                 request.fileSizes(),
+                request.fileMinSeqNos(),
+                request.fileMaxSeqNos(),
                 System.nanoTime()
             );
 
             mailbox.deliver(request.targetIndex(), request.targetShard(), advert);
 
-            listener.onResponse(new MVCheckpointPublishAction.Response(true, -1L));
+            // Return the target's current watermark from the mailbox.
+            // The mailbox tracks the highest consumed maxSeqNo — which is the
+            // most recently processed advert's maxSeqNo. If no adverts have been
+            // consumed yet (target poller hasn't run), we peek the last-consumed
+            // highwater from the mailbox's metadata. For now, use -1 (unknown)
+            // as a correct initial value — the watermark will be populated from
+            // the target's DerivedShardPoller state in a follow-up when the poller
+            // reports back. This is safe: -1 means "send full list" (fail-open).
+            long targetWatermark = mailbox.lastConsumedWatermark(
+                request.targetIndex(), request.targetShard(),
+                request.sourceIndex(), request.sourceShard()
+            );
+
+            listener.onResponse(new MVCheckpointPublishAction.Response(true, targetWatermark));
         } catch (Exception e) {
             logger.warn(
                 "checkpoint_publish: failed to deliver advert for target=[{}][{}] source=[{}][{}]",

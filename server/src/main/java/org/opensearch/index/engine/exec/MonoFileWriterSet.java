@@ -36,7 +36,19 @@ public final class MonoFileWriterSet extends WriterFileSet {
     private final String file;
 
     private MonoFileWriterSet(String directory, long writerGeneration, String file, long numRows, long formatVersion) {
-        super(directory, writerGeneration, Set.of(file), numRows, formatVersion);
+        this(directory, writerGeneration, file, numRows, formatVersion, UNKNOWN_SEQ_NO, UNKNOWN_SEQ_NO);
+    }
+
+    private MonoFileWriterSet(
+        String directory,
+        long writerGeneration,
+        String file,
+        long numRows,
+        long formatVersion,
+        long minSeqNo,
+        long maxSeqNo
+    ) {
+        super(directory, writerGeneration, Set.of(file), numRows, formatVersion, minSeqNo, maxSeqNo);
         this.file = file;
     }
 
@@ -70,6 +82,32 @@ public final class MonoFileWriterSet extends WriterFileSet {
     }
 
     /**
+     * Creates a MonoFileWriterSet with explicit seq-range tracking.
+     *
+     * @param directory        the directory containing the file
+     * @param writerGeneration the writer generation that produced this file
+     * @param file             the single file name
+     * @param numRows          the number of rows in the file
+     * @param formatVersion    the long-encoded data-format version stamp
+     * @param minSeqNo         minimum _seq_no in this generation, or {@link #UNKNOWN_SEQ_NO}
+     * @param maxSeqNo         maximum _seq_no in this generation, or {@link #UNKNOWN_SEQ_NO}
+     */
+    public static MonoFileWriterSet of(
+        String directory,
+        long writerGeneration,
+        String file,
+        long numRows,
+        long formatVersion,
+        long minSeqNo,
+        long maxSeqNo
+    ) {
+        if (file == null || file.isEmpty()) {
+            throw new IllegalArgumentException("file must not be null or empty");
+        }
+        return new MonoFileWriterSet(directory, writerGeneration, file, numRows, formatVersion, minSeqNo, maxSeqNo);
+    }
+
+    /**
      * Creates a MonoFileWriterSet from a directory path, generation, file name, and row count.
      */
     public static MonoFileWriterSet of(Path directory, long writerGeneration, String file, long numRows) {
@@ -81,6 +119,21 @@ public final class MonoFileWriterSet extends WriterFileSet {
      */
     public static MonoFileWriterSet of(Path directory, long writerGeneration, String file, long numRows, long formatVersion) {
         return of(directory.toAbsolutePath().toString(), writerGeneration, file, numRows, formatVersion);
+    }
+
+    /**
+     * Creates a MonoFileWriterSet from a directory path with seq-range tracking.
+     */
+    public static MonoFileWriterSet of(
+        Path directory,
+        long writerGeneration,
+        String file,
+        long numRows,
+        long formatVersion,
+        long minSeqNo,
+        long maxSeqNo
+    ) {
+        return of(directory.toAbsolutePath().toString(), writerGeneration, file, numRows, formatVersion, minSeqNo, maxSeqNo);
     }
 
     /**
@@ -109,15 +162,21 @@ public final class MonoFileWriterSet extends WriterFileSet {
             wfs.writerGeneration(),
             wfs.files().iterator().next(),
             wfs.numRows(),
-            wfs.formatVersion()
+            wfs.formatVersion(),
+            wfs.minSeqNo(),
+            wfs.maxSeqNo()
         );
     }
 
     /**
      * Deserializes a MonoFileWriterSet from a stream.
+     * Stream format: generation (long), file (string), numRows (long), [minSeqNo (ZLong), maxSeqNo (ZLong)].
+     * Seq-range fields are optional for legacy compat — missing fields default to UNKNOWN_SEQ_NO.
      */
     public MonoFileWriterSet(StreamInput in, String directory, long version) throws IOException {
-        this(directory, in.readLong(), in.readString(), in.readLong(), version);
+        this(directory, in.readLong(), in.readString(), in.readLong(), version,
+            in.available() > 0 ? in.readZLong() : UNKNOWN_SEQ_NO,
+            in.available() > 0 ? in.readZLong() : UNKNOWN_SEQ_NO);
     }
 
     /**
@@ -133,6 +192,8 @@ public final class MonoFileWriterSet extends WriterFileSet {
         out.writeStringCollection(files());
         out.writeLong(numRows());
         out.writeLong(formatVersion());
+        out.writeZLong(minSeqNo());
+        out.writeZLong(maxSeqNo());
     }
 
     @Override

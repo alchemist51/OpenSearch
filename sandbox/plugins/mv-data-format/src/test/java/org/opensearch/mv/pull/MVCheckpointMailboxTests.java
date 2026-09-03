@@ -131,6 +131,55 @@ public class MVCheckpointMailboxTests extends OpenSearchTestCase {
         MVCheckpointMailbox.setInstance(null);
     }
 
+    public void testLastConsumedWatermark_UnknownSlot() {
+        assertEquals(-1L, mailbox.lastConsumedWatermark("target", 0, "source", 0));
+    }
+
+    public void testLastConsumedWatermark_UpdatedOnConsume() {
+        mailbox.deliver("target-idx", 0, advert(100L, 1L, 5L, List.of("a.parquet")));
+        // Before consume — watermark unknown
+        assertEquals(-1L, mailbox.lastConsumedWatermark("target-idx", 0, "source-idx", 0));
+
+        mailbox.consume("target-idx", 0, "source-idx", 0);
+        // After consume — watermark tracks the consumed maxSeqNo
+        assertEquals(100L, mailbox.lastConsumedWatermark("target-idx", 0, "source-idx", 0));
+    }
+
+    public void testLastConsumedWatermark_MonotonicallyIncreasing() {
+        mailbox.deliver("target-idx", 0, advert(100L, 1L, 5L, List.of("a.parquet")));
+        mailbox.consume("target-idx", 0, "source-idx", 0);
+        assertEquals(100L, mailbox.lastConsumedWatermark("target-idx", 0, "source-idx", 0));
+
+        mailbox.deliver("target-idx", 0, advert(200L, 1L, 6L, List.of("b.parquet")));
+        mailbox.consume("target-idx", 0, "source-idx", 0);
+        assertEquals(200L, mailbox.lastConsumedWatermark("target-idx", 0, "source-idx", 0));
+
+        // Deliver and consume an advert with a LOWER maxSeqNo — watermark should NOT regress
+        mailbox.deliver("target-idx", 0, advert(150L, 1L, 7L, List.of("c.parquet")));
+        mailbox.consume("target-idx", 0, "source-idx", 0);
+        assertEquals(200L, mailbox.lastConsumedWatermark("target-idx", 0, "source-idx", 0));
+    }
+
+    public void testPushedAdvertWithSeqRanges() {
+        MVCheckpointMailbox.PushedAdvert advert = new MVCheckpointMailbox.PushedAdvert(
+            "source-idx", "source-uuid", 0,
+            500L, 1L, 10L,
+            List.of("a.parquet", "b.parquet"),
+            List.of(1024L, 2048L),
+            List.of(0L, 100L),
+            List.of(99L, 500L),
+            System.nanoTime()
+        );
+        assertEquals(List.of(0L, 100L), advert.fileMinSeqNos());
+        assertEquals(List.of(99L, 500L), advert.fileMaxSeqNos());
+    }
+
+    public void testPushedAdvertLegacyConstructorDefaultsSeqRanges() {
+        MVCheckpointMailbox.PushedAdvert advert = advert(100L, 1L, 5L, List.of("a.parquet", "b.parquet"));
+        assertEquals(List.of(-1L, -1L), advert.fileMinSeqNos());
+        assertEquals(List.of(-1L, -1L), advert.fileMaxSeqNos());
+    }
+
     private static MVCheckpointMailbox.PushedAdvert advert(long maxSeqNo, long primaryTerm, long infosVersion, List<String> files) {
         return new MVCheckpointMailbox.PushedAdvert(
             "source-idx",

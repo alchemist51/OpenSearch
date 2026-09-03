@@ -61,6 +61,10 @@ public final class MVCheckpointPublishAction extends ActionType<MVCheckpointPubl
         private final List<String> parquetFiles;
         /** Per-file byte sizes (parallel to parquetFiles); -1 if unavailable. */
         private final List<Long> fileSizes;
+        /** Per-file minimum _seq_no (parallel to parquetFiles); -1 if unknown (legacy). */
+        private final List<Long> fileMinSeqNos;
+        /** Per-file maximum _seq_no (parallel to parquetFiles); -1 if unknown (legacy). */
+        private final List<Long> fileMaxSeqNos;
 
         public Request(
             String targetIndex,
@@ -74,6 +78,26 @@ public final class MVCheckpointPublishAction extends ActionType<MVCheckpointPubl
             List<String> parquetFiles,
             List<Long> fileSizes
         ) {
+            this(targetIndex, targetShard, sourceIndex, sourceUuid, sourceShard,
+                maxSeqNo, primaryTerm, infosVersion, parquetFiles, fileSizes,
+                parquetFiles.stream().map(f -> -1L).toList(),
+                parquetFiles.stream().map(f -> -1L).toList());
+        }
+
+        public Request(
+            String targetIndex,
+            int targetShard,
+            String sourceIndex,
+            String sourceUuid,
+            int sourceShard,
+            long maxSeqNo,
+            long primaryTerm,
+            long infosVersion,
+            List<String> parquetFiles,
+            List<Long> fileSizes,
+            List<Long> fileMinSeqNos,
+            List<Long> fileMaxSeqNos
+        ) {
             this.targetIndex = targetIndex;
             this.targetShard = targetShard;
             this.sourceIndex = sourceIndex;
@@ -84,6 +108,8 @@ public final class MVCheckpointPublishAction extends ActionType<MVCheckpointPubl
             this.infosVersion = infosVersion;
             this.parquetFiles = List.copyOf(parquetFiles);
             this.fileSizes = List.copyOf(fileSizes);
+            this.fileMinSeqNos = List.copyOf(fileMinSeqNos);
+            this.fileMaxSeqNos = List.copyOf(fileMaxSeqNos);
         }
 
         public Request(StreamInput in) throws IOException {
@@ -98,6 +124,14 @@ public final class MVCheckpointPublishAction extends ActionType<MVCheckpointPubl
             this.infosVersion = in.readZLong();
             this.parquetFiles = in.readStringList();
             this.fileSizes = in.readList(StreamInput::readZLong);
+            // Seq-range lists: appended by new serializers, absent in legacy streams.
+            if (in.available() > 0) {
+                this.fileMinSeqNos = in.readList(StreamInput::readZLong);
+                this.fileMaxSeqNos = in.readList(StreamInput::readZLong);
+            } else {
+                this.fileMinSeqNos = parquetFiles.stream().map(f -> -1L).toList();
+                this.fileMaxSeqNos = parquetFiles.stream().map(f -> -1L).toList();
+            }
         }
 
         @Override
@@ -113,6 +147,8 @@ public final class MVCheckpointPublishAction extends ActionType<MVCheckpointPubl
             out.writeZLong(infosVersion);
             out.writeStringCollection(parquetFiles);
             out.writeCollection(fileSizes, StreamOutput::writeZLong);
+            out.writeCollection(fileMinSeqNos, StreamOutput::writeZLong);
+            out.writeCollection(fileMaxSeqNos, StreamOutput::writeZLong);
         }
 
         public String targetIndex() {
@@ -153,6 +189,14 @@ public final class MVCheckpointPublishAction extends ActionType<MVCheckpointPubl
 
         public List<Long> fileSizes() {
             return fileSizes;
+        }
+
+        public List<Long> fileMinSeqNos() {
+            return fileMinSeqNos;
+        }
+
+        public List<Long> fileMaxSeqNos() {
+            return fileMaxSeqNos;
         }
 
         @Override
