@@ -13,28 +13,25 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
-import java.util.List;
+import java.util.Map;
 
 /**
  * Wire round-trip tests for {@link MVCheckpointPublishAction.Request} and
- * {@link MVCheckpointPublishAction.Response}.
+ * {@link MVCheckpointPublishAction.Response}, plus {@link MVReplicationCheckpoint}
+ * and {@link MVFileMetadata} serialization.
  */
 public class MVCheckpointPublishActionTests extends OpenSearchTestCase {
 
     public void testRequestRoundTrip() throws IOException {
-        List<String> files = List.of("gen-1_0.parquet", "gen-1_1.parquet");
-        List<Long> sizes = List.of(1024L, 2048L);
+        Map<String, MVFileMetadata> files = Map.of(
+            "gen-1_0.parquet", new MVFileMetadata(1024L, 0L, 49L, 12345L),
+            "gen-1_1.parquet", new MVFileMetadata(2048L, 50L, 100L, -1L)
+        );
+        MVReplicationCheckpoint cp = new MVReplicationCheckpoint(
+            "source-idx", 0, 3L, 999L, 42L, files, System.currentTimeMillis()
+        );
         MVCheckpointPublishAction.Request original = new MVCheckpointPublishAction.Request(
-            "mv-target",
-            2,
-            "source-idx",
-            "source-uuid-123",
-            0,
-            999L,
-            3L,
-            42L,
-            files,
-            sizes
+            "mv-target", 2, "source-uuid-123", cp
         );
 
         BytesStreamOutput out = new BytesStreamOutput();
@@ -44,28 +41,21 @@ public class MVCheckpointPublishActionTests extends OpenSearchTestCase {
 
         assertEquals("mv-target", deserialized.targetIndex());
         assertEquals(2, deserialized.targetShard());
-        assertEquals("source-idx", deserialized.sourceIndex());
         assertEquals("source-uuid-123", deserialized.sourceUuid());
+        assertEquals("source-idx", deserialized.sourceIndex());
         assertEquals(0, deserialized.sourceShard());
         assertEquals(999L, deserialized.maxSeqNo());
         assertEquals(3L, deserialized.primaryTerm());
         assertEquals(42L, deserialized.infosVersion());
-        assertEquals(files, deserialized.parquetFiles());
-        assertEquals(sizes, deserialized.fileSizes());
+        assertEquals(2, deserialized.checkpoint().fileMetadata().size());
     }
 
     public void testRequestEmptyFiles() throws IOException {
+        MVReplicationCheckpoint cp = new MVReplicationCheckpoint(
+            "source", 0, 1L, 0L, 0L, Map.of(), System.currentTimeMillis()
+        );
         MVCheckpointPublishAction.Request original = new MVCheckpointPublishAction.Request(
-            "target",
-            0,
-            "source",
-            "uuid",
-            0,
-            0L,
-            1L,
-            0L,
-            List.of(),
-            List.of()
+            "target", 0, "uuid", cp
         );
 
         BytesStreamOutput out = new BytesStreamOutput();
@@ -73,8 +63,7 @@ public class MVCheckpointPublishActionTests extends OpenSearchTestCase {
         StreamInput in = out.bytes().streamInput();
         MVCheckpointPublishAction.Request deserialized = new MVCheckpointPublishAction.Request(in);
 
-        assertTrue(deserialized.parquetFiles().isEmpty());
-        assertTrue(deserialized.fileSizes().isEmpty());
+        assertTrue(deserialized.checkpoint().fileMetadata().isEmpty());
     }
 
     public void testResponseRoundTrip() throws IOException {
@@ -102,85 +91,88 @@ public class MVCheckpointPublishActionTests extends OpenSearchTestCase {
     }
 
     public void testRequestValidation() {
+        MVReplicationCheckpoint cp = new MVReplicationCheckpoint(
+            "source", 0, 1L, 100L, 5L,
+            Map.of("a.parquet", new MVFileMetadata(1024L, 0L, 100L, -1L)),
+            System.currentTimeMillis()
+        );
         MVCheckpointPublishAction.Request request = new MVCheckpointPublishAction.Request(
-            "target",
-            0,
-            "source",
-            "uuid",
-            0,
-            100L,
-            1L,
-            5L,
-            List.of("a.parquet"),
-            List.of(1024L)
+            "target", 0, "uuid", cp
         );
         assertNull(request.validate());
     }
 
-    public void testRequestWithNegativeFileSizes() throws IOException {
-        // -1 means size unknown — valid wire format
-        MVCheckpointPublishAction.Request original = new MVCheckpointPublishAction.Request(
-            "target",
-            0,
-            "source",
-            "uuid",
-            0,
-            100L,
-            1L,
-            5L,
-            List.of("a.parquet", "b.parquet"),
-            List.of(-1L, -1L)
-        );
+    public void testFileMetadataRoundTrip() throws IOException {
+        MVFileMetadata original = new MVFileMetadata(4096L, 100L, 200L, 0xDEADBEEFL);
 
         BytesStreamOutput out = new BytesStreamOutput();
         original.writeTo(out);
         StreamInput in = out.bytes().streamInput();
-        MVCheckpointPublishAction.Request deserialized = new MVCheckpointPublishAction.Request(in);
+        MVFileMetadata deserialized = new MVFileMetadata(in);
 
-        assertEquals(List.of(-1L, -1L), deserialized.fileSizes());
+        assertEquals(4096L, deserialized.sizeBytes());
+        assertEquals(100L, deserialized.minSeqNo());
+        assertEquals(200L, deserialized.maxSeqNo());
+        assertEquals(0xDEADBEEFL, deserialized.crc32());
+        assertTrue(deserialized.hasCrc32());
     }
 
-    public void testRequestRoundTripWithSeqRanges() throws IOException {
-        List<String> files = List.of("gen-1_0.parquet", "gen-1_1.parquet", "gen-1_2.parquet");
-        List<Long> sizes = List.of(1024L, 2048L, 512L);
-        List<Long> minSeqs = List.of(0L, 100L, 200L);
-        List<Long> maxSeqs = List.of(99L, 199L, 250L);
-        MVCheckpointPublishAction.Request original = new MVCheckpointPublishAction.Request(
-            "mv-target", 0, "source-idx", "uuid-1", 0,
-            250L, 1L, 10L,
-            files, sizes, minSeqs, maxSeqs
-        );
+    public void testFileMetadataUnknownCrc() throws IOException {
+        MVFileMetadata original = new MVFileMetadata(1024L, 0L, 50L, MVFileMetadata.CRC32_UNKNOWN);
 
         BytesStreamOutput out = new BytesStreamOutput();
         original.writeTo(out);
         StreamInput in = out.bytes().streamInput();
-        MVCheckpointPublishAction.Request deserialized = new MVCheckpointPublishAction.Request(in);
+        MVFileMetadata deserialized = new MVFileMetadata(in);
 
-        assertEquals(files, deserialized.parquetFiles());
-        assertEquals(sizes, deserialized.fileSizes());
-        assertEquals(minSeqs, deserialized.fileMinSeqNos());
-        assertEquals(maxSeqs, deserialized.fileMaxSeqNos());
+        assertFalse(deserialized.hasCrc32());
+        assertEquals(-1L, deserialized.crc32());
     }
 
-    public void testRequestLegacyCompatNoSeqRanges() throws IOException {
-        // Using the 10-arg constructor (legacy) — seq ranges should default to -1
-        MVCheckpointPublishAction.Request original = new MVCheckpointPublishAction.Request(
-            "target", 0, "source", "uuid", 0,
-            100L, 1L, 5L,
-            List.of("a.parquet", "b.parquet"),
-            List.of(1024L, 2048L)
+    public void testCheckpointRoundTrip() throws IOException {
+        Map<String, MVFileMetadata> files = Map.of(
+            "gen-1_0.parquet", new MVFileMetadata(1024L, 0L, 99L, 12345L),
+            "gen-1_1.parquet", new MVFileMetadata(2048L, 100L, 199L, -1L),
+            "gen-1_2.parquet", new MVFileMetadata(512L, 200L, 250L, 67890L)
+        );
+        MVReplicationCheckpoint original = new MVReplicationCheckpoint(
+            "source-idx", 0, 1L, 250L, 10L, files, 1700000000000L
         );
 
-        assertEquals(List.of(-1L, -1L), original.fileMinSeqNos());
-        assertEquals(List.of(-1L, -1L), original.fileMaxSeqNos());
-
-        // Round-trip should preserve the -1 defaults
         BytesStreamOutput out = new BytesStreamOutput();
         original.writeTo(out);
         StreamInput in = out.bytes().streamInput();
-        MVCheckpointPublishAction.Request deserialized = new MVCheckpointPublishAction.Request(in);
+        MVReplicationCheckpoint deserialized = new MVReplicationCheckpoint(in);
 
-        assertEquals(List.of(-1L, -1L), deserialized.fileMinSeqNos());
-        assertEquals(List.of(-1L, -1L), deserialized.fileMaxSeqNos());
+        assertEquals("source-idx", deserialized.sourceIndex());
+        assertEquals(0, deserialized.sourceShard());
+        assertEquals(1L, deserialized.primaryTerm());
+        assertEquals(250L, deserialized.maxSeqNo());
+        assertEquals(10L, deserialized.infosVersion());
+        assertEquals(1700000000000L, deserialized.createdTimeStampMillis());
+        assertEquals(3, deserialized.fileMetadata().size());
+
+        MVFileMetadata gen0 = deserialized.fileMetadata().get("gen-1_0.parquet");
+        assertNotNull(gen0);
+        assertEquals(1024L, gen0.sizeBytes());
+        assertEquals(0L, gen0.minSeqNo());
+        assertEquals(99L, gen0.maxSeqNo());
+        assertEquals(12345L, gen0.crc32());
+    }
+
+    public void testCheckpointEmptySentinel() throws IOException {
+        MVReplicationCheckpoint empty = MVReplicationCheckpoint.empty("source-idx", 0);
+
+        assertTrue(empty.isEmpty());
+        assertEquals(-1L, empty.maxSeqNo());
+        assertEquals(0L, empty.primaryTerm());
+        assertTrue(empty.fileMetadata().isEmpty());
+
+        // Round-trip
+        BytesStreamOutput out = new BytesStreamOutput();
+        empty.writeTo(out);
+        StreamInput in = out.bytes().streamInput();
+        MVReplicationCheckpoint deserialized = new MVReplicationCheckpoint(in);
+        assertTrue(deserialized.isEmpty());
     }
 }

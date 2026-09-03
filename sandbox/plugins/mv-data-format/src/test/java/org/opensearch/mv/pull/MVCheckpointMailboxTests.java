@@ -8,189 +8,273 @@
 
 package org.opensearch.mv.pull;
 
+import org.opensearch.mv.MVFileMetadata;
+import org.opensearch.mv.MVReplicationCheckpoint;
 import org.opensearch.test.OpenSearchTestCase;
 
-import java.util.List;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Map;
+import java.util.zip.CRC32;
 
 /**
- * Tests for {@link MVCheckpointMailbox}: deliver, consume, peek, coalesce,
- * fallback tracking, and concurrent-safety contracts.
+ * Unit tests for {@link MVCheckpointMailbox} (now using {@link MVReplicationCheckpoint})
+ * and {@link MVReplicationCheckpoint#isAheadOf} ordering (term-first, failover-correct).
  */
 public class MVCheckpointMailboxTests extends OpenSearchTestCase {
 
-    private MVCheckpointMailbox mailbox;
+    // ── Basic mailbox operations ─────────────────────────────────────────
 
-    @Override
-    public void setUp() throws Exception {
-        super.setUp();
-        mailbox = new MVCheckpointMailbox();
+    public void testConsumeReturnsNullWhenEmpty() {
+        MVCheckpointMailbox mailbox = new MVCheckpointMailbox();
+        assertNull(mailbox.consume("target", 0, "source", 0));
     }
 
     public void testDeliverAndConsume() {
-        MVCheckpointMailbox.PushedAdvert advert = advert(100L, 1L, 5L, List.of("a.parquet"));
-        mailbox.deliver("target-idx", 0, advert);
+        MVCheckpointMailbox mailbox = new MVCheckpointMailbox();
+        MVReplicationCheckpoint cp = checkpoint("source", 0, 1L, 100L, 5L,
+            Map.of("a.parquet", new MVFileMetadata(1024L, 0L, 100L, -1L)));
+        mailbox.deliver("target", 0, cp);
 
-        assertEquals(1, mailbox.pendingSlots());
-        assertEquals(1L, mailbox.pushCount());
-
-        MVCheckpointMailbox.PushedAdvert consumed = mailbox.consume("target-idx", 0, "source-idx", 0);
+        MVReplicationCheckpoint consumed = mailbox.consume("target", 0, "source", 0);
         assertNotNull(consumed);
         assertEquals(100L, consumed.maxSeqNo());
-        assertEquals(List.of("a.parquet"), consumed.parquetFiles());
+        assertEquals(1, consumed.fileMetadata().size());
 
-        // Consumed — slot is empty
-        assertNull(mailbox.consume("target-idx", 0, "source-idx", 0));
-        assertEquals(0, mailbox.pendingSlots());
-        assertEquals(1L, mailbox.consumeCount());
+        // Second consume should return null (consumed)
+        assertNull(mailbox.consume("target", 0, "source", 0));
     }
 
-    public void testConsumeEmptyMailbox() {
-        assertNull(mailbox.consume("target-idx", 0, "source-idx", 0));
+    public void testCoalesceKeepsNewerCheckpoint() {
+        MVCheckpointMailbox mailbox = new MVCheckpointMailbox();
+        MVReplicationCheckpoint older = checkpoint("source", 0, 1L, 100L, 5L,
+            Map.of("a.parquet", new MVFileMetadata(1024L, 0L, 100L, -1L)));
+        MVReplicationCheckpoint newer = checkpoint("source", 0, 1L, 200L, 10L,
+            Map.of("b.parquet", new MVFileMetadata(2048L, 100L, 200L, -1L),
+                   "c.parquet", new MVFileMetadata(512L, 200L, 250L, -1L)));
+        mailbox.deliver("target", 0, older);
+        mailbox.deliver("target", 0, newer);
+
+        MVReplicationCheckpoint consumed = mailbox.consume("target", 0, "source", 0);
+        assertNotNull(consumed);
+        assertEquals(200L, consumed.maxSeqNo());
+        assertEquals(2, consumed.fileMetadata().size());
     }
 
     public void testPeekDoesNotConsume() {
-        MVCheckpointMailbox.PushedAdvert advert = advert(100L, 1L, 5L, List.of("a.parquet"));
-        mailbox.deliver("target-idx", 0, advert);
+        MVCheckpointMailbox mailbox = new MVCheckpointMailbox();
+        MVReplicationCheckpoint cp = checkpoint("source", 0, 1L, 100L, 5L, Map.of());
+        mailbox.deliver("target", 0, cp);
 
-        MVCheckpointMailbox.PushedAdvert peeked = mailbox.peek("target-idx", 0, "source-idx", 0);
+        MVReplicationCheckpoint peeked = mailbox.peek("target", 0, "source", 0);
         assertNotNull(peeked);
         assertEquals(100L, peeked.maxSeqNo());
 
-        // Peek doesn't consume — still available
-        assertEquals(1, mailbox.pendingSlots());
-        MVCheckpointMailbox.PushedAdvert consumed = mailbox.consume("target-idx", 0, "source-idx", 0);
+        MVReplicationCheckpoint consumed = mailbox.consume("target", 0, "source", 0);
         assertNotNull(consumed);
-    }
-
-    public void testCoalesceNewerMaxSeqNo() {
-        mailbox.deliver("target-idx", 0, advert(100L, 1L, 5L, List.of("a.parquet")));
-        mailbox.deliver("target-idx", 0, advert(200L, 1L, 6L, List.of("b.parquet")));
-
-        MVCheckpointMailbox.PushedAdvert consumed = mailbox.consume("target-idx", 0, "source-idx", 0);
-        assertNotNull(consumed);
-        // Newer advert wins
-        assertEquals(200L, consumed.maxSeqNo());
-        assertEquals(List.of("b.parquet"), consumed.parquetFiles());
-        assertEquals(2L, mailbox.pushCount());
-    }
-
-    public void testCoalesceOlderDropped() {
-        mailbox.deliver("target-idx", 0, advert(200L, 1L, 6L, List.of("b.parquet")));
-        mailbox.deliver("target-idx", 0, advert(100L, 1L, 5L, List.of("a.parquet")));
-
-        MVCheckpointMailbox.PushedAdvert consumed = mailbox.consume("target-idx", 0, "source-idx", 0);
-        assertNotNull(consumed);
-        // Newer advert (200) wins — older (100) is dropped
-        assertEquals(200L, consumed.maxSeqNo());
-    }
-
-    public void testCoalesceSameMaxSeqNoHigherInfosVersion() {
-        mailbox.deliver("target-idx", 0, advert(100L, 1L, 5L, List.of("a.parquet")));
-        mailbox.deliver("target-idx", 0, advert(100L, 1L, 7L, List.of("b.parquet")));
-
-        MVCheckpointMailbox.PushedAdvert consumed = mailbox.consume("target-idx", 0, "source-idx", 0);
-        assertNotNull(consumed);
-        // Same maxSeqNo, higher infosVersion wins
-        assertEquals(7L, consumed.infosVersion());
-        assertEquals(List.of("b.parquet"), consumed.parquetFiles());
-    }
-
-    public void testMultipleSlots() {
-        mailbox.deliver("target-idx", 0, advert(100L, 1L, 5L, List.of("a.parquet")));
-        mailbox.deliver("target-idx", 1, advert(200L, 1L, 6L, List.of("b.parquet")));
-        mailbox.deliver("other-target", 0, advert(300L, 1L, 7L, List.of("c.parquet")));
-
-        assertEquals(3, mailbox.pendingSlots());
-
-        MVCheckpointMailbox.PushedAdvert a = mailbox.consume("target-idx", 0, "source-idx", 0);
-        assertNotNull(a);
-        assertEquals(100L, a.maxSeqNo());
-
-        MVCheckpointMailbox.PushedAdvert b = mailbox.consume("target-idx", 1, "source-idx", 0);
-        assertNotNull(b);
-        assertEquals(200L, b.maxSeqNo());
-
-        MVCheckpointMailbox.PushedAdvert c = mailbox.consume("other-target", 0, "source-idx", 0);
-        assertNotNull(c);
-        assertEquals(300L, c.maxSeqNo());
-
-        assertEquals(0, mailbox.pendingSlots());
+        assertEquals(100L, consumed.maxSeqNo());
     }
 
     public void testFallbackCounter() {
+        MVCheckpointMailbox mailbox = new MVCheckpointMailbox();
         assertEquals(0L, mailbox.fallbackCount());
         mailbox.recordFallback();
         mailbox.recordFallback();
         assertEquals(2L, mailbox.fallbackCount());
     }
 
-    public void testSingletonPattern() {
-        MVCheckpointMailbox.setInstance(mailbox);
-        assertSame(mailbox, MVCheckpointMailbox.instance());
-        // Reset to avoid test pollution
-        MVCheckpointMailbox.setInstance(null);
-    }
-
-    public void testLastConsumedWatermark_UnknownSlot() {
+    public void testLastConsumedWatermark() {
+        MVCheckpointMailbox mailbox = new MVCheckpointMailbox();
         assertEquals(-1L, mailbox.lastConsumedWatermark("target", 0, "source", 0));
+
+        mailbox.deliver("target", 0, checkpoint("source", 0, 1L, 100L, 5L, Map.of()));
+        mailbox.consume("target", 0, "source", 0);
+        assertEquals(100L, mailbox.lastConsumedWatermark("target", 0, "source", 0));
+
+        mailbox.deliver("target", 0, checkpoint("source", 0, 1L, 200L, 10L, Map.of()));
+        mailbox.consume("target", 0, "source", 0);
+        assertEquals(200L, mailbox.lastConsumedWatermark("target", 0, "source", 0));
     }
 
-    public void testLastConsumedWatermark_UpdatedOnConsume() {
-        mailbox.deliver("target-idx", 0, advert(100L, 1L, 5L, List.of("a.parquet")));
-        // Before consume — watermark unknown
-        assertEquals(-1L, mailbox.lastConsumedWatermark("target-idx", 0, "source-idx", 0));
+    public void testPerSlotIsolation() {
+        MVCheckpointMailbox mailbox = new MVCheckpointMailbox();
+        mailbox.deliver("target-a", 0, checkpoint("source-a", 0, 1L, 100L, 5L, Map.of()));
+        mailbox.deliver("target-b", 0, checkpoint("source-b", 0, 1L, 200L, 10L, Map.of()));
 
-        mailbox.consume("target-idx", 0, "source-idx", 0);
-        // After consume — watermark tracks the consumed maxSeqNo
-        assertEquals(100L, mailbox.lastConsumedWatermark("target-idx", 0, "source-idx", 0));
+        MVReplicationCheckpoint consumedA = mailbox.consume("target-a", 0, "source-a", 0);
+        assertNotNull(consumedA);
+        assertEquals(100L, consumedA.maxSeqNo());
+
+        MVReplicationCheckpoint consumedB = mailbox.consume("target-b", 0, "source-b", 0);
+        assertNotNull(consumedB);
+        assertEquals(200L, consumedB.maxSeqNo());
     }
 
-    public void testLastConsumedWatermark_MonotonicallyIncreasing() {
-        mailbox.deliver("target-idx", 0, advert(100L, 1L, 5L, List.of("a.parquet")));
-        mailbox.consume("target-idx", 0, "source-idx", 0);
-        assertEquals(100L, mailbox.lastConsumedWatermark("target-idx", 0, "source-idx", 0));
+    // ── isAheadOf ordering tests (term-first, failover-correct) ──────────
 
-        mailbox.deliver("target-idx", 0, advert(200L, 1L, 6L, List.of("b.parquet")));
-        mailbox.consume("target-idx", 0, "source-idx", 0);
-        assertEquals(200L, mailbox.lastConsumedWatermark("target-idx", 0, "source-idx", 0));
-
-        // Deliver and consume an advert with a LOWER maxSeqNo — watermark should NOT regress
-        mailbox.deliver("target-idx", 0, advert(150L, 1L, 7L, List.of("c.parquet")));
-        mailbox.consume("target-idx", 0, "source-idx", 0);
-        assertEquals(200L, mailbox.lastConsumedWatermark("target-idx", 0, "source-idx", 0));
+    public void testIsAheadOf_HigherTermWins() {
+        MVReplicationCheckpoint termOne = checkpoint("src", 0, 1L, 1000L, 50L, Map.of());
+        MVReplicationCheckpoint termTwo = checkpoint("src", 0, 2L, 100L, 5L, Map.of());
+        // Term 2 is ahead of term 1 even though seqNo is lower
+        assertTrue(termTwo.isAheadOf(termOne));
+        assertFalse(termOne.isAheadOf(termTwo));
     }
 
-    public void testPushedAdvertWithSeqRanges() {
-        MVCheckpointMailbox.PushedAdvert advert = new MVCheckpointMailbox.PushedAdvert(
-            "source-idx", "source-uuid", 0,
-            500L, 1L, 10L,
-            List.of("a.parquet", "b.parquet"),
-            List.of(1024L, 2048L),
-            List.of(0L, 100L),
-            List.of(99L, 500L),
-            System.nanoTime()
-        );
-        assertEquals(List.of(0L, 100L), advert.fileMinSeqNos());
-        assertEquals(List.of(99L, 500L), advert.fileMaxSeqNos());
+    public void testIsAheadOf_SameTermHigherSeqNoWins() {
+        MVReplicationCheckpoint lower = checkpoint("src", 0, 1L, 100L, 10L, Map.of());
+        MVReplicationCheckpoint higher = checkpoint("src", 0, 1L, 200L, 10L, Map.of());
+        assertTrue(higher.isAheadOf(lower));
+        assertFalse(lower.isAheadOf(higher));
     }
 
-    public void testPushedAdvertLegacyConstructorDefaultsSeqRanges() {
-        MVCheckpointMailbox.PushedAdvert advert = advert(100L, 1L, 5L, List.of("a.parquet", "b.parquet"));
-        assertEquals(List.of(-1L, -1L), advert.fileMinSeqNos());
-        assertEquals(List.of(-1L, -1L), advert.fileMaxSeqNos());
+    public void testIsAheadOf_SameTermSameSeqNoHigherInfosVersionWins() {
+        MVReplicationCheckpoint lower = checkpoint("src", 0, 1L, 100L, 10L, Map.of());
+        MVReplicationCheckpoint higher = checkpoint("src", 0, 1L, 100L, 20L, Map.of());
+        assertTrue(higher.isAheadOf(lower));
+        assertFalse(lower.isAheadOf(higher));
     }
 
-    private static MVCheckpointMailbox.PushedAdvert advert(long maxSeqNo, long primaryTerm, long infosVersion, List<String> files) {
-        return new MVCheckpointMailbox.PushedAdvert(
-            "source-idx",
-            "source-uuid",
-            0,
-            maxSeqNo,
-            primaryTerm,
-            infosVersion,
-            files,
-            files.stream().map(f -> -1L).toList(),
-            System.nanoTime()
+    public void testIsAheadOf_EqualCheckpoints() {
+        MVReplicationCheckpoint a = checkpoint("src", 0, 1L, 100L, 10L, Map.of());
+        MVReplicationCheckpoint b = checkpoint("src", 0, 1L, 100L, 10L, Map.of());
+        assertFalse(a.isAheadOf(b));
+        assertFalse(b.isAheadOf(a));
+    }
+
+    public void testIsAheadOf_NullSafe() {
+        MVReplicationCheckpoint cp = checkpoint("src", 0, 1L, 100L, 10L, Map.of());
+        assertTrue(cp.isAheadOf(null));
+    }
+
+    public void testIsAheadOf_EmptySafe() {
+        MVReplicationCheckpoint cp = checkpoint("src", 0, 1L, 100L, 10L, Map.of());
+        MVReplicationCheckpoint empty = MVReplicationCheckpoint.empty("src", 0);
+        assertTrue(cp.isAheadOf(empty));
+        assertFalse(empty.isAheadOf(cp));
+    }
+
+    public void testIsAheadOf_EmptyVsEmpty() {
+        MVReplicationCheckpoint e1 = MVReplicationCheckpoint.empty("src", 0);
+        MVReplicationCheckpoint e2 = MVReplicationCheckpoint.empty("src", 0);
+        assertFalse(e1.isAheadOf(e2));
+        assertFalse(e2.isAheadOf(e1));
+    }
+
+    public void testIsAheadOf_EmptyVsNull() {
+        MVReplicationCheckpoint empty = MVReplicationCheckpoint.empty("src", 0);
+        // EMPTY is not ahead of null: both are sentinel values, EMPTY.isEmpty() is true
+        assertFalse(empty.isAheadOf(null));
+    }
+
+    // ── Coalesce across failover (term-first mailbox ordering fix) ───────
+
+    public void testCoalesceAcrossFailover() {
+        MVCheckpointMailbox mailbox = new MVCheckpointMailbox();
+        // Old-term advert with high seqNo
+        MVReplicationCheckpoint oldTerm = checkpoint("source", 0, 1L, 5000L, 100L, Map.of());
+        // New-term advert with low seqNo (after failover, new primary starts from scratch)
+        MVReplicationCheckpoint newTerm = checkpoint("source", 0, 2L, 50L, 5L, Map.of());
+
+        mailbox.deliver("target", 0, oldTerm);
+        mailbox.deliver("target", 0, newTerm);
+
+        MVReplicationCheckpoint consumed = mailbox.consume("target", 0, "source", 0);
+        assertNotNull(consumed);
+        // New term must win despite lower seqNo — failover correctness
+        assertEquals(2L, consumed.primaryTerm());
+        assertEquals(50L, consumed.maxSeqNo());
+    }
+
+    public void testCoalesceOldTermDoesNotSupersede() {
+        MVCheckpointMailbox mailbox = new MVCheckpointMailbox();
+        // New-term advert arrives first
+        MVReplicationCheckpoint newTerm = checkpoint("source", 0, 2L, 50L, 5L, Map.of());
+        // Delayed old-term advert arrives after (network reordering)
+        MVReplicationCheckpoint oldTerm = checkpoint("source", 0, 1L, 5000L, 100L, Map.of());
+
+        mailbox.deliver("target", 0, newTerm);
+        mailbox.deliver("target", 0, oldTerm);
+
+        MVReplicationCheckpoint consumed = mailbox.consume("target", 0, "source", 0);
+        assertNotNull(consumed);
+        // New term must still be kept — old-term advert must not supersede
+        assertEquals(2L, consumed.primaryTerm());
+        assertEquals(50L, consumed.maxSeqNo());
+    }
+
+    // ── compareTo consistency ────────────────────────────────────────────
+
+    public void testCompareTo() {
+        MVReplicationCheckpoint a = checkpoint("src", 0, 1L, 100L, 10L, Map.of());
+        MVReplicationCheckpoint b = checkpoint("src", 0, 1L, 200L, 10L, Map.of());
+        // b is ahead → compareTo returns negative for b (sorted first)
+        assertTrue(b.compareTo(a) < 0);
+        assertTrue(a.compareTo(b) > 0);
+        assertEquals(0, a.compareTo(checkpoint("src", 0, 1L, 100L, 10L, Map.of())));
+    }
+
+    // ── Equality: positional identity, NOT the map ───────────────────────
+
+    public void testEqualityIgnoresFileMetadata() {
+        MVReplicationCheckpoint a = checkpoint("src", 0, 1L, 100L, 10L,
+            Map.of("a.parquet", new MVFileMetadata(1024L, 0L, 100L, 111L)));
+        MVReplicationCheckpoint b = checkpoint("src", 0, 1L, 100L, 10L,
+            Map.of("b.parquet", new MVFileMetadata(9999L, 50L, 200L, 222L)));
+        assertEquals(a, b);
+        assertEquals(a.hashCode(), b.hashCode());
+    }
+
+    // ── CRC verification helpers ─────────────────────────────────────────
+
+    public void testCrc32GoodFile() throws IOException {
+        Path dir = createTempDir();
+        Path file = dir.resolve("test.parquet");
+        byte[] content = "hello world parquet data".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        CRC32 crc = new CRC32();
+        crc.update(content);
+        long expectedCrc = crc.getValue();
+
+        try (OutputStream os = Files.newOutputStream(file)) {
+            os.write(content);
+        }
+
+        // Verify CRC matches
+        CRC32 verify = new CRC32();
+        verify.update(Files.readAllBytes(file));
+        assertEquals(expectedCrc, verify.getValue());
+    }
+
+    public void testCrc32CorruptedFile() throws IOException {
+        Path dir = createTempDir();
+        Path file = dir.resolve("test.parquet");
+        byte[] content = "original content".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        CRC32 crc = new CRC32();
+        crc.update(content);
+        long originalCrc = crc.getValue();
+
+        // Write corrupted content
+        byte[] corrupted = "corrupted content".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        try (OutputStream os = Files.newOutputStream(file)) {
+            os.write(corrupted);
+        }
+
+        // CRC should NOT match
+        CRC32 verify = new CRC32();
+        verify.update(Files.readAllBytes(file));
+        assertNotEquals(originalCrc, verify.getValue());
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────
+
+    private static MVReplicationCheckpoint checkpoint(
+        String sourceIndex, int sourceShard, long primaryTerm, long maxSeqNo, long infosVersion,
+        Map<String, MVFileMetadata> fileMetadata
+    ) {
+        return new MVReplicationCheckpoint(
+            sourceIndex, sourceShard, primaryTerm, maxSeqNo, infosVersion,
+            fileMetadata, System.currentTimeMillis()
         );
     }
 }

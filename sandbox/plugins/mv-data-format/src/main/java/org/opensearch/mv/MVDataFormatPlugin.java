@@ -209,6 +209,7 @@ public class MVDataFormatPlugin extends Plugin
         );
         this.replicationService = new MVReplicationService(client, routingSnapshotService, threadPool, publishInterval);
         this.replicationService.start();
+        this.replicationService.bindForReconciliation(clusterService);
 
         return java.util.List.of(pullService);
     }
@@ -326,6 +327,8 @@ public class MVDataFormatPlugin extends Plugin
             new ActionHandler<>(MVSourceCommitAction.INSTANCE, MVSourceCommitTransportHandler.class),
             // Checkpoint publish: source-pushed advert for pull-path targets.
             new ActionHandler<>(MVCheckpointPublishAction.INSTANCE, MVCheckpointPublishTransportHandler.class),
+            // Checkpoint request: target cold-start request to source.
+            new ActionHandler<>(MVCheckpointRequestAction.INSTANCE, MVCheckpointRequestTransportHandler.class),
             // Stage 5: MV definition control plane (validate + view CRUD).
             new ActionHandler<>(MVValidateAction.INSTANCE, TransportMVValidateAction.class),
             new ActionHandler<>(MVCreateViewAction.INSTANCE, TransportMVCreateViewAction.class),

@@ -20,10 +20,10 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 /**
- * Receives a source-pushed checkpoint advert and deposits it into the
- * node-local {@link MVCheckpointMailbox}. The target shard's poller
- * consumes the mailbox on its next round instead of doing expensive
- * remote-store listing.
+ * Receives a source-pushed checkpoint and deposits the
+ * {@link MVReplicationCheckpoint} into the node-local
+ * {@link MVCheckpointMailbox}. The target shard's poller consumes the
+ * mailbox on its next round instead of doing expensive remote-store listing.
  *
  * <p>Runs on the GENERIC thread pool. The handler does not touch any
  * IndexShard state — it only writes to the lock-free mailbox.
@@ -57,35 +57,12 @@ public final class MVCheckpointPublishTransportHandler extends HandledTransportA
         try {
             MVCheckpointMailbox mailbox = MVCheckpointMailbox.instance();
             if (mailbox == null) {
-                // Plugin not yet initialized — reject gracefully; source will retry.
                 listener.onResponse(new MVCheckpointPublishAction.Response(false, -1L));
                 return;
             }
 
-            MVCheckpointMailbox.PushedAdvert advert = new MVCheckpointMailbox.PushedAdvert(
-                request.sourceIndex(),
-                request.sourceUuid(),
-                request.sourceShard(),
-                request.maxSeqNo(),
-                request.primaryTerm(),
-                request.infosVersion(),
-                request.parquetFiles(),
-                request.fileSizes(),
-                request.fileMinSeqNos(),
-                request.fileMaxSeqNos(),
-                System.nanoTime()
-            );
+            mailbox.deliver(request.targetIndex(), request.targetShard(), request.checkpoint());
 
-            mailbox.deliver(request.targetIndex(), request.targetShard(), advert);
-
-            // Return the target's current watermark from the mailbox.
-            // The mailbox tracks the highest consumed maxSeqNo — which is the
-            // most recently processed advert's maxSeqNo. If no adverts have been
-            // consumed yet (target poller hasn't run), we peek the last-consumed
-            // highwater from the mailbox's metadata. For now, use -1 (unknown)
-            // as a correct initial value — the watermark will be populated from
-            // the target's DerivedShardPoller state in a follow-up when the poller
-            // reports back. This is safe: -1 means "send full list" (fail-open).
             long targetWatermark = mailbox.lastConsumedWatermark(
                 request.targetIndex(), request.targetShard(),
                 request.sourceIndex(), request.sourceShard()

@@ -58,6 +58,10 @@ public final class MVBuildMetrics {
     // ── Compaction counters ──────────────────────────────────────────────
     private final AtomicLong compactionsStarted = new AtomicLong(0);
 
+    // ── Checkpoint consume latency (push-to-consume observability) ──────
+    private final AtomicLong checkpointConsumeLatencyLast = new AtomicLong(0);
+    private final AtomicLong checkpointConsumeLatencyMax = new AtomicLong(0);
+
     // ── Checksum counters (Stage 3: O(1) checksum for mv_state) ──────────
     private final AtomicLong checksumRegistered = new AtomicLong(0);
     private final AtomicLong checksumMisses = new AtomicLong(0);
@@ -69,6 +73,10 @@ public final class MVBuildMetrics {
     private final AtomicLong compactionOutputRows = new AtomicLong(0);
     private final AtomicLong compactionOutputBytes = new AtomicLong(0);
     private final AtomicLong compactionDurationMs = new AtomicLong(0);
+
+    // ── CRC verification counters (downloadFiles post-download check) ───
+    private final AtomicLong crcVerifyPassed = new AtomicLong(0);
+    private final AtomicLong crcVerifyFailed = new AtomicLong(0);
 
     MVBuildMetrics() {}
 
@@ -201,6 +209,21 @@ public final class MVBuildMetrics {
 
     // ── Compaction recording ─────────────────────────────────────────────
 
+    // ── Checkpoint consume latency recording ────────────────────────────
+
+    public void recordCheckpointConsumeLatency(long latencyMs) {
+        checkpointConsumeLatencyLast.set(latencyMs);
+        checkpointConsumeLatencyMax.accumulateAndGet(latencyMs, Math::max);
+    }
+
+    public long getCheckpointConsumeLatencyLast() {
+        return checkpointConsumeLatencyLast.get();
+    }
+
+    public long getCheckpointConsumeLatencyMax() {
+        return checkpointConsumeLatencyMax.get();
+    }
+
     // ── Checksum recording (Stage 3: O(1) checksum for mv_state) ─────────
 
     public void recordChecksumRegistered() {
@@ -258,6 +281,24 @@ public final class MVBuildMetrics {
         return compactionsSkipped.get();
     }
 
+    // ── CRC verification recording ──────────────────────────────────────
+
+    public void recordCrcVerifyPassed() {
+        crcVerifyPassed.incrementAndGet();
+    }
+
+    public void recordCrcVerifyFailed() {
+        crcVerifyFailed.incrementAndGet();
+    }
+
+    public long getCrcVerifyPassed() {
+        return crcVerifyPassed.get();
+    }
+
+    public long getCrcVerifyFailed() {
+        return crcVerifyFailed.get();
+    }
+
     /**
      * Returns a snapshot of all metrics as a map suitable for
      * stats endpoint serialization.
@@ -289,6 +330,10 @@ public final class MVBuildMetrics {
         m.put("compaction_duration_ms", compactionDurationMs.get());
         m.put("checksum_registered", checksumRegistered.get());
         m.put("checksum_misses", checksumMisses.get());
+        m.put("checkpoint_consume_latency_last_ms", checkpointConsumeLatencyLast.get());
+        m.put("checkpoint_consume_latency_max_ms", checkpointConsumeLatencyMax.get());
+        m.put("crc_verify_passed", crcVerifyPassed.get());
+        m.put("crc_verify_failed", crcVerifyFailed.get());
         return Collections.unmodifiableMap(m);
     }
 
@@ -319,5 +364,9 @@ public final class MVBuildMetrics {
         compactionDurationMs.set(0);
         checksumRegistered.set(0);
         checksumMisses.set(0);
+        checkpointConsumeLatencyLast.set(0);
+        checkpointConsumeLatencyMax.set(0);
+        crcVerifyPassed.set(0);
+        crcVerifyFailed.set(0);
     }
 }

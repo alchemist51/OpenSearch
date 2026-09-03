@@ -10,9 +10,17 @@ package org.opensearch.mv;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.cluster.ClusterChangedEvent;
+import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.ClusterStateListener;
+import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.engine.exec.Segment;
+import org.opensearch.index.engine.exec.WriterFileSet;
+import org.opensearch.index.engine.exec.coord.CatalogSnapshot;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.threadpool.ThreadPool;
@@ -20,6 +28,8 @@ import org.opensearch.threadpool.Scheduler;
 import org.opensearch.transport.client.Client;
 
 import java.io.Closeable;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -27,7 +37,8 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * External checkpoint publisher that observes local primary source shards
- * and pushes adverts to bound MV target shards when new data is available.
+ * and pushes REAL adverts (with file names, sizes, and seq ranges from the
+ * catalog snapshot) to bound MV target shards when new data is available.
  *
  * <h2>Design: scheduled sampler (option b)</h2>
  *
@@ -51,19 +62,27 @@ import java.util.concurrent.atomic.AtomicLong;
  * read — no remote IO), and publishes via {@link MVCheckpointPublisher}
  * only when the checkpoint has advanced since the last published value.</p>
  *
- * <p><b>SAFETY:</b> this service never calls
- * {@code clusterService.state()} — all routing data comes from the
- * lock-free {@link NodeRoutingSnapshotService} maintained by a
- * {@code ClusterStateListener}. Safe to run from any thread.</p>
+ * <p>On CAS-gate advance, reads the shard's catalog snapshot to extract
+ * REAL parquet file lists with names, sizes, and per-file seq ranges,
+ * so that the publisher's per-target filtering actually runs.</p>
  *
- * <p><b>Lifecycle:</b> created in {@code createComponents} (has access to
- * {@code Client}, {@code ThreadPool}, {@code NodeRoutingSnapshotService}),
- * started once, closed on plugin close. Implements {@link IndexEventListener}
- * to track source shard starts and closes for its local registry.</p>
+ * <p><b>Reconciliation:</b> Also implements {@link ClusterStateListener}
+ * to detect source shards that were already STARTED before the MV target
+ * index was created. On cluster state change, checks sourceToTargets for
+ * any source index whose local primary shards are not yet tracked, and
+ * adds them. This mirrors {@code NodeDerivedPullService.reconcileOnGeneric}
+ * and ensures that the normal order (source starts first, target created
+ * later) works without restart.</p>
+ *
+ * <p><b>SAFETY:</b> never calls
+ * {@code clusterService.state()} from the applier thread — all routing
+ * data comes from the lock-free {@link NodeRoutingSnapshotService} maintained
+ * by a {@code ClusterStateListener}. Reconciliation enqueues work to GENERIC.
+ * Safe to run from any thread.</p>
  *
  * @opensearch.experimental
  */
-public final class MVReplicationService implements IndexEventListener, Closeable {
+public final class MVReplicationService implements IndexEventListener, ClusterStateListener, Closeable {
 
     private static final Logger logger = LogManager.getLogger(MVReplicationService.class);
 
@@ -95,8 +114,18 @@ public final class MVReplicationService implements IndexEventListener, Closeable
     private final ThreadPool threadPool;
     private final TimeValue interval;
 
+    /** Optional ClusterService for listener registration — may be null in tests. */
+    private volatile ClusterService clusterService;
+
     /** ShardId → tracked shard state. Lock-free via ConcurrentHashMap. */
     private final ConcurrentHashMap<ShardId, TrackedShard> trackedShards = new ConcurrentHashMap<>();
+
+    /**
+     * All local primary source-eligible shards seen via afterIndexShardStarted,
+     * regardless of whether they had targets at the time. Reconciliation
+     * promotes shards from this pool when targets appear.
+     */
+    private final ConcurrentHashMap<ShardId, IndexShard> allSourceShards = new ConcurrentHashMap<>();
 
     /** Per-shard last-published checkpoint — publish only on advance. */
     private final ConcurrentHashMap<ShardId, AtomicLong> lastPublished = new ConcurrentHashMap<>();
@@ -110,6 +139,8 @@ public final class MVReplicationService implements IndexEventListener, Closeable
     private final AtomicLong tickCount = new AtomicLong();
     private final AtomicLong publishCount = new AtomicLong();
     private final AtomicLong skipCount = new AtomicLong();
+    private final AtomicLong catalogReadCount = new AtomicLong();
+    private final AtomicLong reconcileCount = new AtomicLong();
 
     public MVReplicationService(Client client, NodeRoutingSnapshotService routingService, ThreadPool threadPool, TimeValue interval) {
         this.client = client;
@@ -129,6 +160,79 @@ public final class MVReplicationService implements IndexEventListener, Closeable
         logger.info("mv_replication: started checkpoint publisher with interval [{}]", interval);
     }
 
+    /**
+     * Binds ClusterService for reconciliation. Called from createComponents.
+     */
+    public void bindForReconciliation(ClusterService clusterService) {
+        this.clusterService = clusterService;
+        clusterService.addListener(this);
+    }
+
+    // ── ClusterStateListener: reconcile when targets appear ──────────────
+
+    /**
+     * Called on the cluster-applier thread. We NEVER call clusterService.state()
+     * here — we use event.state(). Enqueues reconciliation to GENERIC.
+     */
+    @Override
+    public void clusterChanged(ClusterChangedEvent event) {
+        if (closed) return;
+        // Only reconcile if indices changed (target created/deleted)
+        if (!event.metadataChanged()) return;
+        try {
+            threadPool.executor(ThreadPool.Names.GENERIC).execute(this::reconcileTrackedShards);
+        } catch (Exception e) {
+            if (!closed) {
+                logger.debug("mv_replication: failed to enqueue reconciliation", e);
+            }
+        }
+    }
+
+    /**
+     * Reconciles tracked shards on the GENERIC thread pool. For each source
+     * index in sourceToTargets that has local primary shards in our pool,
+     * ensure those shards are tracked. Also untrack shards whose sources
+     * no longer have targets.
+     */
+    void reconcileTrackedShards() {
+        if (closed) return;
+
+        reconcileCount.incrementAndGet();
+        Map<String, List<NodeRoutingSnapshotService.BoundTarget>> srcToTgt = routingService.sourceToTargets();
+
+        // Add: promote pool shards that now have targets
+        for (Map.Entry<ShardId, IndexShard> entry : allSourceShards.entrySet()) {
+            ShardId shardId = entry.getKey();
+            if (trackedShards.containsKey(shardId)) continue;
+
+            String indexName = shardId.getIndexName();
+            List<NodeRoutingSnapshotService.BoundTarget> targets = srcToTgt.get(indexName);
+            if (targets == null || targets.isEmpty()) continue;
+
+            IndexShard shard = entry.getValue();
+            try {
+                if (!shard.routingEntry().primary() || !shard.routingEntry().active()) continue;
+            } catch (Exception e) {
+                continue;
+            }
+
+            trackShard(shard, targets);
+        }
+
+        // Remove: untrack shards whose source no longer has any targets
+        for (Map.Entry<ShardId, TrackedShard> entry : trackedShards.entrySet()) {
+            ShardId shardId = entry.getKey();
+            List<NodeRoutingSnapshotService.BoundTarget> targets = srcToTgt.get(shardId.getIndexName());
+            if (targets == null || targets.isEmpty()) {
+                TrackedShard removed = trackedShards.remove(shardId);
+                if (removed != null) {
+                    lastPublished.remove(shardId);
+                    logger.info("mv_replication: untracked source shard [{}] — no more targets", shardId);
+                }
+            }
+        }
+    }
+
     // ── IndexEventListener: track source shard lifecycle ─────────────────
 
     @Override
@@ -137,16 +241,25 @@ public final class MVReplicationService implements IndexEventListener, Closeable
         // Only track primary source shards — target shards and replicas are not sources.
         if (!indexShard.routingEntry().primary()) return;
 
-        // Check if this index has bound MV targets via the routing snapshot.
-        // This is a cheap ConcurrentHashMap lookup.
+        // Always register in the pool — targets may appear later via reconciliation
+        allSourceShards.put(indexShard.shardId(), indexShard);
+
+        // Check if this index already has bound MV targets via the routing snapshot.
         String indexName = indexShard.shardId().getIndexName();
         Map<String, List<NodeRoutingSnapshotService.BoundTarget>> srcToTgt = routingService.sourceToTargets();
         List<NodeRoutingSnapshotService.BoundTarget> targets = srcToTgt.get(indexName);
         if (targets == null || targets.isEmpty()) {
-            return; // Not an MV source — ignore
+            return; // Not an MV source yet — reconciliation will pick it up later
         }
 
+        trackShard(indexShard, targets);
+    }
+
+    private void trackShard(IndexShard indexShard, List<NodeRoutingSnapshotService.BoundTarget> targets) {
         ShardId shardId = indexShard.shardId();
+        if (trackedShards.containsKey(shardId)) return;
+
+        String indexName = shardId.getIndexName();
         String indexUuid = shardId.getIndex().getUUID();
         MVCheckpointPublisher publisher = new MVCheckpointPublisher(
             client,
@@ -167,6 +280,7 @@ public final class MVReplicationService implements IndexEventListener, Closeable
         @org.opensearch.common.Nullable IndexShard indexShard,
         org.opensearch.common.settings.Settings indexSettings
     ) {
+        allSourceShards.remove(shardId);
         TrackedShard removed = trackedShards.remove(shardId);
         if (removed != null) {
             lastPublished.remove(shardId);
@@ -179,47 +293,39 @@ public final class MVReplicationService implements IndexEventListener, Closeable
     /**
      * Called every {@link #interval} on the GENERIC thread pool. Iterates
      * all tracked local primary source shards and publishes checkpoints
-     * for any that have advanced.
+     * for any that have advanced. On advance, reads the catalog snapshot
+     * to extract REAL file lists with seq ranges.
      */
     void tick() {
         if (closed || trackedShards.isEmpty()) return;
         tickCount.incrementAndGet();
 
-        // Re-check sourceToTargets each tick — targets may appear/disappear
-        // dynamically as MV indices are created/deleted.
         Map<String, List<NodeRoutingSnapshotService.BoundTarget>> srcToTgt = routingService.sourceToTargets();
 
         for (Map.Entry<ShardId, TrackedShard> entry : trackedShards.entrySet()) {
             ShardId shardId = entry.getKey();
             TrackedShard tracked = entry.getValue();
 
-            // Re-verify this source still has targets
             List<NodeRoutingSnapshotService.BoundTarget> targets = srcToTgt.get(shardId.getIndexName());
             if (targets == null || targets.isEmpty()) {
                 continue;
             }
 
-            // Skip if the shard is no longer started or no longer primary
             try {
                 if (!tracked.shard.routingEntry().primary() || !tracked.shard.routingEntry().active()) {
                     continue;
                 }
             } catch (Exception e) {
-                // Shard may be closed concurrently
                 continue;
             }
 
-            // Read the processed local checkpoint — a lock-free volatile read.
-            // This is the same data MVIndexingEngine.refresh() had access to.
             long currentCheckpoint;
             try {
                 currentCheckpoint = tracked.shard.getProcessedLocalCheckpoint();
             } catch (Exception e) {
-                // Shard may be closing
                 continue;
             }
 
-            // Check advance: only publish when checkpoint has moved forward
             AtomicLong lastPub = lastPublished.get(shardId);
             if (lastPub == null) continue;
             long last = lastPub.get();
@@ -228,30 +334,71 @@ public final class MVReplicationService implements IndexEventListener, Closeable
                 continue;
             }
 
-            // CAS to avoid concurrent publishes for the same advance
             if (!lastPub.compareAndSet(last, currentCheckpoint)) {
-                continue; // Another tick already published a newer value
+                continue;
             }
 
-            // Publish: fire-and-forget to all bound targets.
-            // We pass empty file lists — the push is a lightweight notification
-            // that tells the target "source has data up to maxSeqNo=X; pull it".
-            // The target's poller resolves actual files from remote store.
-            tracked.publisher.publish(
-                currentCheckpoint,
+            // ── REAL ADVERT: read catalog snapshot on advance ────────────
+            Map<String, MVFileMetadata> fileMetadata = new java.util.LinkedHashMap<>();
+            long infosVersion = 0L;
+
+            try (GatedCloseable<CatalogSnapshot> ref = tracked.shard.getCatalogSnapshot()) {
+                catalogReadCount.incrementAndGet();
+                CatalogSnapshot catalog = ref.get();
+                infosVersion = catalog.getVersion();
+
+                for (Segment seg : catalog.getSegments()) {
+                    // Look for parquet filesets in the segment
+                    for (Map.Entry<String, WriterFileSet> fsEntry : seg.dfGroupedSearchableFiles().entrySet()) {
+                        String formatName = fsEntry.getKey();
+                        if (!"parquet".equals(formatName)) continue;
+
+                        WriterFileSet wfs = fsEntry.getValue();
+                        Path dir = Path.of(wfs.directory());
+                        for (String fileName : wfs.files()) {
+                            // Best-effort local size
+                            long size = -1L;
+                            try {
+                                Path filePath = dir.resolve(fileName);
+                                if (Files.exists(filePath)) {
+                                    size = Files.size(filePath);
+                                }
+                            } catch (Exception ignored) {}
+                            // CRC32: attempt to read from shard's PrecomputedChecksumStrategy
+                            // if cheaply accessible; else -1 (unknown).
+                            long crc32 = MVFileMetadata.CRC32_UNKNOWN;
+                            fileMetadata.put(fileName, new MVFileMetadata(
+                                size, wfs.minSeqNo(), wfs.maxSeqNo(), crc32
+                            ));
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // Catalog read failed — publish with empty map (notification-only).
+                // Target falls back to pull path.
+                logger.debug("mv_replication: catalog read failed for shard [{}], publishing notification-only", shardId, e);
+            }
+
+            MVReplicationCheckpoint checkpoint = new MVReplicationCheckpoint(
+                shardId.getIndexName(),
+                shardId.id(),
                 tracked.shard.getOperationPrimaryTerm(),
-                0L,          // infosVersion: not needed for notification-only publish
-                List.of(),   // parquetFiles: target resolves from remote store
-                List.of()    // fileSizes: not needed
+                currentCheckpoint,
+                infosVersion,
+                fileMetadata,
+                System.currentTimeMillis()
             );
+
+            tracked.publisher.publish(checkpoint);
             publishCount.incrementAndGet();
 
             if (logger.isTraceEnabled()) {
                 logger.trace(
-                    "mv_replication: published checkpoint {} for source shard [{}] (advanced from {})",
+                    "mv_replication: published checkpoint {} for source shard [{}] (advanced from {}) files={}",
                     currentCheckpoint,
                     shardId,
-                    last
+                    last,
+                    fileMetadata.size()
                 );
             }
         }
@@ -266,35 +413,53 @@ public final class MVReplicationService implements IndexEventListener, Closeable
         if (tick != null) {
             tick.cancel();
         }
+        ClusterService cs = clusterService;
+        if (cs != null) {
+            cs.removeListener(this);
+        }
         trackedShards.clear();
+        allSourceShards.clear();
         lastPublished.clear();
-        logger.info("mv_replication: closed (ticks={}, publishes={}, skips={})", tickCount.get(), publishCount.get(), skipCount.get());
+        logger.info(
+            "mv_replication: closed (ticks={}, publishes={}, skips={}, catalog_reads={}, reconciles={})",
+            tickCount.get(), publishCount.get(), skipCount.get(), catalogReadCount.get(), reconcileCount.get()
+        );
     }
 
     // ── Accessors for tests ──────────────────────────────────────────────
 
-    /** Number of shards currently being tracked. */
     public int trackedShardCount() {
         return trackedShards.size();
     }
 
-    /** Total ticks executed. */
     public long tickCount() {
         return tickCount.get();
     }
 
-    /** Total checkpoint publishes (advances). */
     public long publishCount() {
         return publishCount.get();
     }
 
-    /** Total tick iterations where checkpoint hadn't advanced (skipped). */
     public long skipCount() {
         return skipCount.get();
     }
 
-    /** Whether the service is closed. */
+    public long catalogReadCount() {
+        return catalogReadCount.get();
+    }
+
+    public long reconcileCount() {
+        return reconcileCount.get();
+    }
+
     public boolean isClosed() {
         return closed;
+    }
+
+    /**
+     * Package-private access to tracked shards for testing.
+     */
+    ConcurrentHashMap<ShardId, TrackedShard> trackedShardsMap() {
+        return trackedShards;
     }
 }

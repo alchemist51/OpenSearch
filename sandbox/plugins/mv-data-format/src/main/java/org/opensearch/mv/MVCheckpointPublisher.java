@@ -13,27 +13,27 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.transport.client.Client;
 
-import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Source-side checkpoint publisher: after a source shard's parquet generation
- * is uploaded, pushes an advert to each bound target shard's node. This
- * replaces the target's remote-store listing+metadata init on every poll round
- * with a source-pushed notification.
+ * is uploaded, pushes an {@link MVReplicationCheckpoint} to each bound target
+ * shard's node. This replaces the target's remote-store listing+metadata init
+ * on every poll round with a source-pushed notification.
  *
  * <p>Throttle: only publishes when maxSeqNo advances beyond the last published
  * value (coalesce). Fire-and-forget: publish failures are logged but do not
  * block the source refresh. The target's poller fallback to pull mode handles
  * missed pushes.
  *
- * <p>Maintains per-target-shard watermark state learned from publish responses
- * ({@link MVCheckpointPublishAction.Response#targetWatermark()}). When building
- * adverts, files whose seq range falls entirely at or below the target's
- * watermark are excluded — the target already has that data. Legacy files
- * (unknown seq range) are always included (fail-open).
+ * <p>Maintains per-target-shard watermark state learned from publish responses.
+ * When building checkpoints, files whose seq range falls entirely at or below
+ * the target's watermark are excluded — the target already has that data.
+ * Legacy files (unknown seq range) are always included (fail-open).
  *
  * <p>SAFETY: never calls clusterService.state() — all routing data comes from
  * the lock-free {@link NodeRoutingSnapshotService} maintained by a
@@ -82,23 +82,11 @@ public final class MVCheckpointPublisher {
      * Publishes a checkpoint to all bound target shards. Called after the
      * source shard's refresh completes and parquet files are uploaded.
      *
-     * @param maxSeqNo        the maximum sequence number in the published generation
-     * @param primaryTerm     the source shard's primary term
-     * @param infosVersion    the segment infos version of the published generation
-     * @param parquetFiles    the parquet file names in this generation
-     * @param fileSizes       per-file byte sizes (parallel to parquetFiles, -1 if unknown)
-     * @param fileMinSeqNos   per-file minimum _seq_no (parallel to parquetFiles, -1 if unknown)
-     * @param fileMaxSeqNos   per-file maximum _seq_no (parallel to parquetFiles, -1 if unknown)
+     * @param checkpoint  the fully-built MVReplicationCheckpoint from the catalog snapshot
      */
-    public void publish(
-        long maxSeqNo,
-        long primaryTerm,
-        long infosVersion,
-        List<String> parquetFiles,
-        List<Long> fileSizes,
-        List<Long> fileMinSeqNos,
-        List<Long> fileMaxSeqNos
-    ) {
+    public void publish(MVReplicationCheckpoint checkpoint) {
+        long maxSeqNo = checkpoint.maxSeqNo();
+
         // Coalesce: skip if maxSeqNo hasn't advanced
         long last = lastPublishedSeqNo.get();
         if (maxSeqNo <= last) {
@@ -106,16 +94,15 @@ public final class MVCheckpointPublisher {
         }
         // CAS to prevent concurrent publishes for the same seqNo
         if (lastPublishedSeqNo.compareAndSet(last, maxSeqNo) == false) {
-            return; // Another thread already publishing a newer checkpoint
+            return;
         }
 
         List<NodeRoutingSnapshotService.BoundTarget> targets = routingService.sourceToTargets().get(sourceIndex);
         if (targets == null || targets.isEmpty()) {
-            return; // No bound MV targets for this source
+            return;
         }
 
         for (NodeRoutingSnapshotService.BoundTarget target : targets) {
-            // Validate source UUID matches the binding (stale binding detection)
             if (sourceUuid != null && target.sourceUuid() != null && sourceUuid.equals(target.sourceUuid()) == false) {
                 logger.warn(
                     "checkpoint_publish: skipping target [{}] — bound sourceUuid [{}] != live [{}]",
@@ -126,37 +113,22 @@ public final class MVCheckpointPublisher {
                 continue;
             }
 
-            // Resolve target shard via modular mapping (same as ship path)
             int targetShardId = target.targetShards() > 0 ? sourceShard % target.targetShards() : 0;
 
-            // Source-side seq-scoped file filtering: exclude files the target already has.
+            // Source-side file filtering using checkpoint metadata map
             String watermarkKey = target.targetIndex() + ":" + targetShardId;
             long watermark = getLastKnownWatermark(watermarkKey);
 
-            List<String> scopedFiles;
-            List<Long> scopedSizes;
-            List<Long> scopedMinSeqNos;
-            List<Long> scopedMaxSeqNos;
-            if (watermark == -1L || parquetFiles.isEmpty()) {
-                // Unknown watermark: send full list (fail-open)
-                scopedFiles = parquetFiles;
-                scopedSizes = fileSizes;
-                scopedMinSeqNos = fileMinSeqNos;
-                scopedMaxSeqNos = fileMaxSeqNos;
+            MVReplicationCheckpoint scopedCheckpoint;
+            if (watermark == -1L || checkpoint.fileMetadata().isEmpty()) {
+                scopedCheckpoint = checkpoint;
             } else {
-                scopedFiles = new ArrayList<>();
-                scopedSizes = new ArrayList<>();
-                scopedMinSeqNos = new ArrayList<>();
-                scopedMaxSeqNos = new ArrayList<>();
-                int totalFiles = parquetFiles.size();
-                for (int i = 0; i < totalFiles; i++) {
-                    long fMax = i < fileMaxSeqNos.size() ? fileMaxSeqNos.get(i) : -1L;
-                    long fMin = i < fileMinSeqNos.size() ? fileMinSeqNos.get(i) : -1L;
-                    if (includeFile(fMin, fMax, watermark, maxSeqNo)) {
-                        scopedFiles.add(parquetFiles.get(i));
-                        scopedSizes.add(i < fileSizes.size() ? fileSizes.get(i) : -1L);
-                        scopedMinSeqNos.add(fMin);
-                        scopedMaxSeqNos.add(fMax);
+                Map<String, MVFileMetadata> scopedFiles = new LinkedHashMap<>();
+                int totalFiles = checkpoint.fileMetadata().size();
+                for (Map.Entry<String, MVFileMetadata> entry : checkpoint.fileMetadata().entrySet()) {
+                    MVFileMetadata meta = entry.getValue();
+                    if (includeFile(meta.minSeqNo(), meta.maxSeqNo(), watermark, maxSeqNo)) {
+                        scopedFiles.put(entry.getKey(), meta);
                     }
                 }
                 int filtered = totalFiles - scopedFiles.size();
@@ -171,28 +143,27 @@ public final class MVCheckpointPublisher {
                         watermark
                     );
                 }
+                scopedCheckpoint = new MVReplicationCheckpoint(
+                    checkpoint.sourceIndex(),
+                    checkpoint.sourceShard(),
+                    checkpoint.primaryTerm(),
+                    checkpoint.maxSeqNo(),
+                    checkpoint.infosVersion(),
+                    scopedFiles,
+                    checkpoint.createdTimeStampMillis()
+                );
             }
 
             MVCheckpointPublishAction.Request request = new MVCheckpointPublishAction.Request(
                 target.targetIndex(),
                 targetShardId,
-                sourceIndex,
                 sourceUuid,
-                sourceShard,
-                maxSeqNo,
-                primaryTerm,
-                infosVersion,
-                scopedFiles,
-                scopedSizes,
-                scopedMinSeqNos,
-                scopedMaxSeqNos
+                scopedCheckpoint
             );
 
             publishCount.incrementAndGet();
-            // Fire-and-forget: do not block the source refresh
             client.execute(MVCheckpointPublishAction.INSTANCE, request, ActionListener.wrap(response -> {
                 if (response.accepted()) {
-                    // Update per-target watermark from response (CAS to max)
                     updateTargetWatermark(watermarkKey, response.targetWatermark());
                     logger.debug(
                         "checkpoint_publish: target [{}][{}] accepted maxSeqNo={} targetWatermark={}",
@@ -223,15 +194,6 @@ public final class MVCheckpointPublisher {
     }
 
     /**
-     * Legacy overload: publishes without per-file seq ranges.
-     */
-    public void publish(long maxSeqNo, long primaryTerm, long infosVersion, List<String> parquetFiles, List<Long> fileSizes) {
-        publish(maxSeqNo, primaryTerm, infosVersion, parquetFiles, fileSizes,
-            parquetFiles.stream().map(f -> -1L).toList(),
-            parquetFiles.stream().map(f -> -1L).toList());
-    }
-
-    /**
      * Determines whether a file should be included in the advert for a target.
      * A file is included if:
      * <ul>
@@ -241,36 +203,26 @@ public final class MVCheckpointPublisher {
      * A file is excluded only when its entire seq range is at or below the watermark.
      */
     static boolean includeFile(long fileMinSeqNo, long fileMaxSeqNo, long targetWatermark, long sourceMaxSeqNo) {
-        // Legacy file: unknown seq range → always include
         if (fileMaxSeqNo == -1L) {
             return true;
         }
-        // File's entire range is at or below the target's watermark → target already has this data
         if (fileMaxSeqNo <= targetWatermark) {
             return false;
         }
-        // File has data above the watermark → include
         return true;
     }
 
-    /**
-     * Updates the per-target watermark from a publish response using CAS-to-max.
-     */
     void updateTargetWatermark(String key, long reportedWatermark) {
-        if (reportedWatermark < 0) return; // Unknown watermark, don't update
+        if (reportedWatermark < 0) return;
         targetWatermarks.compute(key, (k, existing) -> {
             if (existing == null) {
                 return new AtomicLong(reportedWatermark);
             }
-            // CAS to max: only advance, never regress
             existing.accumulateAndGet(reportedWatermark, Math::max);
             return existing;
         });
     }
 
-    /**
-     * Returns the last known watermark for a target shard, or -1 if unknown.
-     */
     long getLastKnownWatermark(String key) {
         AtomicLong wm = targetWatermarks.get(key);
         return wm != null ? wm.get() : -1L;
@@ -288,7 +240,6 @@ public final class MVCheckpointPublisher {
         return filesFilteredCount.get();
     }
 
-    /** Exposed for testing. */
     ConcurrentHashMap<String, AtomicLong> targetWatermarks() {
         return targetWatermarks;
     }
