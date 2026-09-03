@@ -428,7 +428,7 @@ public class MVFFIResultContractTests extends OpenSearchTestCase {
     public void testSnapshotContainsAllElevenKeys() {
         MVBuildMetrics metrics = new MVBuildMetrics();
         Map<String, Long> snap = metrics.snapshot();
-        assertEquals("snapshot must contain exactly 11 metric keys", 11, snap.size());
+        assertEquals("snapshot must contain exactly 25 metric keys", 25, snap.size());
 
         // Verify each documented key exists
         assertTrue(snap.containsKey("spill_bytes"));
@@ -442,6 +442,23 @@ public class MVFFIResultContractTests extends OpenSearchTestCase {
         assertTrue(snap.containsKey("failed_builds"));
         assertTrue(snap.containsKey("total_build_duration_us"));
         assertTrue(snap.containsKey("total_output_batches"));
+        // Metadata cache counters
+        assertTrue(snap.containsKey("metadata_cache_hits"));
+        assertTrue(snap.containsKey("metadata_cache_refreshes"));
+        assertTrue(snap.containsKey("incremental_sync_skipped_files"));
+        // Compaction counters
+        assertTrue(snap.containsKey("compactions_started"));
+        assertTrue(snap.containsKey("compactions_completed"));
+        assertTrue(snap.containsKey("compactions_failed"));
+        assertTrue(snap.containsKey("compactions_skipped"));
+        assertTrue(snap.containsKey("compaction_input_generations"));
+        assertTrue(snap.containsKey("compaction_input_bytes"));
+        assertTrue(snap.containsKey("compaction_output_rows"));
+        assertTrue(snap.containsKey("compaction_output_bytes"));
+        assertTrue(snap.containsKey("compaction_duration_ms"));
+        // Checksum counters (O(1) checksum for mv_state)
+        assertTrue(snap.containsKey("checksum_registered"));
+        assertTrue(snap.containsKey("checksum_misses"));
     }
 
     // ═════════════════════════════════════════════════════════════════════

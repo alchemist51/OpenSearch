@@ -65,6 +65,28 @@ public final class MVPullSettings {
         Setting.Property.Final
     );
 
+    // ── Compaction ─────────────────────────────────────────────────────────
+
+    /**
+     * Maximum number of mv_state generations (catalog segments) before
+     * background compaction is triggered. When the segment count exceeds
+     * this threshold after a successful publish, the compaction service
+     * k-way merges the oldest generations into one via the Stage-4
+     * streaming merge engine.
+     *
+     * <p>Default {@code 8}. Set higher to delay compaction (more
+     * generations in the catalog, larger restart CRC cost, larger
+     * fsync/blob-list surface). Set lower to compact sooner (more CPU
+     * spent on compaction, but smaller catalog).
+     */
+    public static final Setting<Integer> MAX_GENERATIONS_BEFORE_COMPACT = Setting.intSetting(
+        "index.mv_pull.max_generations_before_compact",
+        8,
+        2,
+        Setting.Property.IndexScope,
+        Setting.Property.Dynamic
+    );
+
     // ── Bounded streaming rounds ─────────────────────────────────────────
 
     /**
@@ -152,7 +174,8 @@ public final class MVPullSettings {
             MAX_SOURCE_BYTES_PER_ROUND,
             MAX_OPS_ESTIMATE_PER_ROUND,
             MAX_CARDINALITY_ESTIMATE_PER_ROUND,
-            MAX_NATIVE_PRESSURE_FRACTION
+            MAX_NATIVE_PRESSURE_FRACTION,
+            MAX_GENERATIONS_BEFORE_COMPACT
         );
     }
 

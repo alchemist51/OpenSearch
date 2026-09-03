@@ -63,6 +63,8 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
     private volatile MVBuildRuntime buildRuntime;
     private volatile MVDataFusionReadEngine coverageReader;
     private volatile MVWatermark watermark;
+    /** Compaction: background k-way merge of accumulated mv_state generations. */
+    private volatile MVCompactionService compactionService;
 
     MVDerivedArtifactBuilder(IndexSettings indexSettings, MVPullSettings.Services services) {
         this.indexSettings = indexSettings;
@@ -345,6 +347,17 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             long publishNanos = System.nanoTime() - tPublish;
             watermark = next;
 
+            // Register the pre-computed checksum on the shard's shared strategy
+            // AFTER publish so the upload path can serve it in O(1).
+            // One sequential read of the new ~500 MB generation (~2s) — eliminates
+            // repeated O(n) scans on every publish and restart recovery.
+            MVStateChecksumUtil.computeAndRegister(
+                artifact.path(),
+                artifact.path().getFileName().toString(),
+                generation,
+                shard
+            );
+
             logger.info(
                 "mv_pull published generation={} rows={} range=({}, {}] watermark={} "
                     + "coverage={}ms native_build={}ms publish={}ms schema_hash={} capped={} remaining_lag={} [streaming]",
@@ -379,6 +392,19 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             stats.put("capped_watermark", appliedThrough);
             stats.put("snapshot_watermark", snapshotWatermark);
             stats.put("remaining_lag", roundCapped ? (snapshotWatermark - appliedThrough) : 0L);
+
+            // ── Compaction: trigger background merge of accumulated generations ──
+            try {
+                if (compactionService == null) {
+                    compactionService = new MVCompactionService(compiledDefinition, services.threadPool());
+                }
+                int threshold = MVPullSettings.MAX_GENERATIONS_BEFORE_COMPACT.get(indexSettings.getSettings());
+                compactionService.maybeCompact(shard, threshold);
+            } catch (Exception compactEx) {
+                // Never fail a successful build because of compaction scheduling
+                logger.warn("mv_pull compaction trigger failed for shard [{}]", shard.shardId(), compactEx);
+            }
+
             return new MVBuildResult(true, "gen-" + generation, stats);
         } finally {
             coverageReader.cleanupStagedParquet(stagedParquet);
@@ -438,6 +464,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
 
             moveCompletedArtifact(temporary, completed);
             completedCreated = true;
+
             WriterFileSet fileSet = MonoFileWriterSet.of(formatDirectory.toAbsolutePath(), writerGeneration, fileName, stateRows);
             success = true;
             return new ManagedArtifact(completed, fileSet, stateRows, artifactResult.schemaHash(), artifactResult.definitionHash());
@@ -476,6 +503,9 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
 
     @Override
     public void close() throws IOException {
+        if (compactionService != null) {
+            compactionService.close();
+        }
         if (buildRuntime != null) {
             buildRuntime.close();
         }

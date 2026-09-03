@@ -509,6 +509,31 @@ public final class MVCompiledDefinition {
     }
 
     /**
+     * Stage 4: Pre-built merge call parameters that derive the ordering
+     * identity from the PHYSICAL column names in an actual Arrow IPC state
+     * file — the GROUND TRUTH for what the Rust merge engine will compute.
+     *
+     * <p><b>Why this overload exists:</b> DataFusion's Partial aggregate
+     * stage names expression group keys using its internal Display form
+     * (e.g. {@code mv_input.EventTime / Int64(300000)}), not the SQL alias
+     * (e.g. {@code event_bucket}). The zero-arg {@link #buildMergeCallParams()}
+     * uses the logical alias, which mismatches the Rust-side identity
+     * computed from the file schema. This overload reads the physical names
+     * from the first input state file so the identity is byte-identical to
+     * what Rust computes. For plain column keys the physical name equals the
+     * alias, so the substitution is a no-op.</p>
+     *
+     * @param referenceStateFile path to any input Arrow IPC state file; only
+     *        the footer schema is read (no record batches loaded)
+     * @return merge call params with a physical ordering identity
+     * @throws java.io.IOException if the reference file cannot be read
+     * @see MVArrowIpcSchemaReader#readGroupKeyNames
+     */
+    public MergeCallParams buildMergeCallParams(String referenceStateFile) throws java.io.IOException {
+        return MergeCallParams.fromWithPhysicalNames(this, referenceStateFile);
+    }
+
+    /**
      * Stage 4: Fully resolved FFI parameters for
      * {@link MVNativeBridge#mergeStateStreams}. All arrays are freshly allocated
      * and owned by the caller.
@@ -557,14 +582,133 @@ public final class MVCompiledDefinition {
                 foldOps[numGroupKeys + i] = (byte) (aggMeta.accumulatorTypes()[i] + 1);
             }
 
+            // Derive the PHYSICAL aggregate column names that DataFusion's
+            // Partial stage emits in the Arrow IPC state files. The compiled
+            // definition's stateColumnNames() are user-facing logical aliases
+            // (e.g. "sum_AdvEngineID") but DataFusion writes physical names
+            // like "sum(mv_input.AdvEngineID)[sum]". The Rust merge_state_streams
+            // validates the passed names against the Arrow schema, so we must
+            // pass the physical names. We derive them from the AggregateSpec's
+            // partialSqlFragment and the canonical table name.
+            String[] physicalAggNames = derivePhysicalAggColumnNames(def.aggregates());
+
             return new MergeCallParams(
                 indices,
                 asc,
                 nullsFirst,
                 foldOps,
-                aggMeta.stateColumnNames(),
+                physicalAggNames,
                 ordering.orderingIdentity()
             );
+        }
+
+        /**
+         * Build from a compiled definition, deriving the ordering identity
+         * from the PHYSICAL column names in an actual Arrow IPC state file.
+         *
+         * <p>This is the authoritative factory for the merge path. The Rust
+         * {@code compute_ordering_identity} reads column names from the file
+         * schema at {@code schema.field(idx).name()}. For expression group
+         * keys (e.g. {@code floor(EventTime/300000) AS event_bucket}),
+         * DataFusion's Partial aggregate writes the expression's Display form
+         * ({@code mv_input.EventTime / Int64(300000)}) as the column name,
+         * NOT the SQL alias. Reading the physical name from the file is the
+         * only authoritative source — it is stable regardless of DataFusion
+         * version or expression rendering changes.</p>
+         *
+         * @param def                 compiled definition
+         * @param referenceStateFile  path to any input Arrow IPC state file
+         * @return merge call params with physical ordering identity
+         * @throws java.io.IOException if the file cannot be read
+         */
+        public static MergeCallParams fromWithPhysicalNames(
+            MVCompiledDefinition def,
+            String referenceStateFile
+        ) throws java.io.IOException {
+            MVGroupByOrdering ordering = def.groupByOrdering();
+            List<MVGroupByOrdering.Key> keys = ordering.keys();
+            int numGroupKeys = keys.size();
+
+            int[] indices = new int[numGroupKeys];
+            boolean[] asc = new boolean[numGroupKeys];
+            boolean[] nullsFirst = new boolean[numGroupKeys];
+            for (int i = 0; i < numGroupKeys; i++) {
+                MVGroupByOrdering.Key key = keys.get(i);
+                indices[i] = key.stateFieldIndex();
+                asc[i] = key.direction() == MVGroupByOrdering.Direction.ASCENDING;
+                nullsFirst[i] = key.nullPlacement().nullsFirst();
+            }
+
+            AggregateFFIMetadata aggMeta = def.aggregateFFIMetadata();
+            int numCols = numGroupKeys + aggMeta.length();
+            byte[] foldOps = new byte[numCols];
+            for (int i = 0; i < numGroupKeys; i++) {
+                foldOps[i] = (byte) 0; // GROUP_KEY
+            }
+            for (int i = 0; i < aggMeta.length(); i++) {
+                foldOps[numGroupKeys + i] = (byte) (aggMeta.accumulatorTypes()[i] + 1);
+            }
+
+            String[] physicalAggNames = derivePhysicalAggColumnNames(def.aggregates());
+
+            // Read group key physical names from the actual state file —
+            // this is the GROUND TRUTH for the ordering identity. The Rust
+            // merge computes the identity from schema.field(idx).name() so
+            // we must match exactly.
+            List<String> physicalKeyNames = MVArrowIpcSchemaReader.readGroupKeyNames(
+                referenceStateFile, numGroupKeys
+            );
+            String physicalIdentity = ordering.physicalOrderingIdentity(physicalKeyNames);
+
+            return new MergeCallParams(
+                indices,
+                asc,
+                nullsFirst,
+                foldOps,
+                physicalAggNames,
+                physicalIdentity
+            );
+        }
+
+        /**
+         * Derive the physical column names that DataFusion's Partial aggregate
+         * stage emits in Arrow IPC state files. The naming convention is:
+         * {@code func(table.column)[func]} for single-column aggregates and
+         * {@code count(*)[count]} for COUNT(*).
+         *
+         * <p>For AVG, which decomposes into COUNT + SUM, the physical names
+         * follow the same pattern for each decomposed fragment.</p>
+         *
+         * @param aggregates the aggregate specs from the compiled definition
+         * @return physical column names in state-column order
+         */
+        private static String[] derivePhysicalAggColumnNames(List<AggregateSpec> aggregates) {
+            String table = MVConstants.INPUT_TABLE;
+            List<String> names = new ArrayList<>();
+            for (AggregateSpec agg : aggregates) {
+                switch (agg.function()) {
+                    case COUNT -> {
+                        if (agg.sourceField() == null) {
+                            // COUNT(*) → count(*)[count]
+                            names.add("count(*)[count]");
+                        } else {
+                            // COUNT(field) → count(table.field)[count]
+                            names.add("count(" + table + "." + agg.sourceField() + ")[count]");
+                        }
+                    }
+                    case SUM -> names.add("sum(" + table + "." + agg.sourceField() + ")[sum]");
+                    // DataFusion uses [value] as the state suffix for MIN/MAX
+                    // accumulators, NOT [min]/[max].
+                    case MIN -> names.add("min(" + table + "." + agg.sourceField() + ")[value]");
+                    case MAX -> names.add("max(" + table + "." + agg.sourceField() + ")[value]");
+                    case AVG -> {
+                        // AVG decomposes to COUNT(field) + SUM(field) in Partial stage
+                        names.add("count(" + table + "." + agg.sourceField() + ")[count]");
+                        names.add("sum(" + table + "." + agg.sourceField() + ")[sum]");
+                    }
+                }
+            }
+            return names.toArray(new String[0]);
         }
     }
 

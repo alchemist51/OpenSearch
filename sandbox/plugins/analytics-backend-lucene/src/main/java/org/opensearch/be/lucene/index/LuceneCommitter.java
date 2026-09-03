@@ -110,6 +110,20 @@ public class LuceneCommitter extends SafeBootstrapCommitter {
     private final Map<Long, LuceneReader> readers = new ConcurrentHashMap<>();
 
     /**
+     * Files synced by previous commits. Used for incremental fsync: only files added since
+     * the last commit need syncing — prior generations were already fsynced by their own
+     * commit. Populated after each successful commit. {@code null} until the first commit
+     * (recovery case), which falls back to a full sync for safety.
+     *
+     * <p>This is an optimization for derived-artifact (MV) publish workloads where the
+     * catalog grows monotonically. Normal non-derived engines also benefit because the same
+     * file set was already fsynced on the prior commit, but the savings are typically small
+     * because non-derived flushes don't accumulate a large catalog. The full-sync fallback
+     * when {@code lastCommittedFiles == null} ensures no durability regression.
+     */
+    private volatile java.util.Set<String> lastCommittedFiles = null;
+
+    /**
      * Creates a new LuceneCommitter. Trims unsafe commits (via {@link SafeBootstrapCommitter}),
      * then opens the IndexWriter.
      *
@@ -159,15 +173,56 @@ public class LuceneCommitter extends SafeBootstrapCommitter {
             indexWriter.setLiveCommitData(commitData.userData());
             // Write-ahead fsync: data files durable before the commit point that references them.
             // getFiles(false) excludes segments_N — IndexWriter.commit() handles that via rename + syncMetaData.
+            //
+            // INCREMENTAL FSYNC OPTIMIZATION: When lastCommittedFiles is non-null (i.e., we have
+            // a record of what was synced by the prior commit), we only fsync files that are NEW
+            // since that commit. Files from prior generations were already fsynced by the commit
+            // that added them. This turns an O(total catalog) fsync into O(new files per commit),
+            // critical for derived-artifact (MV) workloads where the catalog grows to 175+ GB
+            // across hundreds of publish rounds but each round adds only a few files.
+            //
+            // Safety: when lastCommittedFiles is null (first commit after construction / recovery),
+            // we fall back to syncing everything — no durability regression.
             if (commitData.catalogSnapshot() != null) {
                 long syncStart = System.nanoTime();
-                store.directory().sync(commitData.catalogSnapshot().getFiles(false));
+                java.util.Collection<String> allFiles = commitData.catalogSnapshot().getFiles(false);
+                java.util.Collection<String> filesToSync;
+                java.util.Set<String> previousFiles = this.lastCommittedFiles;
+                if (previousFiles != null && previousFiles.isEmpty() == false) {
+                    // Incremental: sync only files not in the previous committed set
+                    filesToSync = new java.util.ArrayList<>();
+                    for (String file : allFiles) {
+                        if (previousFiles.contains(file) == false) {
+                            filesToSync.add(file);
+                        }
+                    }
+                    if (logger.isDebugEnabled() && filesToSync.size() < allFiles.size()) {
+                        logger.debug(
+                            "incremental fsync: syncing {} new files out of {} total (skipped {} already-durable)",
+                            filesToSync.size(),
+                            allFiles.size(),
+                            allFiles.size() - filesToSync.size()
+                        );
+                    }
+                } else {
+                    // First commit after construction/recovery — full sync for safety
+                    filesToSync = allFiles;
+                }
+                if (filesToSync.isEmpty() == false) {
+                    store.directory().sync(filesToSync);
+                }
                 store.directory().syncMetaData();
                 syncMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - syncStart);
             }
             indexWriter.commit();
             SegmentInfos committed = SegmentInfos.readLatestCommit(indexWriter.getDirectory());
             this.lastCommittedSegmentInfos = committed;
+
+            // Update the committed file set for incremental fsync on the next commit.
+            if (commitData.catalogSnapshot() != null) {
+                this.lastCommittedFiles = new java.util.HashSet<>(commitData.catalogSnapshot().getFiles(false));
+            }
+
             // Encode writer's Lucene version as a long — keeps CatalogSnapshot Lucene-type-agnostic.
             long version = LuceneVersionConverter.encode(committed.getCommitLuceneVersion());
             return new CommitResult(committed.getSegmentsFileName(), committed.getGeneration(), version);

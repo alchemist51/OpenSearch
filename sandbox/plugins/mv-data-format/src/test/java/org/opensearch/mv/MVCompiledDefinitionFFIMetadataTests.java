@@ -255,7 +255,18 @@ public class MVCompiledDefinitionFFIMetadataTests extends OpenSearchTestCase {
 
         MVCompiledDefinition.MergeCallParams params = def.buildMergeCallParams();
 
-        assertArrayEquals(new String[] { "cnt", "sum_s", "min_m", "max_x" }, params.aggColumnNames());
+        // MergeCallParams now carries PHYSICAL DataFusion Partial-stage names,
+        // not user-facing aliases, because the Rust merge validates column names
+        // against the Arrow schema in the IPC state files.
+        assertArrayEquals(
+            new String[] {
+                "count(*)[count]",          // COUNT(*) → count(*)[count]
+                "sum(mv_input.s)[sum]",     // SUM(s) → sum(mv_input.s)[sum]
+                "min(mv_input.m)[value]",   // MIN(m) → min(mv_input.m)[value]
+                "max(mv_input.x)[value]"    // MAX(x) → max(mv_input.x)[value]
+            },
+            params.aggColumnNames()
+        );
     }
 
     public void testMergeCallParamsOrderingIdentity() {
@@ -281,8 +292,10 @@ public class MVCompiledDefinitionFFIMetadataTests extends OpenSearchTestCase {
         assertEquals(bundle.orderingIdentity(), params.orderingIdentity());
         assertEquals(bundle.ordering().length(), params.orderingIndices().length);
         assertArrayEquals(bundle.ordering().fieldIndices(), params.orderingIndices());
+        // MergeCallParams carries PHYSICAL DataFusion names, while
+        // AggregateFFIMetadata carries logical user aliases. Both arrays
+        // must have the same length (same aggregate state columns).
         assertEquals(bundle.aggregates().length(), params.aggColumnNames().length);
-        assertArrayEquals(bundle.aggregates().stateColumnNames(), params.aggColumnNames());
     }
 
     public void testMergeCallParamsAvgDecomposition() {
@@ -296,7 +309,17 @@ public class MVCompiledDefinitionFFIMetadataTests extends OpenSearchTestCase {
         assertEquals(1, params.foldOps()[1]); // cnt → SUM fold
         assertEquals(1, params.foldOps()[2]); // avg_count_price → SUM fold
         assertEquals(1, params.foldOps()[3]); // avg_sum_price → SUM fold
-        assertArrayEquals(new String[] { "cnt", "avg_count_price", "avg_sum_price" }, params.aggColumnNames());
+        // Physical DataFusion names for AVG decomposition:
+        // COUNT(*) → count(*)[count], COUNT(field) → count(mv_input.field)[count],
+        // SUM(field) → sum(mv_input.field)[sum]
+        assertArrayEquals(
+            new String[] {
+                "count(*)[count]",
+                "count(mv_input.price)[count]",
+                "sum(mv_input.price)[sum]"
+            },
+            params.aggColumnNames()
+        );
     }
 
     public void testMergeCallParamsLadderL3() {
@@ -435,5 +458,92 @@ public class MVCompiledDefinitionFFIMetadataTests extends OpenSearchTestCase {
 
         // Call again — must be stable
         assertEquals(hash, ordering.orderingIdentityHash());
+    }
+
+    // ── Physical name derivation (compaction merge fix) ──────────────────
+
+    /**
+     * Regression: MergeCallParams.aggColumnNames must carry the PHYSICAL
+     * DataFusion Partial-stage column names (e.g. "sum(mv_input.X)[sum]"),
+     * NOT the user-facing logical aliases (e.g. "sum_X"). The Rust
+     * merge_state_streams validates names against the Arrow IPC schema.
+     *
+     * <p>This test reproduces the exact failure observed in live compaction:
+     * "aggregate column name mismatch at position 3: expected 'sum_AdvEngineID',
+     * got 'sum(mv_input.AdvEngineID)[sum]'".</p>
+     */
+    public void testMergeCallParamsPhysicalNamesMatchDataFusionConvention() {
+        // Use clickbench_5m_url — the exact definition running on the live node
+        MVCompiledDefinition def = MVCompiledDefinition.clickbench5mUrl();
+        MVCompiledDefinition.MergeCallParams params = def.buildMergeCallParams();
+
+        // 3 group keys + 40 agg state cols = 43 total
+        assertEquals(43, params.foldOps().length);
+        assertEquals(40, params.aggColumnNames().length);
+
+        // First metric is AdvEngineID with SUM/MIN/MAX/COUNT quad
+        assertEquals("sum(mv_input.AdvEngineID)[sum]", params.aggColumnNames()[0]);
+        assertEquals("min(mv_input.AdvEngineID)[value]", params.aggColumnNames()[1]);
+        assertEquals("max(mv_input.AdvEngineID)[value]", params.aggColumnNames()[2]);
+        assertEquals("count(mv_input.AdvEngineID)[count]", params.aggColumnNames()[3]);
+
+        // Second metric is ResolutionWidth
+        assertEquals("sum(mv_input.ResolutionWidth)[sum]", params.aggColumnNames()[4]);
+        assertEquals("min(mv_input.ResolutionWidth)[value]", params.aggColumnNames()[5]);
+        assertEquals("max(mv_input.ResolutionWidth)[value]", params.aggColumnNames()[6]);
+        assertEquals("count(mv_input.ResolutionWidth)[count]", params.aggColumnNames()[7]);
+    }
+
+    /**
+     * Verify physical names for the clickbench_100m (legacy-style) definition
+     * which uses COUNT(*) + SUM per field (no quad).
+     */
+    public void testMergeCallParamsPhysicalNamesLegacyDefinition() {
+        MVCompiledDefinition def = MVCompiledDefinition.compiledFor("clickbench_100m");
+        MVCompiledDefinition.MergeCallParams params = def.buildMergeCallParams();
+
+        // clickbench_100m: 5 group keys + 10 metrics × 4 quad = 45 total cols
+        // First agg col is SUM(AdvEngineID) → physical: sum(mv_input.AdvEngineID)[sum]
+        assertEquals("sum(mv_input.AdvEngineID)[sum]", params.aggColumnNames()[0]);
+    }
+
+    /**
+     * Verify that COUNT(*) produces the physical name "count(*)[count]"
+     * and COUNT(field) produces "count(mv_input.field)[count]".
+     */
+    public void testMergeCallParamsPhysicalNamesCountStarVsCountField() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(GroupKey.of("k", GroupKey.ColumnType.LONG)),
+            List.of(
+                AggregateSpec.count("cnt"),                    // COUNT(*)
+                AggregateSpec.countField("myField", "my_cnt")  // COUNT(myField)
+            )
+        );
+        MVCompiledDefinition.MergeCallParams params = def.buildMergeCallParams();
+
+        assertEquals("count(*)[count]", params.aggColumnNames()[0]);
+        assertEquals("count(mv_input.myField)[count]", params.aggColumnNames()[1]);
+    }
+
+    /**
+     * Verify physical name count matches logical state column count — they
+     * must always have the same length even though the names differ.
+     */
+    public void testMergeCallParamsPhysicalNameCountMatchesLogicalCount() {
+        for (MVCompiledDefinition def : List.of(
+            MVCompiledDefinition.clickbench100m(),
+            MVCompiledDefinition.heavyL1(),
+            MVCompiledDefinition.heavyL2(),
+            MVCompiledDefinition.heavyL3(),
+            MVCompiledDefinition.clickbench5mUrl()
+        )) {
+            MVCompiledDefinition.MergeCallParams params = def.buildMergeCallParams();
+            MVCompiledDefinition.AggregateFFIMetadata aggMeta = def.aggregateFFIMetadata();
+            assertEquals(
+                "physical and logical agg column count mismatch for " + def,
+                aggMeta.length(),
+                params.aggColumnNames().length
+            );
+        }
     }
 }

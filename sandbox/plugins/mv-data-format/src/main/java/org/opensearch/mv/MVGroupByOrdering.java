@@ -243,6 +243,13 @@ public final class MVGroupByOrdering {
      * <p>The identity is deterministic: same ordered key list always produces
      * the same string. Format:
      * {@code "idx0:col0:dir0:null0;idx1:col1:dir1:null1;..."}</p>
+     *
+     * <p><b>IMPORTANT — alias vs physical names:</b> This method uses the
+     * <em>logical alias</em> of each group key (e.g. {@code event_bucket}).
+     * For merge-time validation against actual state files, use
+     * {@link #physicalOrderingIdentity(java.util.List)} instead, which
+     * substitutes the PHYSICAL column names that DataFusion's Partial
+     * aggregate stage writes into the Arrow IPC schema.</p>
      */
     public String orderingIdentity() {
         return keys.stream()
@@ -256,6 +263,56 @@ public final class MVGroupByOrdering {
                     + k.nullPlacement().wireToken()
             )
             .collect(Collectors.joining(";"));
+    }
+
+    /**
+     * Stage 4: Returns a physical ordering identity string that uses the
+     * ACTUAL column names from the Arrow IPC state files instead of the
+     * logical aliases.
+     *
+     * <p>DataFusion's Partial aggregate stage names its output columns using
+     * the physical expression Display form (e.g.
+     * {@code mv_input.EventTime / Int64(300000)}), not the SQL alias (e.g.
+     * {@code event_bucket}). The Rust {@code compute_ordering_identity}
+     * reads these physical names from the file schema. This method produces
+     * an identity that matches the Rust computation by substituting the
+     * physical group key names read from an actual state file.</p>
+     *
+     * <p>For plain column keys the physical name equals the alias, so the
+     * substitution is a no-op. For expression keys the physical name is
+     * DataFusion's internal rendering of the expression, which can vary
+     * across DataFusion versions — reading it from the file is the only
+     * authoritative source.</p>
+     *
+     * @param physicalGroupKeyNames the physical column names for each group
+     *        key position, read from an actual Arrow IPC state file's schema
+     *        (e.g. via {@link MVArrowIpcSchemaReader#readGroupKeyNames})
+     * @return ordering identity matching the Rust {@code compute_ordering_identity}
+     * @throws IllegalArgumentException if the list size does not match the
+     *         number of ordering keys
+     */
+    public String physicalOrderingIdentity(java.util.List<String> physicalGroupKeyNames) {
+        if (physicalGroupKeyNames.size() != keys.size()) {
+            throw new IllegalArgumentException(
+                "physicalGroupKeyNames size (" + physicalGroupKeyNames.size()
+                    + ") does not match ordering key count (" + keys.size() + ")"
+            );
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < keys.size(); i++) {
+            if (i > 0) {
+                sb.append(';');
+            }
+            Key k = keys.get(i);
+            sb.append(k.stateFieldIndex())
+                .append(':')
+                .append(physicalGroupKeyNames.get(i))
+                .append(':')
+                .append(k.direction().wireToken())
+                .append(':')
+                .append(k.nullPlacement().wireToken());
+        }
+        return sb.toString();
     }
 
     /**

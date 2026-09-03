@@ -93,7 +93,7 @@ public class MVMergeStrategyTests extends OpenSearchTestCase {
         assertNotNull(capturedParams.get());
         assertEquals("0:k:0:0", capturedParams.get().orderingIdentity());
         assertArrayEquals(new int[] { 0 }, capturedParams.get().orderingIndices());
-        assertArrayEquals(new String[] { "cnt", "sum_v" }, capturedParams.get().aggColumnNames());
+        assertArrayEquals(new String[] { "count(*)[count]", "sum(mv_input.v)[sum]" }, capturedParams.get().aggColumnNames());
 
         WriterFileSet output = result.getMergedWriterFileSetForDataformat(MVStateDataFormat.INSTANCE);
         assertNotNull(output);
@@ -204,8 +204,16 @@ public class MVMergeStrategyTests extends OpenSearchTestCase {
         assertEquals(2, params.foldOps()[4]); // min_val → MIN fold
         assertEquals(3, params.foldOps()[5]); // max_val → MAX fold
 
-        // 4 agg column names
-        assertArrayEquals(new String[] { "cnt", "sum_val", "min_val", "max_val" }, params.aggColumnNames());
+        // 4 agg column names (physical DataFusion names)
+        assertArrayEquals(
+            new String[] {
+                "count(*)[count]",
+                "sum(mv_input.val)[sum]",
+                "min(mv_input.val)[value]",
+                "max(mv_input.val)[value]"
+            },
+            params.aggColumnNames()
+        );
 
         // Ordering identity
         assertEquals("0:region:0:0;1:os:0:0", params.orderingIdentity());
@@ -382,12 +390,12 @@ public class MVMergeStrategyTests extends OpenSearchTestCase {
         assertEquals(2, params.foldOps()[4]); // min_val → MIN fold
         assertEquals(3, params.foldOps()[5]); // max_val → MAX fold
 
-        // 4 agg column names
+        // 4 agg column names (physical DataFusion names)
         assertEquals(4, params.aggColumnNames().length);
-        assertEquals("cnt", params.aggColumnNames()[0]);
-        assertEquals("sum_val", params.aggColumnNames()[1]);
-        assertEquals("min_val", params.aggColumnNames()[2]);
-        assertEquals("max_val", params.aggColumnNames()[3]);
+        assertEquals("count(*)[count]", params.aggColumnNames()[0]);
+        assertEquals("sum(mv_input.val)[sum]", params.aggColumnNames()[1]);
+        assertEquals("min(mv_input.val)[value]", params.aggColumnNames()[2]);
+        assertEquals("max(mv_input.val)[value]", params.aggColumnNames()[3]);
 
         // Ordering identity
         assertEquals("0:region:0:0;1:os:0:0", params.orderingIdentity());

@@ -250,7 +250,17 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                 // This is done to avoid delete post each refresh.
                 // Also trigger cleanup if the uploaded segments map exceeds the configured threshold,
                 // to prevent unbounded memory growth when flushes do not happen.
-                if (isRefreshAfterCommit() || uploadedSegmentsMapExceedsThreshold()) {
+                //
+                // OPTIMIZATION: When the engine is a DataFormatAwareEngine (composite/derived engine),
+                // commits come from derived-artifact publishes (e.g., MV publication rounds) which do NOT
+                // produce stale Lucene segments needing cleanup. The stale segment deletion path calls
+                // listFilesByPrefixInLexicographicOrder(Integer.MAX_VALUE) which lists ALL remote metadata
+                // files — O(total metadata) per call. In profiled MV workloads, this fired 96,649 times
+                // across hundreds of publish rounds. Skipping the cleanup for DFA engines eliminates this
+                // per-publish listing overhead while preserving cleanup for normal InternalEngine flushes
+                // and the threshold-based cleanup (which handles long-running DFA shards).
+                boolean isDfaEngine = indexShard.getIndexerOrNull() instanceof DataFormatAwareEngine;
+                if ((isRefreshAfterCommit() && !isDfaEngine) || uploadedSegmentsMapExceedsThreshold()) {
                     remoteDirectory.deleteStaleSegmentsAsync(indexShard.getRemoteStoreSettings().getMinRemoteSegmentMetadataFiles());
                 }
 

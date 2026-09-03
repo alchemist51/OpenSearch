@@ -20,6 +20,7 @@ import org.opensearch.index.engine.dataformat.ReaderManagerConfig;
 import org.opensearch.index.engine.derived.pull.NodeDerivedPullService;
 import org.opensearch.index.engine.exec.EngineReaderManager;
 import org.opensearch.index.mapper.MappedFieldType;
+import org.opensearch.index.store.PrecomputedChecksumStrategy;
 import org.opensearch.index.store.checksum.GenericCRC32ChecksumHandler;
 import org.opensearch.mv.pull.MVBuildRuntime;
 import org.opensearch.mv.pull.MVDerivedPullFormat;
@@ -404,12 +405,16 @@ public class MVDataFormatPlugin extends Plugin
 
     @Override
     public Map<String, Supplier<DataFormatDescriptor>> getFormatDescriptors(IndexSettings indexSettings, DataFormatRegistry registry) {
-        // Register descriptors for BOTH formats from this single plugin
+        // Register descriptors for BOTH formats from this single plugin.
+        // mv_state uses PrecomputedChecksumStrategy so that CRC32 checksums
+        // registered at write time (after native build or compaction) are served
+        // in O(1) by the upload/recovery path. Without this, every publish and
+        // every restart CRC32-scans the entire mv_state catalog (219 GB @ gen-38).
         return Map.of(
             MVDataFormat.NAME,
             () -> new DataFormatDescriptor(MVDataFormat.NAME, new GenericCRC32ChecksumHandler()),
             MVStateDataFormat.NAME,
-            () -> new DataFormatDescriptor(MVStateDataFormat.NAME, new GenericCRC32ChecksumHandler())
+            () -> new DataFormatDescriptor(MVStateDataFormat.NAME, new PrecomputedChecksumStrategy())
         );
     }
 

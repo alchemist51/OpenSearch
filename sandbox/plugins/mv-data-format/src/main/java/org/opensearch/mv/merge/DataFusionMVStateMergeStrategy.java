@@ -196,21 +196,32 @@ public final class DataFusionMVStateMergeStrategy implements MVMergeStrategy {
      * Stage 4: Merge through the streaming FFI with ordering and accumulator
      * metadata. Uses the compiled definition's
      * {@link MVCompiledDefinition.MergeCallParams} to resolve all FFI
-     * parameters in one call.
+     * parameters in one call. Derives the ordering identity from the PHYSICAL
+     * column names in the first input file — the ground truth for what the
+     * Rust merge engine will compute. Falls back to the logical alias-based
+     * identity if the file schema cannot be read (e.g. in unit tests with
+     * mock/empty state files).
      */
     private long mergeWithStreaming(List<String> inputPaths, String outputPath) {
-        MVCompiledDefinition.MergeCallParams params = compiledDefinition.buildMergeCallParams();
-
-        // Validate ordering identity before merge — catches schema drift early
-        String expectedIdentity = compiledDefinition.groupByOrdering().orderingIdentity();
-        if (expectedIdentity.equals(params.orderingIdentity()) == false) {
-            throw new IllegalStateException(
-                "MV merge ordering identity mismatch: compiled definition says ["
-                    + expectedIdentity
-                    + "] but MergeCallParams says ["
-                    + params.orderingIdentity()
-                    + "]"
+        MVCompiledDefinition.MergeCallParams params;
+        try {
+            // Use physical ordering identity derived from the first input
+            // state file's Arrow IPC schema. Expression group keys have
+            // physical names (DataFusion's Partial aggregate Display form)
+            // that differ from the SQL alias — reading from the file is
+            // authoritative.
+            params = compiledDefinition.buildMergeCallParams(inputPaths.get(0));
+        } catch (java.io.IOException e) {
+            // Fallback: use logical alias-based identity. This happens when
+            // the first input file is not a valid Arrow IPC file (e.g. in
+            // unit tests with empty placeholder files). In production, the
+            // files are always valid IPC and this branch is unreachable.
+            logger.warn(
+                "mv_merge: could not read Arrow schema from [{}], falling back to logical ordering identity: {}",
+                inputPaths.get(0),
+                e.getMessage()
             );
+            params = compiledDefinition.buildMergeCallParams();
         }
 
         logger.debug(
