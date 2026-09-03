@@ -161,6 +161,19 @@ public final class MVBuildRuntime implements Closeable {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment resultBuf = arena.allocate(MvBuildResultLayout.NATIVE_ALLOC_SIZE);
 
+            // ── NATIVE_FFI_PRE log (instrumentation point 4 detail) ──
+            logger.info(
+                "mv_pull NATIVE_FFI_PRE runtimePtr={} spillBudget={}B spillFileLimit={} "
+                    + "memEstimate={}B breaker_used={} breaker_limit={} ordering_fields={}",
+                runtimePtr,
+                spillBudgetBytes,
+                spillFileCountLimit,
+                buildMemoryEstimate,
+                circuitBreaker != null ? circuitBreaker.getUsed() : -1,
+                circuitBreaker != null ? circuitBreaker.getLimit() : -1,
+                ffi.fieldIndices().length
+            );
+
             MVNativeBridge.buildStreamingArtifactNative(
                 runtimePtr,
                 parquetInput,
@@ -208,6 +221,23 @@ public final class MVBuildRuntime implements Closeable {
                 MVBuildMetrics.INSTANCE.recordBuildFailed();
                 throw new IOException("mv_pull streaming build produced no state rows");
             }
+
+            // ── NATIVE_FFI_POST log (instrumentation point 4 detail) ─
+            logger.info(
+                "mv_pull NATIVE_FFI_POST status={} rows={} spill_bytes={} spill_files={} "
+                    + "output_batches={} peak_rss_bytes={} build_duration_us={} "
+                    + "schema_hash={} definition_hash={} ordering_hash={}",
+                statusCode,
+                rows,
+                spillBytesVal,
+                spillFileCountVal,
+                outputBatchCount,
+                peakRssBytes,
+                buildDurationUs,
+                Long.toHexString(schemaHash),
+                Long.toHexString(definitionHash),
+                Long.toHexString(orderingHash)
+            );
 
             // Validate ordering identity: compare native ordering hash against
             // the Java-computed ordering identity hash. Fail-closed on mismatch.

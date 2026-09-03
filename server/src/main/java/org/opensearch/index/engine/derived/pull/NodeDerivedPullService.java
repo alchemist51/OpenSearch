@@ -215,12 +215,70 @@ public final class NodeDerivedPullService extends AbstractLifecycleComponent imp
         }
 
         try {
+            // ── WATERMARK_RECOVERY: attempt to recover from shard commit userData ──
+            long initialWatermark = -1L;
+            try {
+                var catalogRef = shard.getCatalogSnapshot();
+                if (catalogRef != null) {
+                    try {
+                        var userData = catalogRef.get().getUserData();
+                        if (userData != null) {
+                            // Scan for any mv.wm.* key
+                            for (Map.Entry<String, String> entry : userData.entrySet()) {
+                                if (entry.getKey().startsWith("mv.wm.")) {
+                                    String[] parts = entry.getValue().split(":");
+                                    if (parts.length == 3) {
+                                        long seqNo = Long.parseLong(parts[1]);
+                                        if (seqNo > initialWatermark) {
+                                            initialWatermark = seqNo;
+                                        }
+                                    }
+                                    logger.info(
+                                        "derived_pull WATERMARK_RECOVERY shard=[{}] found_key=[{}] value=[{}]",
+                                        shard.shardId(),
+                                        entry.getKey(),
+                                        entry.getValue()
+                                    );
+                                }
+                            }
+                        }
+                        if (initialWatermark == -1L) {
+                            logger.warn(
+                                "derived_pull WATERMARK_RECOVERY shard=[{}] no mv.wm.* keys found in commit userData "
+                                    + "(available_keys={})",
+                                shard.shardId(),
+                                userData != null ? userData.keySet() : "null"
+                            );
+                        } else {
+                            logger.info(
+                                "derived_pull WATERMARK_RECOVERY shard=[{}] recovered_watermark={}",
+                                shard.shardId(),
+                                initialWatermark
+                            );
+                        }
+                    } finally {
+                        catalogRef.close();
+                    }
+                } else {
+                    logger.warn(
+                        "derived_pull WATERMARK_RECOVERY shard=[{}] catalogSnapshot is null",
+                        shard.shardId()
+                    );
+                }
+            } catch (Exception e) {
+                logger.warn(
+                    "derived_pull WATERMARK_RECOVERY shard=[{}] failed to read commit userData, defaulting to -1: {}",
+                    shard.shardId(),
+                    e.getMessage()
+                );
+            }
+
             DerivedShardPoller poller = new DerivedShardPoller(
                 shard,
                 format,
                 DEFAULT_INTERVAL,
                 threadPool,
-                -1L // TODO: recover watermark from shard commit userData
+                initialWatermark
             );
             pollers.put(shard.shardId(), poller);
             poller.start();

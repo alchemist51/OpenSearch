@@ -147,11 +147,38 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             return new MVBuildResult(false, "no-parquet-files", Map.of());
         }
 
+        // ── Bounded streaming rounds: cap per-round range ────────────────
+        // When lag exceeds max_docs_per_round, process only a bounded chunk.
+        // Each chunk emits one generation; the compaction machinery folds them.
+        // Memory becomes O(chunk) instead of O(full_lag).
+        Settings admissionSettings = indexSettings.getSettings();
+        long maxDocsPerRound = MVPullSettings.MAX_DOCS_PER_ROUND.get(admissionSettings);
+        final long snapshotWatermark = mvSnapshot.watermark();
+        final long totalLag = snapshotWatermark - current.seqNo();
+        final long roundWatermark;
+        final boolean roundCapped;
+        if (maxDocsPerRound < Long.MAX_VALUE && totalLag > maxDocsPerRound) {
+            roundWatermark = current.seqNo() + maxDocsPerRound;
+            roundCapped = true;
+            logger.info(
+                "mv_pull ROUND_START_CAPPED shard=[{}] range=({}, {}] capped_from={} "
+                    + "total_lag={} max_docs_per_round={}",
+                shard.shardId(),
+                current.seqNo(),
+                roundWatermark,
+                snapshotWatermark,
+                totalLag,
+                maxDocsPerRound
+            );
+        } else {
+            roundWatermark = snapshotWatermark;
+            roundCapped = false;
+        }
+
         // ── Pull-round admission gate (Stage 5, criteria H) ─────────────
         // Check sourceBytes, opsEstimate, and nativePressure against
         // configured limits. Safe defaults (Long.MAX_VALUE / 1.0) mean
         // all checks are no-ops unless the operator tunes them.
-        Settings admissionSettings = indexSettings.getSettings();
 
         // H1: source bytes admission
         long maxSourceBytes = MVPullSettings.MAX_SOURCE_BYTES_PER_ROUND.get(admissionSettings);
@@ -171,10 +198,10 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             }
         }
 
-        // H2: ops estimate admission (row count in the source range)
+        // H2: ops estimate admission (row count in the capped range)
         long maxOpsEstimate = MVPullSettings.MAX_OPS_ESTIMATE_PER_ROUND.get(admissionSettings);
         if (maxOpsEstimate < Long.MAX_VALUE) {
-            long opsEstimate = mvSnapshot.watermark() - current.seqNo();
+            long opsEstimate = roundWatermark - current.seqNo();
             if (opsEstimate > maxOpsEstimate) {
                 logger.warn(
                     "mv_pull admission rejected: opsEstimate={} exceeds limit={} for shard [{}]",
@@ -211,9 +238,9 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             }
         }
 
-        // Use compiled definition to build SQL
+        // Use compiled definition to build SQL — capped to roundWatermark
         String baseSql = compiledDefinition.buildPartialSql(MVConstants.INPUT_TABLE);
-        String filteredSql = wrapWithSeqNoFilter(baseSql, current.seqNo(), mvSnapshot.watermark());
+        String filteredSql = wrapWithSeqNoFilter(baseSql, current.seqNo(), roundWatermark);
 
         // Coverage is schema-agnostic: count every source row in the range and
         // reduce all partial MAX(_seq_no) rows.
@@ -222,7 +249,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             parquetFiles,
             definitionName,
             current.seqNo(),
-            mvSnapshot.watermark(),
+            roundWatermark,
             mvSnapshot.infosVersion()
         );
         long coverageNanos = System.nanoTime() - tCoverage;
@@ -230,7 +257,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         if (coverage.observedMaxSeqNo() < 0L) {
             return new MVBuildResult(false, "no-coverage", Map.of());
         }
-        long appliedThrough = Math.min(coverage.observedMaxSeqNo(), mvSnapshot.watermark());
+        long appliedThrough = Math.min(coverage.observedMaxSeqNo(), roundWatermark);
 
         // H4: cardinality estimate admission (post-coverage, uses totalRows
         // as upper bound on distinct group keys). Safe default Long.MAX_VALUE.
@@ -262,6 +289,25 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         long generation = shard.reserveDerivedArtifactGeneration();
         Path stagedParquet = coverageReader.stageParquetFiles(parquetFiles, generation);
         try {
+            // ── NATIVE_BUILD_PRE log (instrumentation point 4) ───────
+            logger.info(
+                "mv_pull NATIVE_BUILD_PRE shard=[{}] generation={} parquet_files={} "
+                    + "pool_limit={}B mem_estimate={}B breaker={} range=({}, {}] coverage_rows={} capped={}",
+                shard.shardId(),
+                generation,
+                parquetFiles.size(),
+                buildRuntime != null ? buildRuntime.runtimePtr() : -1,
+                MVBuildRuntime.MV_BUILD_MEMORY_ESTIMATE.get(indexSettings.getSettings()),
+                services.parentCircuitBreaker() != null
+                    ? services.parentCircuitBreaker().getName() + "/"
+                        + services.parentCircuitBreaker().getUsed() + "/"
+                        + services.parentCircuitBreaker().getLimit()
+                    : "none",
+                current.seqNo(),
+                roundWatermark,
+                coverage.totalRows(),
+                roundCapped
+            );
             long tNativeBuild = System.nanoTime();
             ManagedArtifact artifact = buildManagedArtifact(
                 stagedParquet,
@@ -271,6 +317,21 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
                 generation
             );
             long nativeBuildNanos = System.nanoTime() - tNativeBuild;
+
+            // ── NATIVE_BUILD_POST log (instrumentation point 4) ──────
+            // The artifact carries the full ArtifactResult from the streaming
+            // build path. Log ALL fields from buildStreamingArtifact at INFO
+            // since these are the most important diagnostics for OOM/spill.
+            logger.info(
+                "mv_pull NATIVE_BUILD_POST shard=[{}] generation={} rows={} "
+                    + "native_build_ms={} schema_hash={} definition_hash={}",
+                shard.shardId(),
+                generation,
+                artifact.stateRows(),
+                nativeBuildNanos / 1_000_000,
+                Long.toHexString(artifact.schemaHash()),
+                Long.toHexString(artifact.definitionHash())
+            );
 
             MVWatermark next = new MVWatermark(mvSnapshot.primaryTerm(), appliedThrough, mvSnapshot.infosVersion());
 
@@ -286,7 +347,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
 
             logger.info(
                 "mv_pull published generation={} rows={} range=({}, {}] watermark={} "
-                    + "coverage={}ms native_build={}ms publish={}ms schema_hash={} [streaming]",
+                    + "coverage={}ms native_build={}ms publish={}ms schema_hash={} capped={} remaining_lag={} [streaming]",
                 generation,
                 artifact.stateRows(),
                 current.seqNo(),
@@ -295,7 +356,9 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
                 coverageNanos / 1_000_000,
                 nativeBuildNanos / 1_000_000,
                 publishNanos / 1_000_000,
-                Long.toHexString(artifact.schemaHash())
+                Long.toHexString(artifact.schemaHash()),
+                roundCapped,
+                roundCapped ? (snapshotWatermark - appliedThrough) : 0L
             );
 
             Map<String, Object> stats = new java.util.LinkedHashMap<>();
@@ -310,6 +373,12 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             stats.put("streaming", true); // Stage 3 marker: no collect/concat/sort/take
             stats.put("schema_hash", Long.toHexString(artifact.schemaHash()));
             stats.put("definition_hash", Long.toHexString(artifact.definitionHash()));
+            // Bounded streaming round metadata: the poller reads these to decide
+            // whether to advance to the capped watermark and continue immediately.
+            stats.put("capped", roundCapped);
+            stats.put("capped_watermark", appliedThrough);
+            stats.put("snapshot_watermark", snapshotWatermark);
+            stats.put("remaining_lag", roundCapped ? (snapshotWatermark - appliedThrough) : 0L);
             return new MVBuildResult(true, "gen-" + generation, stats);
         } finally {
             coverageReader.cleanupStagedParquet(stagedParquet);
@@ -431,8 +500,42 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
 
     private static MVWatermark recoveredWatermark(IndexShard shard, int sourceShardId) throws IOException {
         try (var ref = shard.getCatalogSnapshot()) {
-            String encoded = ref.get().getUserData().get(MVWatermark.key(sourceShardId));
-            return encoded == null ? MVWatermark.EMPTY : MVWatermark.decode(encoded);
+            var userData = ref.get().getUserData();
+            String key = MVWatermark.key(sourceShardId);
+            String encoded = userData.get(key);
+            if (encoded == null) {
+                logger.warn(
+                    "mv_pull WATERMARK_RECOVERY shard=[{}] source_shard={} key=[{}] "
+                        + "result=EMPTY (no entry in commit userData; available keys={})",
+                    shard.shardId(),
+                    sourceShardId,
+                    key,
+                    userData.keySet()
+                );
+                return MVWatermark.EMPTY;
+            }
+            MVWatermark wm = MVWatermark.decode(encoded);
+            logger.info(
+                "mv_pull WATERMARK_RECOVERY shard=[{}] source_shard={} key=[{}] "
+                    + "recovered={} (term={} seqNo={} gen={})",
+                shard.shardId(),
+                sourceShardId,
+                key,
+                encoded,
+                wm.primaryTerm(),
+                wm.seqNo(),
+                wm.generation()
+            );
+            return wm;
+        } catch (Exception e) {
+            logger.error(
+                "mv_pull WATERMARK_RECOVERY shard=[{}] source_shard={} FAILED: {}",
+                shard.shardId(),
+                sourceShardId,
+                e.getMessage(),
+                e
+            );
+            return MVWatermark.EMPTY;
         }
     }
 

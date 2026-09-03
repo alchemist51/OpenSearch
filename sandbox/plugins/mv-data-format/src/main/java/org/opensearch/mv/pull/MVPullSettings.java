@@ -65,6 +65,27 @@ public final class MVPullSettings {
         Setting.Property.Final
     );
 
+    // ── Bounded streaming rounds ─────────────────────────────────────────
+
+    /**
+     * Maximum number of source documents (seq-no range size) processed per
+     * pull round. When the lag exceeds this cap, each round builds only a
+     * chunk of size {@code max_docs_per_round} and the poller immediately
+     * starts the next round (no interval wait) until the lag is drained.
+     * This bounds memory to O(chunk) and produces one generation per chunk
+     * which the existing compaction machinery folds.
+     *
+     * <p>Default {@link Long#MAX_VALUE} (uncapped — full range per round).
+     * Set to e.g. 2_000_000 for production workloads.
+     */
+    public static final Setting<Long> MAX_DOCS_PER_ROUND = Setting.longSetting(
+        "index.mv_pull.max_docs_per_round",
+        Long.MAX_VALUE,
+        1L,
+        Setting.Property.IndexScope,
+        Setting.Property.Dynamic
+    );
+
     // ── Pull-round admission settings (Stage 5, criteria H) ─────────────
 
     /**
@@ -127,6 +148,7 @@ public final class MVPullSettings {
      */
     public static List<Setting<?>> admissionSettings() {
         return List.of(
+            MAX_DOCS_PER_ROUND,
             MAX_SOURCE_BYTES_PER_ROUND,
             MAX_OPS_ESTIMATE_PER_ROUND,
             MAX_CARDINALITY_ESTIMATE_PER_ROUND,

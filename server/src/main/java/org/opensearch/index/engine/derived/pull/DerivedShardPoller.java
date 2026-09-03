@@ -63,6 +63,13 @@ public final class DerivedShardPoller implements Runnable, Closeable {
 
     private volatile long currentWatermark;
 
+    // ── Consecutive failure tracking & backoff ───────────────────────────
+    private final AtomicLong consecutiveFailures = new AtomicLong();
+    private volatile long lastSuccessEpochMs = -1L;
+    /** Backoff: 1s base, x2 per consecutive failure, cap 60s, reset on success. */
+    private static final long BACKOFF_BASE_MS = 1000L;
+    private static final long BACKOFF_CAP_MS = 60_000L;
+
     // ── Cumulative stage metrics (thread-safe) ──────────────────────────
     private final AtomicLong roundCount = new AtomicLong();
     private final AtomicLong successCount = new AtomicLong();
@@ -102,6 +109,24 @@ public final class DerivedShardPoller implements Runnable, Closeable {
         } catch (IOException e) {
             throw new IllegalStateException("derived_pull: failed to create working directory " + workingDir, e);
         }
+
+        // ── WATERMARK RECOVERY LOG (instrumentation point 6) ─────────
+        if (initialWatermark == -1L) {
+            logger.warn(
+                "derived_pull [{}] WATERMARK_RECOVERY shard=[{}] recovered_watermark=-1 "
+                    + "(NodeDerivedPullService passed -1; watermark recovery from commit userData not yet implemented). "
+                    + "Poller will attempt full range 0->maxSeqNo each round until first successful publication.",
+                formatId,
+                targetShard.shardId()
+            );
+        } else {
+            logger.info(
+                "derived_pull [{}] WATERMARK_RECOVERY shard=[{}] recovered_watermark={}",
+                formatId,
+                targetShard.shardId(),
+                initialWatermark
+            );
+        }
         logger.info("derived_pull [{}] poller created for shard [{}] watermark={}", formatId, targetShard.shardId(), initialWatermark);
     }
 
@@ -128,32 +153,75 @@ public final class DerivedShardPoller implements Runnable, Closeable {
         if (closed.get()) {
             return;
         }
+        boolean lagRemains = false;
         try {
-            pollRound();
+            lagRemains = pollRound();
         } catch (Exception e) {
             if (closed.get() == false) {
+                long failures = consecutiveFailures.incrementAndGet();
+                String rootCause = deepestMessage(e);
+                long backoffMs = Math.min(BACKOFF_BASE_MS * (1L << Math.min(failures - 1, 16)), BACKOFF_CAP_MS);
+                long msSinceLastSuccess = lastSuccessEpochMs > 0
+                    ? System.currentTimeMillis() - lastSuccessEpochMs
+                    : -1L;
                 logger.error(
-                    "derived_pull [{}] poll round failed for shard [{}]; watermark held at {}",
+                    "derived_pull [{}] ROUND_FAILURE shard=[{}] watermark={} consecutive_failures={} "
+                        + "root_cause=[{}] backoff_ms={} ms_since_last_success={} exception_class={}",
                     formatId,
                     targetShard.shardId(),
                     currentWatermark,
+                    failures,
+                    rootCause,
+                    backoffMs,
+                    msSinceLastSuccess,
+                    e.getClass().getSimpleName(),
                     e
                 );
+                schedule(TimeValue.timeValueMillis(backoffMs));
+                return; // skip the default schedule below
             }
-        } finally {
+        }
+        // When a bounded round succeeded but lag remains, continue immediately
+        // (yield between rounds but no interval wait). Otherwise normal cadence.
+        if (lagRemains) {
+            schedule(TimeValue.timeValueMillis(0));
+        } else {
             schedule(interval);
         }
     }
 
-    private void pollRound() throws IOException {
-        roundCount.incrementAndGet();
+    /** Walk the cause chain to find the deepest non-null message. */
+    private static String deepestMessage(Throwable t) {
+        String msg = t.getMessage();
+        Throwable cause = t.getCause();
+        int depth = 0;
+        while (cause != null && depth < 20) {
+            if (cause.getMessage() != null) {
+                msg = cause.getMessage();
+            }
+            cause = cause.getCause();
+            depth++;
+        }
+        return msg != null ? msg : t.getClass().getSimpleName();
+    }
+
+    /**
+     * Executes a single poll round.
+     *
+     * @return {@code true} if the round was capped (bounded streaming) and
+     *         lag remains — the caller should schedule an immediate
+     *         continuation. {@code false} otherwise (no data, caught up,
+     *         or failure).
+     */
+    private boolean pollRound() throws IOException {
+        long round = roundCount.incrementAndGet();
         PollRoundStats.Builder statsBuilder = new PollRoundStats.Builder().startRound();
 
         // Check we're still a primary
         if (targetShard.routingEntry().primary() == false) {
             logger.info("derived_pull [{}] shard [{}] is no longer primary; closing poller", formatId, targetShard.shardId());
             close();
-            return;
+            return false;
         }
 
         // Step 1: Fetch snapshot from remote source
@@ -161,11 +229,32 @@ public final class DerivedShardPoller implements Runnable, Closeable {
         DerivedSourceSnapshot snapshot = reader.fetchSnapshot(targetShard.routingEntry(), currentWatermark);
         statsBuilder.stage("fetch_snapshot", System.nanoTime() - t0);
         if (snapshot == null) {
-            return; // No new data
+            return false; // No new data
         }
         if (snapshot.watermark() <= currentWatermark) {
-            return; // Already at or beyond this watermark
+            return false; // Already at or beyond this watermark
         }
+
+        // ── ROUND_START log (instrumentation point 2) ────────────────
+        long rangeSize = snapshot.watermark() - currentWatermark;
+        long lag = Math.max(0L, snapshot.watermark() - currentWatermark);
+        long failures = consecutiveFailures.get();
+        long msSinceLastSuccess = lastSuccessEpochMs > 0
+            ? System.currentTimeMillis() - lastSuccessEpochMs
+            : -1L;
+        logger.info(
+            "derived_pull [{}] ROUND_START shard=[{}] round={} watermark={} snapshot_max_seqno={} "
+                + "range_size={} lag={} consecutive_failures={} ms_since_last_success={}",
+            formatId,
+            targetShard.shardId(),
+            round,
+            currentWatermark,
+            snapshot.watermark(),
+            rangeSize,
+            lag,
+            failures,
+            msSinceLastSuccess
+        );
 
         // Step 2: Download to staging directory
         Path stageDir = workingDir.resolve("stage-" + snapshot.watermark());
@@ -174,7 +263,30 @@ public final class DerivedShardPoller implements Runnable, Closeable {
         try {
             long t1 = System.nanoTime();
             reader.downloadToStage(snapshot, stageDir);
-            statsBuilder.stage("download", System.nanoTime() - t1);
+            long downloadNanos = System.nanoTime() - t1;
+            statsBuilder.stage("download", downloadNanos);
+
+            // ── STAGING log (instrumentation point 3) ────────────────
+            long stagedFileCount = 0;
+            long stagedTotalBytes = 0;
+            try (Stream<Path> stagedFiles = Files.list(stageDir)) {
+                for (Path f : (Iterable<Path>) stagedFiles::iterator) {
+                    stagedFileCount++;
+                    stagedTotalBytes += Files.size(f);
+                }
+            }
+            long freeSpaceBytes = stageDir.toFile().getUsableSpace();
+            logger.info(
+                "derived_pull [{}] STAGING shard=[{}] stage_dir={} files={} total_bytes={} "
+                    + "free_space_bytes={} download_ms={}",
+                formatId,
+                targetShard.shardId(),
+                stageDir,
+                stagedFileCount,
+                stagedTotalBytes,
+                freeSpaceBytes,
+                downloadNanos / 1_000_000
+            );
 
             // Step 3: Build artifact
             long t2 = System.nanoTime();
@@ -204,26 +316,48 @@ public final class DerivedShardPoller implements Runnable, Closeable {
 
         if (result != null && result.success()) {
             successCount.incrementAndGet();
+            consecutiveFailures.set(0);
+            lastSuccessEpochMs = System.currentTimeMillis();
+
+            // ── Bounded streaming: read the actual applied watermark from
+            // the builder. When a round is capped, the builder processes
+            // only a subset of the snapshot range and returns the capped
+            // watermark in the stats. Advance to that, not snapshot.watermark().
             long previousWatermark = currentWatermark;
-            currentWatermark = snapshot.watermark();
+            boolean capped = Boolean.TRUE.equals(result.stats().get("capped"));
+            Object cappedWmObj = result.stats().get("capped_watermark");
+            if (capped && cappedWmObj instanceof Number) {
+                currentWatermark = ((Number) cappedWmObj).longValue();
+            } else {
+                currentWatermark = snapshot.watermark();
+            }
+
             statsBuilder.counter("source_watermark", snapshot.watermark());
             statsBuilder.counter("target_watermark", currentWatermark);
-            statsBuilder.counter("lag", Math.max(0L, snapshot.watermark() - currentWatermark));
+            long remainingLag = Math.max(0L, snapshot.watermark() - currentWatermark);
+            statsBuilder.counter("lag", remainingLag);
             statsBuilder.counter("round_success", 1L);
 
             // Finalize only after outcome/watermark counters are recorded.
             PollRoundStats roundStats = statsBuilder.build();
             recordRoundStats(roundStats);
             logger.info(
-                "derived_pull [{}] shard [{}] published artifact={} watermark {} -> {} stats={}",
+                "derived_pull [{}] shard [{}] published artifact={} watermark {} -> {} "
+                    + "capped={} remaining_lag={} stats={}",
                 formatId,
                 targetShard.shardId(),
                 result.artifactId(),
                 previousWatermark,
                 currentWatermark,
+                capped,
+                remainingLag,
                 roundStats
             );
+            // Signal immediate continuation if the round was capped and lag remains
+            return capped && remainingLag > 0;
         } else {
+            long buildFailures = consecutiveFailures.incrementAndGet();
+            long backoffMs = Math.min(BACKOFF_BASE_MS * (1L << Math.min(buildFailures - 1, 16)), BACKOFF_CAP_MS);
             failureCount.incrementAndGet();
             statsBuilder.counter("source_watermark", snapshot.watermark());
             statsBuilder.counter("target_watermark", currentWatermark);
@@ -233,12 +367,19 @@ public final class DerivedShardPoller implements Runnable, Closeable {
             PollRoundStats roundStats = statsBuilder.build();
             recordRoundStats(roundStats);
             logger.warn(
-                "derived_pull [{}] shard [{}] build failed for watermark {}; will retry. stats={}",
+                "derived_pull [{}] BUILD_FAILURE shard=[{}] watermark={} attempted_range=({}, {}] "
+                    + "consecutive_failures={} backoff_ms={} artifact={} stats={}",
                 formatId,
                 targetShard.shardId(),
+                currentWatermark,
+                currentWatermark,
                 snapshot.watermark(),
+                buildFailures,
+                backoffMs,
+                result != null ? result.artifactId() : "null",
                 roundStats
             );
+            return false;
         }
     }
 
