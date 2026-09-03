@@ -27,14 +27,15 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.zip.CRC32;
 
 /**
  * MV-specific implementation of {@link DerivedSourceReader}. Owns the
- * {@link MVRemoteSource} that reads the source index's remote segment store
- * for {@code .si} and {@code .parquet} files.
+ * {@link MVRemoteSource} for name-addressed file downloads from the
+ * source index's remote segment store.
  *
- * <h2>Push-first, pull-fallback</h2>
+ * <h2>Push-first, cold-start RPC</h2>
  * <p>When the source publishes a checkpoint advert via {@link MVCheckpointMailbox},
  * {@code fetchSnapshot} consumes the mailbox and uses name-addressed
  * {@link MVRemoteSource#downloadFiles} to fetch ONLY the referenced files
@@ -42,22 +43,30 @@ import java.util.zip.CRC32;
  * <ul>
  *   <li><b>Seeded (had a previous successful round):</b> return null immediately
  *       (no remote IO). The next push will populate the mailbox.</li>
- *   <li><b>Not seeded (cold start):</b> attempt a cold-start request via
- *       {@link MVCheckpointRequestAction} to the source node. If that fails,
- *       fall back to the legacy full-listing pull path ONCE to seed.</li>
+ *   <li><b>Not seeded (cold start):</b> send a cold-start request via
+ *       {@link MVCheckpointRequestAction} to the source node. The source
+ *       handler reads its local catalog and replies with a full checkpoint.
+ *       On RPC failure, return null — the poller's existing backoff will
+ *       retry on the next round.</li>
  * </ul>
+ *
+ * <p>There is no legacy pull path. All data arrives via push (mailbox) or
+ * cold-start RPC.</p>
  */
 final class MVDerivedSourceReader implements DerivedSourceReader {
 
     private static final Logger logger = LogManager.getLogger(MVDerivedSourceReader.class);
+
+    /** Cold-start RPC timeout. The poller thread is GENERIC; a short block is acceptable. */
+    private static final long COLD_START_TIMEOUT_SECONDS = 5;
 
     private final IndexSettings indexSettings;
     private final MVPullSettings.Services services;
     private volatile MVRemoteSource source;
     private volatile org.apache.lucene.store.NIOFSDirectory workingDirectory;
     private volatile Path workingPath;
-    /** True after the first successful pull-fallback or push seeds the reader. */
-    private volatile boolean seededByPull = false;
+    /** True after the first successful round seeds the reader. */
+    private volatile boolean seeded = false;
 
     MVDerivedSourceReader(IndexSettings indexSettings, MVPullSettings.Services services) {
         this.indexSettings = indexSettings;
@@ -70,102 +79,82 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
 
         // ── Push-first: check the mailbox for a source-pushed checkpoint ─────
         MVCheckpointMailbox mailbox = MVCheckpointMailbox.instance();
-        if (mailbox != null) {
-            DerivedIndexBinding binding = DerivedIndexBinding.fromSettings(indexSettings.getSettings());
-            if (binding != null) {
-                String sourceIndexName = binding.sourceName();
-                int sourceShardId = binding.resolveSourceShard(shard.shardId().id());
-                MVReplicationCheckpoint pushed = mailbox.consume(
-                    indexSettings.getIndex().getName(),
-                    shard.shardId().id(),
-                    sourceIndexName,
-                    sourceShardId
-                );
-                if (pushed != null) {
-                    if (pushed.maxSeqNo() <= sinceWatermark) {
-                        logger.debug(
-                            "MAILBOX_STALE target=[{}][{}] pushed_maxSeqNo={} <= watermark={}",
-                            indexSettings.getIndex().getName(),
-                            shard.shardId().id(),
-                            pushed.maxSeqNo(),
-                            sinceWatermark
-                        );
-                        return null;
-                    }
-                    // Use the pushed checkpoint — name-addressed download with CRC verification
-                    return fetchFromCheckpoint(shard, pushed);
-                }
-
-                // ── Mailbox empty ────────────────────────────────────────
-                if (seededByPull) {
-                    logger.trace(
-                        "MAILBOX_EMPTY_SEEDED target=[{}][{}] watermark={} — no-op",
-                        indexSettings.getIndex().getName(),
-                        shard.shardId().id(),
-                        sinceWatermark
-                    );
-                    return null;
-                }
-
-                // ── Cold start: try request action, then legacy fallback ─
-                logger.debug(
-                    "COLD_START target=[{}][{}] watermark={}",
-                    indexSettings.getIndex().getName(),
-                    shard.shardId().id(),
-                    sinceWatermark
-                );
-
-                MVReplicationCheckpoint coldStart = tryColdStartRequest(
-                    sourceIndexName, sourceShardId, shard
-                );
-                if (coldStart != null) {
-                    if (coldStart.maxSeqNo() <= sinceWatermark) {
-                        seededByPull = true;
-                        return null;
-                    }
-                    DerivedSourceSnapshot snapshot = fetchFromCheckpoint(shard, coldStart);
-                    if (snapshot != null) {
-                        seededByPull = true;
-                    }
-                    return snapshot;
-                }
-            }
+        if (mailbox == null) {
+            // Mailbox not initialized — cannot proceed
+            logger.warn("mv_pull: checkpoint mailbox not initialized");
+            return null;
         }
 
-        // ── Legacy pull fallback: full remote listing (last resort) ──────
-        if (mailbox != null) {
-            mailbox.recordFallback();
+        DerivedIndexBinding binding = DerivedIndexBinding.fromSettings(indexSettings.getSettings());
+        if (binding == null) {
+            return null;
         }
-        logger.debug(
-            "PULL_FALLBACK target=[{}][{}] watermark={} seeded={}",
+
+        String sourceIndexName = binding.sourceName();
+        int sourceShardId = binding.resolveSourceShard(shard.shardId().id());
+        MVReplicationCheckpoint pushed = mailbox.consume(
             indexSettings.getIndex().getName(),
             shard.shardId().id(),
-            sinceWatermark,
-            seededByPull
+            sourceIndexName,
+            sourceShardId
         );
 
-        MVRemoteSource.Advert advert = source.latestAdvert(workingDirectory);
-        if (advert == null) {
-            return null;
+        if (pushed != null) {
+            if (pushed.maxSeqNo() <= sinceWatermark) {
+                logger.debug(
+                    "MAILBOX_STALE target=[{}][{}] pushed_maxSeqNo={} <= watermark={}",
+                    indexSettings.getIndex().getName(),
+                    shard.shardId().id(),
+                    pushed.maxSeqNo(),
+                    sinceWatermark
+                );
+                return null;
+            }
+            // Use the pushed checkpoint — name-addressed download with CRC verification
+            return fetchFromCheckpoint(shard, pushed);
         }
-        if (advert.maxSeqNo() <= sinceWatermark) {
+
+        // ── Mailbox empty ────────────────────────────────────────────
+        if (seeded) {
+            logger.trace(
+                "MAILBOX_EMPTY_SEEDED target=[{}][{}] watermark={} — no-op",
+                indexSettings.getIndex().getName(),
+                shard.shardId().id(),
+                sinceWatermark
+            );
             return null;
         }
 
-        List<Path> parquetFiles = source.downloadedParquetFiles(workingPath);
-        if (parquetFiles.isEmpty()) {
-            logger.warn("mv_pull gen {} claims through {} without parquet; no snapshot returned", advert.infosVersion(), advert.maxSeqNo());
-            return null;
-        }
-
-        seededByPull = true;
-        return new MVSourceSnapshot(
-            shard.shardId().toString(),
-            advert.maxSeqNo(),
-            advert.primaryTerm(),
-            advert.infosVersion(),
-            parquetFiles
+        // ── Cold start: RPC to source node ───────────────────────────
+        logger.debug(
+            "COLD_START target=[{}][{}] watermark={}",
+            indexSettings.getIndex().getName(),
+            shard.shardId().id(),
+            sinceWatermark
         );
+
+        MVReplicationCheckpoint coldStart = tryColdStartRequest(
+            sourceIndexName, sourceShardId, shard
+        );
+        if (coldStart != null) {
+            if (coldStart.maxSeqNo() <= sinceWatermark) {
+                seeded = true;
+                return null;
+            }
+            DerivedSourceSnapshot snapshot = fetchFromCheckpoint(shard, coldStart);
+            if (snapshot != null) {
+                seeded = true;
+            }
+            return snapshot;
+        }
+
+        // Cold-start RPC failed — return null, poller's backoff retries next round.
+        logger.debug(
+            "COLD_START_FAILED target=[{}][{}] — will retry next round",
+            indexSettings.getIndex().getName(),
+            shard.shardId().id()
+        );
+        return null;
     }
 
     /**
@@ -254,7 +243,7 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
             return null;
         }
 
-        seededByPull = true;
+        seeded = true;
         return new MVSourceSnapshot(
             shard.shardId().toString(),
             checkpoint.maxSeqNo(),
@@ -280,14 +269,27 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
     }
 
     /**
-     * Attempts a cold-start request to the source node. Returns the checkpoint
-     * from the response, or null on failure.
+     * Cold-start RPC: sends {@link MVCheckpointRequestAction} to the source
+     * primary node. The handler runs on GENERIC (verified in
+     * {@link org.opensearch.mv.MVCheckpointRequestTransportHandler} — registered
+     * with {@code ThreadPool.Names.GENERIC} executor) so there is no deadlock
+     * even when source and target are on the same node: the request executes on
+     * a different GENERIC thread than this caller.
+     *
+     * <p>Blocks for up to {@link #COLD_START_TIMEOUT_SECONDS}. On any failure,
+     * returns null — the poller's existing backoff retries next round.</p>
      */
     private MVReplicationCheckpoint tryColdStartRequest(
         String sourceIndexName,
         int sourceShardId,
         ShardRouting shard
     ) {
+        org.opensearch.transport.client.Client client = services.client();
+        if (client == null) {
+            logger.debug("COLD_START_REQUEST: client not available (test context?)");
+            return null;
+        }
+
         try {
             // Resolve the source primary node from cluster state
             org.opensearch.cluster.routing.ShardRouting sourceRouting = services.clusterService()
@@ -307,23 +309,46 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
                 shard.shardId().id()
             );
 
-            // Synchronous execution with a short timeout
-            MVCheckpointRequestAction.Response response = services.clusterService()
-                .localNode()
-                .getId()
-                .equals(sourceRouting.currentNodeId())
-                    // Source is local: we cannot use client.execute here because
-                    // that may deadlock on the same thread pool. Just return null
-                    // and let the legacy fallback handle it.
-                    ? null
-                    : null; // TODO: Wire client.execute with a timeout.
-            // For now, cold-start request is a documented TODO — the legacy
-            // pull fallback handles cold starts. The key fix (seeded+empty => null)
-            // eliminates 99.9% of the PULL_FALLBACK traffic. Cold-start request
-            // saves only the FIRST round's listing.
-            return null;
+            logger.debug(
+                "COLD_START_REQUEST target=[{}][{}] -> source=[{}][{}]",
+                indexSettings.getIndex().getName(),
+                shard.shardId().id(),
+                sourceIndexName,
+                sourceShardId
+            );
+
+            // Synchronous with bounded timeout. The handler is registered on
+            // GENERIC executor (not SAME), so even co-located source/target
+            // won't deadlock — the handler runs on a separate GENERIC thread.
+            MVCheckpointRequestAction.Response response = client.execute(
+                MVCheckpointRequestAction.INSTANCE,
+                request
+            ).actionGet(COLD_START_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+            if (response.available() && response.checkpoint() != null) {
+                logger.info(
+                    "COLD_START_REPLY target=[{}][{}] maxSeqNo={} files={}",
+                    indexSettings.getIndex().getName(),
+                    shard.shardId().id(),
+                    response.checkpoint().maxSeqNo(),
+                    response.checkpoint().fileMetadata().size()
+                );
+                return response.checkpoint();
+            } else {
+                logger.debug(
+                    "COLD_START_REPLY: source has no data for [{}][{}]",
+                    sourceIndexName,
+                    sourceShardId
+                );
+                return null;
+            }
         } catch (Exception e) {
-            logger.debug("COLD_START_REQUEST failed for [{}][{}]: {}", sourceIndexName, sourceShardId, e.getMessage());
+            logger.debug(
+                "COLD_START_REQUEST failed for [{}][{}]: {}",
+                sourceIndexName,
+                sourceShardId,
+                e.getMessage()
+            );
             return null;
         }
     }

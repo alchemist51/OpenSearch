@@ -45,7 +45,6 @@ public final class MVCheckpointMailbox {
     private final ConcurrentMap<String, MVReplicationCheckpoint> slots = new ConcurrentHashMap<>();
     private final AtomicLong pushCount = new AtomicLong();
     private final AtomicLong consumeCount = new AtomicLong();
-    private final AtomicLong fallbackCount = new AtomicLong();
     /**
      * Per-slot last consumed maxSeqNo — the target's effective watermark as
      * seen by the mailbox. Updated on every {@link #consume} call. Key format
@@ -137,11 +136,6 @@ public final class MVCheckpointMailbox {
         return slots.get(slotKey(targetIndex, targetShard, sourceIndex, sourceShard));
     }
 
-    /** Records a pull fallback for observability. */
-    public void recordFallback() {
-        fallbackCount.incrementAndGet();
-    }
-
     /**
      * Returns the last consumed maxSeqNo for a given target/source slot — the
      * target's effective watermark as seen by this mailbox. Returns -1 if the
@@ -159,10 +153,6 @@ public final class MVCheckpointMailbox {
 
     public long consumeCount() {
         return consumeCount.get();
-    }
-
-    public long fallbackCount() {
-        return fallbackCount.get();
     }
 
     public int pendingSlots() {

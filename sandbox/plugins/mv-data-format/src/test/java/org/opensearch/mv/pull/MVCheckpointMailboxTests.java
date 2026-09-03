@@ -77,14 +77,6 @@ public class MVCheckpointMailboxTests extends OpenSearchTestCase {
         assertEquals(100L, consumed.maxSeqNo());
     }
 
-    public void testFallbackCounter() {
-        MVCheckpointMailbox mailbox = new MVCheckpointMailbox();
-        assertEquals(0L, mailbox.fallbackCount());
-        mailbox.recordFallback();
-        mailbox.recordFallback();
-        assertEquals(2L, mailbox.fallbackCount());
-    }
-
     public void testLastConsumedWatermark() {
         MVCheckpointMailbox mailbox = new MVCheckpointMailbox();
         assertEquals(-1L, mailbox.lastConsumedWatermark("target", 0, "source", 0));

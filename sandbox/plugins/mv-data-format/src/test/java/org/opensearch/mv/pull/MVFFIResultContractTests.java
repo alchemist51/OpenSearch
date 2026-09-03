@@ -428,7 +428,7 @@ public class MVFFIResultContractTests extends OpenSearchTestCase {
     public void testSnapshotContainsAllElevenKeys() {
         MVBuildMetrics metrics = new MVBuildMetrics();
         Map<String, Long> snap = metrics.snapshot();
-        assertEquals("snapshot must contain exactly 25 metric keys", 25, snap.size());
+        assertEquals("snapshot must contain exactly 29 metric keys", 29, snap.size());
 
         // Verify each documented key exists
         assertTrue(snap.containsKey("spill_bytes"));

@@ -28,8 +28,8 @@ import java.io.IOException;
  * snapshot → replies with full {@link MVReplicationCheckpoint} → target
  * delivers into mailbox → proceeds as MAILBOX_HIT.
  *
- * <p>The legacy latestAdvert pull (full remote listing) is used ONLY as
- * a last resort if the RPC fails.
+ * <p>On RPC failure, the poller returns null and retries on the next round
+ * (covered by the poller's existing backoff).
  *
  * <p>Logs: COLD_START_REQUEST on send, COLD_START_REPLY on response.
  */

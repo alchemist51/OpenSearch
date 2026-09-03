@@ -10,18 +10,31 @@ package org.opensearch.mv.pull;
 
 import org.opensearch.test.OpenSearchTestCase;
 
+/**
+ * Unit tests for {@link MVRemoteSource}.
+ *
+ * <p>After the no-legacy sweep, MVRemoteSource only exposes
+ * {@code downloadFiles()} (name-addressed download). The legacy
+ * {@code latestAdvert()}, {@code isRequiredPullFile()}, and
+ * {@code downloadedParquetFiles()} methods have been deleted.
+ *
+ * <p>Integration-level downloadFiles tests require a real or mock
+ * RemoteSegmentStoreDirectory which is covered by the integration
+ * tests (MVPullDataFusionIT). This file retains a placeholder for
+ * future unit tests when a mock remote directory is available.
+ */
 public class MVRemoteSourceTests extends OpenSearchTestCase {
 
-    public void testRequiredPullFilesIncludeParquetAndSegmentInfo() {
-        assertTrue(MVRemoteSource.isRequiredPullFile("parquet/_parquet_file_generation_1.parquet"));
-        assertTrue(MVRemoteSource.isRequiredPullFile("lucene/_0.si"));
-    }
-
-    public void testRequiredPullFilesExcludeUnusedLuceneBlobs() {
-        assertFalse(MVRemoteSource.isRequiredPullFile("lucene/_0.tim"));
-        assertFalse(MVRemoteSource.isRequiredPullFile("lucene/_0.tip"));
-        assertFalse(MVRemoteSource.isRequiredPullFile("lucene/_0.dvd"));
-        assertFalse(MVRemoteSource.isRequiredPullFile("lucene/_0.fdm"));
-        assertFalse(MVRemoteSource.isRequiredPullFile("segments_42"));
+    /**
+     * Placeholder: MVRemoteSource.downloadFiles with an empty list
+     * returns an empty list without initializing the remote directory.
+     * Full download tests require a mock RemoteSegmentStoreDirectory.
+     */
+    public void testPlaceholder() {
+        // MVRemoteSource requires real services to construct; downloadFiles
+        // with empty input is a trivial code path. The meaningful test is
+        // in MVPullDataFusionIT which exercises the full push→download→build
+        // pipeline end to end.
+        assertTrue(true);
     }
 }

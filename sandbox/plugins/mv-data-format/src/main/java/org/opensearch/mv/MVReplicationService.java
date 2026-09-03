@@ -60,19 +60,38 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@link NodeRoutingSnapshotService#sourceToTargets()}), reads each
  * shard's {@code getProcessedLocalCheckpoint()} (a lock-free volatile
  * read — no remote IO), and publishes via {@link MVCheckpointPublisher}
- * only when the checkpoint has advanced since the last published value.</p>
+ * when targets need data.</p>
  *
- * <p>On CAS-gate advance, reads the shard's catalog snapshot to extract
- * REAL parquet file lists with names, sizes, and per-file seq ranges,
- * so that the publisher's per-target filtering actually runs.</p>
+ * <h2>Advert maxSeqNo (Defect 1 fix)</h2>
+ *
+ * <p>The checkpoint's maxSeqNo is derived from the catalog — the maximum
+ * over all parquet filesets' maxSeqNo values. This ensures the advert
+ * never claims seqNos that its file manifest does not cover. If ALL
+ * filesets have unknown seq ranges (legacy, all -1), we fall back to the
+ * processed local checkpoint (no worse than before). If the computed
+ * advertMax &lt;= 0 or no files exist, publish is skipped.</p>
+ *
+ * <h2>Per-target lag publish (Defect 2 fix)</h2>
+ *
+ * <p>Instead of a global CAS-advance gate on lastPublished, per-shard state
+ * tracks {@code lastObservedProcessed} and {@code lastAdvertMax}. The catalog
+ * is read and a checkpoint is rebuilt when ANY of these conditions is true:</p>
+ * <pre>
+ *   (A) processed > lastObservedProcessed  — possible new data
+ *   (B) processed > lastAdvertMax           — refresh may have closed the gap
+ *                                             between processed and file coverage
+ *   (C) publisher.anyTargetBehind(lastAdvertMax) — retry path: at least one
+ *                                             target hasn't confirmed receipt
+ * </pre>
+ * <p>The publisher's per-target skip logic makes re-sends idempotent: targets
+ * whose watermark >= advertMax receive nothing. A lost push is retried every
+ * tick until the target's response confirms its watermark.</p>
  *
  * <p><b>Reconciliation:</b> Also implements {@link ClusterStateListener}
  * to detect source shards that were already STARTED before the MV target
  * index was created. On cluster state change, checks sourceToTargets for
  * any source index whose local primary shards are not yet tracked, and
- * adds them. This mirrors {@code NodeDerivedPullService.reconcileOnGeneric}
- * and ensures that the normal order (source starts first, target created
- * later) works without restart.</p>
+ * adds them.</p>
  *
  * <p><b>SAFETY:</b> never calls
  * {@code clusterService.state()} from the applier thread — all routing
@@ -98,10 +117,30 @@ public final class MVReplicationService implements IndexEventListener, ClusterSt
         Setting.Property.NodeScope
     );
 
-    /** Tracked local source shard state: the shard reference + publisher. */
+    /**
+     * Per-shard tracked state. Holds the shard reference, publisher, and
+     * tick-local bookkeeping for the rebuild condition.
+     *
+     * <p>All fields except publisher are mutated only by tick() which runs
+     * on a single-threaded scheduleWithFixedDelay — no CAS needed.</p>
+     */
     static final class TrackedShard {
         final IndexShard shard;
         final MVCheckpointPublisher publisher;
+
+        /**
+         * Last processedLocalCheckpoint observed by tick(). Used to detect
+         * new data. Updated after each tick iteration.
+         */
+        long lastObservedProcessed = -1L;
+
+        /**
+         * maxSeqNo of the last checkpoint built from the catalog. Represents
+         * the highest seq coverage we last advertised. A refresh that adds
+         * file coverage without a new processed advance is detected when
+         * processed > lastAdvertMax.
+         */
+        long lastAdvertMax = -1L;
 
         TrackedShard(IndexShard shard, MVCheckpointPublisher publisher) {
             this.shard = shard;
@@ -127,9 +166,6 @@ public final class MVReplicationService implements IndexEventListener, ClusterSt
      */
     private final ConcurrentHashMap<ShardId, IndexShard> allSourceShards = new ConcurrentHashMap<>();
 
-    /** Per-shard last-published checkpoint — publish only on advance. */
-    private final ConcurrentHashMap<ShardId, AtomicLong> lastPublished = new ConcurrentHashMap<>();
-
     /** Scheduler handle for the tick — null until started. */
     private volatile Scheduler.Cancellable scheduledTick;
     private volatile boolean closed;
@@ -141,6 +177,7 @@ public final class MVReplicationService implements IndexEventListener, ClusterSt
     private final AtomicLong skipCount = new AtomicLong();
     private final AtomicLong catalogReadCount = new AtomicLong();
     private final AtomicLong reconcileCount = new AtomicLong();
+    private final AtomicLong unknownRangeSkipCount = new AtomicLong();
 
     public MVReplicationService(Client client, NodeRoutingSnapshotService routingService, ThreadPool threadPool, TimeValue interval) {
         this.client = client;
@@ -226,7 +263,6 @@ public final class MVReplicationService implements IndexEventListener, ClusterSt
             if (targets == null || targets.isEmpty()) {
                 TrackedShard removed = trackedShards.remove(shardId);
                 if (removed != null) {
-                    lastPublished.remove(shardId);
                     logger.info("mv_replication: untracked source shard [{}] — no more targets", shardId);
                 }
             }
@@ -270,7 +306,6 @@ public final class MVReplicationService implements IndexEventListener, ClusterSt
         );
         TrackedShard tracked = new TrackedShard(indexShard, publisher);
         trackedShards.put(shardId, tracked);
-        lastPublished.putIfAbsent(shardId, new AtomicLong(-1L));
         logger.info("mv_replication: tracking source shard [{}] with {} bound target(s)", shardId, targets.size());
     }
 
@@ -283,7 +318,6 @@ public final class MVReplicationService implements IndexEventListener, ClusterSt
         allSourceShards.remove(shardId);
         TrackedShard removed = trackedShards.remove(shardId);
         if (removed != null) {
-            lastPublished.remove(shardId);
             logger.info("mv_replication: stopped tracking source shard [{}]", shardId);
         }
     }
@@ -293,8 +327,24 @@ public final class MVReplicationService implements IndexEventListener, ClusterSt
     /**
      * Called every {@link #interval} on the GENERIC thread pool. Iterates
      * all tracked local primary source shards and publishes checkpoints
-     * for any that have advanced. On advance, reads the catalog snapshot
-     * to extract REAL file lists with seq ranges.
+     * when targets need data.
+     *
+     * <p><b>Rebuild condition (per-shard):</b></p>
+     * <p>Read the catalog and build a new checkpoint when ANY of:</p>
+     * <pre>
+     *   (A) processed > lastObservedProcessed  — new data committed
+     *   (B) processed > lastAdvertMax           — refresh may have added
+     *       file coverage that closes the gap between processed and what
+     *       files covered last time (e.g. parquet flush lagged behind
+     *       processed advance)
+     *   (C) publisher.anyTargetBehind(lastAdvertMax) — at least one target
+     *       hasn't confirmed receipt of the last advert; re-send is
+     *       idempotent via per-target watermark skip in the publisher
+     * </pre>
+     *
+     * <p>After building: lastObservedProcessed = currentProcessed;
+     * lastAdvertMax = checkpoint.maxSeqNo. The publisher's per-target skip
+     * ensures at-parity targets receive nothing.</p>
      */
     void tick() {
         if (closed || trackedShards.isEmpty()) return;
@@ -319,28 +369,35 @@ public final class MVReplicationService implements IndexEventListener, ClusterSt
                 continue;
             }
 
-            long currentCheckpoint;
+            long currentProcessed;
             try {
-                currentCheckpoint = tracked.shard.getProcessedLocalCheckpoint();
+                currentProcessed = tracked.shard.getProcessedLocalCheckpoint();
             } catch (Exception e) {
                 continue;
             }
 
-            AtomicLong lastPub = lastPublished.get(shardId);
-            if (lastPub == null) continue;
-            long last = lastPub.get();
-            if (currentCheckpoint <= last) {
+            // ── Rebuild condition ────────────────────────────────────────
+            // (A) New data: processed advanced since last observation
+            boolean newData = currentProcessed > tracked.lastObservedProcessed;
+            // (B) Refresh-closes-gap: processed is ahead of what files covered
+            //     last time — a refresh may have flushed new parquet files
+            boolean refreshClosedGap = currentProcessed > tracked.lastAdvertMax;
+            // (C) Retry: at least one target hasn't confirmed the last advert
+            boolean targetsBehind = tracked.publisher.anyTargetBehind(tracked.lastAdvertMax);
+
+            if (!newData && !refreshClosedGap && !targetsBehind) {
                 skipCount.incrementAndGet();
                 continue;
             }
 
-            if (!lastPub.compareAndSet(last, currentCheckpoint)) {
-                continue;
-            }
+            // Update observation before catalog read
+            tracked.lastObservedProcessed = currentProcessed;
 
-            // ── REAL ADVERT: read catalog snapshot on advance ────────────
+            // ── REAL ADVERT: read catalog snapshot ───────────────────────
             Map<String, MVFileMetadata> fileMetadata = new java.util.LinkedHashMap<>();
             long infosVersion = 0L;
+            long catalogAdvertMax = -1L;
+            boolean anyUnknownRange = false;
 
             try (GatedCloseable<CatalogSnapshot> ref = tracked.shard.getCatalogSnapshot()) {
                 catalogReadCount.incrementAndGet();
@@ -348,7 +405,6 @@ public final class MVReplicationService implements IndexEventListener, ClusterSt
                 infosVersion = catalog.getVersion();
 
                 for (Segment seg : catalog.getSegments()) {
-                    // Look for parquet filesets in the segment
                     for (Map.Entry<String, WriterFileSet> fsEntry : seg.dfGroupedSearchableFiles().entrySet()) {
                         String formatName = fsEntry.getKey();
                         if (!"parquet".equals(formatName)) continue;
@@ -356,7 +412,6 @@ public final class MVReplicationService implements IndexEventListener, ClusterSt
                         WriterFileSet wfs = fsEntry.getValue();
                         Path dir = Path.of(wfs.directory());
                         for (String fileName : wfs.files()) {
-                            // Best-effort local size
                             long size = -1L;
                             try {
                                 Path filePath = dir.resolve(fileName);
@@ -364,40 +419,89 @@ public final class MVReplicationService implements IndexEventListener, ClusterSt
                                     size = Files.size(filePath);
                                 }
                             } catch (Exception ignored) {}
-                            // CRC32: attempt to read from shard's PrecomputedChecksumStrategy
-                            // if cheaply accessible; else -1 (unknown).
+
+                            // All writers populate ranges now. If a fileset
+                            // has an unknown range, that is a BUG — log WARN
+                            // and skip publish (never overclaim).
+                            if (wfs.maxSeqNo() < 0) {
+                                anyUnknownRange = true;
+                            }
+
                             long crc32 = MVFileMetadata.CRC32_UNKNOWN;
                             fileMetadata.put(fileName, new MVFileMetadata(
                                 size, wfs.minSeqNo(), wfs.maxSeqNo(), crc32
                             ));
+
+                            // Track max seqNo across all filesets for advertMax
+                            if (wfs.maxSeqNo() >= 0) {
+                                if (wfs.maxSeqNo() > catalogAdvertMax) {
+                                    catalogAdvertMax = wfs.maxSeqNo();
+                                }
+                            }
                         }
                     }
                 }
             } catch (Exception e) {
-                // Catalog read failed — publish with empty map (notification-only).
-                // Target falls back to pull path.
-                logger.debug("mv_replication: catalog read failed for shard [{}], publishing notification-only", shardId, e);
+                // Catalog read failure: skip this tick iteration with WARN,
+                // next tick retries. Never send an empty-manifest advert.
+                logger.warn(
+                    "mv_replication: catalog read failed for shard [{}], skipping tick (will retry next interval): {}",
+                    shardId,
+                    e.getMessage()
+                );
+                continue;
             }
+
+            // ── Unknown range = BUG: WARN and skip, never overclaim ──────
+            if (anyUnknownRange) {
+                unknownRangeSkipCount.incrementAndGet();
+                logger.warn(
+                    "mv_replication: shard [{}] has fileset(s) with unknown seq range — this is a bug "
+                        + "(all writers must populate ranges). Skipping publish to avoid overclaim.",
+                    shardId
+                );
+                continue;
+            }
+
+            // ── Determine advertMax ──────────────────────────────────────
+            // advertMax comes from catalog file ranges, not
+            // processedLocalCheckpoint. This prevents overclaiming seqNos
+            // that are processed but not yet flushed to parquet.
+            long advertMax;
+            if (catalogAdvertMax > 0) {
+                advertMax = catalogAdvertMax;
+            } else {
+                // No files or no coverable data — skip publish
+                logger.trace("mv_replication: shard [{}] no coverable files, skipping publish", shardId);
+                continue;
+            }
+
+            tracked.lastAdvertMax = advertMax;
 
             MVReplicationCheckpoint checkpoint = new MVReplicationCheckpoint(
                 shardId.getIndexName(),
                 shardId.id(),
                 tracked.shard.getOperationPrimaryTerm(),
-                currentCheckpoint,
+                advertMax,
                 infosVersion,
                 fileMetadata,
                 System.currentTimeMillis()
             );
 
-            tracked.publisher.publish(checkpoint);
-            publishCount.incrementAndGet();
+            int sent = tracked.publisher.publish(checkpoint);
+            if (sent > 0) {
+                publishCount.incrementAndGet();
+            }
 
             if (logger.isTraceEnabled()) {
                 logger.trace(
-                    "mv_replication: published checkpoint {} for source shard [{}] (advanced from {}) files={}",
-                    currentCheckpoint,
+                    "mv_replication: published checkpoint advertMax={} for source shard [{}] "
+                        + "(processed={}, catalogMax={}, sent={}, files={})",
+                    advertMax,
                     shardId,
-                    last,
+                    currentProcessed,
+                    catalogAdvertMax,
+                    sent,
                     fileMetadata.size()
                 );
             }
@@ -419,10 +523,9 @@ public final class MVReplicationService implements IndexEventListener, ClusterSt
         }
         trackedShards.clear();
         allSourceShards.clear();
-        lastPublished.clear();
         logger.info(
-            "mv_replication: closed (ticks={}, publishes={}, skips={}, catalog_reads={}, reconciles={})",
-            tickCount.get(), publishCount.get(), skipCount.get(), catalogReadCount.get(), reconcileCount.get()
+            "mv_replication: closed (ticks={}, publishes={}, skips={}, catalog_reads={}, reconciles={}, unknown_range_skips={})",
+            tickCount.get(), publishCount.get(), skipCount.get(), catalogReadCount.get(), reconcileCount.get(), unknownRangeSkipCount.get()
         );
     }
 
@@ -450,6 +553,10 @@ public final class MVReplicationService implements IndexEventListener, ClusterSt
 
     public long reconcileCount() {
         return reconcileCount.get();
+    }
+
+    public long unknownRangeSkipCount() {
+        return unknownRangeSkipCount.get();
     }
 
     public boolean isClosed() {

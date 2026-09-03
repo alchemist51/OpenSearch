@@ -193,13 +193,22 @@ public final class MVPullSettings {
      * </ul>
      */
     public record Services(ClusterService clusterService, ThreadPool threadPool, Supplier<RepositoriesService> repositoriesService,
-        long dataFusionRuntimePtr, CircuitBreaker parentCircuitBreaker) {
+        long dataFusionRuntimePtr, CircuitBreaker parentCircuitBreaker,
+        org.opensearch.transport.client.Client client) {
         /**
-         * Backward-compatible constructor without Stage 2 services.
+         * Backward-compatible constructor without Stage 2 services or client.
          * Used by tests and legacy code paths that don't need managed builds.
          */
         public Services(ClusterService clusterService, ThreadPool threadPool, Supplier<RepositoriesService> repositoriesService) {
-            this(clusterService, threadPool, repositoriesService, 0L, null);
+            this(clusterService, threadPool, repositoriesService, 0L, null, null);
+        }
+
+        /**
+         * Constructor without client — for existing call sites that don't need cold-start RPC.
+         */
+        public Services(ClusterService clusterService, ThreadPool threadPool, Supplier<RepositoriesService> repositoriesService,
+            long dataFusionRuntimePtr, CircuitBreaker parentCircuitBreaker) {
+            this(clusterService, threadPool, repositoriesService, dataFusionRuntimePtr, parentCircuitBreaker, null);
         }
 
         /** The node's fixed segments path prefix — MUST match what the source's own uploads use. */
@@ -243,6 +252,14 @@ public final class MVPullSettings {
          */
         public CircuitBreaker parentCircuitBreaker() {
             return parentCircuitBreaker;
+        }
+
+        /**
+         * Returns the transport client for cold-start RPC (checkpoint request
+         * action). May be null in unit tests — callers must null-check.
+         */
+        public org.opensearch.transport.client.Client client() {
+            return client;
         }
     }
 }

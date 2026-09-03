@@ -194,7 +194,8 @@ public class MVDataFormatPlugin extends Plugin
             threadPool,
             repositoriesServiceSupplier,
             mvRuntimePtr,
-            mvPullBreaker
+            mvPullBreaker,
+            client
         );
         MVDerivedPullFormat mvFormat = new MVDerivedPullFormat(mvServices);
         this.pullService = new NodeDerivedPullService(threadPool, java.util.List.of(mvFormat));

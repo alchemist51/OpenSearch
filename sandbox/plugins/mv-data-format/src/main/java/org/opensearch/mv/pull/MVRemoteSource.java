@@ -10,34 +10,23 @@ package org.opensearch.mv.pull;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.lucene.index.SegmentInfos;
-import org.apache.lucene.store.BufferedChecksumIndexInput;
-import org.apache.lucene.store.ChecksumIndexInput;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.remote.RemoteStoreUtils;
-import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
-import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 /**
- * Remote-store pull source: reads the SOURCE index's published segment
- * metadata and segment files directly from its remote segment store. The
- * source shard is never contacted — mirroring how a segrep replica hydrates
- * via {@code RemoteStoreReplicationSource}, but from a different index.
+ * Remote-store source: reads the SOURCE index's remote segment store
+ * for name-addressed file downloads. The source shard is never contacted
+ * directly — all data arrives via the remote segment store.
  *
  * <h2>Name-addressed download</h2>
  * <p>{@link #downloadFiles(List, Path)} fetches exactly the named parquet files
@@ -55,14 +44,12 @@ final class MVRemoteSource {
     private final int sourceShardId;
     private final org.opensearch.cluster.metadata.DerivedIndexBinding binding;
     private RemoteSegmentStoreDirectory remoteDirectory;
-    private final Set<String> downloadedParquet = new HashSet<>();
 
     /**
      * Cached metadata from the last successful {@code remote.init()} call.
      */
     private volatile RemoteSegmentMetadata cachedMetadata;
 
-    private long metadataCacheHits;
     private long metadataCacheRefreshes;
     private long nameAddressedDownloads;
     private long nameAddressedReinits;
@@ -77,55 +64,6 @@ final class MVRemoteSource {
         this.sourceIndexName = sourceIndexName;
         this.sourceShardId = sourceShardId;
         this.binding = binding;
-    }
-
-    /** One published source state: fencing term + per-refresh infos version + fold bound + parsed infos. */
-    record Advert(long primaryTerm, long infosVersion, long maxSeqNo, SegmentInfos infos) {
-    }
-
-    /**
-     * Reads the latest published metadata, downloads any missing segment
-     * files into the working directory, and only THEN parses the infos.
-     * This is the LEGACY pull path — used only as a last-resort fallback.
-     */
-    Advert latestAdvert(Directory workingDirectory) throws IOException {
-        RemoteSegmentStoreDirectory remote = remoteDirectory();
-        RemoteSegmentMetadata metadata = resolveMetadata(remote);
-        if (metadata == null) {
-            return null;
-        }
-        Set<String> local = new HashSet<>(java.util.Arrays.asList(workingDirectory.listAll()));
-        int downloaded = 0;
-        downloadedParquet.clear();
-        for (String file : metadata.getMetadata().keySet()) {
-            if (isRequiredPullFile(file) == false) {
-                continue;
-            }
-            String localName = file.replace('/', '$');
-            if (local.contains(localName) == false && file.startsWith(org.apache.lucene.index.IndexFileNames.SEGMENTS) == false) {
-                workingDirectory.copyFrom(remote, file, localName, IOContext.DEFAULT);
-                downloaded++;
-            }
-            if (file.endsWith(".parquet")) {
-                downloadedParquet.add(localName);
-            }
-        }
-        if (downloaded > 0) {
-            logger.debug("mv_pull gen={} files_downloaded={}", metadata.getGeneration(), downloaded);
-        }
-        ReplicationCheckpoint checkpoint = metadata.getReplicationCheckpoint();
-        byte[] infosBytes = metadata.getSegmentInfosBytes();
-        SegmentInfos infos;
-        try (ChecksumIndexInput input = new BufferedChecksumIndexInput(new ByteArrayIndexInput("mv_pull segment infos", infosBytes))) {
-            infos = SegmentInfos.readCommit(workingDirectory, input, metadata.getGeneration());
-        }
-        String maxSeqNo = infos.getUserData().get(SequenceNumbers.MAX_SEQ_NO);
-        if (maxSeqNo == null) {
-            throw new IllegalStateException(
-                "mv_pull: published metadata for [" + sourceIndexName + "] carries no " + SequenceNumbers.MAX_SEQ_NO
-            );
-        }
-        return new Advert(checkpoint.getPrimaryTerm(), checkpoint.getSegmentInfosVersion(), Long.parseLong(maxSeqNo), infos);
     }
 
     /**
@@ -167,7 +105,7 @@ final class MVRemoteSource {
             try {
                 // Try to copy from remote using the cached metadata
                 try (var dir = new org.apache.lucene.store.NIOFSDirectory(destDir)) {
-                    dir.copyFrom(remote, fileName, fileName.replace('/', '$'), IOContext.DEFAULT);
+                    dir.copyFrom(remote, fileName, fileName.replace('/', '$'), org.apache.lucene.store.IOContext.DEFAULT);
                 }
                 downloaded.add(localFile);
             } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
@@ -181,7 +119,7 @@ final class MVRemoteSource {
                         metadataCacheRefreshes++;
                         // Retry the download
                         try (var dir = new org.apache.lucene.store.NIOFSDirectory(destDir)) {
-                            dir.copyFrom(remote, fileName, fileName.replace('/', '$'), IOContext.DEFAULT);
+                            dir.copyFrom(remote, fileName, fileName.replace('/', '$'), org.apache.lucene.store.IOContext.DEFAULT);
                         }
                         downloaded.add(localFile);
                     } catch (Exception retryEx) {
@@ -202,27 +140,6 @@ final class MVRemoteSource {
         return downloaded;
     }
 
-    /**
-     * Resolves the current remote segment metadata.
-     */
-    private RemoteSegmentMetadata resolveMetadata(RemoteSegmentStoreDirectory remote) throws IOException {
-        if (cachedMetadata == null) {
-            cachedMetadata = remote.init();
-            metadataCacheRefreshes++;
-            return cachedMetadata;
-        }
-        RemoteSegmentMetadata freshMetadata = remote.init();
-        metadataCacheRefreshes++;
-        if (freshMetadata != null) {
-            cachedMetadata = freshMetadata;
-        }
-        return cachedMetadata;
-    }
-
-    long getMetadataCacheHits() {
-        return metadataCacheHits;
-    }
-
     long getMetadataCacheRefreshes() {
         return metadataCacheRefreshes;
     }
@@ -233,14 +150,6 @@ final class MVRemoteSource {
 
     long getNameAddressedReinits() {
         return nameAddressedReinits;
-    }
-
-    static boolean isRequiredPullFile(String file) {
-        return file.endsWith(".parquet") || file.endsWith(".si");
-    }
-
-    java.util.List<java.nio.file.Path> downloadedParquetFiles(java.nio.file.Path workingPath) {
-        return downloadedParquet.stream().sorted().map(workingPath::resolve).toList();
     }
 
     private RemoteSegmentStoreDirectory remoteDirectory() throws IOException {
@@ -265,7 +174,7 @@ final class MVRemoteSource {
                 sourceMetadata,
                 services.clusterService().getSettings()
             );
-            Directory directory = factory.newDirectory(
+            org.apache.lucene.store.Directory directory = factory.newDirectory(
                 repository,
                 sourceMetadata.getIndexUUID(),
                 new ShardId(sourceMetadata.getIndex(), sourceShardId),
