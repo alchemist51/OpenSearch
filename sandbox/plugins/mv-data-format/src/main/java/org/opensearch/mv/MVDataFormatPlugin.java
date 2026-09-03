@@ -144,6 +144,10 @@ public class MVDataFormatPlugin extends Plugin
         // per eligible local target primary shard — no MV-specific orchestration
         // code is needed.
 
+        // Initialize node-global checkpoint mailbox for push-based pull path.
+        org.opensearch.mv.pull.MVCheckpointMailbox checkpointMailbox = new org.opensearch.mv.pull.MVCheckpointMailbox();
+        org.opensearch.mv.pull.MVCheckpointMailbox.setInstance(checkpointMailbox);
+
         // Stage 2: create a shared DataFusionRuntime within this plugin's
         // native instance for managed MV builds. The MV classloader has its
         // own native globals (separate from the DF plugin), so we must
@@ -301,6 +305,8 @@ public class MVDataFormatPlugin extends Plugin
             new ActionHandler<>(MVShipStateAction.INSTANCE, MVShipStateTransportHandler.class),
             new ActionHandler<>(MVCursorAction.INSTANCE, MVCursorTransportHandler.class),
             new ActionHandler<>(MVSourceCommitAction.INSTANCE, MVSourceCommitTransportHandler.class),
+            // Checkpoint publish: source-pushed advert for pull-path targets.
+            new ActionHandler<>(MVCheckpointPublishAction.INSTANCE, MVCheckpointPublishTransportHandler.class),
             // Stage 5: MV definition control plane (validate + view CRUD).
             new ActionHandler<>(MVValidateAction.INSTANCE, TransportMVValidateAction.class),
             new ActionHandler<>(MVCreateViewAction.INSTANCE, TransportMVCreateViewAction.class),
@@ -399,7 +405,8 @@ public class MVDataFormatPlugin extends Plugin
             () -> clusterService,
             config.indexSettings().getSettings().getAsBoolean(MVConstants.STATE_MERGE_SETTING, false),
             routingSnapshotService != null ? routingSnapshotService::current : () -> TargetRoutingSnapshot.EMPTY,
-            mergeDefinition
+            mergeDefinition,
+            routingSnapshotService
         );
     }
 

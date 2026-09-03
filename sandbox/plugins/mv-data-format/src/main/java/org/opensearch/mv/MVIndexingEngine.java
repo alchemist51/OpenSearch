@@ -66,6 +66,14 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
      * safety reasoning.
      */
     private final java.util.function.Supplier<TargetRoutingSnapshot> routingSnapshotSupplier;
+    /**
+     * Node-scoped routing service for source→target resolution (checkpoint publishing).
+     * Null when not provided (legacy callers, test paths). Contains both the
+     * TargetRoutingSnapshot AND the source→targets mapping.
+     */
+    private final NodeRoutingSnapshotService nodeRoutingService;
+    /** Source-pushed checkpoint publisher for pull-path targets. Null on targets. */
+    private volatile MVCheckpointPublisher checkpointPublisher;
     /** Standard data-format merger backed by the selected MV strategy. */
     private final Merger merger;
     /** Definition name from index.mv.definition — the ship fingerprint (D30 I6). */
@@ -153,6 +161,7 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
             clusterServiceSupplier,
             stateMergeEnabled,
             routingSnapshotSupplier,
+            null,
             null
         );
     }
@@ -177,7 +186,8 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
         java.util.function.Supplier<org.opensearch.cluster.service.ClusterService> clusterServiceSupplier,
         boolean stateMergeEnabled,
         java.util.function.Supplier<TargetRoutingSnapshot> routingSnapshotSupplier,
-        MVCompiledDefinition mergeDefinition
+        MVCompiledDefinition mergeDefinition,
+        NodeRoutingSnapshotService nodeRoutingService
     ) {
         this.spec = spec;
         this.format = format;
@@ -189,6 +199,7 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
         this.clientSupplier = clientSupplier;
         this.clusterServiceSupplier = clusterServiceSupplier;
         this.routingSnapshotSupplier = routingSnapshotSupplier;
+        this.nodeRoutingService = nodeRoutingService;
         MVMergeStrategy mergeStrategy;
         if (this.shipTargets.isEmpty() == false) {
             mergeStrategy = new NoOpMVMergeStrategy();
@@ -255,6 +266,25 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
             knownNoOps.set(
                 encodedNoOps == null ? MVSourceSeqCoverage.EMPTY : MVSourceSeqCoverage.decode(encodedNoOps).through(localCheckpoint)
             );
+        }
+        // Source side: initialize checkpoint publisher for push-based pull targets.
+        // The publisher resolves bound targets from the routing snapshot service
+        // (cluster-state-safe). Only created on source engines (not mv_state targets).
+        if (MVStateDataFormat.NAME.equals(format.name()) == false && nodeRoutingService != null) {
+            org.opensearch.transport.client.Client c = clientSupplier.get();
+            if (c != null) {
+                // Source UUID is read from index metadata in the cluster state via
+                // the routing service's latest snapshot (not clusterService.state()).
+                // For now, pass null as sourceUuid — the publisher validates via
+                // the routing service's BoundTarget.sourceUuid at publish time.
+                this.checkpointPublisher = new MVCheckpointPublisher(
+                    c,
+                    sourceIndexName,
+                    null, // sourceUuid resolved at publish time from BoundTarget
+                    shardPath.getShardId().id(),
+                    nodeRoutingService
+                );
+            }
         }
         // Target side: seed the exact cursor ledger from our own last commit
         // so certification never regresses across restarts.
@@ -793,7 +823,69 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
         List<Segment> segments = new ArrayList<>();
         segments.addAll(refreshInput.existingSegments());
         segments.addAll(refreshInput.writerFiles());
+
+        // Source side: publish checkpoint to pull-path targets.
+        // Extract parquet file names from the refresh input's writer files and
+        // publish an advert so targets avoid remote-store listing.
+        MVCheckpointPublisher publisher = this.checkpointPublisher;
+        if (publisher != null && MVStateDataFormat.NAME.equals(format.name()) == false) {
+            publishCheckpointFromRefresh(publisher, refreshInput);
+        }
+
         return new RefreshResult(List.copyOf(segments));
+    }
+
+    /**
+     * Extracts parquet file metadata from the current catalog and pushes a
+     * checkpoint advert to bound pull-path targets. Fire-and-forget: failures
+     * are logged but never block the source refresh.
+     */
+    private void publishCheckpointFromRefresh(MVCheckpointPublisher publisher, RefreshInput refreshInput) {
+        try {
+            // Read the source's own latest catalog to get the full parquet file list
+            // and maxSeqNo (the fold bound C). The catalog is the authoritative
+            // view of what's been uploaded to the remote segment store.
+            var snapshotSupplier = catalogSnapshotSupplier;
+            if (snapshotSupplier == null) {
+                return;
+            }
+            try (var snapshotRef = snapshotSupplier.get()) {
+                java.util.List<org.opensearch.index.engine.exec.MonoFileWriterSet> parquetFiles = snapshotRef.get()
+                    .getSearchableFiles("parquet")
+                    .stream()
+                    .map(org.opensearch.index.engine.exec.MonoFileWriterSet::from)
+                    .toList();
+
+                if (parquetFiles.isEmpty()) {
+                    return;
+                }
+
+                // Extract parquet file names and sizes
+                java.util.List<String> fileNames = new ArrayList<>();
+                java.util.List<Long> fileSizes = new ArrayList<>();
+                for (var f : parquetFiles) {
+                    fileNames.add(f.file());
+                    // File size is not directly available from MonoFileWriterSet;
+                    // pass -1 and let the target resolve from remote metadata.
+                    // TODO: Plumb per-file byte sizes from the catalog if cheaply available.
+                    fileSizes.add(-1L);
+                }
+
+                // Get maxSeqNo from the fold tracker (the contiguous processed checkpoint)
+                org.opensearch.index.seqno.LocalCheckpointTracker tracker = foldTracker;
+                long maxSeqNo = tracker != null ? tracker.getProcessedCheckpoint() : -1L;
+                if (maxSeqNo < 0) {
+                    return;
+                }
+
+                // infosVersion is not directly available here; use 0 as placeholder.
+                // The target uses maxSeqNo as the primary freshness signal.
+                publisher.publish(maxSeqNo, 0L, 0L, fileNames, fileSizes);
+            }
+        } catch (Exception e) {
+            org.apache.logging.log4j.LogManager.getLogger(MVIndexingEngine.class)
+                .debug("checkpoint_publish: failed to extract/publish from refresh: {}", e.getMessage());
+        }
     }
 
     @Override

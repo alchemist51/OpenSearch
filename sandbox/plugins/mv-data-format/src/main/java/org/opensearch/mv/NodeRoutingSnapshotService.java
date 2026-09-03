@@ -16,7 +16,14 @@ import org.opensearch.cluster.ClusterStateListener;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 
+import org.opensearch.cluster.metadata.DerivedIndexBinding;
+import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.cluster.routing.ShardRouting;
+
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -50,8 +57,16 @@ public class NodeRoutingSnapshotService implements ClusterStateListener {
     private static final Logger logger = LogManager.getLogger(NodeRoutingSnapshotService.class);
 
     private final AtomicReference<TargetRoutingSnapshot> current = new AtomicReference<>(TargetRoutingSnapshot.EMPTY);
+    /** Source index name → list of bound target descriptors. Lock-free via AtomicReference. */
+    private final AtomicReference<Map<String, List<BoundTarget>>> sourceToTargets = new AtomicReference<>(Map.of());
     private final String nodeId;
     private volatile ClusterService clusterService;
+
+    /**
+     * Describes a target index that is bound to a source via DerivedIndexBinding.
+     * Immutable, published atomically alongside the routing snapshot.
+     */
+    public record BoundTarget(String targetIndex, int targetShards, String sourceUuid) {}
 
     public NodeRoutingSnapshotService(String nodeId) {
         this.nodeId = nodeId;
@@ -80,14 +95,35 @@ public class NodeRoutingSnapshotService implements ClusterStateListener {
     public void clusterChanged(ClusterChangedEvent event) {
         ClusterState state = event.state();
         Map<String, Integer> shardCounts = new HashMap<>();
+        Map<String, List<BoundTarget>> srcToTgt = new HashMap<>();
         for (Map.Entry<String, IndexMetadata> entry : state.metadata().indices().entrySet()) {
+            String indexName = entry.getKey();
+            IndexMetadata metadata = entry.getValue();
             // Capture shard counts for ALL indices — the engine's ship targets
             // may reference any of them. The map is small (index name → int).
-            shardCounts.put(entry.getKey(), entry.getValue().getNumberOfShards());
+            shardCounts.put(indexName, metadata.getNumberOfShards());
+
+            // Build source→target mapping from DerivedIndexBinding.
+            // Target indices declare their source via index.derived.source.name/uuid;
+            // we invert that into source→[targets] for checkpoint publishing.
+            DerivedIndexBinding binding = metadata.getDerivedIndexBinding();
+            if (binding != null) {
+                String category = DerivedIndexBinding.dataFormatCategory(metadata.getSettings());
+                if (category != null) {
+                    BoundTarget bt = new BoundTarget(indexName, metadata.getNumberOfShards(), binding.sourceUuid());
+                    srcToTgt.computeIfAbsent(binding.sourceName(), k -> new ArrayList<>()).add(bt);
+                }
+            }
         }
+        // Make inner lists immutable
+        Map<String, List<BoundTarget>> immutable = new HashMap<>();
+        srcToTgt.forEach((k, v) -> immutable.put(k, Collections.unmodifiableList(v)));
+
         TargetRoutingSnapshot snap = new TargetRoutingSnapshot(shardCounts, state.version(), nodeId);
         current.set(snap); // atomic publish — lock-free
-        logger.trace("Updated routing snapshot to version {} with {} indices", state.version(), shardCounts.size());
+        sourceToTargets.set(Collections.unmodifiableMap(immutable));
+        logger.trace("Updated routing snapshot to version {} with {} indices, {} source→target bindings",
+            state.version(), shardCounts.size(), srcToTgt.size());
     }
 
     /**
@@ -97,6 +133,17 @@ public class NodeRoutingSnapshotService implements ClusterStateListener {
      */
     public TargetRoutingSnapshot current() {
         return current.get();
+    }
+
+    /**
+     * Returns the current source→targets map. Lock-free read via
+     * AtomicReference. Used by the checkpoint publisher in afterRefresh
+     * to resolve which target shards to push to for a given source index.
+     *
+     * @return immutable map of source index name → list of bound targets
+     */
+    public Map<String, List<BoundTarget>> sourceToTargets() {
+        return sourceToTargets.get();
     }
 
     /**
