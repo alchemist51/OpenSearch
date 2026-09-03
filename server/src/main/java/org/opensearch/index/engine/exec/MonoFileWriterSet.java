@@ -9,10 +9,7 @@
 package org.opensearch.index.engine.exec;
 
 import org.opensearch.common.annotation.ExperimentalApi;
-import org.opensearch.core.common.io.stream.StreamInput;
-import org.opensearch.core.common.io.stream.StreamOutput;
 
-import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Set;
 
@@ -169,31 +166,10 @@ public final class MonoFileWriterSet extends WriterFileSet {
     }
 
     /**
-     * Deserializes a MonoFileWriterSet from a stream.
-     * Stream format: generation (long), file (string), numRows (long), [minSeqNo (ZLong), maxSeqNo (ZLong)].
-     * Seq-range fields are optional for legacy compat — missing fields default to UNKNOWN_SEQ_NO.
-     */
-    public MonoFileWriterSet(StreamInput in, String directory, long version) throws IOException {
-        this(directory, in.readLong(), in.readString(), in.readLong(), version,
-            in.available() > 0 ? in.readZLong() : UNKNOWN_SEQ_NO,
-            in.available() > 0 ? in.readZLong() : UNKNOWN_SEQ_NO);
-    }
-
-    /**
      * Returns the single file in this set.
      */
     public String file() {
         return file;
-    }
-
-    @Override
-    public void writeTo(StreamOutput out) throws IOException {
-        out.writeLong(writerGeneration());
-        out.writeStringCollection(files());
-        out.writeLong(numRows());
-        out.writeLong(formatVersion());
-        out.writeZLong(minSeqNo());
-        out.writeZLong(maxSeqNo());
     }
 
     @Override
@@ -204,8 +180,14 @@ public final class MonoFileWriterSet extends WriterFileSet {
             + writerGeneration()
             + ", file="
             + file
+            + ", numRows="
+            + numRows()
             + ", formatVersion="
             + formatVersion()
-            + '}';
+            + ", seqRange=["
+            + minSeqNo()
+            + ","
+            + maxSeqNo()
+            + "]}";
     }
 }
