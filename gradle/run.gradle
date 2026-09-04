@@ -106,8 +106,10 @@ testClusters {
         if (p.equals("parquet-data-format") || p.equals("analytics-backend-datafusion")) {
           // Composite engine / DataFusion requires pluggable dataformat feature flag
           systemProperty 'opensearch.experimental.feature.pluggable.dataformat.enabled', 'true'
-          // Enable composite merges (Lucene → Parquet); off by default
-          systemProperty 'opensearch.pluggable.dataformat.merge.enabled', 'true'
+          // Composite merges (Lucene -> Parquet) follow the code-default property gate
+          // (opensearch.pluggable.dataformat.merge.enabled, default false).
+          // Do NOT hardcode it here: it silently overrides -Dtests.jvm.argline
+          // and defeated the bench merge quarantine (2026-09-04 node crash).
           // Native lib path for DataFusion FFM bridge
           def nativeLibDir = new File(project(':sandbox:libs:dataformat-native').projectDir, 'rust/target/release').absolutePath
           systemProperty 'java.library.path', nativeLibDir
