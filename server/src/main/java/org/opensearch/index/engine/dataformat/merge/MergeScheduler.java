@@ -44,16 +44,6 @@ import java.util.function.BiConsumer;
 @ExperimentalApi
 public class MergeScheduler {
 
-    /**
-     * Hard kill-switch for data-format merges (benchmark quarantine). Default
-     * TRUE = merges are disabled on every shard: scheduled merge triggers are
-     * ignored and force merges are refused. Override with
-     * {@code -Dopensearch.dataformat.merges.disabled=false} to re-enable.
-     */
-    public static final boolean MERGES_DISABLED = Boolean.parseBoolean(
-        System.getProperty("opensearch.dataformat.merges.disabled", "true")
-    );
-
     private final Logger logger;
     private final MergeHandler mergeHandler;
     private final BiConsumer<MergeResult, OneMerge> applyMergeChanges;
@@ -139,10 +129,6 @@ public class MergeScheduler {
      * concurrency limits.
      */
     public void triggerMerges() {
-        if (MERGES_DISABLED) {
-            logger.debug("MergeScheduler disabled (opensearch.dataformat.merges.disabled=true), ignoring merge trigger");
-            return;
-        }
         if (isShutdown.get()) {
             logger.warn("MergeScheduler is shutdown, ignoring merge trigger");
             return;
@@ -165,10 +151,6 @@ public class MergeScheduler {
      * @param maxNumSegment the maximum number of segments after the force merge
      */
     public void forceMerge(int maxNumSegment) throws IOException {
-        if (MERGES_DISABLED) {
-            logger.warn("MergeScheduler disabled (opensearch.dataformat.merges.disabled=true), refusing force merge");
-            return;
-        }
         assert Thread.currentThread().getName().contains(ThreadPool.Names.FORCE_MERGE)
             : "forceMerge must be called on FORCE_MERGE thread but was: " + Thread.currentThread().getName();
         forceMergeLock.acquireUninterruptibly();
