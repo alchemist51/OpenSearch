@@ -156,7 +156,7 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
             ).actionGet(CHECKPOINT_REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             if (response.available() && response.checkpoint() != null) {
-                logger.debug(
+                logger.info(
                     "CHECKPOINT_REPLY target=[{}][{}] maxSeqNo={} files={} noops={}",
                     indexSettings.getIndex().getName(),
                     shard.shardId().id(),

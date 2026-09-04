@@ -221,7 +221,7 @@ public final class MVCheckpointRequestTransportHandler extends HandledTransportA
                 scopedNoops
             );
 
-            logger.debug(
+            logger.info(
                 "CHECKPOINT_REPLY source=[{}][{}] target=[{}][{}] files={} noops={} advertMax={} watermark={}",
                 request.sourceIndex(),
                 request.sourceShard(),
