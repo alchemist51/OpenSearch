@@ -1,6 +1,6 @@
 # ClickBench MV setup
 
-Each numbered script performs exactly one `curl` request. Defaults:
+Each numbered script contains exactly one literal `curl` request. Index names, URLs, and request bodies are fixed and directly inspectable—there is no runtime payload generation.
 
 - OpenSearch: `http://localhost:9200`
 - Source index: `cb100m`
@@ -17,10 +17,11 @@ cd /home/ec2-user/OpenSearch/sandbox/plugins/mv-data-format/scripts/clickbench
 ./04-configure-target-index.sh
 ```
 
-The target must be created through `PUT /_mv/views/{name}`. Do not issue a direct `PUT /cb100m_mv`: the view service creates the dedicated DerivedEngine index and persists its source binding and definition metadata.
+Static request bodies:
 
-Override names or endpoint without editing scripts:
+- `cb100m-source-index.json`
+- `cb100m-mv-validate.json`
+- `cb100m-mv-create.json`
+- `cb100m-mv-settings.json`
 
-```bash
-OS_URL=http://localhost:9200 SOURCE_INDEX=cb100m TARGET_INDEX=cb100m_mv VIEW_NAME=cb100m_mv ./03-create-target-index.sh
-```
+The target must be created through `PUT /_mv/views/cb100m_mv`. Do not issue a direct `PUT /cb100m_mv`: the view service creates the dedicated DerivedEngine index and persists its source binding and definition metadata.

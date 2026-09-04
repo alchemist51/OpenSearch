@@ -1,0 +1,4 @@
+{
+  "index.mv_pull.max_docs_per_round": 2000000,
+  "index.mv_pull.max_generations_before_compact": 1000000
+}
