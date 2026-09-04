@@ -105,15 +105,15 @@ public record MVDefinitionSpec(List<Column> columns, int groupKeys, String sql, 
         );
     }
 
-    /** The source index's definition (raw fields → state). */
+    /** The source index's definition (raw fields → state). SQL + ship fields GENERATED from the typed definition. */
     public static final MVDefinitionSpec SOURCE = new MVDefinitionSpec(
         List.of(new Column("service", ColumnType.UTF8), new Column("status", ColumnType.UTF8), new Column("latency_ms", ColumnType.INT64)),
         2,
-        MVConstants.MV_SQL,
-        List.of("service", "status", "cnt", "lat_sum", "lat_min", "lat_max")
+        MVCompiledDefinition.payments().buildPartialSql(MVConstants.INPUT_TABLE),
+        MVCompiledDefinition.payments().projectionOrder()
     );
 
-    /** The target index's definition: the FOLD of the shipped state schema. */
+    /** The target index's definition: the FOLD of the shipped state schema. SQL GENERATED from the typed fold definition. */
     public static final MVDefinitionSpec TARGET_FOLD = new MVDefinitionSpec(
         List.of(
             new Column("service", ColumnType.UTF8),
@@ -124,8 +124,8 @@ public record MVDefinitionSpec(List<Column> columns, int groupKeys, String sql, 
             new Column("lat_max", ColumnType.INT64)
         ),
         2,
-        "SELECT service, status, SUM(cnt), SUM(lat_sum), MIN(lat_min), MAX(lat_max) FROM mv_input GROUP BY service, status",
-        List.of("service", "status", "cnt", "lat_sum", "lat_min", "lat_max")
+        MVCompiledDefinition.paymentsFold().buildPartialSql(MVConstants.INPUT_TABLE),
+        MVCompiledDefinition.paymentsFold().projectionOrder()
     );
 
     /** Pull-engine count/sum definition over the source's raw columns. */

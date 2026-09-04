@@ -46,8 +46,8 @@ public class MVMergeStrategyTests extends OpenSearchTestCase {
         Path shardData = createTempDir();
         Path firstDirectory = createTempDir();
         Path secondDirectory = createTempDir();
-        Path firstFile = Files.writeString(firstDirectory.resolve("first.mv.arrow"), "first");
-        Path secondFile = Files.writeString(secondDirectory.resolve("second.mv.arrow"), "second");
+        Path firstFile = Files.writeString(firstDirectory.resolve("first.mv.parquet"), "first");
+        Path secondFile = Files.writeString(secondDirectory.resolve("second.mv.parquet"), "second");
 
         WriterFileSet firstSet = MonoFileWriterSet.of(firstDirectory, 1L, firstFile.getFileName().toString(), 2L);
         WriterFileSet secondSet = MonoFileWriterSet.of(secondDirectory, 2L, secondFile.getFileName().toString(), 3L);
@@ -146,7 +146,7 @@ public class MVMergeStrategyTests extends OpenSearchTestCase {
     public void testDataFusionStateStrategyUsesStreamingWithCorrectParams() throws Exception {
         Path shardData = createTempDir();
         Path firstDirectory = createTempDir();
-        Path firstFile = Files.writeString(firstDirectory.resolve("first.mv.arrow"), "first");
+        Path firstFile = Files.writeString(firstDirectory.resolve("first.mv.parquet"), "first");
 
         WriterFileSet firstSet = MonoFileWriterSet.of(firstDirectory, 1L, firstFile.getFileName().toString(), 2L);
         Segment firstSegment = Segment.builder(1L).addSearchableFiles(MVStateDataFormat.INSTANCE, firstSet).build();
@@ -412,9 +412,9 @@ public class MVMergeStrategyTests extends OpenSearchTestCase {
         Path dir1 = createTempDir();
         Path dir2 = createTempDir();
         Path dir3 = createTempDir();
-        Path file1 = Files.writeString(dir1.resolve("a.mv.arrow"), "data1");
-        Path file2 = Files.writeString(dir2.resolve("b.mv.arrow"), "data2");
-        Path file3 = Files.writeString(dir3.resolve("c.mv.arrow"), "data3");
+        Path file1 = Files.writeString(dir1.resolve("a.mv.parquet"), "data1");
+        Path file2 = Files.writeString(dir2.resolve("b.mv.parquet"), "data2");
+        Path file3 = Files.writeString(dir3.resolve("c.mv.parquet"), "data3");
 
         WriterFileSet set1 = MonoFileWriterSet.of(dir1, 1L, file1.getFileName().toString(), 10L);
         WriterFileSet set2 = MonoFileWriterSet.of(dir2, 2L, file2.getFileName().toString(), 20L);

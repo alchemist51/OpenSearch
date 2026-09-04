@@ -67,10 +67,6 @@ public final class MVWriter implements Writer<MVDocumentInput> {
     /** The format this writer registers its files under (source vs target-fold). */
     private final org.opensearch.index.engine.dataformat.DataFormat dataFormat;
 
-    public MVWriter(long writerGeneration, ShardPath shardPath, String tableName) {
-        this(writerGeneration, shardPath, tableName, MVDefinitionSpec.SOURCE, MVDataFormat.INSTANCE, null, null);
-    }
-
     public MVWriter(
         long writerGeneration,
         ShardPath shardPath,
@@ -220,21 +216,12 @@ public final class MVWriter implements Writer<MVDocumentInput> {
             return FileInfos.empty();
         }
 
-        // Embedded mode: build the state file (Arrow IPC) next to the shard.
-        Path mvDir = shardPath.getDataPath().resolve(dataFormat.name());
-        Files.createDirectories(mvDir);
-        Path mvFile = mvDir.resolve(MVConstants.mvFileName(writerGeneration));
-
-        long stateRows = MVNativeBridge.buildStateFile(parquet.toString(), MVConstants.INPUT_TABLE, spec.sql(), mvFile.toString());
-        logger.info("mv flush gen={} built {} state rows at refresh -> {}", writerGeneration, stateRows, mvFile.getFileName());
-
-        MonoFileWriterSet fileSet = MonoFileWriterSet.of(
-            mvDir.toAbsolutePath(),
-            writerGeneration,
-            mvFile.getFileName().toString(),
-            Math.max(stateRows, 1)
+        // Embedded Arrow-at-rest mode removed: persisted MV state is Parquet on
+        // the dedicated derived target (managed build / streaming writer). A
+        // source-side MV writer without a ship target has no valid output path.
+        throw new IllegalStateException(
+            "mv flush gen=" + writerGeneration + ": embedded MV state mode was removed — configure ship targets or use the pull path"
         );
-        return FileInfos.builder().putWriterFileSet(dataFormat, fileSet).build();
     }
 
     /** This generation's primary parquet file, by the engine's naming convention. */

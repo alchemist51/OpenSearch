@@ -164,7 +164,6 @@ public final class MVViewsService {
             // BWC; the REST path is descriptor-only and self-contained.
             Settings targetSettings = MVViewCreation.commonTargetSettings(source, sourceShards)
                 .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, view.definition())
-                .put(MVConstants.DEFINITION_SETTING, view.definition())
                 // Stage 4: persisted self-contained descriptor (authoritative,
                 // resolved first by MVDefinitionResolver).
                 .put(MVConstants.DESCRIPTOR_SETTING, descriptorJson)

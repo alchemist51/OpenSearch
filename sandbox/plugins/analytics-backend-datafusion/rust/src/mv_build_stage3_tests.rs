@@ -20,15 +20,13 @@
 mod stage3_tests {
     use arrow::compute::{lexsort_to_indices, SortColumn, SortOptions};
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::ipc::reader::FileReader as IpcFileReader;
-    use arrow::ipc::writer::FileWriter as IpcFileWriter;
     use arrow_array::Array;
     use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
     use std::fs::File;
     use std::sync::Arc;
 
     use crate::mv_build_managed::{
-        compute_definition_hash, compute_schema_hash, validate_ipc_ordering, ArtifactMetadata,
+        compute_definition_hash, compute_schema_hash, validate_parquet_ordering, ArtifactMetadata,
         OrderingContract,
     };
 
@@ -313,7 +311,7 @@ mod stage3_tests {
     // ── Test: Arrow IPC output ordering ──────────────────────────────────
 
     #[test]
-    fn test_ipc_write_and_validate_sorted_3key() {
+    fn test_parquet_write_and_validate_sorted_3key() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("region", DataType::Int64, true),
             Field::new("svc", DataType::Utf8, true),
@@ -336,22 +334,25 @@ mod stage3_tests {
         .unwrap();
         let sorted = sort_batch(&unsorted, &ordering);
 
-        // Write to IPC
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
+        // Write to Parquet
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.mv.parquet").to_str().unwrap().to_string();
         {
             let file = File::create(&path).unwrap();
-            let mut writer = IpcFileWriter::try_new(file, &schema).unwrap();
+            let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None).unwrap();
             writer.write(&sorted).unwrap();
-            writer.finish().unwrap();
+            writer.close().unwrap();
         }
 
         // Validate
-        assert!(validate_ipc_ordering(&path, &ordering).unwrap());
+        assert!(validate_parquet_ordering(&path, &ordering).unwrap());
 
         // Read back and verify row count
         let file = File::open(&path).unwrap();
-        let reader = IpcFileReader::try_new(file, None).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
         let mut rows = 0;
         for b in reader {
             rows += b.unwrap().num_rows();
@@ -360,7 +361,7 @@ mod stage3_tests {
     }
 
     #[test]
-    fn test_ipc_validate_detects_unsorted() {
+    fn test_parquet_validate_detects_unsorted() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("k0", DataType::Int64, true),
             Field::new("val", DataType::Int64, false),
@@ -376,21 +377,21 @@ mod stage3_tests {
         )
         .unwrap();
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.mv.parquet").to_str().unwrap().to_string();
         {
             let file = File::create(&path).unwrap();
-            let mut writer = IpcFileWriter::try_new(file, &schema).unwrap();
+            let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None).unwrap();
             writer.write(&batch).unwrap();
-            writer.finish().unwrap();
+            writer.close().unwrap();
         }
 
         let ordering = OrderingContract::from_parallel_arrays(&[0], &[0], &[0]);
-        assert!(!validate_ipc_ordering(&path, &ordering).unwrap());
+        assert!(!validate_parquet_ordering(&path, &ordering).unwrap());
     }
 
     #[test]
-    fn test_ipc_with_nulls_validates_ordering() {
+    fn test_parquet_with_nulls_validates_ordering() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("k0", DataType::Int64, true),
             Field::new("k1", DataType::Utf8, true),
@@ -415,16 +416,16 @@ mod stage3_tests {
         )
         .unwrap();
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.mv.parquet").to_str().unwrap().to_string();
         {
             let file = File::create(&path).unwrap();
-            let mut writer = IpcFileWriter::try_new(file, &schema).unwrap();
+            let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None).unwrap();
             writer.write(&batch).unwrap();
-            writer.finish().unwrap();
+            writer.close().unwrap();
         }
 
-        assert!(validate_ipc_ordering(&path, &ordering).unwrap());
+        assert!(validate_parquet_ordering(&path, &ordering).unwrap());
     }
 
     // ── Test: Schema / definition hash validation ────────────────────────
@@ -519,7 +520,7 @@ mod stage3_tests {
     // ── Test: Multi-batch IPC with ordering continuity ───────────────────
 
     #[test]
-    fn test_ipc_multi_batch_sorted_validates() {
+    fn test_parquet_multi_batch_sorted_validates() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("k0", DataType::Int64, false),
             Field::new("val", DataType::Int64, false),
@@ -543,22 +544,22 @@ mod stage3_tests {
         )
         .unwrap();
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.mv.parquet").to_str().unwrap().to_string();
         {
             let file = File::create(&path).unwrap();
-            let mut writer = IpcFileWriter::try_new(file, &schema).unwrap();
+            let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None).unwrap();
             writer.write(&batch1).unwrap();
             writer.write(&batch2).unwrap();
-            writer.finish().unwrap();
+            writer.close().unwrap();
         }
 
         let ordering = OrderingContract::from_parallel_arrays(&[0], &[0], &[0]);
-        assert!(validate_ipc_ordering(&path, &ordering).unwrap());
+        assert!(validate_parquet_ordering(&path, &ordering).unwrap());
     }
 
     #[test]
-    fn test_ipc_multi_batch_unsorted_cross_batch_detects() {
+    fn test_parquet_multi_batch_unsorted_cross_batch_detects() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("k0", DataType::Int64, false),
             Field::new("val", DataType::Int64, false),
@@ -582,19 +583,19 @@ mod stage3_tests {
         )
         .unwrap();
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.mv.parquet").to_str().unwrap().to_string();
         {
             let file = File::create(&path).unwrap();
-            let mut writer = IpcFileWriter::try_new(file, &schema).unwrap();
+            let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None).unwrap();
             writer.write(&batch1).unwrap();
             writer.write(&batch2).unwrap();
-            writer.finish().unwrap();
+            writer.close().unwrap();
         }
 
         let ordering = OrderingContract::from_parallel_arrays(&[0], &[0], &[0]);
         assert!(
-            !validate_ipc_ordering(&path, &ordering).unwrap(),
+            !validate_parquet_ordering(&path, &ordering).unwrap(),
             "cross-batch ordering violation should be detected"
         );
     }
@@ -602,7 +603,7 @@ mod stage3_tests {
 
 /// Stage 3 streaming-path integration tests. Unlike the pure-Arrow tests
 /// above, these drive the *real* production entry points
-/// ([`build_streaming_ipc_artifact`] and [`plan_partial_then_sort`]) end to end
+/// ([`build_streaming_parquet_artifact`] and [`plan_partial_then_sort`]) end to end
 /// through a DataFusion session + Parquet I/O, and assert:
 ///   * exact row count read back from the finalized Arrow IPC file,
 ///   * global multi-key order across ALL emitted batches (not per-batch),
@@ -615,7 +616,6 @@ mod stage3_streaming_integration {
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::ipc::reader::FileReader as IpcFileReader;
     use arrow_array::{Int64Array, RecordBatch};
     use datafusion::datasource::MemTable;
     use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
@@ -633,7 +633,7 @@ mod stage3_streaming_integration {
     use crate::api::DataFusionRuntime;
     use crate::memory::DynamicLimitPool;
     use crate::mv_build_managed::{
-        build_streaming_ipc_artifact, plan_partial_then_sort, validate_ipc_ordering,
+        build_streaming_parquet_artifact, plan_partial_then_sort, validate_parquet_ordering,
         OrderingContract,
     };
 
@@ -711,9 +711,13 @@ mod stage3_streaming_integration {
             .sum::<usize>()
     }
 
-    fn read_ipc_row_count(path: &str) -> i64 {
+    fn read_parquet_row_count(path: &str) -> i64 {
         let file = std::fs::File::open(path).unwrap();
-        let reader = IpcFileReader::try_new(file, None).unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap()
+                .build()
+                .unwrap();
         let mut rows = 0i64;
         for b in reader {
             rows += b.unwrap().num_rows() as i64;
@@ -783,7 +787,7 @@ mod stage3_streaming_integration {
     #[test]
     fn test_streaming_build_end_to_end_exact_and_ordered() {
         // 30_000 groups → the finalized IPC file spans multiple batches
-        // (default batch size 8192), so validate_ipc_ordering exercises the
+        // (default batch size 8192), so validate_parquet_ordering exercises the
         // cross-batch (global) ordering guarantee, not merely intra-batch.
         const GROUPS: usize = 30_000;
         let data_dir = TempDir::new().unwrap();
@@ -792,10 +796,10 @@ mod stage3_streaming_integration {
         let runtime = make_runtime(BIG_POOL_BYTES, spill_dir.path());
 
         let out = TempDir::new().unwrap();
-        let out_file = out.path().join("state.arrow").to_str().unwrap().to_string();
+        let out_file = out.path().join("state.mv.parquet").to_str().unwrap().to_string();
 
         let ordering = OrderingContract::from_parallel_arrays(&[0, 1], &[0, 0], &[0, 0]);
-        let meta = build_streaming_ipc_artifact(
+        let meta = build_streaming_parquet_artifact(
             &runtime,
             data_dir.path().to_str().unwrap(),
             "t",
@@ -815,12 +819,12 @@ mod stage3_streaming_integration {
         );
         assert_eq!(meta.row_count, GROUPS as u64, "one state row per group");
         assert_eq!(
-            read_ipc_row_count(&out_file),
+            read_parquet_row_count(&out_file),
             GROUPS as i64,
-            "IPC file row count must match returned metadata exactly"
+            "Parquet file row count must match returned metadata exactly"
         );
         assert!(
-            validate_ipc_ordering(&out_file, &ordering).unwrap(),
+            validate_parquet_ordering(&out_file, &ordering).unwrap(),
             "output must be globally sorted by the full (k0, k1) tuple across all batches"
         );
         assert!(meta.schema_hash != 0, "schema_hash should be non-zero");
@@ -894,16 +898,16 @@ mod stage3_streaming_integration {
         .await
         .expect("plan build");
 
-        // Drain the stream exactly as production does, writing to IPC.
+        // Drain the stream exactly as production does, writing to Parquet.
         let schema = plan.schema();
         let out = TempDir::new().unwrap();
-        let out_file = out.path().join("state.arrow").to_str().unwrap().to_string();
+        let out_file = out.path().join("state.mv.parquet").to_str().unwrap().to_string();
         let mut row_count = 0i64;
         {
             let mut stream = execute_stream(plan.clone(), ctx.task_ctx()).unwrap();
             let file = std::fs::File::create(&out_file).unwrap();
             let mut writer =
-                arrow::ipc::writer::FileWriter::try_new(std::io::BufWriter::new(file), &schema)
+                parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None)
                     .unwrap();
             while let Some(b) = stream.next().await {
                 let b = b.unwrap();
@@ -912,7 +916,7 @@ mod stage3_streaming_integration {
                     row_count += b.num_rows() as i64;
                 }
             }
-            writer.finish().unwrap();
+            writer.close().unwrap();
         }
 
         // Correctness survives spill.
@@ -920,9 +924,9 @@ mod stage3_streaming_integration {
             row_count, GROUPS as i64,
             "spill must not change the row count"
         );
-        assert_eq!(read_ipc_row_count(&out_file), GROUPS as i64);
+        assert_eq!(read_parquet_row_count(&out_file), GROUPS as i64);
         assert!(
-            validate_ipc_ordering(&out_file, &ordering).unwrap(),
+            validate_parquet_ordering(&out_file, &ordering).unwrap(),
             "spilled output must still be globally sorted by (k0, k1)"
         );
 
@@ -946,12 +950,12 @@ mod stage3_streaming_integration {
         let runtime = make_runtime(BIG_POOL_BYTES, spill_dir.path());
 
         let out = TempDir::new().unwrap();
-        let out_file = out.path().join("state.arrow").to_str().unwrap().to_string();
+        let out_file = out.path().join("state.mv.parquet").to_str().unwrap().to_string();
 
         let ordering = OrderingContract::from_parallel_arrays(&[0, 1], &[0, 0], &[0, 0]);
         // WHERE clause matches no rows → GROUP BY yields zero groups → zero
         // output rows → the build must fail AND remove the output file.
-        let result = build_streaming_ipc_artifact(
+        let result = build_streaming_parquet_artifact(
             &runtime,
             data_dir.path().to_str().unwrap(),
             "t",
@@ -972,7 +976,7 @@ mod stage3_streaming_integration {
 }
 
 /// Stage 3 MvBuildResult contract tests. These exercise the new
-/// `MvBuildResult` return path from `build_streaming_ipc_artifact`:
+/// `MvBuildResult` return path from `build_streaming_parquet_artifact`:
 ///   * End-to-end: all fields populated on success
 ///   * Cancellation: status_code=1, data fields zeroed
 ///   * Spill: spill_bytes > 0 under tiny pool
@@ -993,7 +997,7 @@ mod stage3_mv_build_result_tests {
     use crate::api::DataFusionRuntime;
     use crate::memory::DynamicLimitPool;
     use crate::mv_build_managed::{
-        alloc_cancel_context, build_streaming_ipc_artifact, cancel_build, MvBuildResult,
+        alloc_cancel_context, build_streaming_parquet_artifact, cancel_build, MvBuildResult,
         OrderingContract,
     };
 
@@ -1055,10 +1059,10 @@ mod stage3_mv_build_result_tests {
         let runtime = make_runtime(BIG_POOL_BYTES, spill_dir.path());
 
         let out = TempDir::new().unwrap();
-        let out_file = out.path().join("state.arrow").to_str().unwrap().to_string();
+        let out_file = out.path().join("state.mv.parquet").to_str().unwrap().to_string();
 
         let ordering = OrderingContract::from_parallel_arrays(&[0, 1], &[0, 0], &[0, 0]);
-        let result = build_streaming_ipc_artifact(
+        let result = build_streaming_parquet_artifact(
             &runtime,
             data_dir.path().to_str().unwrap(),
             "t",
@@ -1122,7 +1126,7 @@ mod stage3_mv_build_result_tests {
         let runtime = make_runtime(BIG_POOL_BYTES, spill_dir.path());
 
         let out = TempDir::new().unwrap();
-        let out_file = out.path().join("state.arrow").to_str().unwrap().to_string();
+        let out_file = out.path().join("state.mv.parquet").to_str().unwrap().to_string();
 
         let ordering = OrderingContract::from_parallel_arrays(&[0, 1], &[0, 0], &[0, 0]);
 
@@ -1131,7 +1135,7 @@ mod stage3_mv_build_result_tests {
         let ctx_id = alloc_cancel_context();
         cancel_build(ctx_id);
 
-        let result = build_streaming_ipc_artifact(
+        let result = build_streaming_parquet_artifact(
             &runtime,
             data_dir.path().to_str().unwrap(),
             "t",
@@ -1176,10 +1180,10 @@ mod stage3_mv_build_result_tests {
         let runtime = make_runtime(BIG_POOL_BYTES, spill_dir.path());
 
         let out = TempDir::new().unwrap();
-        let out_file = out.path().join("state.arrow").to_str().unwrap().to_string();
+        let out_file = out.path().join("state.mv.parquet").to_str().unwrap().to_string();
 
         let ordering = OrderingContract::from_parallel_arrays(&[0, 1], &[0, 0], &[0, 0]);
-        let result = build_streaming_ipc_artifact(
+        let result = build_streaming_parquet_artifact(
             &runtime,
             data_dir.path().to_str().unwrap(),
             "t",
@@ -1207,7 +1211,7 @@ mod stage3_mv_build_result_tests {
     /// has spill_bytes > 0 and spill_file_count > 0. Validates that spill
     /// metrics are propagated through the MvBuildResult struct.
     ///
-    /// NOTE: `build_streaming_ipc_artifact` uses the default
+    /// NOTE: `build_streaming_parquet_artifact` uses the default
     /// `sort_spill_reservation_bytes` (10 MiB), so the pool must be large
     /// enough for the reservation but small enough that actual data forces
     /// spill. 32 MiB with 200k groups achieves this: the reservation
@@ -1240,10 +1244,10 @@ mod stage3_mv_build_result_tests {
         };
 
         let out = TempDir::new().unwrap();
-        let out_file = out.path().join("state.arrow").to_str().unwrap().to_string();
+        let out_file = out.path().join("state.mv.parquet").to_str().unwrap().to_string();
 
         let ordering = OrderingContract::from_parallel_arrays(&[0, 1], &[0, 0], &[0, 0]);
-        let result = build_streaming_ipc_artifact(
+        let result = build_streaming_parquet_artifact(
             &runtime,
             data_dir.path().to_str().unwrap(),
             "t",
@@ -1285,11 +1289,11 @@ mod stage3_mv_build_result_tests {
         let runtime = make_runtime(BIG_POOL_BYTES, spill_dir.path());
 
         let out = TempDir::new().unwrap();
-        let out_file = out.path().join("state.arrow").to_str().unwrap().to_string();
+        let out_file = out.path().join("state.mv.parquet").to_str().unwrap().to_string();
 
         let ordering = OrderingContract::from_parallel_arrays(&[0, 1], &[0, 0], &[0, 0]);
         // WHERE clause matches no rows → zero output rows → error
-        let result = build_streaming_ipc_artifact(
+        let result = build_streaming_parquet_artifact(
             &runtime,
             data_dir.path().to_str().unwrap(),
             "t",
@@ -1308,12 +1312,13 @@ mod stage3_mv_build_result_tests {
         );
     }
 
-    /// Test: MvBuildResult.output_batch_count matches the number of IPC
-    /// batches in the output file. The streaming writer increments
-    /// output_batch_count by 1 per non-empty RecordBatch written; reading
-    /// back the IPC file should yield the same number of batches.
+    /// Test: MvBuildResult.output_batch_count tracks the number of non-empty
+    /// RecordBatch writes the streaming writer performed. The Parquet reader
+    /// may split or merge row groups differently, so we assert row-count
+    /// equality (rows in == rows out) and output_batch_count > 0 instead of
+    /// matching the reader's batch count exactly.
     #[test]
-    fn test_mv_build_result_output_batch_count_matches_ipc() {
+    fn test_mv_build_result_output_batch_count_matches_parquet() {
         const GROUPS: usize = 30_000;
         let data_dir = TempDir::new().unwrap();
         write_grouped_parquet(data_dir.path(), GROUPS);
@@ -1321,10 +1326,10 @@ mod stage3_mv_build_result_tests {
         let runtime = make_runtime(BIG_POOL_BYTES, spill_dir.path());
 
         let out = TempDir::new().unwrap();
-        let out_file = out.path().join("state.arrow").to_str().unwrap().to_string();
+        let out_file = out.path().join("state.mv.parquet").to_str().unwrap().to_string();
 
         let ordering = OrderingContract::from_parallel_arrays(&[0, 1], &[0, 0], &[0, 0]);
-        let result = build_streaming_ipc_artifact(
+        let result = build_streaming_parquet_artifact(
             &runtime,
             data_dir.path().to_str().unwrap(),
             "t",
@@ -1339,26 +1344,29 @@ mod stage3_mv_build_result_tests {
 
         assert_eq!(result.status_code, MvBuildResult::STATUS_OK);
 
-        // Count IPC batches by reading the file back
+        // Count rows by reading back the Parquet file.
+        // NOTE: Parquet row-group batching may differ from the writer's
+        // per-RecordBatch writes (the ArrowWriter buffers rows into row groups),
+        // so we assert row-count equality rather than batch-count equality.
         let file = std::fs::File::open(&out_file).unwrap();
-        let reader = arrow::ipc::reader::FileReader::try_new(file, None).unwrap();
-        let mut ipc_batch_count: u32 = 0;
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut parquet_row_count: i64 = 0;
         for batch_result in reader {
             let batch = batch_result.unwrap();
-            if batch.num_rows() > 0 {
-                ipc_batch_count += 1;
-            }
+            parquet_row_count += batch.num_rows() as i64;
         }
 
         assert_eq!(
-            result.output_batch_count, ipc_batch_count,
-            "MvBuildResult.output_batch_count ({}) must match the number of non-empty \
-             IPC batches read back from the file ({})",
-            result.output_batch_count, ipc_batch_count
+            parquet_row_count, GROUPS as i64,
+            "Parquet file total row count ({}) must match expected groups ({})",
+            parquet_row_count, GROUPS
         );
         assert!(
-            ipc_batch_count > 0,
-            "expected at least 1 IPC batch for {} groups",
+            result.output_batch_count > 0,
+            "output_batch_count must be > 0 for {} groups",
             GROUPS
         );
     }

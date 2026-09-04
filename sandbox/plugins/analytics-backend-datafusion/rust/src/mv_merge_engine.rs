@@ -34,36 +34,77 @@ use std::io::BufWriter;
 use std::sync::Arc;
 
 use arrow::compute::{lexsort_to_indices, SortColumn, SortOptions};
-use arrow::ipc::reader::FileReader as IpcFileReader;
-use arrow::ipc::writer::FileWriter as IpcFileWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ArrowWriter as ParquetWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Schema, SchemaRef};
 
 // ── Public API ──────────────────────────────────────────────────────────
+
+/// Reads the physical field names of a Parquet MV state file from its footer
+/// schema, in physical order. This is the GROUND TRUTH the merge ordering
+/// identity is derived from (Java asks via `df_mv_state_field_names` instead
+/// of shipping its own Parquet footer parser — one reader stack).
+///
+/// Footer-only: no row groups are read.
+pub fn state_field_names(file_path: &str) -> Result<Vec<String>, String> {
+    // Legacy Arrow IPC guard: fail closed with rebuild-required error.
+    if file_path.ends_with(".mv.arrow") {
+        return Err(format!(
+            "state_field_names: legacy Arrow IPC state file '{}' is no longer supported; \
+             rebuild the materialized view to generate Parquet state files",
+            file_path
+        ));
+    }
+    let file = File::open(file_path)
+        .map_err(|e| format!("state_field_names: open {file_path}: {e}"))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("state_field_names: read {file_path}: {e}"))?;
+    Ok(builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect())
+}
 
 /// Validates that an IPC file's schema matches the expected schema hash and
 /// that its rows are sorted according to the given ordering contract.
 ///
 /// Returns `Ok(())` when all checks pass, or an error string describing the
 /// first mismatch found.
-pub fn validate_ipc_header(
+pub fn validate_parquet_header(
     file_path: &str,
     expected_schema_hash: u64,
     ordering_indices: &[usize],
     ordering_asc: &[bool],
     ordering_nulls_first: &[bool],
 ) -> Result<(), String> {
-    let file =
-        File::open(file_path).map_err(|e| format!("validate_ipc_header: open {file_path}: {e}"))?;
-    let reader = IpcFileReader::try_new(file, None)
-        .map_err(|e| format!("validate_ipc_header: read {file_path}: {e}"))?;
-    let schema = reader.schema();
+    // Legacy Arrow IPC guard: fail closed with rebuild-required error.
+    if file_path.ends_with(".mv.arrow") {
+        return Err(format!(
+            "validate_parquet_header: legacy Arrow IPC state file '{}' is no longer supported; \
+             rebuild the materialized view to generate Parquet state files",
+            file_path
+        ));
+    }
+
+    let file = File::open(file_path)
+        .map_err(|e| format!("validate_parquet_header: open {file_path}: {e}"))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("validate_parquet_header: read {file_path}: {e}"))?;
+    let schema = builder.schema().clone();
+    let reader = builder
+        .build()
+        .map_err(|e| format!("validate_parquet_header: build reader {file_path}: {e}"))?;
 
     // Schema hash check.
     let actual_hash = compute_schema_hash(&schema);
     if actual_hash != expected_schema_hash {
         return Err(format!(
-            "validate_ipc_header: schema hash mismatch in {file_path}: \
+            "validate_parquet_header: schema hash mismatch in {file_path}: \
              expected {expected_schema_hash:#x}, got {actual_hash:#x}"
         ));
     }
@@ -73,17 +114,17 @@ pub fn validate_ipc_header(
     let mut all_batches = Vec::new();
     for batch_result in reader {
         let batch = batch_result
-            .map_err(|e| format!("validate_ipc_header: read batch in {file_path}: {e}"))?;
+            .map_err(|e| format!("validate_parquet_header: read batch in {file_path}: {e}"))?;
         all_batches.push(batch);
     }
     if all_batches.is_empty() {
         return Ok(()); // empty file is trivially sorted
     }
     let concatenated = arrow::compute::concat_batches(&all_batches[0].schema(), &all_batches)
-        .map_err(|e| format!("validate_ipc_header: concat {file_path}: {e}"))?;
+        .map_err(|e| format!("validate_parquet_header: concat {file_path}: {e}"))?;
     if !is_sorted(&concatenated, &ordering) {
         return Err(format!(
-            "validate_ipc_header: rows in {file_path} are not sorted by the declared ordering"
+            "validate_parquet_header: rows in {file_path} are not sorted by the declared ordering"
         ));
     }
     Ok(())
@@ -156,17 +197,27 @@ pub fn merge_state_streams_validated(
     }
 
     // Open all readers and validate schemas match.
-    let mut readers: Vec<IpcFileReader<File>> = Vec::with_capacity(state_files.len());
+    let mut readers: Vec<parquet::arrow::arrow_reader::ParquetRecordBatchReader> =
+        Vec::with_capacity(state_files.len());
     let mut reference_schema: Option<SchemaRef> = None;
     let mut reference_schema_hash: Option<u64> = None;
 
     for path in state_files {
+        // Legacy Arrow IPC guard: fail closed with rebuild-required error.
+        if path.ends_with(".mv.arrow") {
+            return Err(format!(
+                "merge_state_streams: legacy Arrow IPC state file '{}' is no longer supported; \
+                 rebuild the materialized view to generate Parquet state files",
+                path
+            ));
+        }
+
         let file =
             File::open(path).map_err(|e| format!("merge_state_streams: open {path}: {e}"))?;
-        let reader = IpcFileReader::try_new(file, None)
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .map_err(|e| format!("merge_state_streams: read {path}: {e}"))?;
 
-        let schema = reader.schema();
+        let schema = builder.schema().clone();
 
         // Schema hash consistency: all files must share the same schema hash.
         let file_hash = compute_schema_hash(&schema);
@@ -210,6 +261,9 @@ pub fn merge_state_streams_validated(
                 }
             }
         }
+        let reader = builder
+            .build()
+            .map_err(|e| format!("merge_state_streams: build reader {path}: {e}"))?;
         readers.push(reader);
     }
 
@@ -294,11 +348,14 @@ pub fn merge_state_streams_validated(
         // All files were empty — write an empty output with the right schema.
         let out_file = File::create(output_file)
             .map_err(|e| format!("merge_state_streams: create {output_file}: {e}"))?;
-        let mut writer = IpcFileWriter::try_new(out_file, &schema)
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(Default::default()))
+            .build();
+        let writer = ParquetWriter::try_new(out_file, schema.clone(), Some(props))
             .map_err(|e| format!("merge_state_streams: writer init: {e}"))?;
         writer
-            .finish()
-            .map_err(|e| format!("merge_state_streams: finish empty: {e}"))?;
+            .close()
+            .map_err(|e| format!("merge_state_streams: close empty: {e}"))?;
         return Ok(0);
     }
 
@@ -315,7 +372,10 @@ pub fn merge_state_streams_validated(
     let out_file = File::create(output_file)
         .map_err(|e| format!("merge_state_streams: create {output_file}: {e}"))?;
     let buf_writer = BufWriter::with_capacity(64 * 1024, out_file);
-    let mut writer = IpcFileWriter::try_new(buf_writer, &schema)
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+    let mut writer = ParquetWriter::try_new(buf_writer, schema.clone(), Some(props))
         .map_err(|e| format!("merge_state_streams: writer init: {e}"))?;
 
     // Streaming merge + fold loop.
@@ -371,8 +431,8 @@ pub fn merge_state_streams_validated(
     }
 
     writer
-        .finish()
-        .map_err(|e| format!("merge_state_streams: finish: {e}"))?;
+        .close()
+        .map_err(|e| format!("merge_state_streams: close: {e}"))?;
 
     Ok(rows_written)
 }
@@ -514,10 +574,10 @@ impl FoldOp {
     }
 }
 
-/// Row cursor for streaming through an IPC file one row at a time.
+/// Row cursor for streaming through a Parquet file one row at a time.
 /// Buffers one batch internally; advances batch-by-batch from the reader.
 struct RowCursor {
-    reader: IpcFileReader<File>,
+    reader: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
     current_batch: RecordBatch,
     row_idx: usize,
     file_idx: usize,
@@ -526,7 +586,10 @@ struct RowCursor {
 impl RowCursor {
     /// Creates a new cursor. Returns None if the file is empty (no batches or
     /// all batches are zero-row).
-    fn new(mut reader: IpcFileReader<File>, file_idx: usize) -> Result<Option<Self>, String> {
+    fn new(
+        mut reader: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
+        file_idx: usize,
+    ) -> Result<Option<Self>, String> {
         loop {
             match reader.next() {
                 Some(Ok(batch)) if batch.num_rows() > 0 => {
@@ -911,13 +974,20 @@ mod tests {
         )
         .unwrap();
         let file = File::create(path).unwrap();
-        let mut w = IpcFileWriter::try_new(file, &batch.schema()).unwrap();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(Default::default()))
+            .build();
+        let mut w = ParquetWriter::try_new(file, batch.schema(), Some(props)).unwrap();
         w.write(&batch).unwrap();
-        w.finish().unwrap();
+        w.close().unwrap();
     }
 
     fn read_rows(path: &str) -> Vec<(i64, i64, i64, u64, f64)> {
-        let reader = IpcFileReader::try_new(File::open(path).unwrap(), None).unwrap();
+        let file = File::open(path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
         let mut out = vec![];
         for batch in reader {
             let b = batch.unwrap();
@@ -955,21 +1025,21 @@ mod tests {
         let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
         write_state_file(
-            &p("g1.arrow"),
+            &p("g1.parquet"),
             &[(2, 3, 1, 1, 1440.0), (229, 2, 2, 2, 3288.0)],
         );
         write_state_file(
-            &p("g2.arrow"),
+            &p("g2.parquet"),
             &[(7, 0, 1, 1, 800.0), (229, 7, 1, 1, 1366.0)],
         );
-        write_state_file(&p("g3.arrow"), &[(229, 1, 4, 4, 5000.0)]);
+        write_state_file(&p("g3.parquet"), &[(229, 1, 4, 4, 5000.0)]);
 
         let (oi, oa, onf) = default_ordering();
         let ops = default_fold_ops();
 
         let rows = merge_state_streams(
-            &[p("g1.arrow"), p("g2.arrow"), p("g3.arrow")],
-            &p("merged.arrow"),
+            &[p("g1.parquet"), p("g2.parquet"), p("g3.parquet")],
+            &p("merged.parquet"),
             &oi,
             &oa,
             &onf,
@@ -978,7 +1048,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(rows, 3, "three distinct regions");
-        let merged = read_rows(&p("merged.arrow"));
+        let merged = read_rows(&p("merged.parquet"));
         assert_eq!(
             merged,
             vec![
@@ -995,22 +1065,22 @@ mod tests {
         let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
         write_state_file(
-            &p("g1.arrow"),
+            &p("g1.parquet"),
             &[(2, 3, 1, 1, 1440.0), (229, 2, 2, 2, 3288.0)],
         );
         write_state_file(
-            &p("g2.arrow"),
+            &p("g2.parquet"),
             &[(7, 0, 1, 1, 800.0), (229, 7, 1, 1, 1366.0)],
         );
-        write_state_file(&p("g3.arrow"), &[(229, 1, 4, 4, 5000.0)]);
+        write_state_file(&p("g3.parquet"), &[(229, 1, 4, 4, 5000.0)]);
 
         let (oi, oa, onf) = default_ordering();
         let ops = default_fold_ops();
 
         // 3-way merge
         merge_state_streams(
-            &[p("g1.arrow"), p("g2.arrow"), p("g3.arrow")],
-            &p("merged.arrow"),
+            &[p("g1.parquet"), p("g2.parquet"), p("g3.parquet")],
+            &p("merged.parquet"),
             &oi,
             &oa,
             &onf,
@@ -1020,8 +1090,8 @@ mod tests {
 
         // Incremental: (g1⊕g2)⊕g3
         merge_state_streams(
-            &[p("g1.arrow"), p("g2.arrow")],
-            &p("m12.arrow"),
+            &[p("g1.parquet"), p("g2.parquet")],
+            &p("m12.parquet"),
             &oi,
             &oa,
             &onf,
@@ -1029,8 +1099,8 @@ mod tests {
         )
         .unwrap();
         merge_state_streams(
-            &[p("m12.arrow"), p("g3.arrow")],
-            &p("m123.arrow"),
+            &[p("m12.parquet"), p("g3.parquet")],
+            &p("m123.parquet"),
             &oi,
             &oa,
             &onf,
@@ -1039,8 +1109,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            read_rows(&p("m123.arrow")),
-            read_rows(&p("merged.arrow")),
+            read_rows(&p("m123.parquet")),
+            read_rows(&p("merged.parquet")),
             "merge must be associative-in-effect"
         );
     }
@@ -1051,53 +1121,53 @@ mod tests {
         let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
         write_state_file(
-            &p("g1.arrow"),
+            &p("g1.parquet"),
             &[(2, 3, 1, 1, 1440.0), (229, 2, 2, 2, 3288.0)],
         );
 
         let (oi, oa, onf) = default_ordering();
         let ops = default_fold_ops();
 
-        merge_state_streams(&[p("g1.arrow")], &p("m_self.arrow"), &oi, &oa, &onf, &ops).unwrap();
+        merge_state_streams(&[p("g1.parquet")], &p("m_self.parquet"), &oi, &oa, &onf, &ops).unwrap();
 
         assert_eq!(
-            read_rows(&p("m_self.arrow")),
-            read_rows(&p("g1.arrow")),
+            read_rows(&p("m_self.parquet")),
+            read_rows(&p("g1.parquet")),
             "idempotent on already-folded input"
         );
     }
 
     #[test]
-    fn test_validate_ipc_header_passes_valid_file() {
+    fn test_validate_parquet_header_passes_valid_file() {
         let dir = TempDir::new().unwrap();
-        let p = dir.path().join("valid.arrow").to_str().unwrap().to_string();
+        let p = dir.path().join("valid.parquet").to_str().unwrap().to_string();
 
         write_state_file(&p, &[(1, 10, 1, 1, 100.0), (2, 20, 2, 2, 200.0)]);
 
         let schema = state_schema();
         let hash = compute_schema_hash(&schema);
-        let result = validate_ipc_header(&p, hash, &[0], &[true], &[true]);
+        let result = validate_parquet_header(&p, hash, &[0], &[true], &[true]);
         assert!(result.is_ok(), "valid file should pass: {:?}", result);
     }
 
     #[test]
-    fn test_validate_ipc_header_rejects_wrong_hash() {
+    fn test_validate_parquet_header_rejects_wrong_hash() {
         let dir = TempDir::new().unwrap();
-        let p = dir.path().join("valid.arrow").to_str().unwrap().to_string();
+        let p = dir.path().join("valid.parquet").to_str().unwrap().to_string();
 
         write_state_file(&p, &[(1, 10, 1, 1, 100.0)]);
 
-        let result = validate_ipc_header(&p, 0xDEADBEEF, &[0], &[true], &[true]);
+        let result = validate_parquet_header(&p, 0xDEADBEEF, &[0], &[true], &[true]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("schema hash mismatch"));
     }
 
     #[test]
-    fn test_validate_ipc_header_rejects_unsorted() {
+    fn test_validate_parquet_header_rejects_unsorted() {
         let dir = TempDir::new().unwrap();
         let path = dir
             .path()
-            .join("unsorted.arrow")
+            .join("unsorted.parquet")
             .to_str()
             .unwrap()
             .to_string();
@@ -1116,12 +1186,12 @@ mod tests {
         )
         .unwrap();
         let file = File::create(&path).unwrap();
-        let mut w = IpcFileWriter::try_new(file, &batch.schema()).unwrap();
+        let mut w = ParquetWriter::try_new(file, batch.schema(), Some(WriterProperties::builder().set_compression(Compression::ZSTD(Default::default())).build())).unwrap();
         w.write(&batch).unwrap();
-        w.finish().unwrap();
+        w.close().unwrap();
 
         let hash = compute_schema_hash(&schema);
-        let result = validate_ipc_header(&path, hash, &[0], &[true], &[true]);
+        let result = validate_parquet_header(&path, hash, &[0], &[true], &[true]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not sorted"));
     }
@@ -1203,18 +1273,18 @@ mod tests {
             )
             .unwrap();
             let file = File::create(path).unwrap();
-            let mut w = IpcFileWriter::try_new(file, &batch.schema()).unwrap();
+            let mut w = ParquetWriter::try_new(file, batch.schema(), Some(WriterProperties::builder().set_compression(Compression::ZSTD(Default::default())).build())).unwrap();
             w.write(&batch).unwrap();
-            w.finish().unwrap();
+            w.close().unwrap();
         };
 
-        write(&p("f1.arrow"), &[(1, 10, 5, 15), (2, 20, 8, 25)]);
-        write(&p("f2.arrow"), &[(1, 30, 3, 20), (2, 40, 12, 18)]);
+        write(&p("f1.parquet"), &[(1, 10, 5, 15), (2, 20, 8, 25)]);
+        write(&p("f2.parquet"), &[(1, 30, 3, 20), (2, 40, 12, 18)]);
 
         // fold_ops: key=0, sum=1, min=2, max=3
         let rows = merge_state_streams(
-            &[p("f1.arrow"), p("f2.arrow")],
-            &p("out.arrow"),
+            &[p("f1.parquet"), p("f2.parquet")],
+            &p("out.parquet"),
             &[0],
             &[true],
             &[true],
@@ -1224,7 +1294,10 @@ mod tests {
 
         assert_eq!(rows, 2);
 
-        let reader = IpcFileReader::try_new(File::open(&p("out.arrow")).unwrap(), None).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&p("out.parquet")).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
         for batch in reader {
             let b = batch.unwrap();
             let keys = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1251,13 +1324,13 @@ mod tests {
 
         // Write an empty file.
         let schema = state_schema();
-        let file = File::create(&p("empty.arrow")).unwrap();
-        let mut w = IpcFileWriter::try_new(file, &schema).unwrap();
-        w.finish().unwrap();
+        let file = File::create(&p("empty.parquet")).unwrap();
+        let mut w = ParquetWriter::try_new(file, schema.clone(), Some(WriterProperties::builder().set_compression(Compression::ZSTD(Default::default())).build())).unwrap();
+        w.close().unwrap();
 
         let (oi, oa, onf) = default_ordering();
         let ops = default_fold_ops();
-        let rows = merge_state_streams(&[p("empty.arrow")], &p("out.arrow"), &oi, &oa, &onf, &ops)
+        let rows = merge_state_streams(&[p("empty.parquet")], &p("out.parquet"), &oi, &oa, &onf, &ops)
             .unwrap();
         assert_eq!(rows, 0);
     }
@@ -1287,7 +1360,7 @@ mod tests {
         let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
         // File 1 with 5-column schema
-        write_state_file(&p("f1.arrow"), &[(1, 10, 1, 1, 100.0)]);
+        write_state_file(&p("f1.parquet"), &[(1, 10, 1, 1, 100.0)]);
 
         // File 2 with different schema (3 columns)
         let schema2 = Arc::new(Schema::new(vec![
@@ -1304,14 +1377,14 @@ mod tests {
             ],
         )
         .unwrap();
-        let file = File::create(&p("f2.arrow")).unwrap();
-        let mut w = IpcFileWriter::try_new(file, &batch.schema()).unwrap();
+        let file = File::create(&p("f2.parquet")).unwrap();
+        let mut w = ParquetWriter::try_new(file, batch.schema(), Some(WriterProperties::builder().set_compression(Compression::ZSTD(Default::default())).build())).unwrap();
         w.write(&batch).unwrap();
-        w.finish().unwrap();
+        w.close().unwrap();
 
         let result = merge_state_streams(
-            &[p("f1.arrow"), p("f2.arrow")],
-            &p("out.arrow"),
+            &[p("f1.parquet"), p("f2.parquet")],
+            &p("out.parquet"),
             &[0],
             &[true],
             &[true],
@@ -1333,11 +1406,11 @@ mod tests {
         let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
         write_state_file(
-            &p("g1.arrow"),
+            &p("g1.parquet"),
             &[(2, 3, 1, 1, 1440.0), (229, 2, 2, 2, 3288.0)],
         );
         write_state_file(
-            &p("g2.arrow"),
+            &p("g2.parquet"),
             &[(7, 0, 1, 1, 800.0), (229, 7, 1, 1, 1366.0)],
         );
 
@@ -1349,8 +1422,8 @@ mod tests {
         ];
 
         let rows = merge_state_streams_validated(
-            &[p("g1.arrow"), p("g2.arrow")],
-            &p("merged.arrow"),
+            &[p("g1.parquet"), p("g2.parquet")],
+            &p("merged.parquet"),
             &[0],
             &[true],
             &[true],
@@ -1368,7 +1441,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
-        write_state_file(&p("g1.arrow"), &[(2, 3, 1, 1, 1440.0)]);
+        write_state_file(&p("g1.parquet"), &[(2, 3, 1, 1, 1440.0)]);
 
         let wrong_agg_names = vec![
             "wrong_name".to_string(),
@@ -1378,8 +1451,8 @@ mod tests {
         ];
 
         let result = merge_state_streams_validated(
-            &[p("g1.arrow")],
-            &p("out.arrow"),
+            &[p("g1.parquet")],
+            &p("out.parquet"),
             &[0],
             &[true],
             &[true],
@@ -1400,7 +1473,7 @@ mod tests {
         let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
         write_state_file(
-            &p("g1.arrow"),
+            &p("g1.parquet"),
             &[(2, 3, 1, 1, 1440.0), (229, 2, 2, 2, 3288.0)],
         );
 
@@ -1408,8 +1481,8 @@ mod tests {
         let identity = "0:RegionID:0:0";
 
         let rows = merge_state_streams_validated(
-            &[p("g1.arrow")],
-            &p("merged.arrow"),
+            &[p("g1.parquet")],
+            &p("merged.parquet"),
             &[0],
             &[true],
             &[true],
@@ -1427,13 +1500,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
-        write_state_file(&p("g1.arrow"), &[(2, 3, 1, 1, 1440.0)]);
+        write_state_file(&p("g1.parquet"), &[(2, 3, 1, 1, 1440.0)]);
 
         let wrong_identity = "0:RegionID:1:1"; // DESC NULLS_LAST, but data is ASC NULLS_FIRST
 
         let result = merge_state_streams_validated(
-            &[p("g1.arrow")],
-            &p("out.arrow"),
+            &[p("g1.parquet")],
+            &p("out.parquet"),
             &[0],
             &[true],
             &[true],
@@ -1462,13 +1535,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
-        write_state_file(&p("g1.arrow"), &[(1, 10, 1, 1, 100.0)]);
-        write_state_file(&p("g2.arrow"), &[(2, 20, 2, 2, 200.0)]);
+        write_state_file(&p("g1.parquet"), &[(1, 10, 1, 1, 100.0)]);
+        write_state_file(&p("g2.parquet"), &[(2, 20, 2, 2, 200.0)]);
 
         // Both files use the same schema, so merge should succeed
         let rows = merge_state_streams_validated(
-            &[p("g1.arrow"), p("g2.arrow")],
-            &p("out.arrow"),
+            &[p("g1.parquet"), p("g2.parquet")],
+            &p("out.parquet"),
             &[0],
             &[true],
             &[true],

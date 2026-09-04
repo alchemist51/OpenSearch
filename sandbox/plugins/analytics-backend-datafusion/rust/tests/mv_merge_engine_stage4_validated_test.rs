@@ -42,11 +42,11 @@
 use std::fs::{self, File};
 use std::sync::Arc;
 
-use arrow::ipc::reader::FileReader as IpcFileReader;
-use arrow::ipc::writer::FileWriter as IpcFileWriter;
 use arrow_array::{Array, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use opensearch_datafusion::mv_merge_engine;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ArrowWriter as ParquetWriter;
 
 // ── Shared helpers ──────────────────────────────────────────────────────
 
@@ -62,11 +62,11 @@ fn state_schema() -> SchemaRef {
     ]))
 }
 
-/// Writes sorted rows to an IPC state file with the standard 5-column schema.
+/// Writes sorted rows to a Parquet state file with the standard 5-column schema.
 fn write_state_file(path: &str, rows: &[(i64, i64, i64, u64, f64)]) {
     let schema = state_schema();
     let batch = RecordBatch::try_new(
-        schema,
+        schema.clone(),
         vec![
             Arc::new(Int64Array::from(
                 rows.iter().map(|r| r.0).collect::<Vec<_>>(),
@@ -87,12 +87,12 @@ fn write_state_file(path: &str, rows: &[(i64, i64, i64, u64, f64)]) {
     )
     .unwrap();
     let file = File::create(path).unwrap();
-    let mut w = IpcFileWriter::try_new(file, &batch.schema()).unwrap();
+    let mut w = ParquetWriter::try_new(file, batch.schema(), None).unwrap();
     w.write(&batch).unwrap();
-    w.finish().unwrap();
+    w.close().unwrap();
 }
 
-/// Writes sorted rows to an IPC file with nullable i64 columns.
+/// Writes sorted rows to a Parquet file with nullable i64 columns.
 fn write_nullable_state_file(path: &str, rows: &[(Option<i64>, Option<i64>, Option<i64>)]) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("key", DataType::Int64, true),
@@ -115,14 +115,17 @@ fn write_nullable_state_file(path: &str, rows: &[(Option<i64>, Option<i64>, Opti
     )
     .unwrap();
     let file = File::create(path).unwrap();
-    let mut w = IpcFileWriter::try_new(file, &batch.schema()).unwrap();
+    let mut w = ParquetWriter::try_new(file, batch.schema(), None).unwrap();
     w.write(&batch).unwrap();
-    w.finish().unwrap();
+    w.close().unwrap();
 }
 
-/// Reads rows from a standard 5-column state IPC file, returns sorted by key.
+/// Reads rows from a standard 5-column state Parquet file, returns sorted by key.
 fn read_rows(path: &str) -> Vec<(i64, i64, i64, u64, f64)> {
-    let reader = IpcFileReader::try_new(File::open(path).unwrap(), None).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+        .unwrap()
+        .build()
+        .unwrap();
     let mut out = vec![];
     for batch in reader {
         let b = batch.unwrap();
@@ -145,9 +148,12 @@ fn read_rows(path: &str) -> Vec<(i64, i64, i64, u64, f64)> {
     out
 }
 
-/// Reads rows from a 3-column nullable state IPC file.
+/// Reads rows from a 3-column nullable state Parquet file.
 fn read_nullable_rows(path: &str) -> Vec<(Option<i64>, Option<i64>, Option<i64>)> {
-    let reader = IpcFileReader::try_new(File::open(path).unwrap(), None).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+        .unwrap()
+        .build()
+        .unwrap();
     let mut out = vec![];
     for batch in reader {
         let b = batch.unwrap();
@@ -230,16 +236,16 @@ fn plan_shape_validated_no_sort_exec() {
             let overlap_key = base - 1;
             rows.insert(0, (overlap_key, 1, 1, 1, 1.0));
         }
-        write_state_file(&p(&format!("f{file_idx}.arrow")), &rows);
+        write_state_file(&p(&format!("f{file_idx}.mv.parquet")), &rows);
     }
 
-    let files: Vec<String> = (0..4).map(|i| p(&format!("f{i}.arrow"))).collect();
+    let files: Vec<String> = (0..4).map(|i| p(&format!("f{i}.mv.parquet"))).collect();
     let identity = standard_ordering_identity();
     let agg_names = standard_agg_names();
 
     let rows = mv_merge_engine::merge_state_streams_validated(
         &files,
-        &p("out.arrow"),
+        &p("out.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -249,7 +255,7 @@ fn plan_shape_validated_no_sort_exec() {
     )
     .unwrap();
 
-    let output = read_rows(&p("out.arrow"));
+    let output = read_rows(&p("out.mv.parquet"));
 
     // Output must be strictly sorted (SortPreservingMerge property).
     for window in output.windows(2) {
@@ -284,7 +290,7 @@ fn duplicate_across_files_validated_fold_correctly() {
     for file_idx in 0..5u32 {
         let v = (file_idx + 1) as i64;
         write_state_file(
-            &p(&format!("d{file_idx}.arrow")),
+            &p(&format!("d{file_idx}.mv.parquet")),
             &[
                 (1, v * 10, v, v as u64, v as f64 * 100.0),
                 (2, v * 20, v * 2, (v * 2) as u64, v as f64 * 200.0),
@@ -293,13 +299,13 @@ fn duplicate_across_files_validated_fold_correctly() {
         );
     }
 
-    let files: Vec<String> = (0..5).map(|i| p(&format!("d{i}.arrow"))).collect();
+    let files: Vec<String> = (0..5).map(|i| p(&format!("d{i}.mv.parquet"))).collect();
     let identity = standard_ordering_identity();
     let agg_names = standard_agg_names();
 
     let rows = mv_merge_engine::merge_state_streams_validated(
         &files,
-        &p("out.arrow"),
+        &p("out.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -310,7 +316,7 @@ fn duplicate_across_files_validated_fold_correctly() {
     .unwrap();
 
     assert_eq!(rows, 3, "only 3 distinct keys");
-    let output = read_rows(&p("out.arrow"));
+    let output = read_rows(&p("out.mv.parquet"));
 
     assert_eq!(output[0], (1, 150, 15, 15, 1500.0));
     assert_eq!(output[1], (2, 300, 30, 30, 3000.0));
@@ -327,7 +333,7 @@ fn null_handling_validated() {
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
     write_nullable_state_file(
-        &p("n1.arrow"),
+        &p("n1.mv.parquet"),
         &[
             (None, Some(100), Some(1)),
             (Some(1), None, Some(1)),
@@ -335,7 +341,7 @@ fn null_handling_validated() {
         ],
     );
     write_nullable_state_file(
-        &p("n2.arrow"),
+        &p("n2.mv.parquet"),
         &[
             (None, Some(200), Some(2)),
             (Some(1), Some(10), None),
@@ -343,17 +349,17 @@ fn null_handling_validated() {
         ],
     );
     write_nullable_state_file(
-        &p("n3.arrow"),
+        &p("n3.mv.parquet"),
         &[(Some(2), None, None), (Some(3), Some(700), Some(7))],
     );
 
-    let files = vec![p("n1.arrow"), p("n2.arrow"), p("n3.arrow")];
+    let files = vec![p("n1.mv.parquet"), p("n2.mv.parquet"), p("n3.mv.parquet")];
     let nullable_agg_names = vec!["val_sum".to_string(), "val_cnt".to_string()];
     let nullable_identity = "0:key:0:0";
 
     let rows = mv_merge_engine::merge_state_streams_validated(
         &files,
-        &p("out.arrow"),
+        &p("out.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -364,7 +370,7 @@ fn null_handling_validated() {
     .unwrap();
 
     assert_eq!(rows, 4, "4 distinct groups: null, 1, 2, 3");
-    let output = read_nullable_rows(&p("out.arrow"));
+    let output = read_nullable_rows(&p("out.mv.parquet"));
 
     assert_eq!(output[0], (None, Some(300), Some(3)));
     assert_eq!(output[1], (Some(1), Some(10), Some(1)));
@@ -382,7 +388,7 @@ fn recursive_merge_validated_associative() {
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
     write_state_file(
-        &p("a.arrow"),
+        &p("a.mv.parquet"),
         &[
             (1, 10, 1, 1, 100.0),
             (3, 30, 3, 3, 300.0),
@@ -390,7 +396,7 @@ fn recursive_merge_validated_associative() {
         ],
     );
     write_state_file(
-        &p("b.arrow"),
+        &p("b.mv.parquet"),
         &[
             (2, 20, 2, 2, 200.0),
             (3, 31, 1, 1, 310.0),
@@ -398,7 +404,7 @@ fn recursive_merge_validated_associative() {
         ],
     );
     write_state_file(
-        &p("c.arrow"),
+        &p("c.mv.parquet"),
         &[
             (1, 11, 1, 1, 110.0),
             (4, 40, 4, 4, 400.0),
@@ -406,7 +412,7 @@ fn recursive_merge_validated_associative() {
         ],
     );
     write_state_file(
-        &p("d.arrow"),
+        &p("d.mv.parquet"),
         &[
             (2, 21, 1, 1, 210.0),
             (4, 41, 1, 1, 410.0),
@@ -420,8 +426,8 @@ fn recursive_merge_validated_associative() {
 
     // Flat 4-way merge via validated path.
     mv_merge_engine::merge_state_streams_validated(
-        &[p("a.arrow"), p("b.arrow"), p("c.arrow"), p("d.arrow")],
-        &p("flat.arrow"),
+        &[p("a.mv.parquet"), p("b.mv.parquet"), p("c.mv.parquet"), p("d.mv.parquet")],
+        &p("flat.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -433,8 +439,8 @@ fn recursive_merge_validated_associative() {
 
     // Recursive: merge(A,B) → AB, merge(C,D) → CD, merge(AB,CD) → final.
     mv_merge_engine::merge_state_streams_validated(
-        &[p("a.arrow"), p("b.arrow")],
-        &p("ab.arrow"),
+        &[p("a.mv.parquet"), p("b.mv.parquet")],
+        &p("ab.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -444,8 +450,8 @@ fn recursive_merge_validated_associative() {
     )
     .unwrap();
     mv_merge_engine::merge_state_streams_validated(
-        &[p("c.arrow"), p("d.arrow")],
-        &p("cd.arrow"),
+        &[p("c.mv.parquet"), p("d.mv.parquet")],
+        &p("cd.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -455,8 +461,8 @@ fn recursive_merge_validated_associative() {
     )
     .unwrap();
     mv_merge_engine::merge_state_streams_validated(
-        &[p("ab.arrow"), p("cd.arrow")],
-        &p("recursive.arrow"),
+        &[p("ab.mv.parquet"), p("cd.mv.parquet")],
+        &p("recursive.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -466,8 +472,8 @@ fn recursive_merge_validated_associative() {
     )
     .unwrap();
 
-    let flat_output = read_rows(&p("flat.arrow"));
-    let recursive_output = read_rows(&p("recursive.arrow"));
+    let flat_output = read_rows(&p("flat.mv.parquet"));
+    let recursive_output = read_rows(&p("recursive.mv.parquet"));
 
     assert_eq!(
         flat_output, recursive_output,
@@ -501,11 +507,11 @@ fn cancellation_validated_returns_error() {
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
     write_state_file(
-        &p("c1.arrow"),
+        &p("c1.mv.parquet"),
         &[(1, 10, 1, 1, 100.0), (2, 20, 2, 2, 200.0)],
     );
     write_state_file(
-        &p("c2.arrow"),
+        &p("c2.mv.parquet"),
         &[(3, 30, 3, 3, 300.0), (4, 40, 4, 4, 400.0)],
     );
 
@@ -515,7 +521,7 @@ fn cancellation_validated_returns_error() {
     let bad_output_str = bad_output.to_str().unwrap().to_string();
 
     let result = mv_merge_engine::merge_state_streams_validated(
-        &[p("c1.arrow"), p("c2.arrow")],
+        &[p("c1.mv.parquet"), p("c2.mv.parquet")],
         &bad_output_str,
         &[0],
         &[true],
@@ -544,12 +550,12 @@ fn cleanup_validated_aborted_merge_no_temp_files() {
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
     let out_p = |n: &str| out_dir.path().join(n).to_str().unwrap().to_string();
 
-    write_state_file(&p("ok.arrow"), &[(1, 10, 1, 1, 100.0)]);
+    write_state_file(&p("ok.mv.parquet"), &[(1, 10, 1, 1, 100.0)]);
 
     // Wrong fold_ops length to force early error.
     let result = mv_merge_engine::merge_state_streams_validated(
-        &[p("ok.arrow")],
-        &out_p("should_not_exist.arrow"),
+        &[p("ok.mv.parquet")],
+        &out_p("should_not_exist.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -580,7 +586,7 @@ fn schema_mismatch_validated_returns_error() {
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
     // Standard 5-column file.
-    write_state_file(&p("s1.arrow"), &[(1, 10, 1, 1, 100.0)]);
+    write_state_file(&p("s1.mv.parquet"), &[(1, 10, 1, 1, 100.0)]);
 
     // Different schema: 3 columns, different types.
     let schema2 = Arc::new(Schema::new(vec![
@@ -597,15 +603,15 @@ fn schema_mismatch_validated_returns_error() {
         ],
     )
     .unwrap();
-    let f2 = File::create(&p("s2.arrow")).unwrap();
-    let mut w2 = IpcFileWriter::try_new(f2, &schema2).unwrap();
+    let f2 = File::create(&p("s2.mv.parquet")).unwrap();
+    let mut w2 = ParquetWriter::try_new(f2, schema2.clone(), None).unwrap();
     w2.write(&batch2).unwrap();
-    w2.finish().unwrap();
+    w2.close().unwrap();
 
     // Arity mismatch: 5 cols vs 3 cols via validated path.
     let result = mv_merge_engine::merge_state_streams_validated(
-        &[p("s1.arrow"), p("s2.arrow")],
-        &p("out.arrow"),
+        &[p("s1.mv.parquet"), p("s2.mv.parquet")],
+        &p("out.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -635,14 +641,14 @@ fn schema_mismatch_validated_returns_error() {
         ],
     )
     .unwrap();
-    let f3 = File::create(&p("s3.arrow")).unwrap();
-    let mut w3 = IpcFileWriter::try_new(f3, &schema3).unwrap();
+    let f3 = File::create(&p("s3.mv.parquet")).unwrap();
+    let mut w3 = ParquetWriter::try_new(f3, schema3.clone(), None).unwrap();
     w3.write(&batch3).unwrap();
-    w3.finish().unwrap();
+    w3.close().unwrap();
 
     let result2 = mv_merge_engine::merge_state_streams_validated(
-        &[p("s1.arrow"), p("s3.arrow")],
-        &p("out2.arrow"),
+        &[p("s1.mv.parquet"), p("s3.mv.parquet")],
+        &p("out2.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -666,15 +672,15 @@ fn definition_mismatch_validated_rejects_wrong_identity() {
     let dir = tempfile::tempdir().unwrap();
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
-    write_state_file(&p("g1.arrow"), &[(1, 10, 1, 1, 100.0)]);
+    write_state_file(&p("g1.mv.parquet"), &[(1, 10, 1, 1, 100.0)]);
 
     // Schema says RegionID at 0, ASC, NULLS_FIRST → identity "0:RegionID:0:0"
     // But we pass DESC, NULLS_LAST identity → "0:RegionID:1:1"
     let wrong_identity = "0:RegionID:1:1";
 
     let result = mv_merge_engine::merge_state_streams_validated(
-        &[p("g1.arrow")],
-        &p("out.arrow"),
+        &[p("g1.mv.parquet")],
+        &p("out.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -733,16 +739,16 @@ fn tiny_memory_validated_large_data_exact_and_ordered() {
             rows.push((key, key, 1, 1, key as f64));
         }
         rows.sort_by_key(|r| r.0);
-        write_state_file(&p(&format!("big{file_idx}.arrow")), &rows);
+        write_state_file(&p(&format!("big{file_idx}.mv.parquet")), &rows);
     }
 
-    let files: Vec<String> = (0..k).map(|i| p(&format!("big{i}.arrow"))).collect();
+    let files: Vec<String> = (0..k).map(|i| p(&format!("big{i}.mv.parquet"))).collect();
     let identity = standard_ordering_identity();
     let agg_names = standard_agg_names();
 
     let row_count = mv_merge_engine::merge_state_streams_validated(
         &files,
-        &p("big_out.arrow"),
+        &p("big_out.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -758,7 +764,7 @@ fn tiny_memory_validated_large_data_exact_and_ordered() {
         "row count must match distinct keys"
     );
 
-    let output = read_rows(&p("big_out.arrow"));
+    let output = read_rows(&p("big_out.mv.parquet"));
     assert_eq!(output.len(), expected_distinct as usize);
 
     // Strict ordering.
@@ -789,19 +795,19 @@ fn agg_column_names_pass_correct_names_accepted() {
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
     write_state_file(
-        &p("g1.arrow"),
+        &p("g1.mv.parquet"),
         &[(2, 3, 1, 1, 1440.0), (229, 2, 2, 2, 3288.0)],
     );
     write_state_file(
-        &p("g2.arrow"),
+        &p("g2.mv.parquet"),
         &[(7, 0, 1, 1, 800.0), (229, 7, 1, 1, 1366.0)],
     );
 
     let agg_names = standard_agg_names();
 
     let rows = mv_merge_engine::merge_state_streams_validated(
-        &[p("g1.arrow"), p("g2.arrow")],
-        &p("out.arrow"),
+        &[p("g1.mv.parquet"), p("g2.mv.parquet")],
+        &p("out.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -812,7 +818,7 @@ fn agg_column_names_pass_correct_names_accepted() {
     .unwrap();
 
     assert_eq!(rows, 3, "3 distinct keys: 2, 7, 229");
-    let output = read_rows(&p("out.arrow"));
+    let output = read_rows(&p("out.mv.parquet"));
 
     // Key 229: folded across 2 files → 2+7=9, 2+1=3, 2+1=3, 3288+1366=4654
     let k229 = output.iter().find(|r| r.0 == 229).unwrap();
@@ -831,7 +837,7 @@ fn agg_column_names_reject_wrong_name() {
     let dir = tempfile::tempdir().unwrap();
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
-    write_state_file(&p("g1.arrow"), &[(1, 10, 1, 1, 100.0)]);
+    write_state_file(&p("g1.mv.parquet"), &[(1, 10, 1, 1, 100.0)]);
 
     let wrong_names = vec![
         "WRONG_NAME".to_string(),
@@ -841,8 +847,8 @@ fn agg_column_names_reject_wrong_name() {
     ];
 
     let result = mv_merge_engine::merge_state_streams_validated(
-        &[p("g1.arrow")],
-        &p("out.arrow"),
+        &[p("g1.mv.parquet")],
+        &p("out.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -872,7 +878,7 @@ fn agg_column_names_reject_overflow() {
     let dir = tempfile::tempdir().unwrap();
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
-    write_state_file(&p("g1.arrow"), &[(1, 10, 1, 1, 100.0)]);
+    write_state_file(&p("g1.mv.parquet"), &[(1, 10, 1, 1, 100.0)]);
 
     // 5 agg names + 1 group key = 6 > schema's 5 fields.
     let too_many_names = vec![
@@ -884,8 +890,8 @@ fn agg_column_names_reject_overflow() {
     ];
 
     let result = mv_merge_engine::merge_state_streams_validated(
-        &[p("g1.arrow")],
-        &p("out.arrow"),
+        &[p("g1.mv.parquet")],
+        &p("out.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -912,7 +918,7 @@ fn ordering_identity_pass_correct_identity_accepted() {
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
     write_state_file(
-        &p("g1.arrow"),
+        &p("g1.mv.parquet"),
         &[(1, 10, 1, 1, 100.0), (5, 50, 5, 5, 500.0)],
     );
 
@@ -920,8 +926,8 @@ fn ordering_identity_pass_correct_identity_accepted() {
     let identity = "0:RegionID:0:0";
 
     let rows = mv_merge_engine::merge_state_streams_validated(
-        &[p("g1.arrow")],
-        &p("out.arrow"),
+        &[p("g1.mv.parquet")],
+        &p("out.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -943,14 +949,14 @@ fn ordering_identity_reject_wrong() {
     let dir = tempfile::tempdir().unwrap();
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
-    write_state_file(&p("g1.arrow"), &[(1, 10, 1, 1, 100.0)]);
+    write_state_file(&p("g1.mv.parquet"), &[(1, 10, 1, 1, 100.0)]);
 
     // Wrong: claims DESC NULLS_LAST but schema+ordering contract is ASC NULLS_FIRST.
     let wrong = "0:RegionID:1:1";
 
     let result = mv_merge_engine::merge_state_streams_validated(
-        &[p("g1.arrow")],
-        &p("out.arrow"),
+        &[p("g1.mv.parquet")],
+        &p("out.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -975,12 +981,12 @@ fn ordering_identity_empty_pass() {
     let dir = tempfile::tempdir().unwrap();
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
-    write_state_file(&p("g1.arrow"), &[(1, 10, 1, 1, 100.0)]);
+    write_state_file(&p("g1.mv.parquet"), &[(1, 10, 1, 1, 100.0)]);
 
     // Empty string should skip identity validation.
     let result = mv_merge_engine::merge_state_streams_validated(
-        &[p("g1.arrow")],
-        &p("out.arrow"),
+        &[p("g1.mv.parquet")],
+        &p("out.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -992,8 +998,8 @@ fn ordering_identity_empty_pass() {
 
     // None should also skip identity validation.
     let result2 = mv_merge_engine::merge_state_streams_validated(
-        &[p("g1.arrow")],
-        &p("out2.arrow"),
+        &[p("g1.mv.parquet")],
+        &p("out2.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -1075,12 +1081,12 @@ fn schema_hash_consistency_cross_file_validated() {
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
 
     // Two files with identical schema.
-    write_state_file(&p("g1.arrow"), &[(1, 10, 1, 1, 100.0)]);
-    write_state_file(&p("g2.arrow"), &[(2, 20, 2, 2, 200.0)]);
+    write_state_file(&p("g1.mv.parquet"), &[(1, 10, 1, 1, 100.0)]);
+    write_state_file(&p("g2.mv.parquet"), &[(2, 20, 2, 2, 200.0)]);
 
     let rows = mv_merge_engine::merge_state_streams_validated(
-        &[p("g1.arrow"), p("g2.arrow")],
-        &p("out.arrow"),
+        &[p("g1.mv.parquet"), p("g2.mv.parquet")],
+        &p("out.mv.parquet"),
         &[0],
         &[true],
         &[true],
@@ -1125,14 +1131,14 @@ fn schema_hash_consistency_cross_file_validated() {
         ],
     )
     .unwrap();
-    let f_alt = File::create(&p("alt.arrow")).unwrap();
-    let mut w_alt = IpcFileWriter::try_new(f_alt, &alt_schema_5col).unwrap();
+    let f_alt = File::create(&p("alt.mv.parquet")).unwrap();
+    let mut w_alt = ParquetWriter::try_new(f_alt, alt_schema_5col.clone(), None).unwrap();
     w_alt.write(&batch_alt).unwrap();
-    w_alt.finish().unwrap();
+    w_alt.close().unwrap();
 
     let result = mv_merge_engine::merge_state_streams_validated(
-        &[p("g1.arrow"), p("alt.arrow")],
-        &p("out_cross.arrow"),
+        &[p("g1.mv.parquet"), p("alt.mv.parquet")],
+        &p("out_cross.mv.parquet"),
         &[0],
         &[true],
         &[true],

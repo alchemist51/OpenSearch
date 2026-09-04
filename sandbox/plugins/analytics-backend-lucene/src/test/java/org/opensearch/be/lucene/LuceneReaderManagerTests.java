@@ -304,7 +304,7 @@ public class LuceneReaderManagerTests extends OpenSearchTestCase {
         WriterFileSet derivedWfs = new WriterFileSet(
             createTempDir().toString(),
             derivedGeneration,
-            Set.of("_mv_poc_" + derivedGeneration + ".mv.arrow"),
+            Set.of("_mv_poc_" + derivedGeneration + ".mv.parquet"),
             5,
             0L
         );

@@ -87,9 +87,9 @@ fn build_state_file(path: &str, rows: &[(i64, f64)]) {
             .collect();
         let sorted = RecordBatch::try_new(schema.clone(), cols).unwrap();
         let f = File::create(path).unwrap();
-        let mut w = arrow::ipc::writer::FileWriter::try_new(f, &sorted.schema()).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(f, sorted.schema(), None).unwrap();
         w.write(&sorted).unwrap();
-        w.finish().unwrap();
+        w.close().unwrap();
     });
 }
 
@@ -133,9 +133,9 @@ fn synth_partial(
 
 fn write_batch(path: &str, batch: &RecordBatch) {
     let f = File::create(path).unwrap();
-    let mut w = arrow::ipc::writer::FileWriter::try_new(f, &batch.schema()).unwrap();
+    let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), None).unwrap();
     w.write(batch).unwrap();
-    w.finish().unwrap();
+    w.close().unwrap();
 }
 
 /// (region -> p95) from a finalized batch.
@@ -183,9 +183,9 @@ fn percentile_folds_within_bounds() {
     let g2: Vec<(i64, f64)> = (0..300).map(|_| (229, next())).collect();
     let g3: Vec<(i64, f64)> = (0..300).map(|_| (229, next())).collect();
 
-    build_state_file(&p("g1.arrow"), &g1);
-    build_state_file(&p("g2.arrow"), &g2);
-    build_state_file(&p("g3.arrow"), &g3);
+    build_state_file(&p("g1.mv.parquet"), &g1);
+    build_state_file(&p("g2.mv.parquet"), &g2);
+    build_state_file(&p("g3.mv.parquet"), &g3);
 
     // Exact answer over all 1000 raw values.
     let mut all: Vec<f64> = g1.iter().chain(&g2).chain(&g3).map(|r| r.1).collect();
@@ -193,14 +193,14 @@ fn percentile_folds_within_bounds() {
 
     // MV path: fold the three states, then finalize.
     let folded = mv_fold_state(
-        &[p("g1.arrow"), p("g2.arrow"), p("g3.arrow")],
+        &[p("g1.mv.parquet"), p("g2.mv.parquet"), p("g3.mv.parquet")],
         DEFN,
         input_schema(),
     )
     .unwrap();
     assert_eq!(folded.num_rows(), 1, "one region folds to one state row");
-    write_batch(&p("folded.arrow"), &folded);
-    let answer = finals(&mv_finalize_state(&[p("folded.arrow")], DEFN, input_schema()).unwrap());
+    write_batch(&p("folded.mv.parquet"), &folded);
+    let answer = finals(&mv_finalize_state(&[p("folded.mv.parquet")], DEFN, input_schema()).unwrap());
     let mv_p95 = answer[0].1;
 
     // Honest bound: t-digest is approximate — assert relative error, not equality.
@@ -212,11 +212,11 @@ fn percentile_folds_within_bounds() {
 
     // Fold-order drift: incremental (g1⊕g2)⊕g3 vs the 3-way fold — measured
     // and BOUNDED, deliberately not asserted equal.
-    let f12 = mv_fold_state(&[p("g1.arrow"), p("g2.arrow")], DEFN, input_schema()).unwrap();
-    write_batch(&p("f12.arrow"), &f12);
-    let f123 = mv_fold_state(&[p("f12.arrow"), p("g3.arrow")], DEFN, input_schema()).unwrap();
-    write_batch(&p("f123.arrow"), &f123);
-    let incr = finals(&mv_finalize_state(&[p("f123.arrow")], DEFN, input_schema()).unwrap())[0].1;
+    let f12 = mv_fold_state(&[p("g1.mv.parquet"), p("g2.mv.parquet")], DEFN, input_schema()).unwrap();
+    write_batch(&p("f12.mv.parquet"), &f12);
+    let f123 = mv_fold_state(&[p("f12.mv.parquet"), p("g3.mv.parquet")], DEFN, input_schema()).unwrap();
+    write_batch(&p("f123.mv.parquet"), &f123);
+    let incr = finals(&mv_finalize_state(&[p("f123.mv.parquet")], DEFN, input_schema()).unwrap())[0].1;
     let drift = (incr - mv_p95).abs() / exact;
     assert!(
         drift < 0.02,
@@ -227,7 +227,7 @@ fn percentile_folds_within_bounds() {
     // (the read path may see any fold level).
     let unfolded = finals(
         &mv_finalize_state(
-            &[p("g1.arrow"), p("g2.arrow"), p("g3.arrow")],
+            &[p("g1.mv.parquet"), p("g2.mv.parquet"), p("g3.mv.parquet")],
             DEFN,
             input_schema(),
         )

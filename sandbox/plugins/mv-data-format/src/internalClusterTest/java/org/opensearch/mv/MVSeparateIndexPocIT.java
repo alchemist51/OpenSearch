@@ -224,7 +224,7 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
         assertBusy(() -> {
             java.util.List<String> files = targetStateFiles(TARGET);
             assertFalse("derived state must exist after heal", files.isEmpty());
-            String folded = MVNativeBridge.searchV2(files, MVConstants.TARGET_FOLD_SEARCH_SQL);
+            String folded = MVNativeBridge.searchV2(files, MVCompiledDefinition.paymentsFold().finalFoldSearchSql());
             assertTrue("web/200 state must arrive after heal, saw: " + folded, folded.contains("web\t200"));
         });
     }
@@ -253,7 +253,7 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
         assertBusy(() -> {
             java.util.List<String> files = targetStateFiles(TARGET);
             assertFalse("reconciled target state must exist", files.isEmpty());
-            String folded = MVNativeBridge.searchV2(files, MVConstants.TARGET_FOLD_SEARCH_SQL);
+            String folded = MVNativeBridge.searchV2(files, MVCompiledDefinition.paymentsFold().finalFoldSearchSql());
             assertTrue("api/200 state must be pulled without a new source write, saw: " + folded, folded.contains("api\t200"));
         });
     }
@@ -313,7 +313,7 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
     private void assertGoldenFoldOverTargetState(String targetIndex) throws Exception {
         java.util.List<String> files = targetStateFiles(targetIndex);
         assertFalse("target [" + targetIndex + "] must have mv_state files", files.isEmpty());
-        String result = MVNativeBridge.searchV2(files, MVConstants.TARGET_FOLD_SEARCH_SQL);
+        String result = MVNativeBridge.searchV2(files, MVCompiledDefinition.paymentsFold().finalFoldSearchSql());
         assertEquals(
             "api\t200\t4\t115\t10\t50\n" + "api\t500\t1\t900\t900\t900\n" + "batch\t200\t1\t60\t60\t60\n" + "web\t200\t2\t120\t40\t80\n",
             result
@@ -404,6 +404,7 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
                     .put("index.composite.primary_data_format", "parquet")
                     .putList("index.composite.secondary_data_formats", "lucene", "materialized_view")
                     .put("index.composite.merge_on_refresh_max_size", "0b")
+                    .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "payments")
                     .putList(MVConstants.SHIP_TARGETS_SETTING, targets)
             )
             .setMapping("service", "type=keyword", "status", "type=keyword", "latency_ms", "type=long")
@@ -449,6 +450,7 @@ public class MVSeparateIndexPocIT extends OpenSearchIntegTestCase {
                     .put("index.composite.primary_data_format", "parquet")
                     .putList("index.composite.secondary_data_formats", "lucene")
                     .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DATA_FORMAT, "materialized_view")
+                    .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "payments")
                     .put("index.composite.merge_on_refresh_max_size", "0b")
                     .put(MVConstants.COLOCATE_WITH_SETTING, SOURCE)
             )

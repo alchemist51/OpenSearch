@@ -43,7 +43,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
 use datafusion::common::Result;
-use datafusion::datasource::file_format::arrow::ArrowFormat;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
@@ -180,11 +180,23 @@ async fn build_mv_scan(
     ctx: &SessionContext,
     mv_file_paths: &[String],
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    // Legacy Arrow IPC guard: fail closed with rebuild-required error.
+    for path in mv_file_paths {
+        if path.ends_with(".mv.arrow") {
+            return Err(datafusion::common::DataFusionError::Execution(format!(
+                "mv_read: legacy Arrow IPC state file '{}' is no longer supported; \
+                 rebuild the materialized view to generate Parquet state files",
+                path
+            )));
+        }
+    }
+
     let urls: Vec<ListingTableUrl> = mv_file_paths
         .iter()
         .map(ListingTableUrl::parse)
         .collect::<Result<_>>()?;
-    let listing_options = ListingOptions::new(Arc::new(ArrowFormat)).with_file_extension(".arrow");
+    let listing_options =
+        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
     let schema = listing_options.infer_schema(&ctx.state(), &urls[0]).await?;
     let config = ListingTableConfig::new_with_multi_paths(urls)
         .with_listing_options(listing_options)

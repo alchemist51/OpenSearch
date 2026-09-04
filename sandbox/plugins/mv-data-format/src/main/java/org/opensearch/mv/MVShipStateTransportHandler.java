@@ -85,7 +85,7 @@ public final class MVShipStateTransportHandler extends HandledTransportAction<MV
                     .metadata()
                     .index(request.targetIndex())
                     .getSettings()
-                    .get(MVConstants.DEFINITION_SETTING);
+                    .get(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID);
                 if (targetDefinition != null && targetDefinition.equals(request.definition()) == false) {
                     listener.onFailure(
                         new IllegalStateException(

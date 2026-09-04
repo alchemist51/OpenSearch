@@ -6,11 +6,11 @@
  * compatible open source license.
  */
 
-//! Lazy/streaming Arrow IPC table provider for MV state files.
+//! Lazy/streaming Parquet table provider for MV state files.
 //!
 //! # Problem (the scaling defect this module fixes)
 //!
-//! `create_mv_only_session_context` previously read ALL Arrow IPC state files eagerly
+//! `create_mv_only_session_context` previously read ALL state files eagerly
 //! into `Vec<RecordBatch>` and registered them as a `MemTable`. With 122 files totaling
 //! ~23 GB, this pre-loaded the entire dataset into memory at session creation time,
 //! triggering the DataFusion circuit breaker (26.5 GB limit) before any query execution
@@ -18,25 +18,12 @@
 //! data size as a single reservation, leaving no headroom for hash aggregation or other
 //! operators.
 //!
-//! # Old behavior (lines ~340-380 of session_context.rs, now removed)
-//!
-//! ```text
-//! let mut physical_batches: Vec<RecordBatch> = Vec::new();
-//! for path in state_file_paths {
-//!     let reader = FileReader::try_new(file, None)?;
-//!     for batch_result in reader {
-//!         physical_batches.push(batch_result?);  // ← ALL batches accumulated here
-//!     }
-//! }
-//! let mem_table = MemTable::try_new(table_schema, vec![logical_batches])?;
-//! ```
-//!
 //! # New behavior (this module)
 //!
-//! - Session creation reads ONLY the first file's schema header (~few KB). No record
+//! - Session creation reads ONLY the first file's schema metadata (~few KB). No record
 //!   batches are loaded.
 //! - Each file becomes a separate partition in the `ExecutionPlan`.
-//! - During execution, each partition opens its Arrow IPC file lazily, streams
+//! - During execution, each partition opens its Parquet file lazily, streams
 //!   `RecordBatch`es one at a time through projection/cast/null-fill, and drops
 //!   each batch before reading the next.
 //! - Peak memory = O(batch_size × num_columns × max_partitions_executing), not
@@ -44,11 +31,11 @@
 //! - DataFusion's memory pool tracks only the actively-decoded batches, not
 //!   the entire dataset.
 //!
-//! # Why not ListingTable / register_listing_table?
+//! # Legacy `.mv.arrow` files
 //!
-//! Prior testing proved that ListingTable and `new_with_multi_paths` with directory
-//! URLs silently return zero rows for `.mv.arrow` IPC files. This is a known
-//! limitation: ListingTable is designed for Parquet, not Arrow IPC.
+//! Legacy Arrow IPC state files (`.mv.arrow`) are no longer supported. Any
+//! attempt to open one returns a clear rebuild-required error. This ensures
+//! fail-closed semantics: old state files cannot silently produce wrong results.
 
 use std::fmt;
 use std::pin::Pin;
@@ -347,7 +334,7 @@ impl ExecutionPlan for MvStateExec {
 // RecordBatchStream — lazy file-at-a-time reader
 // ---------------------------------------------------------------------------
 
-/// Lazily opens an Arrow IPC file and streams projected/cast/null-filled batches.
+/// Lazily opens a Parquet state file and streams projected/cast/null-filled batches.
 ///
 /// The file is opened on the first `poll_next`, not at construction time.
 /// Each batch is transformed and yielded; the physical batch is dropped
@@ -362,13 +349,9 @@ struct MvStateStream {
     /// Optional scan projection: which logical columns to emit.
     output_projection: Option<Vec<usize>>,
     /// State machine: None = not yet opened, Some = reader in progress.
-    reader: Option<arrow::ipc::reader::FileReader<std::fs::File>>,
+    reader: Option<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
     /// Whether we've finished reading.
     finished: bool,
-    /// Tracks which batch index we're on within the current file.
-    batch_index: usize,
-    /// Total batches in the file (from IPC footer, known after open).
-    total_batches: usize,
 }
 
 impl MvStateStream {
@@ -396,15 +379,22 @@ impl MvStateStream {
             output_projection,
             reader: None,
             finished: false,
-            batch_index: 0,
-            total_batches: 0,
         }
     }
 
-    /// Opens the IPC file and initializes the reader. Called lazily on first poll.
+    /// Opens the Parquet file and initializes the reader. Called lazily on first poll.
     fn open_file(&mut self) -> std::result::Result<(), DataFusionError> {
         #[cfg(test)]
         test_counters::increment();
+
+        // Legacy Arrow IPC guard: fail closed with a rebuild-required error.
+        if self.file_path.ends_with(".mv.arrow") {
+            return Err(DataFusionError::Execution(format!(
+                "MvStateStream: legacy Arrow IPC state file '{}' is no longer supported; \
+                 rebuild the materialized view to generate Parquet state files",
+                self.file_path
+            )));
+        }
 
         let file = std::fs::File::open(&self.file_path).map_err(|e| {
             DataFusionError::Execution(format!(
@@ -412,18 +402,25 @@ impl MvStateStream {
                 self.file_path, e
             ))
         })?;
-        let reader = arrow::ipc::reader::FileReader::try_new(file, None).map_err(|e| {
-            DataFusionError::Execution(format!(
-                "MvStateStream: failed to read Arrow IPC '{}': {}",
-                self.file_path, e
-            ))
-        })?;
-        self.total_batches = reader.num_batches();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "MvStateStream: failed to read Parquet '{}': {}",
+                    self.file_path, e
+                ))
+            })?
+            .build()
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "MvStateStream: failed to build Parquet reader '{}': {}",
+                    self.file_path, e
+                ))
+            })?;
         self.reader = Some(reader);
         Ok(())
     }
 
-    /// Reads the next batch from the IPC file, applies projection/cast/null-fill,
+    /// Reads the next batch from the Parquet file, applies projection/cast/null-fill,
     /// and optionally applies output_projection.
     fn next_batch(&mut self) -> std::result::Result<Option<RecordBatch>, DataFusionError> {
         if self.finished {
@@ -437,31 +434,23 @@ impl MvStateStream {
 
         let reader = self.reader.as_mut().unwrap();
 
-        // Check if we've exhausted all batches.
-        if self.batch_index >= self.total_batches {
-            self.finished = true;
-            self.reader = None; // Close the file handle.
-            return Ok(None);
-        }
-
         // Read the next physical batch.
         let physical_batch = match reader.next() {
             Some(Ok(batch)) => batch,
             Some(Err(e)) => {
                 self.finished = true;
                 return Err(DataFusionError::Execution(format!(
-                    "MvStateStream: batch read error in '{}' at index {}: {}",
-                    self.file_path, self.batch_index, e
+                    "MvStateStream: batch read error in '{}': {}",
+                    self.file_path, e
                 )));
             }
             None => {
-                // Iterator exhausted before expected batch count.
+                // Iterator exhausted.
                 self.finished = true;
                 self.reader = None;
                 return Ok(None);
             }
         };
-        self.batch_index += 1;
 
         let num_rows = physical_batch.num_rows();
         if num_rows == 0 {
@@ -554,10 +543,12 @@ impl RecordBatchStream for MvStateStream {
 // Public helper: read only the schema header from the first IPC file.
 // ---------------------------------------------------------------------------
 
-/// Reads the Arrow schema from the first IPC file without loading any record
-/// batches. Returns None if there are no files or the first file can't be read.
+/// Reads the Arrow schema from the first Parquet state file without loading any
+/// record batches. Returns None if there are no files or the first file can't
+/// be read.
 ///
-/// Cost: opens file, reads IPC footer (~few KB), closes immediately. O(1) memory.
+/// Cost: opens file, reads Parquet footer metadata (~few KB), closes immediately.
+/// O(1) memory.
 pub fn read_schema_from_first_file(
     state_file_paths: &[String],
 ) -> std::result::Result<Option<SchemaRef>, DataFusionError> {
@@ -565,19 +556,32 @@ pub fn read_schema_from_first_file(
         Some(p) => p,
         None => return Ok(None),
     };
+
+    // Legacy Arrow IPC guard: fail closed with a rebuild-required error.
+    if path.ends_with(".mv.arrow") {
+        return Err(DataFusionError::Execution(format!(
+            "read_schema_from_first_file: legacy Arrow IPC state file '{}' is no longer supported; \
+             rebuild the materialized view to generate Parquet state files",
+            path
+        )));
+    }
+
     let file = std::fs::File::open(path).map_err(|e| {
         DataFusionError::Execution(format!(
             "read_schema_from_first_file: failed to open '{}': {}",
             path, e
         ))
     })?;
-    let reader = arrow::ipc::reader::FileReader::try_new(file, None).map_err(|e| {
-        DataFusionError::Execution(format!(
-            "read_schema_from_first_file: failed to read Arrow IPC '{}': {}",
-            path, e
-        ))
-    })?;
-    Ok(Some(reader.schema()))
+    let builder =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).map_err(
+            |e| {
+                DataFusionError::Execution(format!(
+                    "read_schema_from_first_file: failed to read Parquet '{}': {}",
+                    path, e
+                ))
+            },
+        )?;
+    Ok(Some(builder.schema().clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -589,13 +593,15 @@ mod tests {
     use super::*;
     use arrow::array::{Int16Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{Field, Schema};
-    use arrow::ipc::writer::FileWriter;
     use datafusion::prelude::SessionContext;
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
     use std::io::Write;
     use tempfile::TempDir;
 
-    /// Helper: writes an Arrow IPC file with the given schema and batches.
-    fn write_ipc_file(
+    /// Helper: writes a Parquet file with the given schema and batches.
+    fn write_parquet_file(
         dir: &std::path::Path,
         name: &str,
         schema: &SchemaRef,
@@ -603,11 +609,14 @@ mod tests {
     ) -> String {
         let path = dir.join(name);
         let file = std::fs::File::create(&path).unwrap();
-        let mut writer = FileWriter::try_new(file, schema).unwrap();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(Default::default()))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
         for batch in batches {
             writer.write(batch).unwrap();
         }
-        writer.finish().unwrap();
+        writer.close().unwrap();
         path.to_str().unwrap().to_string()
     }
 
@@ -677,7 +686,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let physical = three_col_physical_schema();
         let batch = make_physical_batch(&physical, &[1, 2, 3], &[10, 20, 30], &[100, 200, 300]);
-        let path = write_ipc_file(dir.path(), "state_0.mv.arrow", &physical, &[batch]);
+        let path = write_parquet_file(dir.path(), "state_0.mv.parquet", &physical, &[batch]);
 
         let logical = three_col_logical_schema();
         let projection = three_col_projection();
@@ -735,17 +744,17 @@ mod tests {
         // File 1: 2 batches
         let b1 = make_physical_batch(&physical, &[1, 2], &[10, 20], &[100, 200]);
         let b2 = make_physical_batch(&physical, &[3], &[30], &[300]);
-        let p1 = write_ipc_file(dir.path(), "state_0.mv.arrow", &physical, &[b1, b2]);
+        let p1 = write_parquet_file(dir.path(), "state_0.mv.parquet", &physical, &[b1, b2]);
 
         // File 2: 1 batch
         let b3 = make_physical_batch(&physical, &[4, 5], &[40, 50], &[400, 500]);
-        let p2 = write_ipc_file(dir.path(), "state_1.mv.arrow", &physical, &[b3]);
+        let p2 = write_parquet_file(dir.path(), "state_1.mv.parquet", &physical, &[b3]);
 
         // File 3: 3 batches
         let b4 = make_physical_batch(&physical, &[6], &[60], &[600]);
         let b5 = make_physical_batch(&physical, &[7, 8], &[70, 80], &[700, 800]);
         let b6 = make_physical_batch(&physical, &[9, 10], &[90, 100], &[900, 1000]);
-        let p3 = write_ipc_file(dir.path(), "state_2.mv.arrow", &physical, &[b4, b5, b6]);
+        let p3 = write_parquet_file(dir.path(), "state_2.mv.parquet", &physical, &[b4, b5, b6]);
 
         let logical = three_col_logical_schema();
         let projection = three_col_projection();
@@ -810,9 +819,9 @@ mod tests {
         // aggregate state already matches the logical Int64 type.
         let first_schema = three_col_physical_schema();
         let first_batch = make_physical_batch(&first_schema, &[1], &[1], &[100]);
-        let first_path = write_ipc_file(
+        let first_path = write_parquet_file(
             dir.path(),
-            "state_int64.mv.arrow",
+            "state_int64.mv.parquet",
             &first_schema,
             &[first_batch],
         );
@@ -833,9 +842,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let narrower_path = write_ipc_file(
+        let narrower_path = write_parquet_file(
             dir.path(),
-            "state_int16.mv.arrow",
+            "state_int16.mv.parquet",
             &narrower_schema,
             &[narrower_batch],
         );
@@ -878,9 +887,9 @@ mod tests {
 
         let mut paths = Vec::new();
         for i in 0..10 {
-            let p = write_ipc_file(
+            let p = write_parquet_file(
                 dir.path(),
-                &format!("state_{}.mv.arrow", i),
+                &format!("state_{}.mv.parquet", i),
                 &physical,
                 &[batch.clone()],
             );
@@ -947,7 +956,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let physical = three_col_physical_schema();
         let batch = make_physical_batch(&physical, &[1, 2], &[10, 20], &[100, 200]);
-        let path = write_ipc_file(dir.path(), "state.mv.arrow", &physical, &[batch]);
+        let path = write_parquet_file(dir.path(), "state.mv.parquet", &physical, &[batch]);
 
         // Logical schema has 4 columns: 3 state + 1 extra (null-filled).
         let logical = Arc::new(Schema::new(vec![
@@ -1032,7 +1041,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let path = write_ipc_file(dir.path(), "state.mv.arrow", &physical, &[batch]);
+        let path = write_parquet_file(dir.path(), "state.mv.parquet", &physical, &[batch]);
 
         let logical = Arc::new(Schema::new(vec![
             Field::new("RegionID", DataType::Int64, true), // widened
@@ -1089,7 +1098,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let physical = three_col_physical_schema();
         let batch = make_physical_batch(&physical, &[1, 2], &[10, 20], &[100, 200]);
-        let path = write_ipc_file(dir.path(), "state.mv.arrow", &physical, &[batch]);
+        let path = write_parquet_file(dir.path(), "state.mv.parquet", &physical, &[batch]);
 
         let logical = three_col_logical_schema();
         let projection = three_col_projection();
@@ -1131,19 +1140,22 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let physical = three_col_physical_schema();
 
-        // File with zero rows — write a proper Arrow IPC file with schema but no batches.
-        let path_empty = dir.path().join("empty.mv.arrow");
+        // File with zero rows — write a proper Parquet file with schema but no batches.
+        let path_empty = dir.path().join("empty.mv.parquet");
         {
             let file = std::fs::File::create(&path_empty).unwrap();
-            let mut writer = FileWriter::try_new(file, &physical).unwrap();
+            let props = WriterProperties::builder()
+                .set_compression(Compression::ZSTD(Default::default()))
+                .build();
+            let writer = ArrowWriter::try_new(file, physical.clone(), Some(props)).unwrap();
             // Write no batches — just the schema footer.
-            writer.finish().unwrap();
+            writer.close().unwrap();
         }
         let p1 = path_empty.to_str().unwrap().to_string();
 
         // File with real data
         let batch = make_physical_batch(&physical, &[1], &[10], &[100]);
-        let p2 = write_ipc_file(dir.path(), "real.mv.arrow", &physical, &[batch]);
+        let p2 = write_parquet_file(dir.path(), "real.mv.parquet", &physical, &[batch]);
 
         let logical = three_col_logical_schema();
         let projection = three_col_projection();
@@ -1221,10 +1233,10 @@ mod tests {
 
         // Two files with overlapping RegionIDs to test aggregation.
         let b1 = make_physical_batch(&physical, &[1, 2, 1], &[10, 20, 5], &[100, 200, 50]);
-        let p1 = write_ipc_file(dir.path(), "state_0.mv.arrow", &physical, &[b1]);
+        let p1 = write_parquet_file(dir.path(), "state_0.mv.parquet", &physical, &[b1]);
 
         let b2 = make_physical_batch(&physical, &[2, 3], &[30, 40], &[300, 400]);
-        let p2 = write_ipc_file(dir.path(), "state_1.mv.arrow", &physical, &[b2]);
+        let p2 = write_parquet_file(dir.path(), "state_1.mv.parquet", &physical, &[b2]);
 
         let logical = three_col_logical_schema();
         let projection = three_col_projection();
@@ -1346,9 +1358,9 @@ mod tests {
                 })
                 .collect();
             let batch = RecordBatch::try_new(Arc::clone(&physical), columns).unwrap();
-            let path = write_ipc_file(
+            let path = write_parquet_file(
                 dir.path(),
-                &format!("state_{}.mv.arrow", f),
+                &format!("state_{}.mv.parquet", f),
                 &physical,
                 &[batch],
             );
@@ -1423,7 +1435,7 @@ mod tests {
 
         let provider = MvStateTableProvider::new(
             Arc::clone(&logical),
-            vec!["/nonexistent/path/state.mv.arrow".to_string()],
+            vec!["/nonexistent/path/state.mv.parquet".to_string()],
             projection,
             Arc::clone(&physical),
         );
@@ -1455,7 +1467,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let physical = three_col_physical_schema();
         let batch = make_physical_batch(&physical, &[1], &[10], &[100]);
-        let p = write_ipc_file(dir.path(), "state.mv.arrow", &physical, &[batch]);
+        let p = write_parquet_file(dir.path(), "state.mv.parquet", &physical, &[batch]);
 
         let schema = read_schema_from_first_file(&[p]).unwrap().unwrap();
         assert_eq!(schema.fields().len(), 3);
@@ -1481,9 +1493,9 @@ mod tests {
         let mut paths = Vec::new();
         for i in 0..num_files {
             let batch = make_physical_batch(&physical, &[(i + 1) as i64], &[1], &[10]);
-            let p = write_ipc_file(
+            let p = write_parquet_file(
                 dir.path(),
-                &format!("state_{:03}.mv.arrow", i),
+                &format!("state_{:03}.mv.parquet", i),
                 &physical,
                 &[batch],
             );
@@ -1554,7 +1566,7 @@ mod tests {
             vec![Arc::new(urls), Arc::new(sums), Arc::new(cnts)],
         )
         .unwrap();
-        let path = write_ipc_file(dir.path(), "state_url_0.mv.arrow", &physical, &[batch]);
+        let path = write_parquet_file(dir.path(), "state_url_0.mv.parquet", &physical, &[batch]);
 
         // Logical schema uses stable aliases; projection reorders to
         // [URL, cip_sum, cip_cnt] (keyword key stays position 0, no cast).
@@ -1668,7 +1680,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let path = write_ipc_file(dir.path(), "state_ts.mv.arrow", &physical, &[batch]);
+        let path = write_parquet_file(dir.path(), "state_ts.mv.parquet", &physical, &[batch]);
 
         // Logical schema: EventTime as Int64 (matching target mapping "long").
         let logical = Arc::new(Schema::new(vec![
@@ -1782,7 +1794,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let p1 = write_ipc_file(dir.path(), "s0.mv.arrow", &physical, &[b1]);
+        let p1 = write_parquet_file(dir.path(), "s0.mv.parquet", &physical, &[b1]);
 
         let b2 = RecordBatch::try_new(
             Arc::clone(&physical),
@@ -1794,7 +1806,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let p2 = write_ipc_file(dir.path(), "s1.mv.arrow", &physical, &[b2]);
+        let p2 = write_parquet_file(dir.path(), "s1.mv.parquet", &physical, &[b2]);
 
         let logical = Arc::new(Schema::new(vec![
             Field::new("EventTime", DataType::Int64, true),

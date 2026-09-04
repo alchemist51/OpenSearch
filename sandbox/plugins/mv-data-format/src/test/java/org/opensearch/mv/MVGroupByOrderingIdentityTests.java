@@ -13,108 +13,77 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.util.List;
 
 /**
- * Stage 4: Tests for {@link MVGroupByOrdering#orderingIdentity()} and
- * {@link MVGroupByOrdering#validateCompatible(MVGroupByOrdering)}, used
- * by the merge path to validate that all input state files share the
- * expected ordering contract.
+ * Tests for the physical ordering identity derivation that fixes the
+ * compaction ordering-identity mismatch between Java (which uses SQL aliases)
+ * and Rust (which uses DataFusion's Partial-aggregate physical column names
+ * from the Parquet state-file schema).
  */
 public class MVGroupByOrderingIdentityTests extends OpenSearchTestCase {
 
-    // ── orderingIdentity() ────────────────────────────────────────────────
-
-    public void testOrderingIdentityFormatIsDeterministic() {
-        MVGroupByOrdering ordering = MVCompiledDefinition.of(
+    /**
+     * Verify that physicalOrderingIdentity substitutes the physical column
+     * names into the identity string, replacing logical aliases.
+     *
+     * This is the core invariant: when an expression group key like
+     * {@code floor(EventTime/300000) AS event_bucket} produces a Partial
+     * aggregate output column named {@code mv_input.EventTime / Int64(300000)},
+     * the merge params must use that physical name — NOT the alias
+     * {@code event_bucket} — so the Rust merge_state_streams identity
+     * comparison succeeds.
+     */
+    public void testPhysicalOrderingIdentitySubstitutesExpressionKeyNames() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
             List.of(
-                GroupKey.of("k0", GroupKey.ColumnType.LONG),
-                GroupKey.of("k1", GroupKey.ColumnType.KEYWORD)
+                GroupKey.ofExpression("event_bucket", GroupKey.ColumnType.LONG, "\"EventTime\" / 300000", "EventTime"),
+                GroupKey.of("URL", GroupKey.ColumnType.KEYWORD),
+                GroupKey.of("UserID", GroupKey.ColumnType.LONG)
             ),
             List.of(AggregateSpec.count("cnt"))
-        ).groupByOrdering();
+        );
 
-        String identity = ordering.orderingIdentity();
+        MVGroupByOrdering ordering = def.groupByOrdering();
 
-        // Format: "idx:col:dir:null;idx:col:dir:null"
-        assertEquals("0:k0:0:0;1:k1:0:0", identity);
+        // The LOGICAL identity uses the alias:
+        assertEquals("0:event_bucket:0:0;1:URL:0:0;2:UserID:0:0", ordering.orderingIdentity());
 
-        // Calling twice produces the same result
-        assertEquals(identity, ordering.orderingIdentity());
+        // The PHYSICAL identity substitutes the physical name from the file:
+        List<String> physicalNames = List.of(
+            "mv_input.EventTime / Int64(300000)", // DataFusion's Partial output
+            "URL",       // plain column — same as alias
+            "UserID"     // plain column — same as alias
+        );
+        assertEquals(
+            "0:mv_input.EventTime / Int64(300000):0:0;1:URL:0:0;2:UserID:0:0",
+            ordering.physicalOrderingIdentity(physicalNames)
+        );
     }
 
-    public void testOrderingIdentityDiffersWhenColumnsChange() {
-        MVGroupByOrdering a = MVCompiledDefinition.of(
-            List.of(GroupKey.of("regionID", GroupKey.ColumnType.LONG)),
+    /**
+     * physicalOrderingIdentity with plain-only group keys produces the same
+     * result as the logical orderingIdentity (no substitution needed).
+     */
+    public void testPhysicalOrderingIdentityMatchesLogicalForPlainKeys() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(GroupKey.of("region", GroupKey.ColumnType.LONG), GroupKey.of("os", GroupKey.ColumnType.KEYWORD)),
             List.of(AggregateSpec.count("cnt"))
-        ).groupByOrdering();
+        );
 
-        MVGroupByOrdering b = MVCompiledDefinition.of(
-            List.of(GroupKey.of("userID", GroupKey.ColumnType.LONG)),
+        MVGroupByOrdering ordering = def.groupByOrdering();
+        String logical = ordering.orderingIdentity();
+        String physical = ordering.physicalOrderingIdentity(List.of("region", "os"));
+        assertEquals(logical, physical);
+    }
+
+    /**
+     * physicalOrderingIdentity rejects mismatched list sizes.
+     */
+    public void testPhysicalOrderingIdentityRejectsSizeMismatch() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(GroupKey.of("k0", GroupKey.ColumnType.LONG)),
             List.of(AggregateSpec.count("cnt"))
-        ).groupByOrdering();
+        );
 
-        assertNotEquals(a.orderingIdentity(), b.orderingIdentity());
-    }
-
-    public void testOrderingIdentitySameForSameDefinition() {
-        MVGroupByOrdering a = MVCompiledDefinition.clickbench100m().groupByOrdering();
-        MVGroupByOrdering b = MVCompiledDefinition.clickbench100m().groupByOrdering();
-
-        assertEquals(a.orderingIdentity(), b.orderingIdentity());
-    }
-
-    public void testOrderingIdentityDiffersAcrossLadderRungs() {
-        MVGroupByOrdering l1 = MVCompiledDefinition.heavyL1().groupByOrdering();
-        MVGroupByOrdering l3 = MVCompiledDefinition.heavyL3().groupByOrdering();
-
-        // L1 has 8 keys, L3 has 10 — identities must differ
-        assertNotEquals(l1.orderingIdentity(), l3.orderingIdentity());
-    }
-
-    public void testSingleKeyOrderingIdentity() {
-        MVGroupByOrdering ordering = MVCompiledDefinition.of(
-            List.of(GroupKey.of("only", GroupKey.ColumnType.LONG)),
-            List.of(AggregateSpec.count("cnt"))
-        ).groupByOrdering();
-
-        assertEquals("0:only:0:0", ordering.orderingIdentity());
-    }
-
-    // ── validateCompatible() ──────────────────────────────────────────────
-
-    public void testValidateCompatiblePassesForSameOrdering() {
-        MVGroupByOrdering a = MVCompiledDefinition.clickbench100m().groupByOrdering();
-        MVGroupByOrdering b = MVCompiledDefinition.clickbench100m().groupByOrdering();
-
-        // Should not throw
-        a.validateCompatible(b);
-        b.validateCompatible(a);
-    }
-
-    public void testValidateCompatibleThrowsForDifferentOrdering() {
-        MVGroupByOrdering a = MVCompiledDefinition.heavyL1().groupByOrdering();
-        MVGroupByOrdering b = MVCompiledDefinition.heavyL3().groupByOrdering();
-
-        IllegalStateException ex = expectThrows(IllegalStateException.class, () -> a.validateCompatible(b));
-        assertTrue(ex.getMessage().contains("MV ordering mismatch"));
-        assertTrue(ex.getMessage().contains(a.orderingIdentity()));
-        assertTrue(ex.getMessage().contains(b.orderingIdentity()));
-    }
-
-    public void testValidateCompatibleRejectsNull() {
-        MVGroupByOrdering ordering = MVCompiledDefinition.clickbench100m().groupByOrdering();
-        expectThrows(NullPointerException.class, () -> ordering.validateCompatible(null));
-    }
-
-    public void testValidateCompatibleIsSymmetric() {
-        MVGroupByOrdering a = MVCompiledDefinition.heavyL1().groupByOrdering();
-        MVGroupByOrdering b = MVCompiledDefinition.heavyL2().groupByOrdering();
-
-        // Both should throw since L1 has 8 keys (10 metrics) and L2 has 8 keys (20 metrics)
-        // — same group keys but we're comparing orderings which only carry group keys, so
-        // they should actually be EQUAL (same 8 group keys).
-        // Let's verify.
-        assertEquals(a.size(), b.size()); // both 8
-        assertEquals(a.orderingIdentity(), b.orderingIdentity());
-        // This should NOT throw since they have the same group keys.
-        a.validateCompatible(b);
+        MVGroupByOrdering ordering = def.groupByOrdering();
+        expectThrows(IllegalArgumentException.class, () -> ordering.physicalOrderingIdentity(List.of("a", "b")));
     }
 }

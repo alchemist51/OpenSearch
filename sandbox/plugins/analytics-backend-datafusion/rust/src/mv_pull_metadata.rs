@@ -596,14 +596,24 @@ fn compute_ordering_identity(indices: &[usize], asc: &[bool], nulls_first: &[boo
 }
 
 /// Read schema hash, definition hash (fold_ops hash), and batch count from
-/// an IPC output file. Uses the Arrow IPC reader to inspect the file header.
+/// a Parquet output file. Uses the Parquet reader to inspect the file metadata.
 fn read_output_hashes(output_file: &str) -> Result<(u64, u64, i32), String> {
+    // Legacy Arrow IPC guard: fail closed with rebuild-required error.
+    if output_file.ends_with(".mv.arrow") {
+        return Err(format!(
+            "read_output_hashes: legacy Arrow IPC state file '{}' is no longer supported; \
+             rebuild the materialized view to generate Parquet state files",
+            output_file
+        ));
+    }
+
     let file = std::fs::File::open(output_file)
         .map_err(|e| format!("read_output_hashes: open {output_file}: {e}"))?;
-    let reader = arrow::ipc::reader::FileReader::try_new(file, None)
-        .map_err(|e| format!("read_output_hashes: reader {output_file}: {e}"))?;
+    let builder =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| format!("read_output_hashes: reader {output_file}: {e}"))?;
 
-    let schema = reader.schema();
+    let schema = builder.schema().clone();
     let schema_hash = crate::mv_merge_engine::compute_schema_hash(&schema);
 
     // Definition hash: hash the schema field count + data types as a proxy.
@@ -619,10 +629,10 @@ fn read_output_hashes(output_file: &str) -> Result<(u64, u64, i32), String> {
         hasher.finish()
     };
 
-    // Count batches in the file.
-    let num_batches = reader.num_batches() as i32;
+    // Count row groups in the Parquet file (closest equivalent to IPC batch count).
+    let num_row_groups = builder.metadata().num_row_groups() as i32;
 
-    Ok((schema_hash, definition_hash, num_batches))
+    Ok((schema_hash, definition_hash, num_row_groups))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

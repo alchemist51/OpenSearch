@@ -293,18 +293,20 @@ fn finalize_sorted_batch(id: i64) -> Result<RecordBatch, String> {
 }
 
 pub fn mv_writer_finalize(id: i64, output_file: &str) -> Result<i64, String> {
-    // State files are ARROW IPC (decision 17): they are small, whole-scanned,
-    // and written INSIDE the refresh (on the ack path in ship mode) — IPC
-    // write is framed buffer copy, no parquet encode tax, and the future
-    // merger mmaps them back zero-copy. Compacted/merged output may revisit
-    // parquet (compression + stats pruning) when the merger lands.
+    // State files are Parquet (replaces Arrow IPC decision 17): Parquet provides
+    // compression (ZSTD) + column statistics for pruning in the future merger.
+    // The refresh/ack path writes these files; the merger reads them back via
+    // the standard Parquet reader.
     let sorted = finalize_sorted_batch(id)?;
     let state_schema = sorted.schema();
     let file = File::create(output_file).map_err(|e| format!("create {output_file}: {e}"))?;
-    let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &state_schema)
-        .map_err(|e| format!("ipc writer: {e}"))?;
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
+        .build();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(file, state_schema.clone(), Some(props))
+        .map_err(|e| format!("parquet writer: {e}"))?;
     writer.write(&sorted).map_err(|e| format!("write: {e}"))?;
-    writer.finish().map_err(|e| format!("finish: {e}"))?;
+    writer.close().map_err(|e| format!("close: {e}"))?;
     Ok(sorted.num_rows() as i64)
 }
 
@@ -352,11 +354,18 @@ pub fn mv_search_v2(state_files: &[String], select_final_sql: &str) -> Result<St
             .build();
         let ctx = SessionContext::new_with_state(state);
         for (i, f) in state_files.iter().enumerate() {
-            // State files are Arrow IPC (decision 17).
-            ctx.register_arrow(
+            // Legacy Arrow IPC guard: fail closed with rebuild-required error.
+            if f.ends_with(".mv.arrow") {
+                return Err(format!(
+                    "mv_search_v2: legacy Arrow IPC state file '{}' is no longer supported; \
+                     rebuild the materialized view to generate Parquet state files", f
+                ));
+            }
+            // State files are Parquet.
+            ctx.register_parquet(
                 &format!("mv_{i}"),
                 f.as_str(),
-                datafusion::execution::options::ArrowReadOptions::default(),
+                datafusion::prelude::ParquetReadOptions::default(),
             )
             .await
             .map_err(|e| format!("register {f}: {e}"))?;

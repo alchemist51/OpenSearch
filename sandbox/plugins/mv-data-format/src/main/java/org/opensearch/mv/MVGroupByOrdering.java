@@ -285,8 +285,8 @@ public final class MVGroupByOrdering {
      * authoritative source.</p>
      *
      * @param physicalGroupKeyNames the physical column names for each group
-     *        key position, read from an actual Arrow IPC state file's schema
-     *        (e.g. via {@link MVArrowIpcSchemaReader#readGroupKeyNames})
+     *        key position, read from an actual Parquet state file's schema
+     *        (e.g. via {@link MVStateSchemaReader#readGroupKeyNames})
      * @return ordering identity matching the Rust {@code compute_ordering_identity}
      * @throws IllegalArgumentException if the list size does not match the
      *         number of ordering keys

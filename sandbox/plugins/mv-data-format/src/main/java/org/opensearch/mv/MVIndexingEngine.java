@@ -16,7 +16,6 @@ import org.opensearch.index.engine.dataformat.Writer;
 import org.opensearch.index.engine.dataformat.WriterConfig;
 import org.opensearch.index.engine.exec.Segment;
 import org.opensearch.index.shard.ShardPath;
-import org.opensearch.mv.merge.DataFusionMVRecomputeMergeStrategy;
 import org.opensearch.mv.merge.DataFusionMVStateMergeStrategy;
 import org.opensearch.mv.merge.MVMergeExecutor;
 import org.opensearch.mv.merge.MVMergeStrategy;
@@ -90,20 +89,6 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
     /** Exact source no-op coverage retained in source commit metadata for target recovery. */
     private final java.util.concurrent.atomic.AtomicReference<MVSourceSeqCoverage> knownNoOps =
         new java.util.concurrent.atomic.AtomicReference<>(MVSourceSeqCoverage.EMPTY);
-
-    public MVIndexingEngine(ShardPath shardPath, String indexName) {
-        this(
-            shardPath,
-            indexName,
-            MVDefinitionSpec.SOURCE,
-            MVDataFormat.INSTANCE,
-            "payments",
-            java.util.List.of(),
-            () -> null,
-            () -> null,
-            false
-        );
-    }
 
     public MVIndexingEngine(
         ShardPath shardPath,
@@ -231,7 +216,12 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
                 mergeStrategy = new NoOpMVMergeStrategy();
             }
         } else {
-            mergeStrategy = new DataFusionMVRecomputeMergeStrategy(format, shardPath, spec.sql());
+            // Recompute-from-parquet merge (Arrow-at-rest output) was removed:
+            // MV state is Parquet and only the compiled-definition streaming
+            // merge is supported. No merge rather than a wrong-format merge.
+            org.apache.logging.log4j.LogManager.getLogger(MVIndexingEngine.class)
+                .warn("mv merge: recompute strategy removed — state merge disabled for [{}]", definitionName);
+            mergeStrategy = new NoOpMVMergeStrategy();
         }
         this.merger = new MVMergeExecutor(mergeStrategy);
         try {

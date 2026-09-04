@@ -45,7 +45,7 @@ import java.util.Locale;
  *       across restarts and never depends on the hardcoded
  *       {@link MVCompiledDefinition#compiledFor(String)} switch.</li>
  *   <li><b>Legacy named fallback.</b> Otherwise the definition name is taken
- *       from {@link MVConstants#DEFINITION_SETTING} (default {@code "payments"},
+ *       from {@code index.derived.definition_id} (fail-closed when absent,
  *       preserving the prior {@code MVDerivedArtifactBuilder} behavior), or —
  *       when that is unset — {@link DerivedIndexBinding#KEY_DEFINITION_ID}, and
  *       compiled via {@link MVCompiledDefinition#compiledFor(String)}.</li>
@@ -223,10 +223,7 @@ public final class MVDefinitionResolver {
         }
         MVCompiledDefinition fromDescriptor = MVCompiledDefinition.fromDescriptor(descriptor);
 
-        String legacyId = settings.get(MVConstants.DEFINITION_SETTING);
-        if (legacyId == null || legacyId.isEmpty()) {
-            legacyId = settings.get(DerivedIndexBinding.KEY_DEFINITION_ID);
-        }
+        String legacyId = settings.get(DerivedIndexBinding.KEY_DEFINITION_ID);
         if (legacyId == null || legacyId.isEmpty()) {
             return; // descriptor-only creation is self-contained and valid
         }
@@ -258,20 +255,17 @@ public final class MVDefinitionResolver {
     // ── Internal ──────────────────────────────────────────────────────────
 
     /**
-     * Extract the legacy definition name, preserving the prior
-     * {@code MVDerivedArtifactBuilder} behavior:
-     * {@code index.mv.definition} (default {@code "payments"}), falling back to
-     * {@code index.derived.definition_id} only when the former is unset.
+     * Extract the named definition id from the canonical derived-binding key
+     * {@code index.derived.definition_id}. Fail-closed: an index that reaches
+     * named resolution without a declared definition is a configuration bug.
      */
     static String legacyDefinitionName(Settings settings) {
-        String def = settings.get(MVConstants.DEFINITION_SETTING);
-        if (def != null && def.isEmpty() == false) {
-            return def;
-        }
         String id = settings.get(DerivedIndexBinding.KEY_DEFINITION_ID);
         if (id != null && id.isEmpty() == false) {
             return id;
         }
-        return "payments";
+        throw new IllegalArgumentException(
+            "no MV definition declared: neither a persisted descriptor nor " + DerivedIndexBinding.KEY_DEFINITION_ID + " is set"
+        );
     }
 }

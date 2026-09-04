@@ -38,7 +38,7 @@ public class MVDefinitionResolverTests extends OpenSearchTestCase {
 
         Settings settings = Settings.builder()
             .put(MVConstants.DESCRIPTOR_SETTING, json)
-            .put(MVConstants.DEFINITION_SETTING, "clickbench_100m")
+            .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "clickbench_100m")
             .build();
 
         MVCompiledDefinition resolved = MVDefinitionResolver.resolve(settings);
@@ -47,15 +47,15 @@ public class MVDefinitionResolverTests extends OpenSearchTestCase {
     }
 
     public void testLegacyOnlyStillWorks() {
-        Settings settings = Settings.builder().put(MVConstants.DEFINITION_SETTING, "clickbench_100m").build();
+        Settings settings = Settings.builder().put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "clickbench_100m").build();
         MVCompiledDefinition resolved = MVDefinitionResolver.resolve(settings);
         assertEquals(MVCompiledDefinition.compiledFor("clickbench_100m").hash(), resolved.hash());
     }
 
-    public void testLegacyDefaultsToPaymentsWhenUnset() {
-        // Preserves the prior MVDerivedArtifactBuilder default of "payments".
-        MVCompiledDefinition resolved = MVDefinitionResolver.resolve(Settings.EMPTY);
-        assertEquals(MVCompiledDefinition.compiledFor("payments").hash(), resolved.hash());
+    public void testResolveFailsClosedWhenNoDefinitionDeclared() {
+        // The silent "payments" default was removed: no descriptor and no
+        // index.derived.definition_id means resolution must fail loudly.
+        expectThrows(IllegalArgumentException.class, () -> MVDefinitionResolver.resolve(Settings.EMPTY));
     }
 
     public void testDefinitionIdFallbackWhenNoDefinitionSetting() {
@@ -65,7 +65,7 @@ public class MVDefinitionResolverTests extends OpenSearchTestCase {
     }
 
     public void testDefinitionLabel() {
-        assertEquals("clickbench_100m", MVDefinitionResolver.definitionLabel(Settings.builder().put(MVConstants.DEFINITION_SETTING, "clickbench_100m").build()));
+        assertEquals("clickbench_100m", MVDefinitionResolver.definitionLabel(Settings.builder().put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "clickbench_100m").build()));
         String json = MVDefinitionResolver.serialize(MVCompiledDefinition.compiledFor("heavy_l1").toDescriptor());
         assertEquals("descriptor", MVDefinitionResolver.definitionLabel(Settings.builder().put(MVConstants.DESCRIPTOR_SETTING, json).build()));
     }
@@ -170,7 +170,7 @@ public class MVDefinitionResolverTests extends OpenSearchTestCase {
         String json = MVDefinitionResolver.serialize(MVCompiledDefinition.compiledFor("heavy_l1").toDescriptor());
         Settings settings = Settings.builder()
             .put(MVConstants.DESCRIPTOR_SETTING, json)
-            .put(MVConstants.DEFINITION_SETTING, "clickbench_100m")
+            .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "clickbench_100m")
             .build();
         IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> MVDefinitionResolver.validateCreation(settings));
         assertThat(e.getMessage(), containsString("disagree"));
@@ -189,7 +189,7 @@ public class MVDefinitionResolverTests extends OpenSearchTestCase {
         String json = MVDefinitionResolver.serialize(MVCompiledDefinition.compiledFor("heavy_l1").toDescriptor());
         Settings settings = Settings.builder()
             .put(MVConstants.DESCRIPTOR_SETTING, json)
-            .put(MVConstants.DEFINITION_SETTING, "heavy_l1")
+            .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "heavy_l1")
             .build();
         MVDefinitionResolver.validateCreation(settings); // must not throw
     }
@@ -201,7 +201,7 @@ public class MVDefinitionResolverTests extends OpenSearchTestCase {
     }
 
     public void testValidateCreationLegacyOnlyIsNoop() {
-        Settings settings = Settings.builder().put(MVConstants.DEFINITION_SETTING, "heavy_l1").build();
+        Settings settings = Settings.builder().put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "heavy_l1").build();
         MVDefinitionResolver.validateCreation(settings); // no descriptor → no-op
     }
 
@@ -224,7 +224,7 @@ public class MVDefinitionResolverTests extends OpenSearchTestCase {
             String json = MVDefinitionResolver.serialize(compiled.toDescriptor());
             Settings settings = Settings.builder()
                 .put(MVConstants.DESCRIPTOR_SETTING, json)
-                .put(MVConstants.DEFINITION_SETTING, name)
+                .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, name)
                 .put(DerivedIndexBinding.KEY_DEFINITION_ID, name)
                 .build();
             MVDefinitionResolver.validateCreation(settings); // must not throw

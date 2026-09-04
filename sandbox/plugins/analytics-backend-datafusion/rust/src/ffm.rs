@@ -679,72 +679,9 @@ pub unsafe extern "C" fn df_mv_writer_abort(writer_id: i64) {
     crate::mv_writer::mv_writer_abort(writer_id);
 }
 
-/// POC(mv): Final-aggregate over MV state files. Writes result text (svc\tcount lines)
-/// into the caller buffer via write_out_buffer.
-#[ffm_safe]
-#[no_mangle]
-pub unsafe extern "C" fn df_mv_search_poc(
-    files_ptr: *const *const u8,
-    files_lens: *const i64,
-    files_count: i64,
-    group_ptr: *const u8,
-    group_len: i64,
-    state_ptr: *const u8,
-    state_len: i64,
-    out_ptr: *mut u8,
-    out_cap: i64,
-    out_len: *mut i64,
-) -> i64 {
-    let mut files = Vec::with_capacity(files_count as usize);
-    for i in 0..files_count as usize {
-        let f_ptr = *files_ptr.add(i);
-        let f_len = *files_lens.add(i);
-        files.push(
-            str_from_raw(f_ptr, f_len)
-                .map_err(|e| format!("df_mv_search_poc: file[{}]: {}", i, e))?
-                .to_string(),
-        );
-    }
-    let group = str_from_raw(group_ptr, group_len)
-        .map_err(|e| format!("df_mv_search_poc: group: {}", e))?;
-    let state = str_from_raw(state_ptr, state_len)
-        .map_err(|e| format!("df_mv_search_poc: state: {}", e))?;
-    let text = crate::mv_poc::mv_search_poc(&files, group, state)?;
-    write_out_buffer(
-        text.as_bytes(),
-        out_ptr,
-        out_cap,
-        out_len,
-        "mv search result",
-    )?;
-    Ok(0)
-}
-
-/// POC(mv): build the hardcoded MV state file from a primary parquet file.
-/// Blocking; returns state-row count (>=0) on success.
-#[ffm_safe]
-#[no_mangle]
-pub unsafe extern "C" fn df_mv_build_poc(
-    input_ptr: *const u8,
-    input_len: i64,
-    table_ptr: *const u8,
-    table_len: i64,
-    sql_ptr: *const u8,
-    sql_len: i64,
-    output_ptr: *const u8,
-    output_len: i64,
-) -> i64 {
-    let input =
-        str_from_raw(input_ptr, input_len).map_err(|e| format!("df_mv_build_poc: input: {}", e))?;
-    let table =
-        str_from_raw(table_ptr, table_len).map_err(|e| format!("df_mv_build_poc: table: {}", e))?;
-    let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_build_poc: sql: {}", e))?;
-    let output = str_from_raw(output_ptr, output_len)
-        .map_err(|e| format!("df_mv_build_poc: output: {}", e))?;
-    let rows = crate::mv_poc::mv_build_poc(input, table, sql, output)?;
-    Ok(rows)
-}
-
+/// Refresh-time ship build: Partial over one parquet file, sorted state batch
+/// EXPORTED via Arrow C-Data (in-memory handoff to the JVM — nothing is
+/// persisted by this call; persisted MV state is Parquet only).
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn df_mv_build_arrow(
@@ -764,36 +701,6 @@ pub unsafe extern "C" fn df_mv_build_arrow(
     let sql =
         str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_build_arrow: sql: {}", e))?;
     let rows = crate::mv_poc::mv_build_arrow(input, table, sql, array_addr, schema_addr)?;
-    Ok(rows)
-}
-
-/// State⊕state merge (code-complete, engine-gated OFF until the orphan
-/// sweep): folds newline-joined state files into one folded state file.
-#[ffm_safe]
-#[no_mangle]
-pub unsafe extern "C" fn df_mv_merge_state(
-    files_ptr: *const u8,
-    files_len: i64,
-    sql_ptr: *const u8,
-    sql_len: i64,
-    output_ptr: *const u8,
-    output_len: i64,
-) -> i64 {
-    let files_joined = str_from_raw(files_ptr, files_len)
-        .map_err(|e| format!("df_mv_merge_state: files: {}", e))?;
-    let sql =
-        str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_merge_state: sql: {}", e))?;
-    let output = str_from_raw(output_ptr, output_len)
-        .map_err(|e| format!("df_mv_merge_state: output: {}", e))?;
-    let files: Vec<String> = files_joined
-        .split('\n')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if files.is_empty() {
-        return Err("df_mv_merge_state: no input files".to_string());
-    }
-    let rows = crate::mv_poc::mv_merge_state(&files, sql, output)?;
     Ok(rows)
 }
 
@@ -949,7 +856,7 @@ pub unsafe extern "C" fn df_mv_build_streaming_result(
     let ordering =
         crate::mv_build_managed::OrderingContract::from_parallel_arrays(indices, dirs, nulls);
 
-    let result = crate::mv_build_managed::build_streaming_ipc_artifact(
+    let result = crate::mv_build_managed::build_streaming_parquet_artifact(
         runtime,
         input,
         table,
@@ -2331,7 +2238,8 @@ pub unsafe extern "C" fn df_mv_merge_state_streams(
     Ok(rows)
 }
 
-/// Stage 4 IPC header validation: checks schema hash and sort ordering.
+/// Stage 4 state header validation: checks schema hash and sort ordering of a
+/// Parquet MV state file.
 ///
 /// Returns 0 on success, negative on validation failure.
 #[ffm_safe]
@@ -2362,12 +2270,37 @@ pub unsafe extern "C" fn df_mv_validate_ipc_header(
         .map(|&v| v != 0)
         .collect();
 
-    crate::mv_merge_engine::validate_ipc_header(
+    crate::mv_merge_engine::validate_parquet_header(
         file,
         expected_schema_hash as u64,
         &ordering_indices,
         &ordering_asc,
         &ordering_nulls_first,
+    )?;
+    Ok(0)
+}
+
+/// Reads the physical field names of a Parquet MV state file (footer only)
+/// and writes them newline-joined into the caller buffer. Ground truth for
+/// the Java-side merge ordering identity.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_state_field_names(
+    file_ptr: *const u8,
+    file_len: i64,
+    out_ptr: *mut u8,
+    out_cap: i64,
+    out_len: *mut i64,
+) -> i64 {
+    let file = str_from_raw(file_ptr, file_len)
+        .map_err(|e| format!("df_mv_state_field_names: file: {}", e))?;
+    let names = crate::mv_merge_engine::state_field_names(file)?;
+    write_out_buffer(
+        names.join("\n").as_bytes(),
+        out_ptr,
+        out_cap,
+        out_len,
+        "mv state field names",
     )?;
     Ok(0)
 }

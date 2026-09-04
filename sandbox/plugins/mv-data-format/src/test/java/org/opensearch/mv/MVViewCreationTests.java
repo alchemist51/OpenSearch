@@ -48,7 +48,6 @@ public class MVViewCreationTests extends OpenSearchTestCase {
 
         // Descriptor-only creation: no legacy definition id/name is set.
         assertNull(s.get(DerivedIndexBinding.KEY_DEFINITION_ID));
-        assertNull(s.get(MVConstants.DEFINITION_SETTING));
 
         // The exact contract gate the auto-creation path also runs must pass.
         MVDefinitionResolver.validateCreation(s);

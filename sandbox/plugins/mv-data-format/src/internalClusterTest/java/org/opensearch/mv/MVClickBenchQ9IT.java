@@ -109,7 +109,8 @@ public class MVClickBenchQ9IT extends OpenSearchIntegTestCase {
                     .put("index.composite.primary_data_format", "parquet")
                     .putList("index.composite.secondary_data_formats", "lucene", "materialized_view")
                     .put("index.composite.merge_on_refresh_max_size", "0b")
-                    .put(MVConstants.DEFINITION_SETTING, "clickbench_q9")
+                    .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "clickbench_q9")
+                    .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "clickbench_q9")
                     .putList(MVConstants.SHIP_TARGETS_SETTING, TARGET)
             )
             // Real hits mapping types (clickbench-reference): integer + short + short.
@@ -132,7 +133,7 @@ public class MVClickBenchQ9IT extends OpenSearchIntegTestCase {
                     .putList("index.composite.secondary_data_formats", "lucene")
                     .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DATA_FORMAT, "materialized_view")
                     .put("index.composite.merge_on_refresh_max_size", "0b")
-                    .put(MVConstants.DEFINITION_SETTING, "clickbench_q9")
+                    .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "clickbench_q9")
                     .put(MVConstants.COLOCATE_WITH_SETTING, SOURCE)
             )
             .setMapping(MVViewsService.TargetCreator.targetMapping("clickbench_q9"))

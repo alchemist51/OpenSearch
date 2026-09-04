@@ -133,7 +133,7 @@ public class MVCompactionServiceTests extends OpenSearchTestCase {
         Path dir = createTempDir();
         List<Segment> segments = new ArrayList<>();
         for (int i = 1; i <= 6; i++) {
-            String fileName = "_mv_poc_" + Long.toHexString(i) + ".mv.arrow";
+            String fileName = "_mv_poc_" + Long.toHexString(i) + ".mv.parquet";
             // Don't actually create the file on disk
             WriterFileSet fileSet = MonoFileWriterSet.of(dir, i, fileName, 100 * i);
             segments.add(Segment.builder(i).addSearchableFiles(MVStateDataFormat.INSTANCE, fileSet).build());
@@ -194,7 +194,7 @@ public class MVCompactionServiceTests extends OpenSearchTestCase {
     }
 
     private Segment createMvStateSegment(Path dir, long generation) throws Exception {
-        String fileName = "_mv_poc_" + Long.toHexString(generation) + ".mv.arrow";
+        String fileName = "_mv_poc_" + Long.toHexString(generation) + ".mv.parquet";
         Path file = dir.resolve(fileName);
         Files.writeString(file, "dummy-state-" + generation);
         WriterFileSet fileSet = MonoFileWriterSet.of(dir, generation, fileName, 100 * generation);

@@ -11,7 +11,7 @@
 //! Replaces the Stage 2 collect→concat→sort→take pattern with:
 //! 1. Spillable partial aggregation via DataFusion's AggregateExec
 //! 2. External sort over the FULL lexicographic group tuple via SortExec
-//! 3. Streaming Arrow IPC write — batches flow directly from SortExec to disk
+//! 3. Streaming Parquet write — batches flow directly from SortExec to disk
 //! 4. Metadata validation: schema hash, definition hash, ordering guarantee
 //!
 //! NO terminal collect/concat/sort/take anywhere in the production path.
@@ -23,9 +23,8 @@ use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use arrow::compute::{lexsort_to_indices, SortColumn, SortOptions};
-use arrow::ipc::writer::FileWriter as IpcFileWriter;
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_expr::expressions::col as physical_col;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
@@ -34,6 +33,9 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{collect, execute_stream, ExecutionPlan};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use futures::StreamExt;
+use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::DataFusionRuntime;
@@ -120,7 +122,7 @@ impl OrderingContract {
 /// Metadata returned from a streaming artifact build.
 #[derive(Debug, Clone)]
 pub struct ArtifactMetadata {
-    /// Number of rows written to the IPC artifact.
+    /// Number of rows written to the Parquet artifact.
     pub row_count: i64,
     /// SHA-256 hex digest of the Arrow schema (serialized via IPC).
     pub schema_hash: String,
@@ -128,9 +130,9 @@ pub struct ArtifactMetadata {
     pub definition_hash: String,
 }
 
-// ── ABI-versioned result struct for `build_streaming_ipc_artifact` ───────
+// ── ABI-versioned result struct for `build_streaming_parquet_artifact` ───────
 
-/// ABI-versioned result struct for `build_streaming_ipc_artifact`.
+/// ABI-versioned result struct for `build_streaming_parquet_artifact`.
 ///
 /// Returned as a flat `#[repr(C)]` struct written into a caller-allocated
 /// buffer (same pattern as `DfStatsBuffer` in stats.rs). Java reads fields
@@ -166,7 +168,7 @@ pub struct MvBuildResult {
     pub status_code: i32,
     /// Padding to align `row_count` to 8 bytes.
     pub _pad0: u32,
-    /// Number of rows written to the IPC artifact.
+    /// Number of rows written to the Parquet artifact.
     pub row_count: u64,
     /// FNV-128 hash of the Arrow schema (field names, types, nullability).
     pub schema_hash: u64,
@@ -349,16 +351,85 @@ fn stable_hex_hash(data: &[u8]) -> String {
     format!("{:032x}", h)
 }
 
-/// Validate that an Arrow IPC file's rows are sorted according to the ordering contract.
-pub fn validate_ipc_ordering(file_path: &str, ordering: &OrderingContract) -> Result<bool, String> {
+/// Compact StringView / BinaryView columns in a batch so that sliced views
+/// do not carry unreferenced backing buffers into the Parquet writer. Uses
+/// `gc()` on view arrays that show significant waste, identical to the
+/// `compact_string_view_columns` logic in `api.rs` but kept local to avoid
+/// coupling the build path to the FFI export module.
+fn compact_string_views(batch: RecordBatch) -> RecordBatch {
+    use arrow_array::Array;
+    let schema = batch.schema();
+    let needs_compaction = batch.columns().iter().zip(schema.fields().iter()).any(|(col, field)| {
+        match field.data_type() {
+            DataType::Utf8View => {
+                let view: &arrow_array::StringViewArray = col
+                    .as_any()
+                    .downcast_ref()
+                    .expect("column must be StringViewArray when schema declares Utf8View");
+                let bufs = view.data_buffers();
+                let allocated: usize = bufs.iter().map(|b| b.len()).sum();
+                let used = view.total_buffer_bytes_used();
+                let waste = allocated.saturating_sub(used);
+                allocated > 2 * used && waste > 10_240
+            }
+            DataType::BinaryView => {
+                let view: &arrow_array::BinaryViewArray = col
+                    .as_any()
+                    .downcast_ref()
+                    .expect("column must be BinaryViewArray when schema declares BinaryView");
+                let bufs = view.data_buffers();
+                let allocated: usize = bufs.iter().map(|b| b.len()).sum();
+                let used = view.total_buffer_bytes_used();
+                let waste = allocated.saturating_sub(used);
+                allocated > 2 * used && waste > 10_240
+            }
+            _ => false,
+        }
+    });
+    if !needs_compaction {
+        return batch;
+    }
+    let columns: Vec<Arc<dyn arrow_array::Array>> = batch
+        .columns()
+        .iter()
+        .zip(schema.fields().iter())
+        .map(|(col, field)| match field.data_type() {
+            DataType::Utf8View => {
+                let view: &arrow_array::StringViewArray = col
+                    .as_any()
+                    .downcast_ref()
+                    .expect("column must be StringViewArray when schema declares Utf8View");
+                Arc::new(view.gc()) as Arc<dyn arrow_array::Array>
+            }
+            DataType::BinaryView => {
+                let view: &arrow_array::BinaryViewArray = col
+                    .as_any()
+                    .downcast_ref()
+                    .expect("column must be BinaryViewArray when schema declares BinaryView");
+                Arc::new(view.gc()) as Arc<dyn arrow_array::Array>
+            }
+            _ => Arc::clone(col),
+        })
+        .collect();
+    RecordBatch::try_new(schema, columns).expect("gc'd columns must match schema")
+}
+
+/// Validate that a Parquet file's rows are sorted according to the ordering contract.
+pub fn validate_parquet_ordering(
+    file_path: &str,
+    ordering: &OrderingContract,
+) -> Result<bool, String> {
     let file = File::open(file_path)
-        .map_err(|e| format!("validate_ipc_ordering open {}: {}", file_path, e))?;
-    let reader = arrow::ipc::reader::FileReader::try_new(file, None)
-        .map_err(|e| format!("validate_ipc_ordering reader {}: {}", file_path, e))?;
+        .map_err(|e| format!("validate_parquet_ordering open {}: {}", file_path, e))?;
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("validate_parquet_ordering reader {}: {}", file_path, e))?
+        .build()
+        .map_err(|e| format!("validate_parquet_ordering build reader {}: {}", file_path, e))?;
 
     let mut prev_batch: Option<RecordBatch> = None;
     for batch_result in reader {
-        let batch = batch_result.map_err(|e| format!("validate_ipc_ordering read batch: {}", e))?;
+        let batch =
+            batch_result.map_err(|e| format!("validate_parquet_ordering read batch: {}", e))?;
         if batch.num_rows() == 0 {
             continue;
         }
@@ -366,7 +437,7 @@ pub fn validate_ipc_ordering(file_path: &str, ordering: &OrderingContract) -> Re
         // Check intra-batch ordering
         let sort_columns = ordering.to_sort_columns(&batch);
         let indices = lexsort_to_indices(&sort_columns, None)
-            .map_err(|e| format!("validate_ipc_ordering lexsort: {}", e))?;
+            .map_err(|e| format!("validate_parquet_ordering lexsort: {}", e))?;
         for i in 0..indices.len() {
             if indices.value(i) != i as u32 {
                 return Ok(false);
@@ -379,7 +450,6 @@ pub fn validate_ipc_ordering(file_path: &str, ordering: &OrderingContract) -> Re
             for key in &ordering.keys {
                 let prev_col = prev.column(key.field_index);
                 let curr_col = batch.column(key.field_index);
-                // Compare the last element of prev with first element of current
                 let prev_sort = SortColumn {
                     values: prev_col.slice(last_row, 1),
                     options: Some(SortOptions {
@@ -394,20 +464,19 @@ pub fn validate_ipc_ordering(file_path: &str, ordering: &OrderingContract) -> Re
                         nulls_first: key.null_placement == 0,
                     }),
                 };
-                // Concatenate and check sort
                 let combined = arrow::compute::concat(&[&*prev_sort.values, &*curr_sort.values])
-                    .map_err(|e| format!("validate_ipc_ordering concat: {}", e))?;
+                    .map_err(|e| format!("validate_parquet_ordering concat: {}", e))?;
                 let combined_sort = vec![SortColumn {
                     values: combined,
                     options: prev_sort.options,
                 }];
                 let idx = lexsort_to_indices(&combined_sort, None)
-                    .map_err(|e| format!("validate_ipc_ordering inter-batch: {}", e))?;
+                    .map_err(|e| format!("validate_parquet_ordering inter-batch: {}", e))?;
                 if idx.value(0) != 0 {
-                    return Ok(false); // prev row > current row on this key
+                    return Ok(false);
                 }
                 if idx.value(0) == 0 && idx.value(1) == 1 {
-                    break; // This key is strictly less or equal; if equal, check next key
+                    break;
                 }
             }
         }
@@ -447,18 +516,20 @@ fn get_cancel_token(context_id: i64) -> Option<CancellationToken> {
     MV_CANCEL_REGISTRY.lock().unwrap().get(&context_id).cloned()
 }
 
-/// Stage 3: Build a streaming MV state artifact using external sort + direct IPC write.
+/// Stage 3: Build a streaming MV state artifact using external sort + direct Parquet write.
 ///
 /// This replaces the Stage 2 collect→concat→sort→take pattern with:
 /// - Partial aggregation via DataFusion AggregateExec (spillable)
 /// - External sort via SortExec over the FULL ordering contract
-/// - Streaming write: batches flow from SortExec directly to Arrow IPC FileWriter
+/// - Streaming write: batches flow from SortExec directly to Parquet via ArrowWriter
 /// - No terminal collect/concat/sort/take in the production path
+///
+/// Output file extension: `.mv.parquet` under the mv_state namespace.
 ///
 /// Returns `MvBuildResult` with full instrumentation (row count, hashes, spill, RSS, duration).
 /// On cancellation returns `MvBuildResult::error(STATUS_CANCELLED)`.
 /// On internal error returns `Err(String)` — the FFI wrapper converts this to STATUS_INTERNAL_ERROR.
-pub fn build_streaming_ipc_artifact(
+pub fn build_streaming_parquet_artifact(
     runtime: &DataFusionRuntime,
     input_file: &str,
     table_name: &str,
@@ -507,7 +578,7 @@ pub fn build_streaming_ipc_artifact(
                 .await
                 .map_err(|e| format!("mv_build_streaming {e}"))?;
 
-            // Stream sorted batches directly to Arrow IPC file
+            // Stream sorted batches directly to Parquet file
             let schema = sort_exec.schema();
             let schema_hash = compute_schema_hash_u64(&schema);
 
@@ -517,8 +588,11 @@ pub fn build_streaming_ipc_artifact(
             let file = File::create(output_file)
                 .map_err(|e| format!("mv_build_streaming create {output_file}: {e}"))?;
             let buffered = BufWriter::new(file);
-            let mut writer = IpcFileWriter::try_new(buffered, &schema)
-                .map_err(|e| format!("mv_build_streaming ipc writer: {e}"))?;
+            let props = WriterProperties::builder()
+                .set_compression(Compression::ZSTD(Default::default()))
+                .build();
+            let mut writer = ArrowWriter::try_new(buffered, schema.clone(), Some(props))
+                .map_err(|e| format!("mv_build_streaming parquet writer: {e}"))?;
 
             let mut row_count: u64 = 0;
             let mut output_batch_count: u32 = 0;
@@ -526,6 +600,9 @@ pub fn build_streaming_ipc_artifact(
                 let batch =
                     batch_result.map_err(|e| format!("mv_build_streaming stream batch: {e}"))?;
                 if batch.num_rows() > 0 {
+                    // Compact StringView/BinaryView columns to avoid carrying
+                    // unreferenced backing buffers into the Parquet writer.
+                    let batch = compact_string_views(batch);
                     writer
                         .write(&batch)
                         .map_err(|e| format!("mv_build_streaming write batch: {e}"))?;
@@ -535,7 +612,7 @@ pub fn build_streaming_ipc_artifact(
             }
 
             writer
-                .finish()
+                .close()
                 .map_err(|e| format!("mv_build_streaming finish: {e}"))?;
 
             if row_count == 0 {
@@ -618,7 +695,7 @@ fn collect_spill_metrics(plan: &dyn ExecutionPlan) -> (u64, u32) {
     (total_bytes, total_files)
 }
 
-/// Stage 3: Managed state-file build with streaming IPC output.
+/// Stage 3: Managed state-file build with streaming Parquet output.
 /// Replaces the Stage 2 mv_build_managed.
 pub fn mv_build_managed(
     runtime: &DataFusionRuntime,
@@ -631,7 +708,7 @@ pub fn mv_build_managed(
     spill_budget_bytes: i64,
     spill_file_count_limit: i32,
 ) -> Result<i64, String> {
-    let result = build_streaming_ipc_artifact(
+    let result = build_streaming_parquet_artifact(
         runtime,
         input_file,
         table_name,
@@ -653,7 +730,7 @@ pub fn mv_build_managed(
 /// Managed Arrow C-Data build.
 ///
 /// NOT on the production pull/ingestion path — that path is
-/// [`build_streaming_ipc_artifact`] (streaming, no terminal `collect`). This
+/// [`build_streaming_parquet_artifact`] (streaming, no terminal `collect`). This
 /// entry point exists only for the Arrow C-Data export FFI
 /// (`df_mv_build_arrow_managed` ← `MVBuildRuntime.buildArrowManaged`), which
 /// hands a single contiguous `StructArray` across the C-Data interface and
@@ -752,7 +829,7 @@ pub fn mv_build_arrow_managed(
 ///
 /// UNREACHABLE from the production pull path: there is no FFI export and no
 /// Java caller for this function (verified — the pull path uses
-/// [`build_streaming_ipc_artifact`]). It is retained only as a convenience for
+/// [`build_streaming_parquet_artifact`]). It is retained only as a convenience for
 /// potential in-process callers that need a single materialized sorted batch.
 /// It sorts via `SortExec` over the full ordering contract but ends in a
 /// terminal `collect`/`concat_batches`, so it is deliberately kept off the
@@ -858,7 +935,7 @@ fn find_partial(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>>
 /// `MVGroupByOrdering.stateFieldIndices()` column, ASC NULLS FIRST).
 ///
 /// This is the single place the streaming plan is constructed, shared by
-/// [`build_streaming_ipc_artifact`] and the Stage 3 structural / spill
+/// [`build_streaming_parquet_artifact`] and the Stage 3 structural / spill
 /// regression tests. `SortExec` is DataFusion's external, spillable sort: when
 /// the session's memory pool is exhausted it spills sorted runs to the
 /// `RuntimeEnv`'s `DiskManager` and merges them, so the plan is bounded-memory
@@ -1477,65 +1554,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_ipc_ordering_sorted_file() {
-        // Create a sorted batch and write to IPC
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k0", DataType::Int64, true),
-            Field::new("k1", DataType::Utf8, true),
-            Field::new("cnt", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 1, 2, 2])),
-                Arc::new(StringArray::from(vec!["a", "b", "a", "b"])),
-                Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
-            ],
-        )
-        .unwrap();
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
-        {
-            let file = File::create(&path).unwrap();
-            let mut writer = IpcFileWriter::try_new(file, &schema).unwrap();
-            writer.write(&batch).unwrap();
-            writer.finish().unwrap();
-        }
-
-        let ordering = OrderingContract::from_parallel_arrays(&[0, 1], &[0, 0], &[0, 0]);
-        assert!(validate_ipc_ordering(&path, &ordering).unwrap());
-    }
-
-    #[test]
-    fn test_validate_ipc_ordering_unsorted_file() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k0", DataType::Int64, true),
-            Field::new("cnt", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![3, 1, 2])),
-                Arc::new(Int64Array::from(vec![10, 20, 30])),
-            ],
-        )
-        .unwrap();
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
-        {
-            let file = File::create(&path).unwrap();
-            let mut writer = IpcFileWriter::try_new(file, &schema).unwrap();
-            writer.write(&batch).unwrap();
-            writer.finish().unwrap();
-        }
-
-        let ordering = OrderingContract::from_parallel_arrays(&[0], &[0], &[0]);
-        assert!(!validate_ipc_ordering(&path, &ordering).unwrap());
-    }
-
-    #[test]
     fn test_multi_key_sort_with_nulls() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("k0", DataType::Int64, true),
@@ -1598,51 +1616,6 @@ mod tests {
         assert_eq!(indices.value(1), 1); // (1, 200, 20, 2000)
         assert_eq!(indices.value(2), 2); // (2, 300, 30, 3000)
         assert_eq!(indices.value(3), 0); // (3, 100, 10, 1000)
-    }
-
-    #[test]
-    fn test_ipc_roundtrip_preserves_ordering() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k0", DataType::Int32, true),
-            Field::new("k1", DataType::Int64, true),
-            Field::new("k2", DataType::Utf8, true),
-            Field::new("val", DataType::Int64, false),
-        ]));
-        // Already sorted: (1, 10, "a"), (1, 10, "b"), (2, 5, "c")
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 1, 2])),
-                Arc::new(Int64Array::from(vec![10, 10, 5])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-                Arc::new(Int64Array::from(vec![100, 200, 300])),
-            ],
-        )
-        .unwrap();
-
-        // Write to IPC
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
-        {
-            let file = File::create(&path).unwrap();
-            let mut writer = IpcFileWriter::try_new(file, &schema).unwrap();
-            writer.write(&batch).unwrap();
-            writer.finish().unwrap();
-        }
-
-        // Read back and verify ordering
-        let ordering = OrderingContract::from_parallel_arrays(&[0, 1, 2], &[0, 0, 0], &[0, 0, 0]);
-        assert!(validate_ipc_ordering(&path, &ordering).unwrap());
-
-        // Read back and verify data
-        let file = File::open(&path).unwrap();
-        let reader = arrow::ipc::reader::FileReader::try_new(file, None).unwrap();
-        let mut total_rows = 0;
-        for batch_result in reader {
-            let b = batch_result.unwrap();
-            total_rows += b.num_rows();
-        }
-        assert_eq!(total_rows, 3);
     }
 
     #[test]

@@ -686,13 +686,13 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         DataFormat primary = stubFormat("parquet", 0);
         DataFormat derived = stubFormat("mv_state", 50);
 
-        WriterFileSet mergedDerived = new WriterFileSet(createTempDir().toString(), 10L, Set.of("merged.mv.arrow"), 7, 1L);
+        WriterFileSet mergedDerived = new WriterFileSet(createTempDir().toString(), 10L, Set.of("merged.mv.parquet"), 7, 1L);
         when(derivedMerger.merge(any(MergeInput.class))).thenReturn(new MergeResult(Map.of(derived, mergedDerived)));
 
         CompositeMergeExecutor executor = new CompositeMergeExecutor(Map.of(primary, primaryMerger, derived, derivedMerger));
 
         // Plan over derived-only segments: the primary (parquet) contributes no files.
-        WriterFileSet inputDerived = new WriterFileSet(createTempDir().toString(), 1L, Set.of("in.mv.arrow"), 3, 1L);
+        WriterFileSet inputDerived = new WriterFileSet(createTempDir().toString(), 1L, Set.of("in.mv.parquet"), 3, 1L);
         MergePlan plan = new MergePlan(10L, primary, List.of(derived), Map.of(primary, List.of(), derived, List.of(inputDerived)));
 
         MergeResult result = executor.execute(plan);

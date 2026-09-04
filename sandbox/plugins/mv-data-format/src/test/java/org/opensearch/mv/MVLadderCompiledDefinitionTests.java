@@ -211,11 +211,34 @@ public class MVLadderCompiledDefinitionTests extends OpenSearchTestCase {
     // ── Legacy definitions are byte-for-byte unchanged ───────────────────
 
     public void testLegacyDefinitionsUnchanged() {
-        for (String name : List.of("payments", "pull_count_sum", "pull_count_sum_userid", "clickbench_q9", "clickbench_q9_native")) {
+        for (String name : List.of("pull_count_sum", "pull_count_sum_userid", "clickbench_q9", "clickbench_q9_native")) {
             MVCompiledDefinition viaCompiledFor = MVCompiledDefinition.compiledFor(name);
             MVCompiledDefinition viaLegacy = MVCompiledDefinition.fromLegacySpec(MVDefinitionSpec.source(name));
             assertEquals("Legacy definition " + name + " must remain unchanged", viaLegacy.hash(), viaCompiledFor.hash());
         }
+    }
+
+    /**
+     * payments is TYPED (COUNT + SUM/MIN/MAX over latency_ms) — a shape
+     * {@code fromLegacySpec} cannot express (it only produces COUNT+SUM).
+     * compiledFor must dispatch to the typed definition, and the spec's SQL
+     * must be the generated partial SQL of that definition.
+     */
+    public void testPaymentsIsTypedDefinition() {
+        MVCompiledDefinition typed = MVCompiledDefinition.payments();
+        assertEquals(typed.hash(), MVCompiledDefinition.compiledFor("payments").hash());
+        assertEquals(
+            List.of("service", "status", "cnt", "lat_sum", "lat_min", "lat_max"),
+            typed.projectionOrder()
+        );
+        assertEquals(typed.buildPartialSql(MVConstants.INPUT_TABLE), MVDefinitionSpec.source("payments").sql());
+        // The fold-search SQL is generated, never hardcoded: physical state
+        // names in the SELECT, stable aliases out.
+        String foldSearch = MVCompiledDefinition.paymentsFold().finalFoldSearchSql();
+        assertTrue(foldSearch, foldSearch.contains("SUM(\"sum(mv_input.cnt)[sum]\") AS \"cnt\""));
+        assertTrue(foldSearch, foldSearch.contains("MIN(\"min(mv_input.lat_min)[value]\") AS \"lat_min\""));
+        assertTrue(foldSearch, foldSearch.contains("MAX(\"max(mv_input.lat_max)[value]\") AS \"lat_max\""));
+        assertTrue(foldSearch, foldSearch.endsWith("FROM __MV_STATES__ GROUP BY \"service\", \"status\" ORDER BY \"service\", \"status\""));
     }
 
     // ── Hash stability across calls ──────────────────────────────────────

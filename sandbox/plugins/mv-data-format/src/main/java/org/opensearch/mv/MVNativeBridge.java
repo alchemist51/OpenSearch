@@ -20,20 +20,16 @@ import java.lang.invoke.MethodHandle;
 
 /**
  * POC(mv): minimal FFI binding for the MV state-file build. Binds
- * {@code df_mv_build_poc} from the shared native lib directly — no dependency
+ * {@code df_mv_build_managed} from the shared native lib directly — no dependency
  * on the DataFusion plugin's Java classes (avoids cross-plugin classloader
  * coupling; both crates' symbols live in the one shared .so).
  */
 public final class MVNativeBridge {
 
     private static final MethodHandle MV_INIT_RUNTIME;
-    private static final MethodHandle MV_BUILD_POC;
     private static final MethodHandle MV_BUILD_ARROW;
-    private static final MethodHandle MV_MERGE_STATE;
     private static final MethodHandle MV_MERGE_STATE_STREAMS;
-    private static final MethodHandle MV_VALIDATE_IPC_HEADER;
     private static final MethodHandle MV_FOLD_ADJACENT_KEYS;
-    private static final MethodHandle MV_SEARCH_POC;
     private static final MethodHandle MV_WRITER_CREATE;
     private static final MethodHandle MV_WRITER_FEED;
     private static final MethodHandle MV_WRITER_FINALIZE;
@@ -45,6 +41,7 @@ public final class MVNativeBridge {
     private static final MethodHandle MV_RELEASE_CANCEL_CTX;
     private static final MethodHandle MV_CANCEL_BUILD;
     private static final MethodHandle MV_SEARCH_V2;
+    private static final MethodHandle MV_STATE_FIELD_NAMES;
     private static final MethodHandle MV_BUILD_STREAMING_RESULT;
     private static final MethodHandle MV_BUILD_RESULT_ABI_VERSION;
     private static final MethodHandle MV_CREATE_GLOBAL_RUNTIME;
@@ -63,23 +60,6 @@ public final class MVNativeBridge {
             lib.find("df_init_runtime_manager").orElseThrow(),
             FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT, ValueLayout.JAVA_DOUBLE, ValueLayout.JAVA_DOUBLE)
         );
-        // i64 df_mv_build_poc(input_ptr, input_len, table_ptr, table_len, sql_ptr, sql_len, output_ptr, output_len)
-        MV_BUILD_POC = linker.downcallHandle(
-            lib.find("df_mv_build_poc").orElseThrow(() -> new IllegalStateException("df_mv_build_poc symbol missing")),
-            FunctionDescriptor.of(
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
-                ValueLayout.JAVA_LONG
-            )
-        );
-        // i64 df_mv_search_poc(files_ptr, files_lens, files_count, group_ptr, group_len,
-        // state_ptr, state_len, out_ptr, out_cap, out_len)
         MV_BUILD_ARROW = linker.downcallHandle(
             lib.find("df_mv_build_arrow").orElseThrow(() -> new IllegalStateException("df_mv_build_arrow not found")),
             FunctionDescriptor.of(
@@ -91,18 +71,6 @@ public final class MVNativeBridge {
                 ValueLayout.ADDRESS,
                 ValueLayout.JAVA_LONG,
                 ValueLayout.JAVA_LONG,
-                ValueLayout.JAVA_LONG
-            )
-        );
-        MV_MERGE_STATE = linker.downcallHandle(
-            lib.find("df_mv_merge_state").orElseThrow(() -> new IllegalStateException("df_mv_merge_state not found")),
-            FunctionDescriptor.of(
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
                 ValueLayout.JAVA_LONG
             )
         );
@@ -135,34 +103,15 @@ public final class MVNativeBridge {
                 ValueLayout.JAVA_LONG         // ordering_identity_len
             )
         );
-        // i64 df_mv_validate_ipc_header(file_ptr, file_len, expected_schema_hash,
-        //     ordering_indices_ptr, ordering_asc_ptr, ordering_nulls_first_ptr, ordering_len)
-        MV_VALIDATE_IPC_HEADER = linker.downcallHandle(
-            lib.find("df_mv_validate_ipc_header").orElseThrow(() -> new IllegalStateException("df_mv_validate_ipc_header not found")),
-            FunctionDescriptor.of(
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,          // file_ptr
-                ValueLayout.JAVA_LONG,        // file_len
-                ValueLayout.JAVA_LONG,        // expected_schema_hash
-                ValueLayout.ADDRESS,          // ordering_indices_ptr
-                ValueLayout.ADDRESS,          // ordering_asc_ptr
-                ValueLayout.ADDRESS,          // ordering_nulls_first_ptr
-                ValueLayout.JAVA_INT          // ordering_len
-            )
-        );
         // i64 df_mv_fold_adjacent_keys(placeholder)
         MV_FOLD_ADJACENT_KEYS = linker.downcallHandle(
             lib.find("df_mv_fold_adjacent_keys").orElseThrow(() -> new IllegalStateException("df_mv_fold_adjacent_keys not found")),
             FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
         );
-        MV_SEARCH_POC = linker.downcallHandle(
-            lib.find("df_mv_search_poc").orElseThrow(() -> new IllegalStateException("df_mv_search_poc symbol missing")),
+        // i64 df_mv_state_field_names(file_ptr, file_len, out_ptr, out_cap, out_len)
+        MV_STATE_FIELD_NAMES = linker.downcallHandle(
+            lib.find("df_mv_state_field_names").orElseThrow(() -> new IllegalStateException("df_mv_state_field_names not found")),
             FunctionDescriptor.of(
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
-                ValueLayout.ADDRESS,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
                 ValueLayout.JAVA_LONG,
                 ValueLayout.ADDRESS,
                 ValueLayout.JAVA_LONG,
@@ -405,63 +354,12 @@ public final class MVNativeBridge {
         }
     }
 
-    /**
-     * Blocking MV state-file build: reads {@code inputFile} (primary parquet),
-     * runs {@code sql} stopped at Partial mode, writes state rows (sorted, per
-     * the ORDER BY in the sql) to {@code outputFile}. Returns state row count.
-     */
-    public static long buildStateFile(String inputFile, String tableName, String sql, String outputFile) {
-        try (var call = new NativeCall()) {
-            var in = call.str(inputFile);
-            var table = call.str(tableName);
-            var query = call.str(sql);
-            var out = call.str(outputFile);
-            return call.invoke(
-                MV_BUILD_POC,
-                in.segment(),
-                in.len(),
-                table.segment(),
-                table.len(),
-                query.segment(),
-                query.len(),
-                out.segment(),
-                out.len()
-            );
-        }
-    }
-
-    /**
-     * DataFusion STATE-to-STATE merge used by
-     * {@link org.opensearch.mv.merge.DataFusionMVStateMergeStrategy}. The
-     * standard data-format merge framework owns candidate selection and
-     * scheduling; this native operation only folds the selected state files
-     * into one group-key-sorted state file with a schema compatible with its
-     * inputs. Returns the merged row count.
-     *
-     * @deprecated Stage 4: replaced by {@link #mergeStateStreams} which carries
-     *             the full ordering contract and accumulator metadata across
-     *             FFI for streaming k-way merge with validation. This SQL-based
-     *             method does not validate ordering identity, does not carry
-     *             per-column fold semantics, and will be removed once all
-     *             definitions compile through {@link MVCompiledDefinition}.
-     */
-    @Deprecated(forRemoval = true)
-    public static long mergeStateFiles(java.util.List<String> stateFiles, String foldSql, String outputFile) {
-        try (var call = new NativeCall()) {
-            var files = call.str(String.join("\n", stateFiles));
-            var query = call.str(foldSql);
-            var out = call.str(outputFile);
-            return call.invoke(MV_MERGE_STATE, files.segment(), files.len(), query.segment(), query.len(), out.segment(), out.len());
-        }
-    }
-
     // ── Stage 4: Streaming merge engine ──────────────────────────────────
 
     /**
-     * Stage 4 streaming merge: folds k IPC state files into one sorted state
-     * file using a streaming k-way merge with adjacent-key folding. Replaces
-     * the SQL-based {@link #mergeStateFiles} path with a purpose-built pipeline
-     * that operates directly on IPC file streams.
+     * Stage 4 streaming merge: folds k Parquet state files into one sorted
+     * state file using a streaming k-way merge with adjacent-key folding — a
+     * purpose-built pipeline operating directly on Parquet file streams.
      *
      * <p><b>Stage 4 enhancement:</b> now carries the full aggregate column
      * names and ordering identity across the FFI boundary so the Rust side
@@ -553,43 +451,6 @@ public final class MVNativeBridge {
         );
     }
 
-    /**
-     * Stage 4 IPC header validation: verifies that an IPC state file's schema
-     * hash matches the expected value and its rows are sorted according to the
-     * given ordering contract.
-     *
-     * @param filePath           IPC state file to validate
-     * @param expectedSchemaHash expected schema hash
-     * @param orderingIndices    column indices forming the sort key
-     * @param orderingAsc        per-key direction
-     * @param orderingNullsFirst per-key null placement
-     * @return 0 on success, negative on validation failure
-     */
-    public static long validateIpcHeader(
-        String filePath,
-        long expectedSchemaHash,
-        int[] orderingIndices,
-        boolean[] orderingAsc,
-        boolean[] orderingNullsFirst
-    ) {
-        try (var call = new NativeCall()) {
-            var file = call.str(filePath);
-            var indices = call.intArray(orderingIndices);
-            var asc = call.intArray(toIntArray(orderingAsc));
-            var nullsFirst = call.intArray(toIntArray(orderingNullsFirst));
-            return call.invoke(
-                MV_VALIDATE_IPC_HEADER,
-                file.segment(),
-                file.len(),
-                expectedSchemaHash,
-                indices.segment(),
-                asc.segment(),
-                nullsFirst.segment(),
-                orderingIndices.length
-            );
-        }
-    }
-
     private static int[] toIntArray(boolean[] booleans) {
         int[] result = new int[booleans.length];
         for (int i = 0; i < booleans.length; i++) {
@@ -623,29 +484,16 @@ public final class MVNativeBridge {
     }
 
     /**
-     * POC search: Final-aggregation over the given MV state files. Always goes
-     * to the MV (no fallback). Returns tab-separated "group\tcount" lines.
+     * Reads the physical field names of a Parquet MV state file (footer only),
+     * in physical order — the ground truth for the merge ordering identity.
      */
-    public static String search(java.util.List<String> stateFiles, String groupKey, String stateCol) {
+    public static java.util.List<String> stateFieldNames(String stateFile) {
         try (var call = new NativeCall()) {
-            var files = call.strArray(stateFiles.toArray(new String[0]));
-            var group = call.str(groupKey);
-            var state = call.str(stateCol);
-            var out = call.outBuffer(1024 * 1024);
-            call.invoke(
-                MV_SEARCH_POC,
-                files.ptrs(),
-                files.lens(),
-                (long) stateFiles.size(),
-                group.segment(),
-                group.len(),
-                state.segment(),
-                state.len(),
-                out.data(),
-                (long) out.capacity(),
-                out.lenOut()
-            );
-            return new String(out.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+            var file = call.str(stateFile);
+            var out = call.outBuffer(64 * 1024);
+            call.invoke(MV_STATE_FIELD_NAMES, file.segment(), file.len(), out.data(), (long) out.capacity(), out.lenOut());
+            String joined = new String(out.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+            return joined.isEmpty() ? java.util.List.of() : java.util.List.of(joined.split("\n", -1));
         }
     }
 

@@ -22,12 +22,12 @@
 use std::fs::{self, File};
 use std::sync::Arc;
 
-use arrow::ipc::writer::FileWriter as IpcFileWriter;
 use arrow_array::{Float64Array, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use opensearch_datafusion::mv_pull_metadata::{
     merge_pull_with_metadata, AdmissionGate, PullRoundBounds,
 };
+use parquet::arrow::ArrowWriter as ParquetWriter;
 
 // ── Shared helpers ──────────────────────────────────────────────────────
 
@@ -44,7 +44,7 @@ fn state_schema() -> SchemaRef {
 fn write_state_file(path: &str, rows: &[(i64, i64, i64, u64, f64)]) {
     let schema = state_schema();
     let batch = RecordBatch::try_new(
-        schema,
+        schema.clone(),
         vec![
             Arc::new(Int64Array::from(
                 rows.iter().map(|r| r.0).collect::<Vec<_>>(),
@@ -65,18 +65,18 @@ fn write_state_file(path: &str, rows: &[(i64, i64, i64, u64, f64)]) {
     )
     .unwrap();
     let file = File::create(path).unwrap();
-    let mut w = IpcFileWriter::try_new(file, &batch.schema()).unwrap();
+    let mut w = ParquetWriter::try_new(file, batch.schema(), None).unwrap();
     w.write(&batch).unwrap();
-    w.finish().unwrap();
+    w.close().unwrap();
 }
 
 fn write_empty_state_file(path: &str) {
     let schema = state_schema();
-    let batch = RecordBatch::new_empty(schema);
+    let batch = RecordBatch::new_empty(schema.clone());
     let file = File::create(path).unwrap();
-    let mut w = IpcFileWriter::try_new(file, &batch.schema()).unwrap();
+    let mut w = ParquetWriter::try_new(file, schema, None).unwrap();
     w.write(&batch).unwrap();
-    w.finish().unwrap();
+    w.close().unwrap();
 }
 
 /// Standard fold ops: [GROUP_KEY, SUM, COUNT, SUM, SUM]
@@ -94,9 +94,9 @@ fn standard_ordering() -> (Vec<usize>, Vec<bool>, Vec<bool>) {
 #[test]
 fn test_happy_path_merge_with_metadata() {
     let dir = tempfile::tempdir().unwrap();
-    let f1 = dir.path().join("s1.ipc").to_str().unwrap().to_string();
-    let f2 = dir.path().join("s2.ipc").to_str().unwrap().to_string();
-    let out = dir.path().join("merged.ipc").to_str().unwrap().to_string();
+    let f1 = dir.path().join("s1.mv.parquet").to_str().unwrap().to_string();
+    let f2 = dir.path().join("s2.mv.parquet").to_str().unwrap().to_string();
+    let out = dir.path().join("merged.mv.parquet").to_str().unwrap().to_string();
 
     // File 1: keys 1, 3
     write_state_file(&f1, &[(1, 10, 1, 1, 10.0), (3, 30, 3, 3, 30.0)]);
@@ -139,8 +139,8 @@ fn test_happy_path_merge_with_metadata() {
 #[test]
 fn test_spill_byte_budget_enforcement() {
     let dir = tempfile::tempdir().unwrap();
-    let f1 = dir.path().join("s1.ipc").to_str().unwrap().to_string();
-    let out = dir.path().join("merged.ipc").to_str().unwrap().to_string();
+    let f1 = dir.path().join("s1.mv.parquet").to_str().unwrap().to_string();
+    let out = dir.path().join("merged.mv.parquet").to_str().unwrap().to_string();
 
     write_state_file(&f1, &[(1, 10, 1, 1, 10.0)]);
 
@@ -170,10 +170,10 @@ fn test_spill_byte_budget_enforcement() {
 #[test]
 fn test_round_bounds_ops_exceeded() {
     let dir = tempfile::tempdir().unwrap();
-    let f1 = dir.path().join("s1.ipc").to_str().unwrap().to_string();
-    let f2 = dir.path().join("s2.ipc").to_str().unwrap().to_string();
-    let f3 = dir.path().join("s3.ipc").to_str().unwrap().to_string();
-    let out = dir.path().join("merged.ipc").to_str().unwrap().to_string();
+    let f1 = dir.path().join("s1.mv.parquet").to_str().unwrap().to_string();
+    let f2 = dir.path().join("s2.mv.parquet").to_str().unwrap().to_string();
+    let f3 = dir.path().join("s3.mv.parquet").to_str().unwrap().to_string();
+    let out = dir.path().join("merged.mv.parquet").to_str().unwrap().to_string();
 
     write_state_file(&f1, &[(1, 10, 1, 1, 10.0)]);
     write_state_file(&f2, &[(2, 20, 2, 2, 20.0)]);
@@ -206,8 +206,8 @@ fn test_round_bounds_ops_exceeded() {
 #[test]
 fn test_round_bounds_cardinality_exceeded() {
     let dir = tempfile::tempdir().unwrap();
-    let f1 = dir.path().join("s1.ipc").to_str().unwrap().to_string();
-    let out = dir.path().join("merged.ipc").to_str().unwrap().to_string();
+    let f1 = dir.path().join("s1.mv.parquet").to_str().unwrap().to_string();
+    let out = dir.path().join("merged.mv.parquet").to_str().unwrap().to_string();
 
     // 3 unique keys → 3 rows output → cardinality = 3
     write_state_file(
@@ -258,8 +258,8 @@ fn test_admission_gate_with_low_threshold() {
 #[test]
 fn test_single_file_merge_metadata() {
     let dir = tempfile::tempdir().unwrap();
-    let f1 = dir.path().join("s1.ipc").to_str().unwrap().to_string();
-    let out = dir.path().join("merged.ipc").to_str().unwrap().to_string();
+    let f1 = dir.path().join("s1.mv.parquet").to_str().unwrap().to_string();
+    let out = dir.path().join("merged.mv.parquet").to_str().unwrap().to_string();
 
     write_state_file(&f1, &[(1, 10, 1, 1, 10.0), (2, 20, 2, 2, 20.0)]);
 
@@ -287,9 +287,9 @@ fn test_single_file_merge_metadata() {
 #[test]
 fn test_empty_files_merge_metadata() {
     let dir = tempfile::tempdir().unwrap();
-    let f1 = dir.path().join("s1.ipc").to_str().unwrap().to_string();
-    let f2 = dir.path().join("s2.ipc").to_str().unwrap().to_string();
-    let out = dir.path().join("merged.ipc").to_str().unwrap().to_string();
+    let f1 = dir.path().join("s1.mv.parquet").to_str().unwrap().to_string();
+    let f2 = dir.path().join("s2.mv.parquet").to_str().unwrap().to_string();
+    let out = dir.path().join("merged.mv.parquet").to_str().unwrap().to_string();
 
     write_empty_state_file(&f1);
     write_empty_state_file(&f2);
@@ -319,8 +319,8 @@ fn test_merge_metadata_with_memory_pool() {
     use datafusion::execution::memory_pool::GreedyMemoryPool;
 
     let dir = tempfile::tempdir().unwrap();
-    let f1 = dir.path().join("s1.ipc").to_str().unwrap().to_string();
-    let out = dir.path().join("merged.ipc").to_str().unwrap().to_string();
+    let f1 = dir.path().join("s1.mv.parquet").to_str().unwrap().to_string();
+    let out = dir.path().join("merged.mv.parquet").to_str().unwrap().to_string();
 
     write_state_file(&f1, &[(1, 10, 1, 1, 10.0)]);
 
@@ -352,8 +352,8 @@ fn test_merge_metadata_memory_pool_oom() {
     use datafusion::execution::memory_pool::GreedyMemoryPool;
 
     let dir = tempfile::tempdir().unwrap();
-    let f1 = dir.path().join("s1.ipc").to_str().unwrap().to_string();
-    let out = dir.path().join("merged.ipc").to_str().unwrap().to_string();
+    let f1 = dir.path().join("s1.mv.parquet").to_str().unwrap().to_string();
+    let out = dir.path().join("merged.mv.parquet").to_str().unwrap().to_string();
 
     write_state_file(&f1, &[(1, 10, 1, 1, 10.0)]);
 

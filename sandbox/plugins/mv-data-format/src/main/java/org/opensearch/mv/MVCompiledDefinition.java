@@ -170,6 +170,7 @@ public final class MVCompiledDefinition {
     public static MVCompiledDefinition compiledFor(String definitionName) {
         Objects.requireNonNull(definitionName, "definitionName");
         return switch (definitionName) {
+            case "payments" -> payments();
             case "clickbench_100m" -> clickbench100m();
             case "heavy_l1" -> heavyL1();
             case "heavy_l2" -> heavyL2();
@@ -205,6 +206,41 @@ public final class MVCompiledDefinition {
             aggs.add(AggregateSpec.sum(col.name(), "sum_" + col.name()));
         }
         return new MVCompiledDefinition(keys, aggs);
+    }
+
+    /**
+     * The {@code payments} definition (the original end-to-end sanity shape):
+     * GROUP BY {@code service, status} with a COUNT plus SUM/MIN/MAX over
+     * {@code latency_ms}. Typed — all SQL (build, fold, fold-search) is
+     * GENERATED from this definition; there are no hardcoded SQL strings.
+     */
+    public static MVCompiledDefinition payments() {
+        return new MVCompiledDefinition(
+            List.of(GroupKey.of("service", GroupKey.ColumnType.KEYWORD), GroupKey.of("status", GroupKey.ColumnType.KEYWORD)),
+            List.of(
+                AggregateSpec.count("cnt"),
+                AggregateSpec.sum("latency_ms", "lat_sum"),
+                AggregateSpec.min("latency_ms", "lat_min"),
+                AggregateSpec.max("latency_ms", "lat_max")
+            )
+        );
+    }
+
+    /**
+     * The fold of the {@code payments} shipped state schema: the target-side
+     * definition whose input columns are the SOURCE's ship fields. Closed over
+     * the state algebra (its output folds again to the same answer).
+     */
+    public static MVCompiledDefinition paymentsFold() {
+        return new MVCompiledDefinition(
+            List.of(GroupKey.of("service", GroupKey.ColumnType.KEYWORD), GroupKey.of("status", GroupKey.ColumnType.KEYWORD)),
+            List.of(
+                AggregateSpec.sum("cnt", "cnt"),
+                AggregateSpec.sum("lat_sum", "lat_sum"),
+                AggregateSpec.min("lat_min", "lat_min"),
+                AggregateSpec.max("lat_max", "lat_max")
+            )
+        );
     }
 
     /**
@@ -527,7 +563,7 @@ public final class MVCompiledDefinition {
      *        the footer schema is read (no record batches loaded)
      * @return merge call params with a physical ordering identity
      * @throws java.io.IOException if the reference file cannot be read
-     * @see MVArrowIpcSchemaReader#readGroupKeyNames
+     * @see MVStateSchemaReader#readGroupKeyNames
      */
     public MergeCallParams buildMergeCallParams(String referenceStateFile) throws java.io.IOException {
         return MergeCallParams.fromWithPhysicalNames(this, referenceStateFile);
@@ -617,7 +653,7 @@ public final class MVCompiledDefinition {
          * version or expression rendering changes.</p>
          *
          * @param def                 compiled definition
-         * @param referenceStateFile  path to any input Arrow IPC state file
+         * @param referenceStateFile  path to any input Parquet state file
          * @return merge call params with physical ordering identity
          * @throws java.io.IOException if the file cannot be read
          */
@@ -651,14 +687,17 @@ public final class MVCompiledDefinition {
 
             String[] physicalAggNames = derivePhysicalAggColumnNames(def.aggregates());
 
-            // Read group key physical names from the actual state file —
-            // this is the GROUND TRUTH for the ordering identity. The Rust
-            // merge computes the identity from schema.field(idx).name() so
-            // we must match exactly.
-            List<String> physicalKeyNames = MVArrowIpcSchemaReader.readGroupKeyNames(
-                referenceStateFile, numGroupKeys
-            );
-            String physicalIdentity = ordering.physicalOrderingIdentity(physicalKeyNames);
+            // Ordering identity ground truth: for plain-column group keys the
+            // physical name IS the alias by construction, so no file read is
+            // needed. Only expression keys (span/derived) require reading the
+            // Parquet state file's footer for DataFusion's physical names.
+            final String physicalIdentity;
+            if (def.groupKeys().stream().allMatch(GroupKey::isPlainColumn)) {
+                physicalIdentity = ordering.orderingIdentity();
+            } else {
+                List<String> physicalKeyNames = MVStateSchemaReader.readGroupKeyNames(referenceStateFile, numGroupKeys);
+                physicalIdentity = ordering.physicalOrderingIdentity(physicalKeyNames);
+            }
 
             return new MergeCallParams(
                 indices,
@@ -875,6 +914,36 @@ public final class MVCompiledDefinition {
         }
         sb.append(" FROM ").append(sourceTable);
         sb.append(" GROUP BY ").append(groupKeys.stream().map(k -> "\"" + k.name() + "\"").collect(Collectors.joining(", ")));
+        return sb.toString();
+    }
+
+    /**
+     * Generate the final-fold SEARCH SQL over this definition's state files.
+     * {@code __MV_STATES__} is replaced natively with the UNION ALL of the
+     * snapshot's state files. State column references are the PHYSICAL names
+     * DataFusion's Partial stage emits ({@code func(table.col)[state]}), and
+     * every output carries the definition's stable user alias — this replaces
+     * the previously hardcoded per-definition {@code *_SEARCH_SQL} constants.
+     */
+    public String finalFoldSearchSql() {
+        String keyList = groupKeys.stream().map(k -> "\"" + k.name() + "\"").collect(Collectors.joining(", "));
+        String[] physical = MergeCallParams.derivePhysicalAggColumnNames(aggregates);
+        StringBuilder sb = new StringBuilder("SELECT ").append(keyList);
+        int p = 0;
+        for (AggregateSpec agg : aggregates) {
+            switch (agg.function()) {
+                // COUNT partial states fold by summation, like SUM.
+                case COUNT, SUM -> sb.append(", SUM(\"").append(physical[p++]).append("\") AS \"").append(agg.userAlias()).append('"');
+                case MIN -> sb.append(", MIN(\"").append(physical[p++]).append("\") AS \"").append(agg.userAlias()).append('"');
+                case MAX -> sb.append(", MAX(\"").append(physical[p++]).append("\") AS \"").append(agg.userAlias()).append('"');
+                case AVG -> {
+                    // AVG decomposes to COUNT + SUM state fragments; both fold by SUM.
+                    sb.append(", SUM(\"").append(physical[p++]).append("\") AS \"").append(agg.userAlias()).append("_count\"");
+                    sb.append(", SUM(\"").append(physical[p++]).append("\") AS \"").append(agg.userAlias()).append("_sum\"");
+                }
+            }
+        }
+        sb.append(" FROM __MV_STATES__ GROUP BY ").append(keyList).append(" ORDER BY ").append(keyList);
         return sb.toString();
     }
 

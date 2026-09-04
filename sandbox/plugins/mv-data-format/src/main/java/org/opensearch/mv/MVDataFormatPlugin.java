@@ -250,11 +250,6 @@ public class MVDataFormatPlugin extends Plugin
                 MVConstants.COLOCATE_WITH_SETTING,
                 org.opensearch.common.settings.Setting.Property.IndexScope
             ),
-            org.opensearch.common.settings.Setting.simpleString(
-                MVConstants.DEFINITION_SETTING,
-                "payments",
-                org.opensearch.common.settings.Setting.Property.IndexScope
-            ),
             // Stage 4: persisted, self-contained MV definition descriptor JSON.
             // Public + Final + IndexScope so the MV control plane can submit it
             // in the create request (like index.derived.definition_id).
@@ -375,7 +370,19 @@ public class MVDataFormatPlugin extends Plugin
     @Override
     public IndexingExecutionEngine<?, ?> indexingEngine(IndexingEngineConfig config) {
         java.util.List<String> shipTargets = config.indexSettings().getSettings().getAsList(MVConstants.SHIP_TARGETS_SETTING);
-        String definition = config.indexSettings().getSettings().get(MVConstants.DEFINITION_SETTING, "payments");
+        // ONE definition carrier: the canonical derived-binding key. No silent
+        // default — an MV-participating index without a declared definition is
+        // a configuration bug and must fail loudly, not fold a toy definition.
+        String definition = config.indexSettings().getSettings().get(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID);
+        if (definition == null || definition.isEmpty()) {
+            throw new IllegalStateException(
+                "mv engine: index ["
+                    + config.indexSettings().getIndex().getName()
+                    + "] participates in MV but declares no definition — set "
+                    + org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID
+                    + " (targets created via /_mv/views carry it automatically)"
+            );
+        }
 
         // Source vs target is decided by the canonical DERIVED DATA-FORMAT
         // CATEGORY, not by scanning primary/secondary format lists for mv_state.
