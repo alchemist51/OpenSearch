@@ -65,8 +65,8 @@ public class MVCheckpointRequestActionTests extends OpenSearchTestCase {
 
     public void testResponseRoundTripAvailable() throws IOException {
         Map<String, MVFileMetadata> files = Map.of(
-            "gen-1_0.parquet", new MVFileMetadata(1024L, 0L, 99L, 12345L),
-            "gen-1_1.parquet", new MVFileMetadata(2048L, 100L, 199L, -1L)
+            "parquet/gen-1_0.parquet", new MVFileMetadata(1024L, 0L, 99L, 12345L),
+            "parquet/gen-1_1.parquet", new MVFileMetadata(2048L, 100L, 199L, -1L)
         );
         MVReplicationCheckpoint cp = new MVReplicationCheckpoint(
             "source-idx", 0, 3L, 199L, 42L, files, System.currentTimeMillis()
@@ -84,6 +84,8 @@ public class MVCheckpointRequestActionTests extends OpenSearchTestCase {
         assertEquals(3L, deserialized.primaryTerm());
         assertEquals(42L, deserialized.infosVersion());
         assertEquals(2, deserialized.checkpoint().fileMetadata().size());
+        assertTrue(deserialized.checkpoint().fileMetadata().containsKey("parquet/gen-1_0.parquet"));
+        assertTrue(deserialized.checkpoint().fileMetadata().containsKey("parquet/gen-1_1.parquet"));
     }
 
     // ── Response round-trip (unavailable / nothing-new) ──────────────────

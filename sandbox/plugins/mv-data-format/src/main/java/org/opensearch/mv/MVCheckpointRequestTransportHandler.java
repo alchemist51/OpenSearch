@@ -21,6 +21,7 @@ import org.opensearch.index.engine.exec.Segment;
 import org.opensearch.index.engine.exec.WriterFileSet;
 import org.opensearch.index.engine.exec.coord.CatalogSnapshot;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.index.store.FileMetadata;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
@@ -143,7 +144,8 @@ public final class MVCheckpointRequestTransportHandler extends HandledTransportA
                                 anyUnknownRange = true;
                             }
 
-                            allFileMetadata.put(fileName, new MVFileMetadata(
+                            String remoteKey = FileMetadata.serialize(fsEntry.getKey(), fileName);
+                            allFileMetadata.put(remoteKey, new MVFileMetadata(
                                 size, wfs.minSeqNo(), wfs.maxSeqNo(), MVFileMetadata.CRC32_UNKNOWN
                             ));
 
