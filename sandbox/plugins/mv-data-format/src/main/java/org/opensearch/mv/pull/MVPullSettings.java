@@ -74,14 +74,16 @@ public final class MVPullSettings {
      * k-way merges the oldest generations into one via the Stage-4
      * streaming merge engine.
      *
-     * <p>Default {@code 8}. Set higher to delay compaction (more
-     * generations in the catalog, larger restart CRC cost, larger
-     * fsync/blob-list surface). Set lower to compact sooner (more CPU
-     * spent on compaction, but smaller catalog).
+     * <p>Default {@code Integer.MAX_VALUE} (compaction disarmed): the
+     * standalone k-way compaction path is quarantined pending its
+     * batch-window rewrite (defect #11 — untracked native allocation, and
+     * input generations can be dropped while still referenced by the live
+     * catalog, failing the shard). Set a finite threshold explicitly only
+     * when exercising compaction on purpose.
      */
     public static final Setting<Integer> MAX_GENERATIONS_BEFORE_COMPACT = Setting.intSetting(
         "index.mv_pull.max_generations_before_compact",
-        8,
+        Integer.MAX_VALUE,
         2,
         Setting.Property.IndexScope,
         Setting.Property.Dynamic

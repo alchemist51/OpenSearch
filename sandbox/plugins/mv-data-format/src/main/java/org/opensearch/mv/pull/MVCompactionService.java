@@ -42,7 +42,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>After each successful generation publish, the poller calls
  * {@link #maybeCompact(IndexShard, int)} which checks the catalog's mv_state
  * segment count against the configured threshold
- * ({@code index.mv_pull.max_generations_before_compact}, default 8).
+ * ({@code index.mv_pull.max_generations_before_compact}, default disarmed).
  * When exceeded, the N oldest/smallest generations are k-way merged into a
  * single folded generation via the existing Stage-4 streaming merge engine
  * (DataFusionMVStateMergeStrategy), published as a new catalog segment, and
