@@ -271,7 +271,7 @@ public class DataFormatAwareEngine implements Indexer {
      * <p>
      * TODO: Remove this flag once merge implementations are complete for all data formats.
      */
-    static final String MERGE_ENABLED_PROPERTY = "opensearch.pluggable.dataformat.merge.enabled";
+    public static final String MERGE_ENABLED_PROPERTY = "opensearch.pluggable.dataformat.merge.enabled";
 
     @Nullable
     private final String historyUUID;

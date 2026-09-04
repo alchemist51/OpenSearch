@@ -10,6 +10,7 @@ package org.opensearch.composite;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.common.Booleans;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.io.IOUtils;
@@ -18,6 +19,7 @@ import org.opensearch.composite.stats.CompositeShardStatsTracker;
 import org.opensearch.composite.stats.CompositeStatsProvider;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.index.engine.DataFormatAwareEngine;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.DataFormatPlugin;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
@@ -520,6 +522,11 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
     }
 
     private boolean shouldMergeOnRefresh(List<Segment> writerFiles) {
+        // Same kill-switch that gates scheduler-driven merges in DataFormatAwareEngine —
+        // merge-on-refresh is just another entry into Merger.merge() and must honor it.
+        if (Booleans.parseBoolean(System.getProperty(DataFormatAwareEngine.MERGE_ENABLED_PROPERTY, Boolean.TRUE.toString())) == false) {
+            return false;
+        }
         long maxBytes = CompositeDataFormatPlugin.MERGE_ON_REFRESH_MAX_SIZE.get(indexSettings.getSettings()).getBytes();
         if (maxBytes <= 0) {
             return false;
