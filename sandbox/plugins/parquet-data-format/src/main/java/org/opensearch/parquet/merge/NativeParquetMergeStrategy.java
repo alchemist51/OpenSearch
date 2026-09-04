@@ -99,11 +99,28 @@ public class NativeParquetMergeStrategy implements ParquetMergeStrategy {
                 + expectedRows
                 + "]";
 
+            // Seq-range propagation: a merged file's range is exactly the
+            // min/max over its inputs (rows are unioned, never dropped). If any
+            // input predates range tracking (UNKNOWN), the merge cannot invent
+            // a range and must propagate UNKNOWN — the checkpoint handler then
+            // refuses to advertise rather than overclaim.
+            long mergedMinSeq = WriterFileSet.UNKNOWN_SEQ_NO;
+            long mergedMaxSeq = WriterFileSet.UNKNOWN_SEQ_NO;
+            boolean allRangesKnown = files.stream()
+                .allMatch(f -> f.minSeqNo() != WriterFileSet.UNKNOWN_SEQ_NO && f.maxSeqNo() != WriterFileSet.UNKNOWN_SEQ_NO);
+            if (allRangesKnown) {
+                mergedMinSeq = files.stream().mapToLong(MonoFileWriterSet::minSeqNo).min().orElse(WriterFileSet.UNKNOWN_SEQ_NO);
+                mergedMaxSeq = files.stream().mapToLong(MonoFileWriterSet::maxSeqNo).max().orElse(WriterFileSet.UNKNOWN_SEQ_NO);
+            }
+
             MonoFileWriterSet mergedWriterFileSet = MonoFileWriterSet.of(
                 mergedFilePath.getParent().toAbsolutePath(),
                 writerGeneration,
                 mergedFileName,
-                mergeMetadata.numRows()
+                mergeMetadata.numRows(),
+                0L,
+                mergedMinSeq,
+                mergedMaxSeq
             );
 
             checksumUpdater.apply(
