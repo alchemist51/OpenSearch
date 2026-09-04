@@ -370,17 +370,20 @@ public class MVDataFormatPlugin extends Plugin
     @Override
     public IndexingExecutionEngine<?, ?> indexingEngine(IndexingEngineConfig config) {
         java.util.List<String> shipTargets = config.indexSettings().getSettings().getAsList(MVConstants.SHIP_TARGETS_SETTING);
-        // ONE definition carrier: the canonical derived-binding key. No silent
-        // default — an MV-participating index without a declared definition is
-        // a configuration bug and must fail loudly, not fold a toy definition.
+        // ONE definition carrier pair: the persisted descriptor (authoritative,
+        // self-contained) or the canonical derived-binding id. No silent
+        // default — an MV-participating index declaring NEITHER is a
+        // configuration bug and must fail loudly, not fold a toy definition.
         String definition = config.indexSettings().getSettings().get(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID);
-        if (definition == null || definition.isEmpty()) {
+        String descriptorJson = config.indexSettings().getSettings().get(MVConstants.DESCRIPTOR_SETTING);
+        boolean hasDescriptor = descriptorJson != null && descriptorJson.isEmpty() == false;
+        if ((definition == null || definition.isEmpty()) && hasDescriptor == false) {
             throw new IllegalStateException(
                 "mv engine: index ["
                     + config.indexSettings().getIndex().getName()
                     + "] participates in MV but declares no definition — set "
                     + org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID
-                    + " (targets created via /_mv/views carry it automatically)"
+                    + " or a persisted descriptor (targets created via /_mv/views carry the descriptor automatically)"
             );
         }
 
@@ -396,11 +399,27 @@ public class MVDataFormatPlugin extends Plugin
         MVDefinitionSpec spec;
         org.opensearch.index.engine.dataformat.DataFormat format;
         if (isMvStateTarget && (shipTargets == null || shipTargets.isEmpty())) {
-            // Target side: use fold definition and mv_state format
-            spec = MVDefinitionSpec.fold(definition);
+            // Target side: fold definition + mv_state format. Descriptor-only
+            // targets (REST /_mv/views) synthesize the fold spec from the
+            // persisted descriptor — the descriptor IS the definition.
+            if (definition == null || definition.isEmpty()) {
+                spec = MVDefinitionSpec.foldOf(MVDefinitionResolver.resolve(config.indexSettings().getSettings()));
+            } else {
+                spec = MVDefinitionSpec.fold(definition);
+            }
             format = MVStateDataFormat.INSTANCE;
         } else {
-            // Source side: use source definition and materialized_view format
+            // Source side: named source definition and materialized_view
+            // format. Ship sources have no descriptor carrier — the id is
+            // required here.
+            if (definition == null || definition.isEmpty()) {
+                throw new IllegalStateException(
+                    "mv engine: source index ["
+                        + config.indexSettings().getIndex().getName()
+                        + "] declares ship targets but no "
+                        + org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID
+                );
+            }
             spec = MVDefinitionSpec.source(definition);
             format = MVDataFormat.INSTANCE;
         }
@@ -431,7 +450,7 @@ public class MVDataFormatPlugin extends Plugin
             config.indexSettings().getIndex().getName(),
             spec,
             format,
-            definition,
+            MVDefinitionResolver.definitionLabel(config.indexSettings().getSettings()),
             shipTargets == null ? java.util.List.of() : shipTargets,
             () -> client,
             () -> clusterService,

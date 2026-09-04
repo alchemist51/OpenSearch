@@ -105,6 +105,33 @@ public record MVDefinitionSpec(List<Column> columns, int groupKeys, String sql, 
         );
     }
 
+    /**
+     * Synthesize the FOLD spec of a compiled definition — the target-side spec
+     * for DESCRIPTOR-ONLY targets (created via {@code PUT /_mv/views}), which
+     * deliberately carry no named-registry id. Input columns are the
+     * definition's state columns (stable aliases); the SQL is the generated
+     * fold. Legacy {@link ColumnType} has no TIMESTAMP, so non-keyword keys
+     * approximate to INT64 — acceptable because pull-path targets never feed
+     * these columns through the ship-receive buffers.
+     */
+    public static MVDefinitionSpec foldOf(MVCompiledDefinition def) {
+        java.util.List<Column> cols = new java.util.ArrayList<>();
+        for (GroupKey k : def.groupKeys()) {
+            cols.add(new Column(k.name(), k.columnType() == GroupKey.ColumnType.KEYWORD ? ColumnType.UTF8 : ColumnType.INT64));
+        }
+        for (AggregateSpec a : def.aggregates()) {
+            for (AggregateSpec.StateColumn sc : a.stateColumns()) {
+                cols.add(new Column(sc.name(), ColumnType.INT64));
+            }
+        }
+        return new MVDefinitionSpec(
+            java.util.List.copyOf(cols),
+            def.groupKeys().size(),
+            def.buildFoldSql(MVConstants.INPUT_TABLE),
+            def.projectionOrder()
+        );
+    }
+
     /** The source index's definition (raw fields → state). SQL + ship fields GENERATED from the typed definition. */
     public static final MVDefinitionSpec SOURCE = new MVDefinitionSpec(
         List.of(new Column("service", ColumnType.UTF8), new Column("status", ColumnType.UTF8), new Column("latency_ms", ColumnType.INT64)),
