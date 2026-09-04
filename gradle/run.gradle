@@ -42,6 +42,11 @@ testClusters {
     // glibc 2.28+) in Files.newDirectoryStream that are not in OpenSearch's
     // allowlist, causing "Function not implemented" on FsBlobContainer listing.
     setting 'bootstrap.system_call_filter', 'false'
+    // Gradle testclusters bind HTTP to loopback by default. Bench nodes may
+    // opt in to an externally reachable bind address for an OSB driver.
+    if (findProperty('httpHost')) {
+      setting 'http.host', findProperty('httpHost').toString()
+    }
     if (numZones > 1) numberOfZones = numZones
     if (numNodes > 1) numberOfNodes = numNodes
     if (findProperty("installedPlugins")) {
