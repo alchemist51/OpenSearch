@@ -46,8 +46,12 @@ public final class MVCheckpointRequestAction extends ActionType<MVCheckpointRequ
      * Request from target to source: "give me files and noops above my
      * current watermark for this source shard."
      */
-    public static final class Request extends ActionRequest {
-        private final String sourceIndex;
+    /**
+     * Routed by {@link org.opensearch.action.support.single.shard.TransportSingleShardAction}
+     * to the node currently holding the SOURCE shard's primary (relocation-safe,
+     * the core single-shard idiom). {@code index()} is the source index.
+     */
+    public static final class Request extends org.opensearch.action.support.single.shard.SingleShardRequest<Request> {
         private final int sourceShard;
         private final String targetIndex;
         private final int targetShard;
@@ -55,7 +59,7 @@ public final class MVCheckpointRequestAction extends ActionType<MVCheckpointRequ
         private final long targetWatermark;
 
         public Request(String sourceIndex, int sourceShard, String targetIndex, int targetShard, long targetWatermark) {
-            this.sourceIndex = sourceIndex;
+            super(sourceIndex);
             this.sourceShard = sourceShard;
             this.targetIndex = targetIndex;
             this.targetShard = targetShard;
@@ -64,7 +68,6 @@ public final class MVCheckpointRequestAction extends ActionType<MVCheckpointRequ
 
         public Request(StreamInput in) throws IOException {
             super(in);
-            this.sourceIndex = in.readString();
             this.sourceShard = in.readVInt();
             this.targetIndex = in.readString();
             this.targetShard = in.readVInt();
@@ -74,14 +77,13 @@ public final class MVCheckpointRequestAction extends ActionType<MVCheckpointRequ
         @Override
         public void writeTo(StreamOutput out) throws IOException {
             super.writeTo(out);
-            out.writeString(sourceIndex);
             out.writeVInt(sourceShard);
             out.writeString(targetIndex);
             out.writeVInt(targetShard);
             out.writeZLong(targetWatermark);
         }
 
-        public String sourceIndex() { return sourceIndex; }
+        public String sourceIndex() { return index(); }
         public int sourceShard() { return sourceShard; }
         public String targetIndex() { return targetIndex; }
         public int targetShard() { return targetShard; }
@@ -89,7 +91,7 @@ public final class MVCheckpointRequestAction extends ActionType<MVCheckpointRequ
 
         @Override
         public ActionRequestValidationException validate() {
-            return null;
+            return super.validateNonNullIndex();
         }
     }
 

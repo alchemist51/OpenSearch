@@ -51,7 +51,7 @@ import java.util.Map;
  *
  * <p>Runs on the GENERIC thread pool executor.</p>
  */
-public final class MVCheckpointRequestTransportHandler extends HandledTransportAction<
+public final class MVCheckpointRequestTransportHandler extends org.opensearch.action.support.single.shard.TransportSingleShardAction<
     MVCheckpointRequestAction.Request,
     MVCheckpointRequestAction.Response> {
 
@@ -70,15 +70,21 @@ public final class MVCheckpointRequestTransportHandler extends HandledTransportA
 
     @Inject
     public MVCheckpointRequestTransportHandler(
+        org.opensearch.threadpool.ThreadPool threadPool,
+        org.opensearch.cluster.service.ClusterService clusterService,
         TransportService transportService,
         ActionFilters actionFilters,
+        org.opensearch.cluster.metadata.IndexNameExpressionResolver indexNameExpressionResolver,
         IndicesService indicesService,
         MVNoopTracker noopTracker
     ) {
         super(
             MVCheckpointRequestAction.NAME,
+            threadPool,
+            clusterService,
             transportService,
             actionFilters,
+            indexNameExpressionResolver,
             MVCheckpointRequestAction.Request::new,
             ThreadPool.Names.GENERIC
         );
@@ -86,30 +92,42 @@ public final class MVCheckpointRequestTransportHandler extends HandledTransportA
         this.noopTracker = noopTracker;
     }
 
+    /** Route to the node holding the SOURCE shard's active primary (relocation-safe). */
     @Override
-    protected void doExecute(
-        Task task,
-        MVCheckpointRequestAction.Request request,
-        ActionListener<MVCheckpointRequestAction.Response> listener
+    protected org.opensearch.cluster.routing.ShardIterator shards(
+        org.opensearch.cluster.ClusterState state,
+        InternalRequest request
     ) {
-        try {
-            // ── Resolve shard via IndicesService in request scope ─────────
-            IndexShard shard = null;
-            for (IndexService indexService : indicesService) {
-                if (indexService.index().getName().equals(request.sourceIndex())) {
-                    shard = indexService.getShardOrNull(request.sourceShard());
-                    break;
-                }
-            }
-            if (shard == null || !shard.routingEntry().primary() || !shard.routingEntry().active()) {
-                logger.debug(
-                    "CHECKPOINT_REPLY: source shard [{}][{}] not available",
-                    request.sourceIndex(),
-                    request.sourceShard()
-                );
-                listener.onResponse(MVCheckpointRequestAction.Response.unavailable());
-                return;
-            }
+        return state.routingTable()
+            .index(request.request().sourceIndex())
+            .shard(request.request().sourceShard())
+            .primaryShardIt();
+    }
+
+    @Override
+    protected boolean resolveIndex(MVCheckpointRequestAction.Request request) {
+        return true;
+    }
+
+    @Override
+    protected org.opensearch.core.common.io.stream.Writeable.Reader<MVCheckpointRequestAction.Response> getResponseReader() {
+        return MVCheckpointRequestAction.Response::new;
+    }
+
+    @Override
+    protected MVCheckpointRequestAction.Response shardOperation(MVCheckpointRequestAction.Request request, ShardId requestShardId)
+        throws java.io.IOException {
+        // Transport routing guarantees this node holds the source primary;
+        // resolve locally in request scope (never cache IndexShard refs).
+        IndexShard shard = indicesService.indexServiceSafe(requestShardId.getIndex()).getShard(requestShardId.id());
+        if (!shard.routingEntry().primary() || !shard.routingEntry().active()) {
+            // Relocation race: surface as retryable failure, never a silent nothing-new.
+            throw new org.opensearch.action.NoShardAvailableActionException(
+                requestShardId,
+                "source primary not active on routed node"
+            );
+        }
+        {
 
             ShardId shardId = shard.shardId();
             long requestWatermark = request.targetWatermark();
@@ -164,8 +182,7 @@ public final class MVCheckpointRequestTransportHandler extends HandledTransportA
                     request.sourceIndex(),
                     request.sourceShard()
                 );
-                listener.onResponse(MVCheckpointRequestAction.Response.unavailable());
-                return;
+                return MVCheckpointRequestAction.Response.unavailable();
             }
 
             // ── Nothing-new: advertMax <= requestWatermark ───────────────
@@ -179,8 +196,7 @@ public final class MVCheckpointRequestTransportHandler extends HandledTransportA
                     catalogAdvertMax,
                     requestWatermark
                 );
-                listener.onResponse(MVCheckpointRequestAction.Response.unavailable());
-                return;
+                return MVCheckpointRequestAction.Response.unavailable();
             }
 
             long advertMax = catalogAdvertMax;
@@ -235,17 +251,7 @@ public final class MVCheckpointRequestTransportHandler extends HandledTransportA
                 requestWatermark
             );
 
-            listener.onResponse(new MVCheckpointRequestAction.Response(checkpoint));
-        } catch (Exception e) {
-            logger.warn(
-                "CHECKPOINT_REPLY: failed for source=[{}][{}] target=[{}][{}]",
-                request.sourceIndex(),
-                request.sourceShard(),
-                request.targetIndex(),
-                request.targetShard(),
-                e
-            );
-            listener.onFailure(e);
+            return new MVCheckpointRequestAction.Response(checkpoint);
         }
     }
 

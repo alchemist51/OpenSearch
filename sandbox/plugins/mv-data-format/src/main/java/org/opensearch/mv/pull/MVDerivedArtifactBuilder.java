@@ -260,6 +260,22 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         }
         long appliedThrough = Math.min(coverage.observedMaxSeqNo(), roundWatermark);
 
+        // A round that applies only a PREFIX of the snapshot range (e.g. some
+        // advertised files were not yet visible in the remote store and were
+        // skipped by staging) is EFFECTIVELY CAPPED: the poller must resume
+        // from appliedThrough next round, never fast-forward to the snapshot
+        // watermark — that would silently skip (appliedThrough, snapshot].
+        final boolean effectivelyCapped = roundCapped || appliedThrough < snapshotWatermark;
+        if (effectivelyCapped && roundCapped == false) {
+            logger.info(
+                "mv_pull ROUND_TRUNCATED shard=[{}] applied_through={} snapshot_watermark={} "
+                    + "(partial staging — resuming from applied prefix next round)",
+                shard.shardId(),
+                appliedThrough,
+                snapshotWatermark
+            );
+        }
+
         // H4: cardinality estimate admission (post-coverage, uses totalRows
         // as upper bound on distinct group keys). Safe default Long.MAX_VALUE.
         long maxCardinalityEstimate = MVPullSettings.MAX_CARDINALITY_ESTIMATE_PER_ROUND.get(admissionSettings);
@@ -327,7 +343,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
                 current.seqNo(),
                 roundWatermark,
                 coverage.totalRows(),
-                roundCapped
+                effectivelyCapped
             );
             long tNativeBuild = System.nanoTime();
             ManagedArtifact artifact = buildManagedArtifact(
@@ -407,10 +423,10 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             stats.put("definition_hash", Long.toHexString(artifact.definitionHash()));
             // Bounded streaming round metadata: the poller reads these to decide
             // whether to advance to the capped watermark and continue immediately.
-            stats.put("capped", roundCapped);
+            stats.put("capped", effectivelyCapped);
             stats.put("capped_watermark", appliedThrough);
             stats.put("snapshot_watermark", snapshotWatermark);
-            stats.put("remaining_lag", roundCapped ? (snapshotWatermark - appliedThrough) : 0L);
+            stats.put("remaining_lag", effectivelyCapped ? (snapshotWatermark - appliedThrough) : 0L);
 
             return new MVBuildResult(true, "gen-" + generation, stats);
         } finally {

@@ -149,7 +149,7 @@ public class MVPullDataFusionIT extends OpenSearchIntegTestCase {
                         // signal for a materialized-view target. mv_state is NOT a secondary
                         // format and serve_state is no longer used.
                         .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DATA_FORMAT, MVDataFormat.NAME)
-                        .put("index.mv.definition", "pull_count_sum")
+                        .put("index.derived.definition_id", "pull_count_sum")
                         .putList("index.mv.state_fields", "RegionID", "cnt", "adv")
                         .put("index.mv.state_merge_enabled", true)
                         .put(MVPullSettings.PULL_INTERVAL.getKey(), "100ms")
