@@ -138,7 +138,8 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
             clusterServiceSupplier,
             stateMergeEnabled,
             routingSnapshotSupplier,
-            null
+            null,
+            0L
         );
     }
 
@@ -162,7 +163,8 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
         java.util.function.Supplier<org.opensearch.cluster.service.ClusterService> clusterServiceSupplier,
         boolean stateMergeEnabled,
         java.util.function.Supplier<TargetRoutingSnapshot> routingSnapshotSupplier,
-        MVCompiledDefinition mergeDefinition
+        MVCompiledDefinition mergeDefinition,
+        long mergeRuntimePtr
     ) {
         this.spec = spec;
         this.format = format;
@@ -178,49 +180,37 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
         if (this.shipTargets.isEmpty() == false) {
             mergeStrategy = new NoOpMVMergeStrategy();
         } else if (stateMergeEnabled && MVStateDataFormat.NAME.equals(format.name())) {
-            // Stage 4: the streaming k-way merge engine needs the compiled MV
-            // definition (ordering contract + per-column fold metadata). Prefer
-            // the definition resolved by the shared MVDefinitionResolver
-            // (persisted descriptor first, else legacy compiledFor), passed in
-            // by the plugin from the target's settings. When absent (legacy /
-            // test callers), fall back to compiledFor(definitionName). If no
-            // definition can be obtained (e.g. a tampered/oversize descriptor
-            // caused the resolver to throw and the plugin passed null), the
-            // engine disables state merge for this shard (fail closed — never
-            // merge with incorrect fold semantics).
+            // Generic sorted merge: the definition is consulted ONLY for the
+            // group-key COUNT (plain config — how many leading columns form
+            // the sort key). Physical column names are read from the input
+            // files at merge time. Fold semantics stay at query time.
             MVCompiledDefinition compiledDef = mergeDefinition;
             if (compiledDef == null) {
                 try {
                     compiledDef = MVCompiledDefinition.compiledFor(definitionName);
                 } catch (Exception e) {
-                    org.apache.logging.log4j.LogManager.getLogger(MVIndexingEngine.class)
-                        .error(
-                            "mv merge: compiled definition unavailable for [{}]; "
-                                + "Stage 4 requires a compiled definition — state merge disabled for this shard",
-                            definitionName,
-                            e
-                        );
                     compiledDef = null;
                 }
             }
-            if (compiledDef != null) {
-                // Stage 4: streaming merge with full ordering/accumulator metadata.
-                // runtimePtr=0 is fine: the streaming merge engine is self-contained
-                // and does not need the shared DataFusionRuntime.
-                mergeStrategy = new DataFusionMVStateMergeStrategy(format, shardPath, spec.sql(), compiledDef, 0L);
+            if (compiledDef != null && mergeRuntimePtr != 0) {
+                mergeStrategy = new DataFusionMVStateMergeStrategy(
+                    format,
+                    shardPath,
+                    compiledDef.groupKeys().size(),
+                    mergeRuntimePtr
+                );
             } else {
-                // Stage 4: compiled definition is required. Without it, disable
-                // merge rather than silently producing incorrect results.
+                // Fail closed: without the key count or the shared runtime,
+                // do not merge rather than merge incorrectly/unpooled.
                 org.apache.logging.log4j.LogManager.getLogger(MVIndexingEngine.class)
-                    .error("mv merge: disabling state merge for [{}] — compiled definition required", definitionName);
+                    .error(
+                        "mv merge: state merge disabled for [{}] — {}",
+                        definitionName,
+                        compiledDef == null ? "group-key count unavailable" : "shared runtime pointer is 0"
+                    );
                 mergeStrategy = new NoOpMVMergeStrategy();
             }
         } else {
-            // Recompute-from-parquet merge (Arrow-at-rest output) was removed:
-            // MV state is Parquet and only the compiled-definition streaming
-            // merge is supported. No merge rather than a wrong-format merge.
-            org.apache.logging.log4j.LogManager.getLogger(MVIndexingEngine.class)
-                .warn("mv merge: recompute strategy removed — state merge disabled for [{}]", definitionName);
             mergeStrategy = new NoOpMVMergeStrategy();
         }
         this.merger = new MVMergeExecutor(mergeStrategy);

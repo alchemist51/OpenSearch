@@ -1383,7 +1383,7 @@ pub async unsafe fn stream_next(stream_ptr: i64) -> Result<i64, DataFusionError>
                 .apply_pending_phantom_correction();
 
             let batch = if handle.has_views {
-                compact_string_view_columns(batch)
+                crate::helper::compact_view_arrays(batch)
             } else {
                 batch
             };
@@ -1396,69 +1396,6 @@ pub async unsafe fn stream_next(stream_ptr: i64) -> Result<i64, DataFusionError>
     }
 }
 
-/// Prevents sliced StringView batches from carrying full backing buffers across FFI.
-fn compact_string_view_columns(batch: RecordBatch) -> RecordBatch {
-    let schema = batch.schema();
-    let needs_compaction =
-        batch
-            .columns()
-            .iter()
-            .zip(schema.fields().iter())
-            .any(|(col, field)| match field.data_type() {
-                DataType::Utf8View => {
-                    let view: &arrow_array::StringViewArray = col
-                        .as_any()
-                        .downcast_ref()
-                        .expect("column must be StringViewArray when schema declares Utf8View");
-                    view_needs_gc(view.data_buffers(), view.total_buffer_bytes_used())
-                }
-                DataType::BinaryView => {
-                    let view: &arrow_array::BinaryViewArray = col
-                        .as_any()
-                        .downcast_ref()
-                        .expect("column must be BinaryViewArray when schema declares BinaryView");
-                    view_needs_gc(view.data_buffers(), view.total_buffer_bytes_used())
-                }
-                _ => false,
-            });
-    if !needs_compaction {
-        return batch;
-    }
-    let columns: Vec<Arc<dyn Array>> = batch
-        .columns()
-        .iter()
-        .zip(schema.fields().iter())
-        .map(|(col, field)| match field.data_type() {
-            DataType::Utf8View => {
-                let view: &arrow_array::StringViewArray = col
-                    .as_any()
-                    .downcast_ref()
-                    .expect("column must be StringViewArray when schema declares Utf8View");
-                Arc::new(view.gc()) as Arc<dyn Array>
-            }
-            DataType::BinaryView => {
-                let view: &arrow_array::BinaryViewArray = col
-                    .as_any()
-                    .downcast_ref()
-                    .expect("column must be BinaryViewArray when schema declares BinaryView");
-                Arc::new(view.gc()) as Arc<dyn Array>
-            }
-            _ => Arc::clone(col),
-        })
-        .collect();
-    RecordBatch::try_new(schema, columns).expect("gc'd columns must match schema")
-}
-
-// 10KB: below this, the gc() copy cost outweighs the transfer savings.
-const GC_MIN_WASTE_BYTES: usize = 10_240;
-
-#[inline]
-fn view_needs_gc(buffers: &[arrow::buffer::Buffer], bytes_used: usize) -> bool {
-    let bytes_allocated: usize = buffers.iter().map(|b| b.len()).sum();
-    let waste = bytes_allocated.saturating_sub(bytes_used);
-    let is_significantly_bloated = bytes_allocated > 2 * bytes_used;
-    is_significantly_bloated && waste > GC_MIN_WASTE_BYTES
-}
 
 /// Closes a result stream. Safe to call with 0 (no-op).
 ///
@@ -2616,7 +2553,7 @@ mod tests {
 
         let before_size = sliced.column(0).get_array_memory_size();
 
-        let compacted = compact_string_view_columns(sliced);
+        let compacted = crate::helper::compact_view_arrays(sliced);
 
         let after_size = compacted.column(0).get_array_memory_size();
 
@@ -2642,7 +2579,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(string_view_array.clone())]).unwrap();
 
-        let compacted = compact_string_view_columns(batch.clone());
+        let compacted = crate::helper::compact_view_arrays(batch.clone());
         let before_size = batch.columns()[0].get_array_memory_size();
         let after_size = compacted.columns()[0].get_array_memory_size();
         assert_eq!(before_size, after_size);
@@ -2657,7 +2594,7 @@ mod tests {
             false,
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(string_view_array)]).unwrap();
-        let compacted = compact_string_view_columns(batch);
+        let compacted = crate::helper::compact_view_arrays(batch);
         assert_eq!(compacted.num_rows(), 0);
     }
 
@@ -2686,7 +2623,7 @@ mod tests {
         let sliced = batch.slice(0, slice_rows);
         let before_size = sliced.columns()[0].get_array_memory_size();
 
-        let compacted = compact_string_view_columns(sliced);
+        let compacted = crate::helper::compact_view_arrays(sliced);
         let after_size = compacted.columns()[0].get_array_memory_size();
 
         assert!(
@@ -2707,7 +2644,7 @@ mod tests {
             false,
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(int_array)]).unwrap();
-        let compacted = compact_string_view_columns(batch.clone());
+        let compacted = crate::helper::compact_view_arrays(batch.clone());
         assert_eq!(
             batch.columns()[0].get_array_memory_size(),
             compacted.columns()[0].get_array_memory_size()
@@ -2730,7 +2667,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::clone(&string_view_array)]).unwrap();
 
-        let compacted = compact_string_view_columns(batch);
+        let compacted = crate::helper::compact_view_arrays(batch);
 
         assert!(
             Arc::ptr_eq(&string_view_array, compacted.column(0)),
@@ -2758,7 +2695,7 @@ mod tests {
         let sliced = full_array.slice(0, 100);
         let sliced_view: &StringViewArray = sliced.as_any().downcast_ref().unwrap();
         assert!(
-            view_needs_gc(
+            crate::helper::view_needs_gc(
                 sliced_view.data_buffers(),
                 sliced_view.total_buffer_bytes_used()
             ),
@@ -2766,7 +2703,7 @@ mod tests {
         );
 
         assert!(
-            !view_needs_gc(
+            !crate::helper::view_needs_gc(
                 full_array.data_buffers(),
                 full_array.total_buffer_bytes_used()
             ),

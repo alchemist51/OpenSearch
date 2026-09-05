@@ -351,68 +351,6 @@ fn stable_hex_hash(data: &[u8]) -> String {
     format!("{:032x}", h)
 }
 
-/// Compact StringView / BinaryView columns in a batch so that sliced views
-/// do not carry unreferenced backing buffers into the Parquet writer. Uses
-/// `gc()` on view arrays that show significant waste, identical to the
-/// `compact_string_view_columns` logic in `api.rs` but kept local to avoid
-/// coupling the build path to the FFI export module.
-fn compact_string_views(batch: RecordBatch) -> RecordBatch {
-    use arrow_array::Array;
-    let schema = batch.schema();
-    let needs_compaction = batch.columns().iter().zip(schema.fields().iter()).any(|(col, field)| {
-        match field.data_type() {
-            DataType::Utf8View => {
-                let view: &arrow_array::StringViewArray = col
-                    .as_any()
-                    .downcast_ref()
-                    .expect("column must be StringViewArray when schema declares Utf8View");
-                let bufs = view.data_buffers();
-                let allocated: usize = bufs.iter().map(|b| b.len()).sum();
-                let used = view.total_buffer_bytes_used();
-                let waste = allocated.saturating_sub(used);
-                allocated > 2 * used && waste > 10_240
-            }
-            DataType::BinaryView => {
-                let view: &arrow_array::BinaryViewArray = col
-                    .as_any()
-                    .downcast_ref()
-                    .expect("column must be BinaryViewArray when schema declares BinaryView");
-                let bufs = view.data_buffers();
-                let allocated: usize = bufs.iter().map(|b| b.len()).sum();
-                let used = view.total_buffer_bytes_used();
-                let waste = allocated.saturating_sub(used);
-                allocated > 2 * used && waste > 10_240
-            }
-            _ => false,
-        }
-    });
-    if !needs_compaction {
-        return batch;
-    }
-    let columns: Vec<Arc<dyn arrow_array::Array>> = batch
-        .columns()
-        .iter()
-        .zip(schema.fields().iter())
-        .map(|(col, field)| match field.data_type() {
-            DataType::Utf8View => {
-                let view: &arrow_array::StringViewArray = col
-                    .as_any()
-                    .downcast_ref()
-                    .expect("column must be StringViewArray when schema declares Utf8View");
-                Arc::new(view.gc()) as Arc<dyn arrow_array::Array>
-            }
-            DataType::BinaryView => {
-                let view: &arrow_array::BinaryViewArray = col
-                    .as_any()
-                    .downcast_ref()
-                    .expect("column must be BinaryViewArray when schema declares BinaryView");
-                Arc::new(view.gc()) as Arc<dyn arrow_array::Array>
-            }
-            _ => Arc::clone(col),
-        })
-        .collect();
-    RecordBatch::try_new(schema, columns).expect("gc'd columns must match schema")
-}
 
 /// Validate that a Parquet file's rows are sorted according to the ordering contract.
 pub fn validate_parquet_ordering(
@@ -602,7 +540,7 @@ pub fn build_streaming_parquet_artifact(
                 if batch.num_rows() > 0 {
                     // Compact StringView/BinaryView columns to avoid carrying
                     // unreferenced backing buffers into the Parquet writer.
-                    let batch = compact_string_views(batch);
+                    let batch = crate::helper::compact_view_arrays(batch);
                     writer
                         .write(&batch)
                         .map_err(|e| format!("mv_build_streaming write batch: {e}"))?;

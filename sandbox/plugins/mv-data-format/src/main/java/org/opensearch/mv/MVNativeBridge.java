@@ -28,8 +28,6 @@ public final class MVNativeBridge {
 
     private static final MethodHandle MV_INIT_RUNTIME;
     private static final MethodHandle MV_BUILD_ARROW;
-    private static final MethodHandle MV_MERGE_STATE_STREAMS;
-    private static final MethodHandle MV_FOLD_ADJACENT_KEYS;
     private static final MethodHandle MV_WRITER_CREATE;
     private static final MethodHandle MV_WRITER_FEED;
     private static final MethodHandle MV_WRITER_FINALIZE;
@@ -42,6 +40,7 @@ public final class MVNativeBridge {
     private static final MethodHandle MV_CANCEL_BUILD;
     private static final MethodHandle MV_SEARCH_V2;
     private static final MethodHandle MV_STATE_FIELD_NAMES;
+    private static final MethodHandle SORTED_PARQUET_MERGE;
     private static final MethodHandle MV_BUILD_STREAMING_RESULT;
     private static final MethodHandle MV_BUILD_RESULT_ABI_VERSION;
     private static final MethodHandle MV_CREATE_GLOBAL_RUNTIME;
@@ -74,40 +73,6 @@ public final class MVNativeBridge {
                 ValueLayout.JAVA_LONG
             )
         );
-        // Stage 4: streaming k-way merge with full ordering + accumulator metadata
-        // i64 df_mv_merge_state_streams(
-        //   files_ptr, files_len,
-        //   output_ptr, output_len,
-        //   ordering_indices_ptr, ordering_asc_ptr, ordering_nulls_ptr, ordering_len,
-        //   fold_ops_ptr, fold_ops_len,
-        //   agg_names_ptr, agg_names_len,
-        //   ordering_identity_ptr, ordering_identity_len
-        // )
-        MV_MERGE_STATE_STREAMS = linker.downcallHandle(
-            lib.find("df_mv_merge_state_streams").orElseThrow(() -> new IllegalStateException("df_mv_merge_state_streams not found")),
-            FunctionDescriptor.of(
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,          // files_ptr (newline-separated)
-                ValueLayout.JAVA_LONG,        // files_len
-                ValueLayout.ADDRESS,          // output_ptr
-                ValueLayout.JAVA_LONG,        // output_len
-                ValueLayout.ADDRESS,          // ordering_indices_ptr (int[])
-                ValueLayout.ADDRESS,          // ordering_asc_ptr (int[])
-                ValueLayout.ADDRESS,          // ordering_nulls_ptr (int[])
-                ValueLayout.JAVA_INT,         // ordering_len
-                ValueLayout.ADDRESS,          // fold_ops_ptr (byte[])
-                ValueLayout.JAVA_INT,         // fold_ops_len
-                ValueLayout.ADDRESS,          // agg_names_ptr (newline-separated)
-                ValueLayout.JAVA_LONG,        // agg_names_len
-                ValueLayout.ADDRESS,          // ordering_identity_ptr
-                ValueLayout.JAVA_LONG         // ordering_identity_len
-            )
-        );
-        // i64 df_mv_fold_adjacent_keys(placeholder)
-        MV_FOLD_ADJACENT_KEYS = linker.downcallHandle(
-            lib.find("df_mv_fold_adjacent_keys").orElseThrow(() -> new IllegalStateException("df_mv_fold_adjacent_keys not found")),
-            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
-        );
         // i64 df_mv_state_field_names(file_ptr, file_len, out_ptr, out_cap, out_len)
         MV_STATE_FIELD_NAMES = linker.downcallHandle(
             lib.find("df_mv_state_field_names").orElseThrow(() -> new IllegalStateException("df_mv_state_field_names not found")),
@@ -118,6 +83,25 @@ public final class MVNativeBridge {
                 ValueLayout.ADDRESS,
                 ValueLayout.JAVA_LONG,
                 ValueLayout.ADDRESS
+            )
+        );
+        // i64 df_sorted_parquet_merge(runtime_ptr, files_ptr, files_len,
+        // sort_cols_ptr, sort_cols_len, desc_ptr, nulls_first_ptr, sort_len,
+        // output_ptr, output_len) — generic N-sorted-files -> one-sorted-file merge.
+        SORTED_PARQUET_MERGE = linker.downcallHandle(
+            lib.find("df_sorted_parquet_merge").orElseThrow(() -> new IllegalStateException("df_sorted_parquet_merge not found")),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,        // runtime_ptr
+                ValueLayout.ADDRESS,          // files_ptr (newline-joined)
+                ValueLayout.JAVA_LONG,        // files_len
+                ValueLayout.ADDRESS,          // sort_cols_ptr (newline-joined)
+                ValueLayout.JAVA_LONG,        // sort_cols_len
+                ValueLayout.ADDRESS,          // desc_ptr (int[] flags)
+                ValueLayout.ADDRESS,          // nulls_first_ptr (int[] flags)
+                ValueLayout.JAVA_INT,         // sort_len
+                ValueLayout.ADDRESS,          // output_ptr
+                ValueLayout.JAVA_LONG         // output_len
             )
         );
         MV_WRITER_CREATE = linker.downcallHandle(
@@ -357,100 +341,50 @@ public final class MVNativeBridge {
     // ── Stage 4: Streaming merge engine ──────────────────────────────────
 
     /**
-     * Stage 4 streaming merge: folds k Parquet state files into one sorted
-     * state file using a streaming k-way merge with adjacent-key folding — a
-     * purpose-built pipeline operating directly on Parquet file streams.
+     * Generic sorted-parquet merge on the shared DataFusionRuntime: merges N
+     * individually sorted parquet files into ONE sorted file via a streaming
+     * k-way SortPreservingMerge. Rows are preserved verbatim — no folding, no
+     * format- or definition-specific semantics (the Lucene merge idiom).
      *
-     * <p><b>Stage 4 enhancement:</b> now carries the full aggregate column
-     * names and ordering identity across the FFI boundary so the Rust side
-     * can validate inputs and apply the correct per-column fold function.</p>
-     *
-     * @param stateFiles         ordered list of IPC state file paths
-     * @param outputFile         output IPC state file path
-     * @param orderingIndices    column indices forming the sort key
-     * @param orderingAsc        per-key direction (true = ASC, false = DESC)
-     * @param orderingNullsFirst per-key null placement (true = NULLS_FIRST)
-     * @param foldOps            per-column fold operation:
-     *                           0=GROUP_KEY, 1=SUM, 2=MIN, 3=MAX, 4=COUNT
-     * @param aggColumnNames     state column names for aggregate columns (used
-     *                           by Rust for validation); null to skip
-     * @param orderingIdentity   deterministic ordering identity string for
-     *                           merge-time validation (from
-     *                           {@link MVGroupByOrdering#orderingIdentity()});
-     *                           null to skip
-     * @return merged row count
+     * @param runtimePtr  shared DataFusionRuntime pointer (from createGlobalRuntime)
+     * @param inputFiles  paths of the sorted input parquet files
+     * @param sortColumns sort column names (the files' declared order)
+     * @param descending  per-column descending flags (parallel to sortColumns)
+     * @param nullsFirst  per-column nulls-first flags (parallel to sortColumns)
+     * @param outputFile  path of the merged output parquet file
+     * @return rows written to the merged file
      */
-    public static long mergeStateStreams(
-        java.util.List<String> stateFiles,
-        String outputFile,
-        int[] orderingIndices,
-        boolean[] orderingAsc,
-        boolean[] orderingNullsFirst,
-        byte[] foldOps,
-        String[] aggColumnNames,
-        String orderingIdentity
+    public static long sortedParquetMerge(
+        long runtimePtr,
+        java.util.List<String> inputFiles,
+        String[] sortColumns,
+        boolean[] descending,
+        boolean[] nullsFirst,
+        String outputFile
     ) {
         try (var call = new NativeCall()) {
-            var files = call.str(String.join("\n", stateFiles));
+            var files = call.str(String.join("\n", inputFiles));
+            var cols = call.str(String.join("\n", sortColumns));
+            var desc = call.intArray(toIntArray(descending));
+            var nulls = call.intArray(toIntArray(nullsFirst));
             var out = call.str(outputFile);
-            var indices = call.intArray(orderingIndices);
-            var dirs = call.intArray(toIntArray(orderingAsc));
-            var nulls = call.intArray(toIntArray(orderingNullsFirst));
-            var ops = call.bytes(foldOps);
-            // Aggregate column names as newline-separated string for FFI
-            String aggNamesJoined = aggColumnNames != null ? String.join("\n", aggColumnNames) : "";
-            var aggNamesStr = call.str(aggNamesJoined);
-            // Ordering identity
-            var identity = call.str(orderingIdentity != null ? orderingIdentity : "");
             return call.invoke(
-                MV_MERGE_STATE_STREAMS,
+                SORTED_PARQUET_MERGE,
+                runtimePtr,
                 files.segment(),
                 files.len(),
-                out.segment(),
-                out.len(),
-                indices.segment(),
-                dirs.segment(),
+                cols.segment(),
+                cols.len(),
+                desc.segment(),
                 nulls.segment(),
-                orderingIndices.length,
-                ops,
-                foldOps.length,
-                aggNamesStr.segment(),
-                aggNamesStr.len(),
-                identity.segment(),
-                identity.len()
+                sortColumns.length,
+                out.segment(),
+                out.len()
             );
         }
     }
 
-    /**
-     * Stage 4: Convenience merge entry point that takes pre-built
-     * {@link MVCompiledDefinition.MergeCallParams} directly. This is the
-     * preferred entry point for the merge path — callers build params once
-     * via {@link MVCompiledDefinition#buildMergeCallParams()} and pass them
-     * here, avoiding manual array construction entirely.
-     *
-     * @param stateFiles ordered list of IPC state file paths
-     * @param outputFile output IPC state file path
-     * @param params     pre-built merge call parameters
-     * @return merged row count
-     */
-    public static long mergeStateStreams(
-        java.util.List<String> stateFiles,
-        String outputFile,
-        MVCompiledDefinition.MergeCallParams params
-    ) {
-        return mergeStateStreams(
-            stateFiles,
-            outputFile,
-            params.orderingIndices(),
-            params.orderingAsc(),
-            params.orderingNullsFirst(),
-            params.foldOps(),
-            params.aggColumnNames(),
-            params.orderingIdentity()
-        );
-    }
-
+    /** Boolean flags -> 0/1 int array for FFI transport. */
     private static int[] toIntArray(boolean[] booleans) {
         int[] result = new int[booleans.length];
         for (int i = 0; i < booleans.length; i++) {

@@ -456,7 +456,8 @@ public class MVDataFormatPlugin extends Plugin
             () -> clusterService,
             config.indexSettings().getSettings().getAsBoolean(MVConstants.STATE_MERGE_SETTING, false),
             routingSnapshotService != null ? routingSnapshotService::current : () -> TargetRoutingSnapshot.EMPTY,
-            mergeDefinition
+            mergeDefinition,
+            mvNativeRuntimePtr
         );
     }
 

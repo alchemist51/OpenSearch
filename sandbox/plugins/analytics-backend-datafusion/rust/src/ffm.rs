@@ -789,6 +789,76 @@ pub extern "C" fn df_mv_build_result_abi_version() -> u32 {
     crate::mv_build_managed::MvBuildResult::ABI_VERSION
 }
 
+/// Generic sorted-parquet merge through the shared DataFusionRuntime:
+/// N individually sorted files in, ONE sorted file out (streaming k-way
+/// SortPreservingMerge; rows preserved verbatim — no folding, no format- or
+/// definition-specific semantics). See `sorted_merge.rs`.
+///
+/// `files` and `sort_cols` are newline-joined strings; `desc`/`nulls_first`
+/// are parallel per-column flag arrays of length `sort_len`.
+///
+/// Returns rows written to the merged file.
+///
+/// # Safety
+/// - `runtime_ptr` must be a valid pointer from `df_create_global_runtime`.
+/// - String pointers must be valid UTF-8 of the given lengths.
+/// - Flag pointers must reference at least `sort_len` i32 values.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_sorted_parquet_merge(
+    runtime_ptr: i64,
+    files_ptr: *const u8,
+    files_len: i64,
+    sort_cols_ptr: *const u8,
+    sort_cols_len: i64,
+    desc_ptr: *const i32,
+    nulls_first_ptr: *const i32,
+    sort_len: i32,
+    output_ptr: *const u8,
+    output_len: i64,
+) -> i64 {
+    if runtime_ptr == 0 {
+        return Err("df_sorted_parquet_merge: runtime_ptr is null".to_string());
+    }
+    let runtime = &*(runtime_ptr as *const crate::api::DataFusionRuntime);
+    let files_joined = str_from_raw(files_ptr, files_len)
+        .map_err(|e| format!("df_sorted_parquet_merge: files: {}", e))?;
+    let cols_joined = str_from_raw(sort_cols_ptr, sort_cols_len)
+        .map_err(|e| format!("df_sorted_parquet_merge: sort_cols: {}", e))?;
+    let output = str_from_raw(output_ptr, output_len)
+        .map_err(|e| format!("df_sorted_parquet_merge: output: {}", e))?;
+
+    let input_files: Vec<String> = files_joined
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    let cols: Vec<&str> = cols_joined.split('\n').filter(|s| !s.is_empty()).collect();
+    let len = sort_len as usize;
+    if cols.len() != len {
+        return Err(format!(
+            "df_sorted_parquet_merge: sort column count {} != flag length {}",
+            cols.len(),
+            len
+        ));
+    }
+    let desc = std::slice::from_raw_parts(desc_ptr, len);
+    let nulls = std::slice::from_raw_parts(nulls_first_ptr, len);
+    let sort: Vec<crate::sorted_merge::SortSpec> = cols
+        .iter()
+        .zip(desc.iter().zip(nulls.iter()))
+        .map(|(c, (d, n))| crate::sorted_merge::SortSpec {
+            column: (*c).to_string(),
+            descending: *d != 0,
+            nulls_first: *n != 0,
+        })
+        .collect();
+
+    let result =
+        crate::sorted_merge::merge_sorted_parquet_files(runtime, &input_files, &sort, output)?;
+    Ok(result.rows_written as i64)
+}
+
 /// Managed streaming-build through the shared DataFusionRuntime, returning
 /// a full `MvBuildResult` written into the caller-allocated output buffer.
 ///
@@ -2125,161 +2195,6 @@ pub extern "C" fn df_set_scoped_page_index_enabled(enabled: i64) -> i64 {
     page_index::set_scoped_page_index_enabled(enabled != 0);
     Ok(0)
 }
-
-// ── Stage 4: Streaming merge engine FFI ──────────────────────────────
-
-/// Stage 4 streaming merge: folds k IPC state files into one, using a
-/// streaming k-way merge with adjacent-key folding. Replaces the SQL-based
-/// `df_mv_merge_state` with a purpose-built pipeline.
-///
-/// Arguments:
-///   - files_ptr/files_len: newline-joined input file paths
-///   - output_ptr/output_len: output file path
-///   - ordering_indices_ptr/ordering_len: int array of column indices for sort key
-///   - ordering_asc_ptr: int array of direction (1=ASC, 0=DESC)
-///   - ordering_nulls_first_ptr: int array of null placement (1=NULLS_FIRST, 0=NULLS_LAST)
-///   - fold_ops_ptr/fold_ops_len: byte array of per-column fold ops
-///     (0=GROUP_KEY, 1=SUM, 2=MIN, 3=MAX, 4=COUNT)
-///
-/// Returns: merged row count (>=0), or negative on error.
-#[ffm_safe]
-#[no_mangle]
-pub unsafe extern "C" fn df_mv_merge_state_streams(
-    files_ptr: *const u8,
-    files_len: i64,
-    output_ptr: *const u8,
-    output_len: i64,
-    ordering_indices_ptr: *const i32,
-    ordering_asc_ptr: *const i32,
-    ordering_nulls_first_ptr: *const i32,
-    ordering_len: i32,
-    fold_ops_ptr: *const u8,
-    fold_ops_len: i32,
-    agg_names_ptr: *const u8,
-    agg_names_len: i64,
-    ordering_identity_ptr: *const u8,
-    ordering_identity_len: i64,
-) -> i64 {
-    let files_joined = str_from_raw(files_ptr, files_len)
-        .map_err(|e| format!("df_mv_merge_state_streams: files: {}", e))?;
-    let output = str_from_raw(output_ptr, output_len)
-        .map_err(|e| format!("df_mv_merge_state_streams: output: {}", e))?;
-
-    let files: Vec<String> = files_joined
-        .split('\n')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if files.is_empty() {
-        return Err("df_mv_merge_state_streams: no input files".to_string());
-    }
-
-    let ol = ordering_len as usize;
-    if ordering_indices_ptr.is_null()
-        || ordering_asc_ptr.is_null()
-        || ordering_nulls_first_ptr.is_null()
-    {
-        return Err("df_mv_merge_state_streams: null ordering array".to_string());
-    }
-    let ordering_indices: Vec<usize> = slice::from_raw_parts(ordering_indices_ptr, ol)
-        .iter()
-        .map(|&v| v as usize)
-        .collect();
-    let ordering_asc: Vec<bool> = slice::from_raw_parts(ordering_asc_ptr, ol)
-        .iter()
-        .map(|&v| v != 0)
-        .collect();
-    let ordering_nulls_first: Vec<bool> = slice::from_raw_parts(ordering_nulls_first_ptr, ol)
-        .iter()
-        .map(|&v| v != 0)
-        .collect();
-
-    let fl = fold_ops_len as usize;
-    if fold_ops_ptr.is_null() {
-        return Err("df_mv_merge_state_streams: null fold_ops".to_string());
-    }
-    let fold_ops = slice::from_raw_parts(fold_ops_ptr, fl);
-
-    // Parse optional aggregate column names for validation (newline-separated).
-    let agg_names: Vec<String> = if agg_names_ptr.is_null() || agg_names_len <= 0 {
-        Vec::new()
-    } else {
-        let agg_str = str_from_raw(agg_names_ptr, agg_names_len)
-            .map_err(|e| format!("df_mv_merge_state_streams: agg_names: {}", e))?;
-        agg_str
-            .split('\n')
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect()
-    };
-
-    // Parse optional ordering identity for cross-file validation.
-    let ordering_identity: Option<String> =
-        if ordering_identity_ptr.is_null() || ordering_identity_len <= 0 {
-            None
-        } else {
-            Some(
-                str_from_raw(ordering_identity_ptr, ordering_identity_len)
-                    .map_err(|e| format!("df_mv_merge_state_streams: ordering_identity: {}", e))?
-                    .to_string(),
-            )
-        };
-
-    let rows = crate::mv_merge_engine::merge_state_streams_validated(
-        &files,
-        output,
-        &ordering_indices,
-        &ordering_asc,
-        &ordering_nulls_first,
-        fold_ops,
-        &agg_names,
-        ordering_identity.as_deref(),
-    )?;
-    Ok(rows)
-}
-
-/// Stage 4 state header validation: checks schema hash and sort ordering of a
-/// Parquet MV state file.
-///
-/// Returns 0 on success, negative on validation failure.
-#[ffm_safe]
-#[no_mangle]
-pub unsafe extern "C" fn df_mv_validate_ipc_header(
-    file_ptr: *const u8,
-    file_len: i64,
-    expected_schema_hash: i64,
-    ordering_indices_ptr: *const i32,
-    ordering_asc_ptr: *const i32,
-    ordering_nulls_first_ptr: *const i32,
-    ordering_len: i32,
-) -> i64 {
-    let file = str_from_raw(file_ptr, file_len)
-        .map_err(|e| format!("df_mv_validate_ipc_header: file: {}", e))?;
-
-    let ol = ordering_len as usize;
-    let ordering_indices: Vec<usize> = slice::from_raw_parts(ordering_indices_ptr, ol)
-        .iter()
-        .map(|&v| v as usize)
-        .collect();
-    let ordering_asc: Vec<bool> = slice::from_raw_parts(ordering_asc_ptr, ol)
-        .iter()
-        .map(|&v| v != 0)
-        .collect();
-    let ordering_nulls_first: Vec<bool> = slice::from_raw_parts(ordering_nulls_first_ptr, ol)
-        .iter()
-        .map(|&v| v != 0)
-        .collect();
-
-    crate::mv_merge_engine::validate_parquet_header(
-        file,
-        expected_schema_hash as u64,
-        &ordering_indices,
-        &ordering_asc,
-        &ordering_nulls_first,
-    )?;
-    Ok(0)
-}
-
 /// Reads the physical field names of a Parquet MV state file (footer only)
 /// and writes them newline-joined into the caller buffer. Ground truth for
 /// the Java-side merge ordering identity.
@@ -2294,7 +2209,7 @@ pub unsafe extern "C" fn df_mv_state_field_names(
 ) -> i64 {
     let file = str_from_raw(file_ptr, file_len)
         .map_err(|e| format!("df_mv_state_field_names: file: {}", e))?;
-    let names = crate::mv_merge_engine::state_field_names(file)?;
+    let names = crate::mv_pull_metadata::state_field_names(file)?;
     write_out_buffer(
         names.join("\n").as_bytes(),
         out_ptr,
@@ -2304,29 +2219,6 @@ pub unsafe extern "C" fn df_mv_state_field_names(
     )?;
     Ok(0)
 }
-
-/// Stage 4 adjacent-key fold: folds a set of single-row arrays sharing the
-/// same group key into one accumulated row. Used for testing and for callers
-/// that manage their own merge loop.
-///
-/// Takes parallel arrays of pointers-to-i64-array-addresses and
-/// fold_ops. This is primarily an internal test surface exposed through FFI
-/// for Java-side integration tests.
-#[ffm_safe]
-#[no_mangle]
-pub unsafe extern "C" fn df_mv_fold_adjacent_keys(
-    // For simplicity, this FFI-level function is a thin validation wrapper.
-    // The real work is done by mv_merge_engine::fold_adjacent_keys which
-    // operates on ArrayRef vectors. Java callers use merge_state_streams
-    // which invokes the fold internally.
-    //
-    // Expose only the validation pass-through for now; the batch-level fold
-    // is tested directly from Rust.
-    _placeholder: i64,
-) -> i64 {
-    Ok(0)
-}
-
 // ---------------------------------------------------------------------------
 // Stage 5: Merge-pull with full PullArtifactMetadata return
 //
@@ -2341,117 +2233,6 @@ pub unsafe extern "C" fn df_mv_fold_adjacent_keys(
 //   2. Java reads fields via df_pull_meta_rows, df_pull_meta_schema_hash, etc.
 //   3. Java calls df_pull_meta_free to deallocate
 // ---------------------------------------------------------------------------
-
-/// Stage 5 merge-pull with metadata: performs a streaming k-way merge and
-/// returns a heap-allocated `PullArtifactMetadata` pointer.
-///
-/// Arguments mirror `df_mv_merge_state_streams` plus spill budget limits,
-/// pull round bounds, and admission gate thresholds.
-///
-/// Returns: opaque pointer to `PullArtifactMetadata` (positive), or negative
-/// error pointer on failure.
-#[ffm_safe]
-#[no_mangle]
-pub unsafe extern "C" fn df_mv_merge_pull_metadata(
-    files_ptr: *const u8,
-    files_len: i64,
-    output_ptr: *const u8,
-    output_len: i64,
-    ordering_indices_ptr: *const i32,
-    ordering_asc_ptr: *const i32,
-    ordering_nulls_first_ptr: *const i32,
-    ordering_len: i32,
-    fold_ops_ptr: *const u8,
-    fold_ops_len: i32,
-    spill_byte_budget: i64,
-    spill_file_budget: i32,
-    max_bytes_processed: i64,
-    max_ops_count: i64,
-    max_estimated_cardinality: i64,
-    admission_pool_limit: i64,
-    admission_threshold_x1000: i64,
-) -> i64 {
-    let files_joined = str_from_raw(files_ptr, files_len)
-        .map_err(|e| format!("df_mv_merge_pull_metadata: files: {}", e))?;
-    let output = str_from_raw(output_ptr, output_len)
-        .map_err(|e| format!("df_mv_merge_pull_metadata: output: {}", e))?;
-
-    let files: Vec<String> = files_joined
-        .split('\n')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if files.is_empty() {
-        return Err("df_mv_merge_pull_metadata: no input files".to_string());
-    }
-
-    let ol = ordering_len as usize;
-    if ordering_indices_ptr.is_null()
-        || ordering_asc_ptr.is_null()
-        || ordering_nulls_first_ptr.is_null()
-    {
-        return Err("df_mv_merge_pull_metadata: null ordering array".to_string());
-    }
-    let ordering_indices: Vec<usize> = slice::from_raw_parts(ordering_indices_ptr, ol)
-        .iter()
-        .map(|&v| v as usize)
-        .collect();
-    let ordering_asc: Vec<bool> = slice::from_raw_parts(ordering_asc_ptr, ol)
-        .iter()
-        .map(|&v| v != 0)
-        .collect();
-    let ordering_nulls_first: Vec<bool> = slice::from_raw_parts(ordering_nulls_first_ptr, ol)
-        .iter()
-        .map(|&v| v != 0)
-        .collect();
-
-    let fl = fold_ops_len as usize;
-    if fold_ops_ptr.is_null() {
-        return Err("df_mv_merge_pull_metadata: null fold_ops".to_string());
-    }
-    let fold_ops = slice::from_raw_parts(fold_ops_ptr, fl);
-
-    // Build optional bounds (non-positive = disabled).
-    let bounds = crate::mv_pull_metadata::PullRoundBounds::new(
-        max_bytes_processed,
-        max_ops_count,
-        max_estimated_cardinality,
-    );
-    let bounds_ref = if bounds.is_unbounded() {
-        None
-    } else {
-        Some(&bounds)
-    };
-
-    // Build optional admission gate.
-    let gate = if admission_pool_limit > 0 && admission_threshold_x1000 > 0 {
-        Some(crate::mv_pull_metadata::AdmissionGate::new(
-            admission_pool_limit,
-            admission_threshold_x1000 as u64,
-        ))
-    } else {
-        None
-    };
-
-    let metadata = crate::mv_pull_metadata::merge_pull_with_metadata(
-        &files,
-        output,
-        &ordering_indices,
-        &ordering_asc,
-        &ordering_nulls_first,
-        fold_ops,
-        spill_byte_budget,
-        spill_file_budget,
-        None, // pool: Java-side does not pass a Rust pool pointer yet
-        bounds_ref,
-        gate.as_ref(),
-    )?;
-
-    // Heap-allocate and return as opaque pointer.
-    let boxed = Box::new(metadata);
-    Ok(Box::into_raw(boxed) as i64)
-}
-
 /// Read the `rows` field from a `PullArtifactMetadata` pointer.
 #[no_mangle]
 pub unsafe extern "C" fn df_pull_meta_rows(ptr: i64) -> i64 {

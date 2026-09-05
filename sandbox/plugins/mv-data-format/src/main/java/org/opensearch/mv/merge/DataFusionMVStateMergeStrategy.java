@@ -16,9 +16,9 @@ import org.opensearch.index.engine.dataformat.MergeResult;
 import org.opensearch.index.engine.exec.MonoFileWriterSet;
 import org.opensearch.index.engine.exec.WriterFileSet;
 import org.opensearch.index.shard.ShardPath;
-import org.opensearch.mv.MVCompiledDefinition;
 import org.opensearch.mv.MVConstants;
 import org.opensearch.mv.MVNativeBridge;
+import org.opensearch.mv.MVStateSchemaReader;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -29,19 +29,22 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * DataFusion strategy for merging partial MV aggregation states.
+ * Generic DataFusion merge strategy for MV state generations:
+ * N individually sorted parquet files in, ONE sorted parquet file out.
  *
- * <p>The generic data-format merge framework selects candidates and schedules
- * the merge. This strategy only defines the format operation:
- * {@code STATE + STATE -> STATE}.
+ * <p>The data-format merge framework (TieredMergePolicy selection +
+ * MergeScheduler) decides WHAT and WHEN to merge; this strategy only defines
+ * the format operation. Rows are merged in the files' declared sort order and
+ * written verbatim — no folding, no definition semantics (the Lucene merge
+ * idiom: consolidate files, never combine rows). Query-time fold already
+ * re-aggregates duplicate keys across state rows, so merging changes file
+ * layout, not results.
  *
- * <p><b>Stage 4:</b> Merges always use the {@code merge_state_streams} FFI
- * which carries the full ordering contract and accumulator metadata across
- * the boundary. The Rust side validates that all inputs share the expected
- * ordering and applies the correct per-column fold function (SUM-fold for
- * SUM/COUNT, MIN-fold for MIN, MAX-fold for MAX). The legacy SQL-based
- * {@code df_mv_merge_state} path has been removed — all merge callers now
- * go through the streaming engine with typed metadata.
+ * <p>Sort columns are the leading {@code sortKeyCount} PHYSICAL column names
+ * of the first input file (read from its parquet footer — the ground truth
+ * for expression keys whose physical names differ from SQL aliases), with the
+ * ordering contract ASC + NULLS FIRST. Executes on the shared
+ * DataFusionRuntime (pool-tracked, breaker-covered, streaming k-way merge).
  */
 public final class DataFusionMVStateMergeStrategy implements MVMergeStrategy {
 
@@ -49,89 +52,38 @@ public final class DataFusionMVStateMergeStrategy implements MVMergeStrategy {
 
     private final DataFormat dataFormat;
     private final ShardPath shardPath;
-    /**
-     * @deprecated Retained only for API compatibility with callers that still
-     *             pass fold SQL. The streaming merge engine ignores this field
-     *             entirely — fold semantics are derived from the compiled
-     *             definition's accumulator metadata.
-     */
-    @Deprecated(forRemoval = true)
-    private final String foldSql;
-    private final MVCompiledDefinition compiledDefinition;
-    private final StreamingMerger streamingMerger;
+    /** Leading sort-key column count (plain config from the target's ordering contract). */
+    private final int sortKeyCount;
+    /** Shared DataFusionRuntime pointer; must be non-zero. */
+    private final long runtimePtr;
+    private final SortedMerger merger;
+    private final SortColumnReader sortColumnReader;
 
-    /**
-     * Stage 4: Primary constructor with compiled definition for streaming merge.
-     *
-     * @param dataFormat         the MV data format
-     * @param shardPath          shard data path
-     * @param foldSql            fold SQL template (retained for API compatibility;
-     *                           ignored by the streaming merge engine)
-     * @param compiledDefinition compiled MV definition (carries ordering +
-     *                           aggregate metadata); must not be null
-     * @param runtimePtr         retained for API compatibility; no longer
-     *                           consulted by the merge gate
-     * @throws IllegalArgumentException if compiledDefinition is null
-     */
-    public DataFusionMVStateMergeStrategy(
-        DataFormat dataFormat,
-        ShardPath shardPath,
-        String foldSql,
-        MVCompiledDefinition compiledDefinition,
-        long runtimePtr
-    ) {
-        this(dataFormat, shardPath, foldSql, compiledDefinition, MVNativeBridge::mergeStateStreams);
+    public DataFusionMVStateMergeStrategy(DataFormat dataFormat, ShardPath shardPath, int sortKeyCount, long runtimePtr) {
+        this(dataFormat, shardPath, sortKeyCount, runtimePtr, MVNativeBridge::sortedParquetMerge, MVStateSchemaReader::readGroupKeyNames);
     }
 
-    /**
-     * Test-injectable constructor for unit tests that want to capture the FFI
-     * parameters without invoking the native library.
-     */
+    /** Test-injectable constructor capturing FFI parameters without native calls. */
     DataFusionMVStateMergeStrategy(
         DataFormat dataFormat,
         ShardPath shardPath,
-        String foldSql,
-        MVCompiledDefinition compiledDefinition,
-        StreamingMerger streamingMerger
+        int sortKeyCount,
+        long runtimePtr,
+        SortedMerger merger,
+        SortColumnReader sortColumnReader
     ) {
-        if (compiledDefinition == null) {
-            throw new IllegalArgumentException(
-                "Stage 4: compiledDefinition is required — the legacy SQL merge path has been removed. "
-                    + "Ensure MVCompiledDefinition.compiledFor(definitionName) succeeds before constructing the merge strategy."
-            );
+        if (sortKeyCount <= 0) {
+            throw new IllegalArgumentException("sortKeyCount must be positive but was: " + sortKeyCount);
+        }
+        if (runtimePtr == 0) {
+            throw new IllegalArgumentException("runtimePtr must be a valid shared DataFusionRuntime pointer");
         }
         this.dataFormat = dataFormat;
         this.shardPath = shardPath;
-        this.foldSql = foldSql;
-        this.compiledDefinition = compiledDefinition;
-        this.streamingMerger = streamingMerger;
-    }
-
-    /**
-     * Legacy constructor without compiled definition.
-     *
-     * @deprecated Stage 4: The legacy SQL merge path has been removed. Use the
-     *             constructor that accepts a {@link MVCompiledDefinition}.
-     *             This constructor now throws {@link IllegalArgumentException}.
-     */
-    @Deprecated(forRemoval = true)
-    public DataFusionMVStateMergeStrategy(DataFormat dataFormat, ShardPath shardPath, String foldSql) {
-        throw new IllegalArgumentException(
-            "Stage 4: The legacy SQL merge path has been removed. Use the constructor "
-                + "that accepts an MVCompiledDefinition for streaming merge with full metadata."
-        );
-    }
-
-    /**
-     * @deprecated Stage 4: Use the test-injectable constructor that accepts
-     *             a {@link StreamingMerger} and {@link MVCompiledDefinition}.
-     */
-    @Deprecated(forRemoval = true)
-    DataFusionMVStateMergeStrategy(DataFormat dataFormat, ShardPath shardPath, String foldSql, StateFileMerger stateFileMerger) {
-        throw new IllegalArgumentException(
-            "Stage 4: The legacy StateFileMerger interface has been replaced by StreamingMerger. "
-                + "Use the constructor that accepts MVCompiledDefinition and StreamingMerger."
-        );
+        this.sortKeyCount = sortKeyCount;
+        this.runtimePtr = runtimePtr;
+        this.merger = merger;
+        this.sortColumnReader = sortColumnReader;
     }
 
     @Override
@@ -166,13 +118,45 @@ public final class DataFusionMVStateMergeStrategy implements MVMergeStrategy {
 
         try {
             List<String> inputPaths = stateFiles.stream().map(Path::toString).toList();
-            long rows = mergeWithStreaming(inputPaths, outputFile.toString());
+
+            // Physical sort column names from the first input's parquet footer —
+            // fail closed if unreadable (never merge on guessed ordering).
+            List<String> keyNames = sortColumnReader.read(inputPaths.get(0), sortKeyCount);
+            String[] sortColumns = keyNames.toArray(new String[0]);
+            // Ordering contract: full-key ASC + NULLS FIRST.
+            boolean[] descending = new boolean[sortColumns.length];
+            boolean[] nullsFirst = new boolean[sortColumns.length];
+            java.util.Arrays.fill(nullsFirst, true);
+
+            logger.debug(
+                "mv_merge sorted: {} inputs -> gen {} on shared runtime, sort={}",
+                inputPaths.size(),
+                writerGeneration,
+                keyNames
+            );
+
+            long rows = merger.merge(runtimePtr, inputPaths, sortColumns, descending, nullsFirst, outputFile.toString());
+
+            // Seq-range propagation (metadata, not data semantics): merged range
+            // is min/max across inputs when ALL are known; any UNKNOWN input
+            // propagates UNKNOWN so the checkpoint handler never overclaims.
+            long mergedMinSeq = WriterFileSet.UNKNOWN_SEQ_NO;
+            long mergedMaxSeq = WriterFileSet.UNKNOWN_SEQ_NO;
+            boolean allRangesKnown = fileSets.stream()
+                .allMatch(f -> f.minSeqNo() != WriterFileSet.UNKNOWN_SEQ_NO && f.maxSeqNo() != WriterFileSet.UNKNOWN_SEQ_NO);
+            if (allRangesKnown) {
+                mergedMinSeq = fileSets.stream().mapToLong(WriterFileSet::minSeqNo).min().orElse(WriterFileSet.UNKNOWN_SEQ_NO);
+                mergedMaxSeq = fileSets.stream().mapToLong(WriterFileSet::maxSeqNo).max().orElse(WriterFileSet.UNKNOWN_SEQ_NO);
+            }
 
             MonoFileWriterSet mergedFiles = MonoFileWriterSet.of(
                 outputDirectory,
                 writerGeneration,
                 outputFile.getFileName().toString(),
-                Math.max(rows, 1L)
+                Math.max(rows, 1L),
+                0L,
+                mergedMinSeq,
+                mergedMaxSeq
             );
             return new MergeResult(Map.of(dataFormat, mergedFiles));
         } catch (Exception e) {
@@ -192,78 +176,22 @@ public final class DataFusionMVStateMergeStrategy implements MVMergeStrategy {
         }
     }
 
-    /**
-     * Stage 4: Merge through the streaming FFI with ordering and accumulator
-     * metadata. Uses the compiled definition's
-     * {@link MVCompiledDefinition.MergeCallParams} to resolve all FFI
-     * parameters in one call. Derives the ordering identity from the PHYSICAL
-     * column names in the first input file — the ground truth for what the
-     * Rust merge engine will compute. Falls back to the logical alias-based
-     * identity if the file schema cannot be read (e.g. in unit tests with
-     * mock/empty state files).
-     */
-    private long mergeWithStreaming(List<String> inputPaths, String outputPath) {
-        MVCompiledDefinition.MergeCallParams params;
-        try {
-            // Use physical ordering identity derived from the first input
-            // state file's Arrow IPC schema. Expression group keys have
-            // physical names (DataFusion's Partial aggregate Display form)
-            // that differ from the SQL alias — reading from the file is
-            // authoritative.
-            params = compiledDefinition.buildMergeCallParams(inputPaths.get(0));
-        } catch (java.io.IOException e) {
-            // Fallback: use logical alias-based identity. This happens when
-            // the first input file is not a valid Arrow IPC file (e.g. in
-            // unit tests with empty placeholder files). In production, the
-            // files are always valid IPC and this branch is unreachable.
-            logger.warn(
-                "mv_merge: could not read Arrow schema from [{}], falling back to logical ordering identity: {}",
-                inputPaths.get(0),
-                e.getMessage()
-            );
-            params = compiledDefinition.buildMergeCallParams();
-        }
+    /** Reads the leading sort-column names from a state file's parquet footer. */
+    @FunctionalInterface
+    interface SortColumnReader {
+        List<String> read(String stateFile, int count) throws IOException;
+    }
 
-        logger.debug(
-            "mv_merge streaming: {} inputs, {} ordering keys, {} total columns, identity=[{}]",
-            inputPaths.size(),
-            params.orderingIndices().length,
-            params.foldOps().length,
-            params.orderingIdentity()
+    /** Functional interface mirroring {@link MVNativeBridge#sortedParquetMerge}. */
+    @FunctionalInterface
+    interface SortedMerger {
+        long merge(
+            long runtimePtr,
+            List<String> inputFiles,
+            String[] sortColumns,
+            boolean[] descending,
+            boolean[] nullsFirst,
+            String outputFile
         );
-
-        return streamingMerger.merge(inputPaths, outputPath, params);
-    }
-
-    /** Compiled definition accessor for test validation. */
-    MVCompiledDefinition compiledDefinition() {
-        return compiledDefinition;
-    }
-
-    /**
-     * Stage 4: Functional interface for the streaming merge engine. Replaces
-     * the legacy {@link StateFileMerger} with a typed interface that carries
-     * the full {@link MVCompiledDefinition.MergeCallParams}.
-     */
-    @FunctionalInterface
-    interface StreamingMerger {
-        long merge(List<String> stateFiles, String outputFile, MVCompiledDefinition.MergeCallParams params);
-    }
-
-    /**
-     * @deprecated Stage 4: Replaced by {@link StreamingMerger}. This interface
-     *             carried fold SQL for the legacy {@code df_mv_merge_state}
-     *             path. All merge callers now use the streaming engine with
-     *             typed metadata from {@link MVCompiledDefinition.MergeCallParams}.
-     */
-    @Deprecated(forRemoval = true)
-    @FunctionalInterface
-    interface StateFileMerger {
-        long merge(List<String> stateFiles, String foldSql, String outputFile) throws Exception;
-    }
-
-    /** Bridge from the new StreamingMerger to the underlying FFI call. */
-    private static long mergeStateStreams(List<String> stateFiles, String outputFile, MVCompiledDefinition.MergeCallParams params) {
-        return MVNativeBridge.mergeStateStreams(stateFiles, outputFile, params);
     }
 }

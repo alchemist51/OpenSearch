@@ -437,149 +437,6 @@ impl SpillCounters {
     }
 }
 
-/// Performs a Stage 4 merge via `merge_state_streams` and wraps the result
-/// in a `PullArtifactMetadata` with full telemetry.
-///
-/// This is the primary entry point for Stage 5 FFI: Java calls
-/// `df_mv_merge_pull_metadata` which delegates here.
-///
-/// Arguments mirror `merge_state_streams` plus spill budget + round bounds +
-/// admission gate.
-#[allow(clippy::too_many_arguments)]
-pub fn merge_pull_with_metadata(
-    state_files: &[String],
-    output_file: &str,
-    ordering_indices: &[usize],
-    ordering_asc: &[bool],
-    ordering_nulls_first: &[bool],
-    fold_ops: &[u8],
-    spill_byte_budget: i64,
-    spill_file_budget: i32,
-    pool: Option<&Arc<dyn MemoryPool>>,
-    bounds: Option<&PullRoundBounds>,
-    admission: Option<&AdmissionGate>,
-) -> Result<PullArtifactMetadata, String> {
-    // ── 1. RSS admission gate ───────────────────────────────────────────
-    if let Some(gate) = admission {
-        gate.check_admission()?;
-    }
-
-    // ── 2. Record starting RSS for peak tracking ────────────────────────
-    let start_rss = cached_resident_bytes();
-    let peak_rss = AtomicI64::new(start_rss);
-
-    // ── 3. Memory reservation for the merge working set ─────────────────
-    // Reserve a conservative per-cursor + accumulator budget:
-    //   k cursors × 64 KiB + 1 MiB accumulator buffer
-    let fan_in = state_files.len() as i32;
-    let estimated_working_set = (fan_in as usize) * 65_536 + 1_048_576;
-    let _mem_guard = if let Some(p) = pool {
-        Some(PullMemoryGuard::try_reserve(
-            p,
-            "mv_merge_pull_working_set",
-            estimated_working_set,
-        )?)
-    } else {
-        None
-    };
-
-    // ── 4. Compute ordering identity hash ───────────────────────────────
-    let ordering_identity =
-        compute_ordering_identity(ordering_indices, ordering_asc, ordering_nulls_first);
-
-    // ── 5. Execute the k-way merge ──────────────────────────────────────
-    let start = Instant::now();
-    let merge_result = crate::mv_merge_engine::merge_state_streams(
-        state_files,
-        output_file,
-        ordering_indices,
-        ordering_asc,
-        ordering_nulls_first,
-        fold_ops,
-    );
-    let _elapsed = start.elapsed();
-
-    // Atomic-finalize: on any merge error, remove the partial output file
-    // so callers never see an incomplete artifact. Mirrors the Stage 3
-    // build path (mv_build_managed.rs) which does the same cleanup.
-    let rows = match merge_result {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = std::fs::remove_file(output_file);
-            return Err(e);
-        }
-    };
-
-    // ── 6. Record peak RSS ──────────────────────────────────────────────
-    let end_rss = cached_resident_bytes();
-    let _ = peak_rss.fetch_max(end_rss, AtomicOrdering::Relaxed);
-    let observed_peak = peak_rss.load(AtomicOrdering::Relaxed);
-
-    // ── 7. Compute schema/definition hashes from the output file ────────
-    let hashes_result = read_output_hashes(output_file);
-    let (schema_hash, definition_hash, output_batch_count) = match hashes_result {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = std::fs::remove_file(output_file);
-            return Err(e);
-        }
-    };
-
-    // ── 8. Spill budget enforcement ─────────────────────────────────────
-    // The current merge engine is CPU-only (no async spill). Spill counters
-    // are tracked as zero. If a future version adds disk spill, the counters
-    // will be populated from the merge engine's spill callbacks.
-    let spill_bytes: i64 = 0;
-    let spill_files: i32 = 0;
-    if let Err(e) = enforce_spill_budget(
-        spill_byte_budget,
-        spill_file_budget,
-        spill_bytes,
-        spill_files,
-    ) {
-        let _ = std::fs::remove_file(output_file);
-        return Err(e.to_string());
-    }
-
-    // ── 9. Pull round bounds check ──────────────────────────────────────
-    if let Some(b) = bounds {
-        // bytes_processed ≈ output file size; ops_count = fan_in;
-        // estimated_cardinality = rows (upper bound on distinct groups).
-        let file_size = std::fs::metadata(output_file)
-            .map(|m| m.len() as i64)
-            .unwrap_or(0);
-        if let Err(e) = check_pull_round_bounds(b, file_size, fan_in as i64, rows) {
-            let _ = std::fs::remove_file(output_file);
-            return Err(e.to_string());
-        }
-    }
-
-    // ── 10. Compute native reservation snapshot ─────────────────────────
-    let native_reservations_bytes = _mem_guard.as_ref().map_or(0, |g| g.size() as i64);
-
-    // Retained estimate: approximate IPC output file size as a proxy for
-    // the Arrow buffer footprint that the JVM will hold after merge.
-    let retained_estimate_bytes = std::fs::metadata(output_file)
-        .map(|m| m.len() as i64)
-        .unwrap_or(0);
-
-    // ── 11. Build and return metadata ───────────────────────────────────
-    Ok(PullArtifactMetadata::new(
-        rows,
-        schema_hash,
-        definition_hash,
-        ordering_identity,
-        spill_bytes,
-        spill_files,
-        observed_peak,
-        fan_in,
-        output_batch_count,
-        native_reservations_bytes,
-        retained_estimate_bytes,
-        0, // breaker_attribution: default bucket (unattributed)
-    ))
-}
-
 // ── Internal helpers ────────────────────────────────────────────────────
 
 /// Compute a deterministic hash of the ordering contract for identity checks.
@@ -614,7 +471,7 @@ fn read_output_hashes(output_file: &str) -> Result<(u64, u64, i32), String> {
             .map_err(|e| format!("read_output_hashes: reader {output_file}: {e}"))?;
 
     let schema = builder.schema().clone();
-    let schema_hash = crate::mv_merge_engine::compute_schema_hash(&schema);
+    let schema_hash = compute_schema_hash(&schema);
 
     // Definition hash: hash the schema field count + data types as a proxy.
     // The true definition hash comes from the fold SQL on the Java side;
@@ -781,4 +638,46 @@ mod tests {
         assert_eq!(c.total_bytes(), 300);
         assert_eq!(c.total_files(), 3);
     }
+}
+
+/// Schema hash for pull-artifact telemetry (relocated from the deleted
+/// row-at-a-time merge engine; schema-shape fingerprint only).
+pub fn compute_schema_hash(schema: &arrow_schema::Schema) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for field in schema.fields() {
+        field.name().hash(&mut hasher);
+        format!("{:?}", field.data_type()).hash(&mut hasher);
+        field.is_nullable().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+// ── Generic parquet-file utilities (relocated from the deleted row-at-a-time merge engine) ──
+
+/// Reads the physical field names of a Parquet MV state file from its footer
+/// schema, in physical order. This is the GROUND TRUTH the merge ordering
+/// identity is derived from (Java asks via `df_mv_state_field_names` instead
+/// of shipping its own Parquet footer parser — one reader stack).
+///
+/// Footer-only: no row groups are read.
+pub fn state_field_names(file_path: &str) -> Result<Vec<String>, String> {
+    // Legacy Arrow IPC guard: fail closed with rebuild-required error.
+    if file_path.ends_with(".mv.arrow") {
+        return Err(format!(
+            "state_field_names: legacy Arrow IPC state file '{}' is no longer supported; \
+             rebuild the materialized view to generate Parquet state files",
+            file_path
+        ));
+    }
+    let file = std::fs::File::open(file_path)
+        .map_err(|e| format!("state_field_names: open {file_path}: {e}"))?;
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("state_field_names: read {file_path}: {e}"))?;
+    Ok(builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect())
 }
