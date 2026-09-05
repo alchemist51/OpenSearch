@@ -2094,6 +2094,11 @@ public class DataFormatAwareEngine implements Indexer {
         // this flush falls back to the prior committed catalog, while a successful return
         // guarantees the artifact and its progress metadata are durable together.
         flush(true, true);
+
+        // A publication seals a new immutable generation — exactly what a refresh does
+        // for writer segments — so give the scheduler the same merge opportunity the
+        // refresh path gets (property-gated inside, TieredMergePolicy selects).
+        triggerPossibleMerges();
     }
 
     @Override

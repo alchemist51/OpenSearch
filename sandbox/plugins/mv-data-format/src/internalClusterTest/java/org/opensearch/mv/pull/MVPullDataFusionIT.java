@@ -29,6 +29,7 @@ import org.opensearch.mv.MVStateDataFormat;
 import org.opensearch.parquet.ParquetDataFormatPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.PluginsService;
+import org.opensearch.common.SuppressForbidden;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.opensearch.transport.Netty4ModulePlugin;
 
@@ -108,61 +109,7 @@ public class MVPullDataFusionIT extends OpenSearchIntegTestCase {
 
     @LockFeatureFlag(STREAM_TRANSPORT)
     public void testDataFusionFoldedPullMatchesSource() throws Exception {
-        client().admin()
-            .indices()
-            .prepareCreate(SOURCE)
-            .setSettings(
-                Settings.builder()
-                    .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
-                    .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
-                    .put("index.pluggable.dataformat.enabled", true)
-                    .put("index.pluggable.dataformat", "composite")
-                    .put("index.composite.primary_data_format", "parquet")
-                    .putList("index.composite.secondary_data_formats", "lucene")
-                    .put("index.composite.merge_on_refresh_max_size", "0b")
-                    .put("index.refresh_interval", "10s")
-                    .put("index.derived.enabled", false)
-            )
-            .setMapping("RegionID", "type=long", "AdvEngineID", "type=long")
-            .get();
-        ensureGreen(SOURCE);
-        client().admin()
-            .cluster()
-            .prepareUpdateSettings()
-            .setPersistentSettings(Settings.builder().put("cluster.pluggable.dataformat", "composite"))
-            .get();
-
-        assertAcked(
-            client().admin()
-                .indices()
-                .prepareCreate(MV)
-                .setSettings(
-                    Settings.builder()
-                        .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
-                        .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
-                        .put("index.pluggable.dataformat.enabled", true)
-                        .put("index.pluggable.dataformat", "composite")
-                        .put("index.composite.primary_data_format", "parquet")
-                        .putList("index.composite.secondary_data_formats", "lucene")
-                        .put("index.derived.enabled", true)
-                        // Canonical derived data-format category — the single control-plane
-                        // signal for a materialized-view target. mv_state is NOT a secondary
-                        // format and serve_state is no longer used.
-                        .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DATA_FORMAT, MVDataFormat.NAME)
-                        .put("index.derived.definition_id", "pull_count_sum")
-                        .putList("index.mv.state_fields", "RegionID", "cnt", "adv")
-                        .put("index.mv.state_merge_enabled", true)
-                        .put(MVPullSettings.PULL_INTERVAL.getKey(), "100ms")
-                        // Public settings only; MetadataCreateIndexService enriches private binding
-                        // (UUID, topology, mapping mode). The deprecated index.mv_pull.source_index
-                        // is NOT set — all pull targets use DerivedIndexBinding exclusively.
-                        .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_SOURCE_NAME, SOURCE)
-                        .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "pull_count_sum")
-                )
-                .setMapping("RegionID", "type=long", "cnt", "type=long", "adv", "type=long")
-        );
-        ensureGreen(MV);
-        assertBusy(this::assertPrimaryOnlyBuildService);
+        createSourceAndTarget();
 
         Map<Long, long[]> expected = new HashMap<>();
         int docs = 0;
@@ -286,6 +233,157 @@ public class MVPullDataFusionIT extends OpenSearchIntegTestCase {
                 assertFalse("superseded mv_state artifact must be deleted: " + superseded, java.nio.file.Files.exists(Path.of(superseded)));
             }
         }, 60, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    private void createSourceAndTarget() throws Exception {
+        client().admin()
+            .indices()
+            .prepareCreate(SOURCE)
+            .setSettings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                    .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
+                    .put("index.pluggable.dataformat.enabled", true)
+                    .put("index.pluggable.dataformat", "composite")
+                    .put("index.composite.primary_data_format", "parquet")
+                    .putList("index.composite.secondary_data_formats", "lucene")
+                    .put("index.composite.merge_on_refresh_max_size", "0b")
+                    .put("index.refresh_interval", "10s")
+                    .put("index.derived.enabled", false)
+            )
+            .setMapping("RegionID", "type=long", "AdvEngineID", "type=long")
+            .get();
+        ensureGreen(SOURCE);
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setPersistentSettings(Settings.builder().put("cluster.pluggable.dataformat", "composite"))
+            .get();
+
+        assertAcked(
+            client().admin()
+                .indices()
+                .prepareCreate(MV)
+                .setSettings(
+                    Settings.builder()
+                        .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                        .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
+                        .put("index.pluggable.dataformat.enabled", true)
+                        .put("index.pluggable.dataformat", "composite")
+                        .put("index.composite.primary_data_format", "parquet")
+                        .putList("index.composite.secondary_data_formats", "lucene")
+                        .put("index.derived.enabled", true)
+                        // Canonical derived data-format category — the single control-plane
+                        // signal for a materialized-view target. mv_state is NOT a secondary
+                        // format and serve_state is no longer used.
+                        .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DATA_FORMAT, MVDataFormat.NAME)
+                        .put("index.derived.definition_id", "pull_count_sum")
+                        .putList("index.mv.state_fields", "RegionID", "cnt", "adv")
+                        .put("index.mv.state_merge_enabled", true)
+                        .put(MVPullSettings.PULL_INTERVAL.getKey(), "100ms")
+                        // Public settings only; MetadataCreateIndexService enriches private binding
+                        // (UUID, topology, mapping mode). The deprecated index.mv_pull.source_index
+                        // is NOT set — all pull targets use DerivedIndexBinding exclusively.
+                        .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_SOURCE_NAME, SOURCE)
+                        .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, "pull_count_sum")
+                )
+                .setMapping("RegionID", "type=long", "cnt", "type=long", "adv", "type=long")
+        );
+        ensureGreen(MV);
+        assertBusy(this::assertPrimaryOnlyBuildService);
+    }
+
+    /**
+     * WITH-LOAD merge round: continuous ingestion produces many small MV
+     * generations while the STOCK DFAE machinery (refresh-driven
+     * triggerPossibleMerges -> TieredMergePolicy selection -> MergeScheduler
+     * MERGE threadpool -> generic DataFusion sorted merge) compacts them
+     * concurrently. No forceMerge, no bespoke triggers. Asserts the merge
+     * gate property is honored, answers stay exact at every checkpoint,
+     * generation count is eventually consolidated below the publication
+     * count, and the watermark never regresses.
+     */
+    @LockFeatureFlag(STREAM_TRANSPORT)
+    public void testNaturalMergesUnderContinuousLoad() throws Exception {
+        enableDataformatMerges();
+        try {
+            createSourceAndTarget();
+
+            Map<Long, long[]> expected = new HashMap<>();
+            long docs = 0;
+            int maxObservedFiles = 0;
+            final int waves = 18;
+            final int docsPerWave = 8;
+            for (int wave = 0; wave < waves; wave++) {
+                for (int i = 0; i < docsPerWave; i++) {
+                    long region = (wave + i) % 4;
+                    long adv = 1 + (i % 3);
+                    client().prepareIndex(SOURCE).setSource("RegionID", region, "AdvEngineID", adv).get();
+                    expected.computeIfAbsent(region, r -> new long[2]);
+                    expected.get(region)[0] += 1;
+                    expected.get(region)[1] += adv;
+                    docs++;
+                }
+                // Seal a source generation; target rounds pull it, publishing
+                // a small MV generation — and each target refresh gives the
+                // scheduler a natural merge opportunity mid-load.
+                client().admin().indices().prepareRefresh(SOURCE).get();
+                PublishedState observed = publishedStateOrNull(primaryNodeName(MV));
+                if (observed != null) {
+                    maxObservedFiles = Math.max(maxObservedFiles, observed.files().size());
+                    assertTrue(
+                        "watermark must never regress under load",
+                        observed.watermark() == null || observed.watermark().seqNo() <= docs - 1
+                    );
+                }
+                if (wave % 6 == 5) {
+                    // Mid-load exactness checkpoint: merges racing ingestion
+                    // must never change answers.
+                    final long docsSoFar = docs;
+                    assertBusy(() -> assertStateFilesEqual(expected, docsSoFar), 60, java.util.concurrent.TimeUnit.SECONDS);
+                }
+            }
+
+            // Drain: full catch-up, exact answers.
+            final long totalDocs = docs;
+            assertBusy(() -> assertStateFilesEqual(expected, totalDocs), 90, java.util.concurrent.TimeUnit.SECONDS);
+
+            // Natural merges must consolidate: strictly fewer live files than
+            // publications occurred (each wave published >= 1 generation).
+            final int peak = Math.max(maxObservedFiles, 1);
+            assertBusy(() -> {
+                PublishedState state = publishedState(primaryNodeName(MV));
+                assertTrue(
+                    "TieredPolicy merges must consolidate generations: live=" + state.files().size() + " waves=" + waves + " peak=" + peak,
+                    state.files().size() < waves
+                );
+            }, 90, java.util.concurrent.TimeUnit.SECONDS);
+
+            // Post-merge: answers still exact, replicas consistent.
+            assertBusy(() -> assertStateFilesEqual(expected, totalDocs), 60, java.util.concurrent.TimeUnit.SECONDS);
+            assertBusy(() -> assertReplicaStateEqual(expected, totalDocs), 60, java.util.concurrent.TimeUnit.SECONDS);
+        } finally {
+            disableDataformatMerges();
+        }
+    }
+
+    @SuppressForbidden(reason = "enable pluggable dataformat merge for the with-load merge round")
+    private static void enableDataformatMerges() {
+        System.setProperty("opensearch.pluggable.dataformat.merge.enabled", "true");
+    }
+
+    @SuppressForbidden(reason = "restore pluggable dataformat merge property after test")
+    private static void disableDataformatMerges() {
+        System.clearProperty("opensearch.pluggable.dataformat.merge.enabled");
+    }
+
+    /** Like {@link #publishedState} but returns null while nothing is published yet. */
+    private PublishedState publishedStateOrNull(String node) {
+        try {
+            return publishedState(node);
+        } catch (AssertionError | Exception e) {
+            return null;
+        }
     }
 
     private void assertStateFilesEqual(Map<Long, long[]> expected, long expectedDocs) throws Exception {
