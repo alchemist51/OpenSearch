@@ -23,7 +23,8 @@ import org.opensearch.index.merge.MergeStatsTracker;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
-import java.util.Collection;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Semaphore;
@@ -160,13 +161,36 @@ public class MergeScheduler {
                 logger.debug("MergeScheduler is shutdown, skipping force merge");
                 return;
             }
-            Collection<OneMerge> oneMerges = mergeHandler.findForceMerges(maxNumSegment);
-            for (OneMerge oneMerge : oneMerges) {
-                if (isShutdown.get()) {
-                    logger.debug("MergeScheduler shutdown during force merge, aborting remaining merges");
-                    break;
+            // Registered merges MUST resolve (Lucene's IndexWriter idiom: every
+            // registered merge is either executed or explicitly aborted). Track
+            // the un-run remainder so an exception or shutdown mid-wave cannot
+            // strand its segments in the currently-merging sets — stranded
+            // claims permanently exclude those segments from all future
+            // selection until a node restart wipes the in-memory sets.
+            Deque<OneMerge> registered = new ArrayDeque<>(mergeHandler.findForceMerges(maxNumSegment));
+            try {
+                while (registered.isEmpty() == false) {
+                    if (isShutdown.get()) {
+                        logger.debug("MergeScheduler shutdown during force merge, aborting remaining merges");
+                        break;
+                    }
+                    runMerge(registered.removeFirst());
                 }
-                runMerge(oneMerge);
+            } finally {
+                for (OneMerge abandoned : registered) {
+                    logger.debug(() -> new ParameterizedMessage("Deregistering abandoned force merge [{}]", abandoned));
+                    mergeHandler.onMergeFailure(abandoned);
+                }
+                // Merges completing in this wave register follow-up background
+                // merges (onMergeFinished -> findAndRegisterMerges). At idle no
+                // publication/refresh trigger will ever drain that queue, so the
+                // registrations would strand their segments as currently-merging.
+                // Drain here — the same "registration is always followed by
+                // scheduling" contract the background path gets from
+                // submitMergeTask's finally.
+                if (isShutdown.get() == false) {
+                    executeMerge();
+                }
             }
         } finally {
             decrementAndFireDrainListeners();
@@ -333,22 +357,33 @@ public class MergeScheduler {
      */
     private void submitMergeTask(OneMerge oneMerge) {
         activeMerges.incrementAndGet();
-        threadPool.executor(ThreadPool.Names.MERGE).execute(() -> {
-            try {
-                if (isShutdown.get()) {
-                    logger.debug("MergeScheduler is shutdown, skipping merge");
-                    return;
+        try {
+            threadPool.executor(ThreadPool.Names.MERGE).execute(() -> {
+                try {
+                    if (isShutdown.get()) {
+                        logger.debug("MergeScheduler is shutdown, skipping merge");
+                        // The merge was registered at selection time; resolve its
+                        // claim so its segments do not stay marked as merging.
+                        mergeHandler.onMergeFailure(oneMerge);
+                        return;
+                    }
+                    runMerge(oneMerge);
+                } catch (Exception e) {
+                    // runMerge already invoked onMergeFailureCleanup; swallow to prevent
+                    // uncaught exception on the merge thread pool.
+                } finally {
+                    decrementAndFireDrainListeners();
+                    // A completed merge may free up capacity for new merges, so check again.
+                    executeMerge();
                 }
-                runMerge(oneMerge);
-            } catch (Exception e) {
-                // runMerge already invoked onMergeFailureCleanup; swallow to prevent
-                // uncaught exception on the merge thread pool.
-            } finally {
-                decrementAndFireDrainListeners();
-                // A completed merge may free up capacity for new merges, so check again.
-                executeMerge();
-            }
-        });
+            });
+        } catch (Exception e) {
+            // Task never made it onto the pool: the increment above must not
+            // leak or the scheduler's concurrency budget shrinks permanently.
+            // The caller (executeMerge) deregisters the merge via onMergeFailure.
+            decrementAndFireDrainListeners();
+            throw e;
+        }
     }
 
     /**

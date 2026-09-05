@@ -20,6 +20,7 @@ import org.opensearch.index.engine.derived.pull.spi.DerivedSourceSnapshot;
 import org.opensearch.index.engine.exec.MonoFileWriterSet;
 import org.opensearch.index.engine.exec.WriterFileSet;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.mv.MVBuildActivity;
 import org.opensearch.mv.MVCompiledDefinition;
 import org.opensearch.mv.MVConstants;
 import org.opensearch.mv.MVDefinitionResolver;
@@ -103,6 +104,32 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
 
     @Override
     public BuildResult build(DerivedSourceSnapshot snapshot, Path stageDir, IndexShard shard) throws IOException {
+        // Defect #23 admission signal: this round is about to hold native pool
+        // memory (coverage scan + streaming build). While the claim is active,
+        // MVIndexingEngine#isMergeEligible admits no new merges for this shard
+        // — merges stall, live MV ingestion never does. The claim ALWAYS
+        // resolves (try/finally); the final round of a catch-up burst resolves
+        // it early, before publishing, so the publication's merge trigger
+        // re-admits deferred merges exactly at the transition to quiet.
+        MVBuildActivity.markActive(shard.shardId().getIndexName(), shard.shardId().id());
+        buildPressureCleared = false;
+        try {
+            return buildUnderPressureClaim(snapshot, stageDir, shard);
+        } finally {
+            if (buildPressureCleared == false) {
+                MVBuildActivity.clearActive(shard.shardId().getIndexName(), shard.shardId().id());
+            }
+        }
+    }
+
+    /**
+     * Set when the round released its build-pressure claim early (final round
+     * of a burst, before publish). Poller rounds are single-threaded per
+     * builder, so a plain field is safe.
+     */
+    private boolean buildPressureCleared;
+
+    private BuildResult buildUnderPressureClaim(DerivedSourceSnapshot snapshot, Path stageDir, IndexShard shard) throws IOException {
         MVDerivedSourceReader.MVSourceSnapshot mvSnapshot = (MVDerivedSourceReader.MVSourceSnapshot) snapshot;
 
         // Stage 5: record fan-in round for metrics
@@ -371,6 +398,20 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             );
 
             MVWatermark next = new MVWatermark(mvSnapshot.primaryTerm(), appliedThrough, mvSnapshot.infosVersion());
+
+            if (effectivelyCapped == false) {
+                // Final round of this catch-up burst: the native build has
+                // released its pool memory and no further round is imminent.
+                // Release the build-pressure claim BEFORE publishing so the
+                // publication's merge trigger (DataFormatAwareEngine
+                // publishDerivedArtifact -> triggerPossibleMerges) can admit
+                // the merges deferred while builds were running. Capped rounds
+                // keep the claim through their publish — their trigger fires
+                // rejected, and the next round re-marks — so merges stay
+                // stalled across sustained catch-up.
+                MVBuildActivity.clearActive(shard.shardId().getIndexName(), shard.shardId().id());
+                buildPressureCleared = true;
+            }
 
             // Publish (commit artifact to shard metadata)
             long tPublish = System.nanoTime();

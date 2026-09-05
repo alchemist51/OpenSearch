@@ -746,6 +746,16 @@ public final class MVIndexingEngine implements IndexingExecutionEngine<org.opens
         if (shipTargets.isEmpty() == false || MVStateDataFormat.NAME.equals(format.name()) == false) {
             return true;
         }
+        // Defect #23 — merges stall, live MV ingestion never does. While a
+        // build round holds native pool memory, admit no new merges for this
+        // shard: both selection paths (scheduled and force) consult this
+        // predicate, so a deferred candidate is simply not registered and
+        // holds no claim. The retry is the existing publication trigger — the
+        // final round of a catch-up burst releases build pressure BEFORE
+        // publishing, so the burst's own last trigger re-admits merges.
+        if (MVBuildActivity.isActive(sourceIndexName, shardPath.getShardId().id())) {
+            return false;
+        }
         // Conservative whole-snapshot proof: when the exact published claim
         // equals the exact durable claim, every segment in the current catalog
         // is from the committed snapshot. If any refreshed batch is newer,
