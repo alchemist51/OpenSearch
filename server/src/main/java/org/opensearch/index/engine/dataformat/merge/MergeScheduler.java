@@ -409,7 +409,27 @@ public class MergeScheduler {
             applyMergeChanges.accept(mergeResult, oneMerge);
             mergeHandler.onMergeFinished(oneMerge, isFrozen());
             tookMS = TimeValue.nsecToMSec((System.nanoTime() - timeNS));
-            logger.info("Merge {} completed in {}ms, result: {}", oneMerge, tookMS, mergeResult.getMergedWriterFileSet());
+            // Mirror OpenSearchConcurrentMergeScheduler's completion logging:
+            // a compact summary — DEBUG when slow (>20s), TRACE otherwise —
+            // NEVER a full per-segment dump at INFO. The dump-at-INFO variant
+            // emitted ~6KB per merge (every Lucene filename + parquet path);
+            // at 100M-scale ingestion (359 merges in 67 min) that produced a
+            // 117MB stdout flood which killed the 64MB gradlew output-relay
+            // client and took the whole node down with it (defect #24/#25).
+            String message = String.format(
+                java.util.Locale.ROOT,
+                "merge done: inputs [%d segments], [%,.1f MB], [%,d docs], took [%s]",
+                oneMerge.getSegmentsToMerge().size(),
+                totalSizeInBytes / 1024f / 1024f,
+                totalNumDocs,
+                TimeValue.timeValueMillis(tookMS)
+            );
+            if (tookMS > 20000) {
+                logger.debug("{}", message);
+            } else if (logger.isTraceEnabled()) {
+                logger.trace("{}", message);
+            }
+            logger.trace(() -> new ParameterizedMessage("merge detail: {} -> {}", oneMerge, mergeResult.getMergedWriterFileSet()));
         } catch (Exception e) {
             logger.error(new ParameterizedMessage("Merge failed for: {}", oneMerge), e);
             mergeHandler.onMergeFailure(oneMerge);
