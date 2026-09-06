@@ -26,6 +26,53 @@ static CACHED_RESIDENT: AtomicI64 = AtomicI64::new(0);
 static LAST_CHECK_MS: AtomicU64 = AtomicU64::new(u64::MAX);
 static EPOCH_BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
+/// Minimum interval between forced all-arena purges (see
+/// [`fresh_resident_elevated`]). Purging walks every arena; once per interval
+/// is enough to unlatch a phantom-elevated reading without adding cost to a
+/// genuine memory storm.
+const PURGE_INTERVAL_MS: u64 = 5_000;
+static LAST_PURGE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Fresh resident reading for the elevated path, purging retained pages first
+/// (rate-limited to one purge per [`PURGE_INTERVAL_MS`]).
+///
+/// An elevated resident value may be nothing but freed-but-retained pages:
+/// decay-based purging only ticks on allocator activity in the owning arena,
+/// so pages freed by finished work (e.g. a source-merge storm on the rayon
+/// pool) stay resident indefinitely once those threads go idle. Every
+/// resident-based gate then latches shut permanently — observed as defect
+/// #27: 18 GB anonymous RSS at total idle kept the shared pool's 95% gate
+/// tripping for hours while every tracked consumer held 0 bytes, livelocking
+/// MV builds until restart. Purge-then-re-measure is the real-memory circuit
+/// breaker's idiom (G1OverLimitStrategy: collect, re-read, only then trip)
+/// translated to jemalloc. Live allocations are untouched, so a genuinely
+/// loaded node still reads high after the purge and the gates still protect
+/// it — only phantom pressure is dispelled.
+fn fresh_resident_elevated(elevated_reading: i64) -> i64 {
+    let base = EPOCH_BASE.get_or_init(Instant::now);
+    let now_ms = base.elapsed().as_millis() as u64;
+    let last = LAST_PURGE_MS.load(Ordering::Relaxed);
+    if now_ms.wrapping_sub(last) >= PURGE_INTERVAL_MS
+        && LAST_PURGE_MS
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        if let Ok(fresh) = native_bridge_common::allocator::purge_all_arenas_and_refresh() {
+            let freed = elevated_reading.saturating_sub(fresh);
+            if freed > 1024 * 1024 * 1024 {
+                native_bridge_common::log_info!(
+                    "Memory gate purge: jemalloc resident {} -> {} bytes ({} freed were retained pages, not live memory)",
+                    elevated_reading,
+                    fresh,
+                    freed
+                );
+            }
+            return fresh;
+        }
+    }
+    native_bridge_common::allocator::resident_bytes()
+}
+
 /// Returns jemalloc resident bytes, cached for up to 100ms on the happy path.
 ///
 /// When the cached value is above the spill threshold, bypasses the cache and
@@ -38,15 +85,16 @@ static EPOCH_BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 pub fn cached_resident_bytes() -> i64 {
     let cached = CACHED_RESIDENT.load(Ordering::Relaxed);
 
-    // If last known value was above spill threshold, bypass cache and read fresh.
-    // A stale-high value would block the override and prevent spill from completing.
+    // If last known value was above spill threshold, bypass cache and read fresh
+    // — purging retained pages first (rate-limited), because an elevated reading
+    // may be phantom pages that decay will never return at idle (defect #27).
     if cached > 0 {
         let spill_x1000 = EXECUTION_SPILL_X1000.load(Ordering::Relaxed);
         let limit = pool_limit_for_guard();
         if limit > 0 {
             let threshold = (limit as u64 * spill_x1000 / 1000) as i64;
             if cached >= threshold {
-                let fresh = native_bridge_common::allocator::resident_bytes();
+                let fresh = fresh_resident_elevated(cached);
                 CACHED_RESIDENT.store(fresh, Ordering::Relaxed);
                 return fresh;
             }

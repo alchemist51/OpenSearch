@@ -74,6 +74,44 @@ pub fn resident_bytes() -> i64 {
     }
 }
 
+/// mallctl name addressing ALL arenas (index 4096 = `MALLCTL_ARENAS_ALL`).
+const ARENA_PURGE_ALL: &[u8] = b"arena.4096.purge\0";
+
+/// Forces jemalloc to purge dirty/muzzy pages from ALL arenas back to the OS,
+/// then re-reads resident bytes.
+///
+/// Decay-based purging only ticks on allocator activity in the owning arena:
+/// pages freed by finished work (e.g. a merge storm on a rayon pool) stay
+/// resident indefinitely once those threads go idle. Any gate comparing
+/// jemalloc resident against a limit then latches shut permanently — even at
+/// total process idle. Callers about to fail an allocation on a
+/// resident-based threshold must purge and re-measure first (rate-limited),
+/// mirroring the real-memory circuit breaker's collect-then-re-measure idiom
+/// (G1OverLimitStrategy: GC, re-read, only then trip).
+///
+/// Live allocations are untouched — only freed-but-retained pages are
+/// returned, so a legitimately loaded node still reads high after a purge.
+///
+/// Returns fresh resident bytes after the purge.
+pub fn purge_all_arenas_and_refresh() -> Result<i64, String> {
+    // Void mallctl command: jemalloc requires ALL pointers null for purge
+    // (READONLY() + WRITEONLY() checks), so this bypasses the typed helpers.
+    let rc = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            ARENA_PURGE_ALL.as_ptr() as *const std::os::raw::c_char,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(format!("jemalloc arena purge failed: rc={rc}"));
+    }
+    PURGE_COUNT.fetch_add(1, Ordering::Relaxed);
+    refresh_stats().map(|(_, res)| res)
+}
+
 /// FFI: Returns current jemalloc allocated bytes, or negative error pointer.
 #[no_mangle]
 pub extern "C" fn native_jemalloc_allocated_bytes() -> i64 {
@@ -182,28 +220,11 @@ fn purge_thread_loop() {
             threshold / (1024 * 1024)
         );
 
-        let narenas: u32 = match unsafe { tikv_jemalloc_ctl::raw::read(b"arenas.narenas\0") } {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let mut any_success = false;
-        for i in 0..narenas {
-            let key = format!("arena.{}.purge\0", i);
-            let ret = unsafe {
-                tikv_jemalloc_sys::mallctl(
-                    key.as_ptr() as *const _,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            if ret == 0 {
-                any_success = true;
-            }
-        }
-        if any_success {
-            PURGE_COUNT.fetch_add(1, Ordering::Relaxed);
+        // Single purge mechanism: same primitive the demand-driven memory-guard
+        // path uses (all-arena purge + counter). Failures are logged-and-skipped
+        // — the thread must survive transient mallctl errors.
+        if let Err(msg) = purge_all_arenas_and_refresh() {
+            log_info!("jemalloc background purge failed: {}", msg);
         }
     }
 }
@@ -338,6 +359,33 @@ mod tests {
     #[global_allocator]
     static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+    /// Serializes every test that touches the process-global purge state
+    /// (background thread + threshold/interval/count atomics + arena-retained
+    /// pages). Without this, cargo's parallel test threads race: one test sets
+    /// threshold=0 (always purge) while another asserts zero purges under
+    /// threshold=MAX, and background purges deflate resident measurements made
+    /// by unrelated tests. Poisoning is ignored — a prior panic must not
+    /// cascade.
+    static PURGE_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Parks the background purge thread (interval=0) and waits until any
+    /// in-flight purge cycle has finished, so the caller owns purge state.
+    /// A thread mid-`park_timeout` may complete one more purge after the
+    /// pause request — poll until the count is stable across a full window.
+    fn quiesce_purge_thread() {
+        native_jemalloc_set_purge_interval(0);
+        let mut settle = native_jemalloc_get_purge_count();
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            let now = native_jemalloc_get_purge_count();
+            if now == settle {
+                return;
+            }
+            settle = now;
+        }
+        panic!("purge thread failed to quiesce");
+    }
+
     #[test]
     fn allocated_bytes_is_positive() {
         assert!(allocated_bytes() > 0);
@@ -357,7 +405,50 @@ mod tests {
     }
 
     #[test]
+    fn purge_all_arenas_returns_retained_pages() {
+        let _guard = PURGE_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        quiesce_purge_thread();
+        // Defect #27 reproduction: freed pages stay resident when decay never
+        // ticks — in production because the owning arena's threads go idle
+        // (decay only advances on allocator activity), modeled here by
+        // disabling decay outright for the window. Without this the drop loop
+        // itself ticks decay and returns most pages, hiding the retention.
+        native_jemalloc_set_dirty_decay_ms(-1);
+        native_jemalloc_set_muzzy_decay_ms(-1);
+
+        // 16 KB blocks stay inside arena size classes (huge allocations would
+        // be unmapped directly on free, hiding the retention this guards).
+        let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(16 * 1024);
+        for _ in 0..(16 * 1024) {
+            blocks.push(vec![1u8; 16 * 1024]); // 256 MB touched
+        }
+        std::hint::black_box(&blocks);
+        drop(blocks);
+
+        let after_drop = resident_bytes();
+        let result = purge_all_arenas_and_refresh();
+
+        // Restore decay before asserting so a failure cannot leak -1 into
+        // the other decay tests.
+        native_jemalloc_set_dirty_decay_ms(10_000);
+        native_jemalloc_set_muzzy_decay_ms(10_000);
+
+        assert!(after_drop > 0);
+        let after_purge = result.expect("arena purge must succeed");
+        assert!(after_purge > 0);
+        // At least half of the 256 MB freed set must have been retained and
+        // then returned by the purge. If purge were a no-op (the pre-fix
+        // behavior of relying on decay alone at idle), after_purge ==
+        // after_drop and this fails.
+        assert!(
+            after_purge + 128 * 1024 * 1024 <= after_drop,
+            "purge should return retained pages: after_drop={after_drop} after_purge={after_purge}"
+        );
+    }
+
+    #[test]
     fn set_dirty_decay_ms_applies_at_runtime() {
+        let _guard = PURGE_STATE.lock().unwrap_or_else(|p| p.into_inner());
         let rc = native_jemalloc_set_dirty_decay_ms(5000);
         assert_eq!(rc, 0, "setter should succeed, got {}", rc);
 
@@ -372,6 +463,7 @@ mod tests {
 
     #[test]
     fn set_muzzy_decay_ms_applies_at_runtime() {
+        let _guard = PURGE_STATE.lock().unwrap_or_else(|p| p.into_inner());
         let rc = native_jemalloc_set_muzzy_decay_ms(10000);
         assert_eq!(rc, 0, "setter should succeed, got {}", rc);
 
@@ -410,6 +502,7 @@ mod tests {
 
     #[test]
     fn background_purge_thread_fires() {
+        let _guard = PURGE_STATE.lock().unwrap_or_else(|p| p.into_inner());
         // threshold=0 means always purge; interval=50ms for fast feedback
         native_jemalloc_start_purge_thread(0, 50);
         let before = native_jemalloc_get_purge_count();
@@ -418,10 +511,13 @@ mod tests {
             native_jemalloc_get_purge_count() > before,
             "purge thread should have fired"
         );
+        // Leave the thread parked so no purges bleed into other tests.
+        native_jemalloc_set_purge_interval(0);
     }
 
     #[test]
     fn background_purge_pauses_when_interval_zero() {
+        let _guard = PURGE_STATE.lock().unwrap_or_else(|p| p.into_inner());
         native_jemalloc_start_purge_thread(0, 50);
         std::thread::sleep(Duration::from_millis(100));
         // Pause the thread
@@ -434,12 +530,12 @@ mod tests {
             before,
             "no purges when paused"
         );
-        // Resume
-        native_jemalloc_set_purge_interval(50);
+        // Leave parked (interval=0) — tests own purge state only under the lock.
     }
 
     #[test]
     fn background_purge_respects_threshold() {
+        let _guard = PURGE_STATE.lock().unwrap_or_else(|p| p.into_inner());
         // Set threshold to MAX — purge should never fire
         native_jemalloc_start_purge_thread(i64::MAX, 50);
         let before = native_jemalloc_get_purge_count();
@@ -449,7 +545,8 @@ mod tests {
             before,
             "no purge when below threshold"
         );
-        // Restore for other tests
+        // Leave the thread parked with a neutral threshold.
+        native_jemalloc_set_purge_interval(0);
         native_jemalloc_set_purge_threshold(0);
     }
 }

@@ -376,18 +376,18 @@ fn test_sender_send_error_path() {
     // channel is now closed.
     unsafe { df_close_local_session(session_ptr) };
 
-    // Attempting to send now fails — `send_blocking` reports "receiver
-    // dropped before send".
+    // Attempting to send now reports receiver-dropped — since #21922
+    // (reduce-input early termination) this is NOT an error but the
+    // early-termination signal rc=1 (SENDER_SEND_RECEIVER_DROPPED), so the
+    // Java side can latch a graceful stop (e.g. LIMIT satisfied) without
+    // tearing down the producer with an exception.
     let batch = i64_batch(&schema, &[1, 2, 3]);
     let (arr_ptr, sch_ptr) = export_batch_ptrs(batch);
     let rc = unsafe { df_sender_send(sender_ptr, arr_ptr, sch_ptr) };
-    assert!(rc < 0, "expected error, got rc={}", rc);
-
-    let msg = decode_error(rc);
-    assert!(
-        msg.contains("receiver dropped") || msg.contains("receiver"),
-        "unexpected error message: {}",
-        msg
+    assert_eq!(
+        rc, 1,
+        "expected SENDER_SEND_RECEIVER_DROPPED (1), got rc={}",
+        rc
     );
 
     unsafe { df_sender_close(sender_ptr) };
@@ -412,16 +412,16 @@ fn test_close_session_drops_registered_senders() {
     // Close the session. The surviving sender's mpsc is now orphaned.
     unsafe { df_close_local_session(session_ptr) };
 
-    // Subsequent `df_sender_send` on the still-live sender pointer fails.
+    // Subsequent `df_sender_send` on the still-live sender pointer reports
+    // receiver-dropped: rc=1 (SENDER_SEND_RECEIVER_DROPPED, the graceful
+    // early-termination signal since #21922), not an error.
     let batch_fail = i64_batch(&schema, &[20]);
     let (a1, s1) = export_batch_ptrs(batch_fail);
     let rc_err = unsafe { df_sender_send(sender_ptr, a1, s1) };
-    assert!(rc_err < 0, "post-close send should fail, got rc={}", rc_err);
-    let msg = decode_error(rc_err);
-    assert!(
-        msg.contains("receiver"),
-        "expected receiver-dropped error, got: {}",
-        msg
+    assert_eq!(
+        rc_err, 1,
+        "post-close send should signal SENDER_SEND_RECEIVER_DROPPED (1), got rc={}",
+        rc_err
     );
 
     unsafe { df_sender_close(sender_ptr) };
