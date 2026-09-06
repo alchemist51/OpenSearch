@@ -59,11 +59,13 @@ public class DerivedShardPollerTests extends OpenSearchTestCase {
         super.setUp();
         threadPool = new TestThreadPool(getTestName());
         tempDir = createTempDir("derived_poller_test");
+        DerivedCatchUpPressure.clearForTests();
     }
 
     @Override
     public void tearDown() throws Exception {
         terminate(threadPool);
+        DerivedCatchUpPressure.clearForTests();
         super.tearDown();
     }
 

@@ -56,6 +56,7 @@ import org.opensearch.index.engine.dataformat.merge.DataFormatAwareMergePolicy;
 import org.opensearch.index.engine.dataformat.merge.MergeFailedEngineException;
 import org.opensearch.index.engine.dataformat.merge.MergeHandler;
 import org.opensearch.index.engine.dataformat.merge.MergeScheduler;
+import org.opensearch.index.engine.derived.pull.DerivedCatchUpPressure;
 import org.opensearch.index.engine.dataformat.merge.OneMerge;
 import org.opensearch.index.engine.exec.CatalogSnapshotLifecycleListener;
 import org.opensearch.index.engine.exec.CombinedCatalogSnapshotDeletionPolicy;
@@ -230,6 +231,12 @@ public class DataFormatAwareEngine implements Indexer {
 
     // Merge
     private final MergeScheduler mergeScheduler;
+    /**
+     * Stable listener reference for {@link DerivedCatchUpPressure} add/remove
+     * pairing (defect #26): re-admits this engine's deferred merges when
+     * derived catch-up pressure releases node-wide.
+     */
+    private final Runnable catchUpPressureReleaseListener = this::triggerPossibleMerges;
 
     /**
      * When {@code true}, tiering-sensitive operations are blocked: primary index ops, merges,
@@ -533,6 +540,13 @@ public class DataFormatAwareEngine implements Indexer {
                     }
                 }
             }, shardId, engineConfig.getIndexSettings(), engineConfig.getThreadPool());
+
+            // Defect #26 re-admission for idle shards: when derived catch-up
+            // pressure releases, an idle engine (no future publication to
+            // re-trigger it) must still re-discover its deferred merge
+            // backlog. The listener is the existing property-gated trigger;
+            // deregistered in closeNoLock().
+            DerivedCatchUpPressure.addOnReleaseListener(catchUpPressureReleaseListener);
             success = true;
             logger.trace("created new DataFormatBasedEngine");
         } catch (IOException | TranslogCorruptedException e) {
@@ -2317,6 +2331,8 @@ public class DataFormatAwareEngine implements Indexer {
                 : "Either the write lock must be held or the engine must be currently failing";
             try {
                 this.versionMap.clear();
+                // Stop re-admission callbacks for this engine (defect #26)
+                DerivedCatchUpPressure.removeOnReleaseListener(catchUpPressureReleaseListener);
                 // Stop accepting new merges immediately
                 mergeScheduler.shutdown();
                 // Discard any pending segments not yet picked up by refresh

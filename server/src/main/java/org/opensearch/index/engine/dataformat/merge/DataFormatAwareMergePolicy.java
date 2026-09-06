@@ -21,6 +21,7 @@ import org.apache.lucene.util.Version;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.logging.Loggers;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.engine.derived.pull.DerivedCatchUpPressure;
 import org.opensearch.index.engine.exec.Segment;
 import org.opensearch.index.engine.exec.WriterFileSet;
 
@@ -216,6 +217,18 @@ public class DataFormatAwareMergePolicy implements MergeHandler.MergePolicy, Mer
     }
 
     private List<List<Segment>> eligible(List<List<Segment>> candidates) {
+        // Defect #26 — merges stall, derived builds never do. The native
+        // memory pool is node-global, so while ANY derived-pull shard is in
+        // sustained catch-up, admit no new merges for ANY data-format shard
+        // (source and derived alike; scheduled and force paths both land
+        // here). A rejected candidate is never registered and holds no claim;
+        // in-flight merges drain, freeing the pool for the starved build.
+        // Re-admission: publication triggers for busy shards, plus the
+        // pressure-release listener for idle ones.
+        if (candidates.isEmpty() == false && DerivedCatchUpPressure.isActive()) {
+            logger.debug("deferring {} merge candidate group(s): derived catch-up pressure active", candidates.size());
+            return List.of();
+        }
         return candidates.stream().filter(mergeEligibility).toList();
     }
 

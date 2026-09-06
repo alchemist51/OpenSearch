@@ -70,6 +70,12 @@ public final class DerivedShardPoller implements Runnable, Closeable {
     private static final long BACKOFF_BASE_MS = 1000L;
     private static final long BACKOFF_CAP_MS = 60_000L;
 
+    // ── Catch-up pressure (defect #26) ───────────────────────────────────
+    /** Guards {@link #catchUpPressureHeld} against the run()/close() race. */
+    private final Object pressureLock = new Object();
+    /** Whether this poller currently holds a node-wide catch-up claim. */
+    private boolean catchUpPressureHeld;
+
     // ── Cumulative stage metrics (thread-safe) ──────────────────────────
     private final AtomicLong roundCount = new AtomicLong();
     private final AtomicLong successCount = new AtomicLong();
@@ -177,16 +183,46 @@ public final class DerivedShardPoller implements Runnable, Closeable {
                     e.getClass().getSimpleName(),
                     e
                 );
+                // Defect #26: a failed round means lag remains and the build
+                // needs the pool. Hold catch-up pressure ACROSS the backoff —
+                // otherwise new merges are admitted during every retry gap and
+                // re-fill the pool before the build's next attempt (the
+                // observed catch-up livelock). In-flight merges drain.
+                holdCatchUpPressure();
                 schedule(TimeValue.timeValueMillis(backoffMs));
                 return; // skip the default schedule below
             }
         }
         // When a bounded round succeeded but lag remains, continue immediately
         // (yield between rounds but no interval wait). Otherwise normal cadence.
+        // Catch-up pressure transitions are decided inside pollRound() where
+        // every outcome is distinguishable (capped -> hold, build failure ->
+        // hold, caught-up / no-new-data -> release); the exception path above
+        // is the only transition owned here.
         if (lagRemains) {
             schedule(TimeValue.timeValueMillis(0));
         } else {
             schedule(interval);
+        }
+    }
+
+    /** Idempotently claim node-wide catch-up pressure for this poller. */
+    private void holdCatchUpPressure() {
+        synchronized (pressureLock) {
+            if (closed.get() == false && catchUpPressureHeld == false) {
+                catchUpPressureHeld = true;
+                DerivedCatchUpPressure.claim();
+            }
+        }
+    }
+
+    /** Idempotently release this poller's catch-up claim (round caught up, or close). */
+    private void releaseCatchUpPressure() {
+        synchronized (pressureLock) {
+            if (catchUpPressureHeld) {
+                catchUpPressureHeld = false;
+                DerivedCatchUpPressure.release();
+            }
         }
     }
 
@@ -229,9 +265,11 @@ public final class DerivedShardPoller implements Runnable, Closeable {
         DerivedSourceSnapshot snapshot = reader.fetchSnapshot(targetShard.routingEntry(), currentWatermark);
         statsBuilder.stage("fetch_snapshot", System.nanoTime() - t0);
         if (snapshot == null) {
+            releaseCatchUpPressure(); // caught up: no new data
             return false; // No new data
         }
         if (snapshot.watermark() <= currentWatermark) {
+            releaseCatchUpPressure(); // caught up: at or beyond source watermark
             return false; // Already at or beyond this watermark
         }
 
@@ -354,7 +392,19 @@ public final class DerivedShardPoller implements Runnable, Closeable {
                 roundStats
             );
             // Signal immediate continuation if the round was capped and lag remains
-            return capped && remainingLag > 0;
+            boolean lagRemains = capped && remainingLag > 0;
+            if (lagRemains) {
+                // Defect #26: sustained catch-up — defer new merge admission
+                // node-wide until this poller is caught up. Held across
+                // subsequent capped rounds and failures alike.
+                holdCatchUpPressure();
+            } else {
+                // Final round of the burst (or steady-state round): release so
+                // deferred merges re-admit. A steady-state poller whose rounds
+                // are never capped never holds pressure at all.
+                releaseCatchUpPressure();
+            }
+            return lagRemains;
         } else {
             long buildFailures = consecutiveFailures.incrementAndGet();
             long backoffMs = Math.min(BACKOFF_BASE_MS * (1L << Math.min(buildFailures - 1, 16)), BACKOFF_CAP_MS);
@@ -379,6 +429,9 @@ public final class DerivedShardPoller implements Runnable, Closeable {
                 result != null ? result.artifactId() : "null",
                 roundStats
             );
+            // Defect #26: a failed build means lag remains and the next
+            // attempt needs the pool — hold pressure across the retry.
+            holdCatchUpPressure();
             return false;
         }
     }
@@ -507,6 +560,9 @@ public final class DerivedShardPoller implements Runnable, Closeable {
     @Override
     public void close() throws IOException {
         if (closed.compareAndSet(false, true)) {
+            // Claims always resolve: a poller closed mid-catch-up (relocation,
+            // shutdown) must not strand node-wide pressure (defect #26).
+            releaseCatchUpPressure();
             try {
                 reader.close();
             } catch (IOException e) {
