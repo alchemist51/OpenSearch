@@ -85,12 +85,15 @@ fn fresh_resident_elevated(elevated_reading: i64) -> i64 {
 pub fn cached_resident_bytes() -> i64 {
     let cached = CACHED_RESIDENT.load(Ordering::Relaxed);
 
-    // If last known value was above spill threshold, bypass cache and read fresh
-    // — purging retained pages first (rate-limited), because an elevated reading
-    // may be phantom pages that decay will never return at idle (defect #27).
+    // If last known value was above spill threshold OF THE NODE NATIVE BUDGET,
+    // bypass cache and read fresh — purging retained pages first (rate-limited),
+    // because an elevated reading may be phantom pages that decay will never
+    // return at idle (defect #27). Thresholds share rss_gate_base() with the
+    // pool's protection gates (defect #28a): unset node limit = no gates, so
+    // no elevated path either.
     if cached > 0 {
         let spill_x1000 = EXECUTION_SPILL_X1000.load(Ordering::Relaxed);
-        let limit = pool_limit_for_guard();
+        let limit = rss_gate_base();
         if limit > 0 {
             let threshold = (limit as u64 * spill_x1000 / 1000) as i64;
             if cached >= threshold {
@@ -118,17 +121,19 @@ pub fn cached_resident_bytes() -> i64 {
     CACHED_RESIDENT.load(Ordering::Relaxed)
 }
 
-// Pool limit stored for the guard's threshold check. Set once from create_global_runtime.
-static POOL_LIMIT_FOR_GUARD: AtomicI64 = AtomicI64::new(0);
-
-/// Set the pool limit used by the cached RSS pressure check.
-/// Called once at runtime creation.
-pub fn set_pool_limit_for_guard(limit: i64) {
-    POOL_LIMIT_FOR_GUARD.store(limit, Ordering::Release);
-}
-
-fn pool_limit_for_guard() -> i64 {
-    POOL_LIMIT_FOR_GUARD.load(Ordering::Relaxed)
+/// Base for every resident-vs-threshold protection gate (defect #28a).
+///
+/// jemalloc resident is whole-process; the only sound denominator is the
+/// node-level native budget (`node.native_memory.limit`). Returns 0 when the
+/// node limit is unset — callers must treat 0 as "gates disabled" and rely on
+/// the pool's reservation accounting (CAS vs pool limit) plus the spill
+/// machinery, which are component-scoped by construction. Comparing global
+/// resident against a fraction of one pool's limit permanently latched MV
+/// builds shut (sort-completion starvation: spillable consumers exempted,
+/// then the sort's mandatory unspillable merge-back reservation rejected)
+/// once unrelated native baseline crossed the fraction.
+pub fn rss_gate_base() -> i64 {
+    native_bridge_common::allocator::node_native_limit_bytes()
 }
 
 // --- Thresholds ---
@@ -419,6 +424,24 @@ pub fn available_disk_space(_path: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// The functions under test consult `cached_resident_bytes()`, whose cache
+    /// starts cold (0) and only one CAS winner per 100ms window refreshes it —
+    /// concurrent test threads can read 0 while a fresh `resident_bytes()`
+    /// reads real memory (these tests were vacuous before jemalloc became the
+    /// test-mode global allocator). Warm until the cache holds a real value
+    /// and use THAT value for threshold arithmetic, so test preconditions and
+    /// the code under test see the same number.
+    fn warm_cached_resident() -> i64 {
+        for _ in 0..40 {
+            let r = cached_resident_bytes();
+            if r > 0 {
+                return r;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
+        panic!("cached resident never warmed — jemalloc must be the test global allocator");
+    }
+
     #[test]
     fn default_thresholds() {
         let t = MemoryThresholds::default();
@@ -506,10 +529,7 @@ mod tests {
         // A Rust test process typically uses 50-200MB RSS, so a 20MB limit
         // should always be exceeded.
         let small_pool = 20 * 1024 * 1024; // 20MB — above MIN_POOL_FOR_OVERRIDE
-        let resident = native_bridge_common::allocator::resident_bytes();
-        if resident <= 0 {
-            return; // jemalloc not available
-        }
+        let resident = warm_cached_resident();
         // Only assert if RSS is actually above 70% of 20MB = 14MB (which it will be)
         if resident as usize > small_pool * 70 / 100 {
             assert!(is_memory_pressured(small_pool));
@@ -558,10 +578,7 @@ mod tests {
         // process RSS should exceed 95% of 20MB = 19MB. A Rust test process
         // typically uses 50-200MB RSS.
         let small_pool = 20 * 1024 * 1024; // 20MB
-        let resident = native_bridge_common::allocator::resident_bytes();
-        if resident <= 0 {
-            return; // jemalloc not available in this test env
-        }
+        let resident = warm_cached_resident();
         // Only assert if RSS actually exceeds the critical threshold
         let critical_bytes = (small_pool as f64 * 0.95) as i64;
         if resident >= critical_bytes {
@@ -584,32 +601,35 @@ mod tests {
         // We can't precisely control RSS in a unit test, but we can verify
         // that the thresholds are read correctly by setting them and checking
         // behavior with known pool sizes.
-        let resident = native_bridge_common::allocator::resident_bytes();
-        if resident <= 0 {
-            return; // jemalloc not available in this test env
+        // Resident cannot be precisely controlled in a parallel unit-test
+        // process (neighbor tests allocate concurrently — resident only
+        // grows). Assert each side of the ordering with its own
+        // comfortably-margined base instead of one fragile midpoint:
+        // ~30% utilization (both overrides fire; resident would have to more
+        // than double mid-test to flip it) and ~200% utilization (neither
+        // fires; resident never shrinks mid-test).
+        let resident = warm_cached_resident() as usize;
+
+        let low_util_base = (resident as f64 / 0.30) as usize;
+        if low_util_base >= MIN_POOL_FOR_OVERRIDE {
+            assert!(
+                should_override(low_util_base, OverrideContext::Admission),
+                "at ~30% utilization the admission override (threshold 75%) must fire"
+            );
+            assert!(
+                should_override(low_util_base, OverrideContext::Execution),
+                "at ~30% utilization the spill override (threshold 85%) must fire"
+            );
         }
-        let resident = resident as usize;
 
-        // Set pool limit so that resident is exactly between 70% and 85%
-        // pool = resident / 0.77 (midpoint) → resident/pool ≈ 77%
-        let pool_at_midpoint = (resident as f64 / 0.77) as usize;
-        if pool_at_midpoint < MIN_POOL_FOR_OVERRIDE {
-            return;
-        }
-
-        // At 77% utilization: admission (75%) should NOT override, operator (85%) SHOULD override
-        let admission_result = should_override(pool_at_midpoint, OverrideContext::Admission);
-        let spill_result = should_override(pool_at_midpoint, OverrideContext::Execution);
-
-        // admission: resident (77%) >= threshold (70%) → NOT below → override = false
+        let high_util_base = std::cmp::max(resident / 2, MIN_POOL_FOR_OVERRIDE);
         assert!(
-            !admission_result,
-            "At 77% RSS, admission override should NOT fire (threshold 70%)"
+            !should_override(high_util_base, OverrideContext::Admission),
+            "at ~200% utilization the admission override must NOT fire"
         );
-        // operator: resident (77%) < threshold (85%) → below → override = true
         assert!(
-            spill_result,
-            "At 77% RSS, spill override SHOULD fire (threshold 85%)"
+            !should_override(high_util_base, OverrideContext::Execution),
+            "at ~200% utilization the spill override must NOT fire"
         );
     }
 }

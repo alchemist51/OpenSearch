@@ -182,6 +182,32 @@ static PURGE_COUNT: AtomicU64 = AtomicU64::new(0);
 static PURGE_STOP: AtomicBool = AtomicBool::new(false);
 static PURGE_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
 
+/// Node-level native memory budget (`node.native_memory.limit`), pushed from
+/// Java alongside the purge threshold. 0 = unset.
+///
+/// This is the ONLY correct base for resident-vs-threshold protection gates:
+/// jemalloc resident is a whole-process measurement (source-index parquet
+/// machinery, read caches, every native module), so comparing it against a
+/// fraction of one component's pool limit latches that component shut as soon
+/// as everyone else's legitimate baseline crosses the fraction — the
+/// OpenSearch parent real-memory breaker idiom is total-vs-total, never
+/// total-vs-component.
+static NODE_NATIVE_LIMIT_BYTES: AtomicI64 = AtomicI64::new(0);
+
+/// Returns the node-level native memory budget in bytes, or 0 when unset.
+pub fn node_native_limit_bytes() -> i64 {
+    NODE_NATIVE_LIMIT_BYTES.load(Ordering::Relaxed)
+}
+
+/// FFI: Pushes the raw `node.native_memory.limit` value (bytes; 0 = unset).
+/// Called from Java at startup and on dynamic setting updates, alongside the
+/// derived purge-threshold push. Negative values are treated as unset.
+#[no_mangle]
+pub extern "C" fn native_set_node_memory_limit(limit_bytes: i64) -> i64 {
+    NODE_NATIVE_LIMIT_BYTES.store(limit_bytes.max(0), Ordering::Relaxed);
+    0
+}
+
 fn start_purge_thread() -> &'static std::thread::Thread {
     PURGE_THREAD.get_or_init(|| {
         let handle = std::thread::Builder::new()

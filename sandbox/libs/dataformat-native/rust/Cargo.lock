@@ -2874,6 +2874,7 @@ dependencies = [
  "substrait",
  "tempfile",
  "thiserror 1.0.69",
+ "tikv-jemallocator",
  "tokio",
  "tokio-metrics",
  "tokio-stream",

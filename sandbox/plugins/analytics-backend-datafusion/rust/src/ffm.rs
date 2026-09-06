@@ -157,7 +157,6 @@ pub unsafe extern "C" fn df_create_global_runtime(
     spill_dir_len: i64,
     spill_limit: i64,
 ) -> i64 {
-    crate::memory_guard::set_pool_limit_for_guard(memory_pool_limit);
     let spill_dir = str_from_raw(spill_dir_ptr, spill_dir_len)
         .map_err(|e| format!("df_create_global_runtime: {}", e))?;
     api::create_global_runtime(memory_pool_limit, cache_manager_ptr, spill_dir, spill_limit)
@@ -212,7 +211,6 @@ pub unsafe extern "C" fn df_set_memory_pool_limit(runtime_ptr: i64, new_limit: i
     if runtime_ptr == 0 {
         return Err("null runtime pointer".to_string());
     }
-    crate::memory_guard::set_pool_limit_for_guard(new_limit);
     api::set_memory_pool_limit(runtime_ptr, new_limit)?;
     Ok(0)
 }

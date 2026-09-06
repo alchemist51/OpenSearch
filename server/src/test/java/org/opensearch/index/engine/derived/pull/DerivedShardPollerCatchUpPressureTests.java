@@ -248,4 +248,60 @@ public class DerivedShardPollerCatchUpPressureTests extends OpenSearchTestCase {
             poller.close();
         }
     }
+
+    /**
+     * Defect #28b: pressure that cannot make progress must not hold merges
+     * hostage. Builds failing repeatedly with merges already deferred are not
+     * starved BY merges — holding forever deadlocks (merges deferred -> native
+     * baseline stays high -> builds keep failing -> lag never drops ->
+     * pressure never releases). After the third consecutive failure the claim
+     * is released so TieredPolicy can consolidate (the observed self-heal
+     * mechanism of the pre-#26 runs).
+     */
+    public void testPressureReleasedAfterConsecutiveFailures() throws Exception {
+        AtomicReference<DerivedSourceSnapshot> snap = new AtomicReference<>(snapshot(100L));
+        DerivedPullFormat format = scriptedFormat(snap, build -> result(false, Map.of()));
+        DerivedShardPoller poller = new DerivedShardPoller(mockPrimaryShard(), format, TimeValue.timeValueSeconds(30), noopThreadPool, -1L);
+        try {
+            poller.run();
+            assertTrue("failure 1 must hold pressure across the retry", DerivedCatchUpPressure.isActive());
+            poller.run();
+            assertTrue("failure 2 must still hold pressure", DerivedCatchUpPressure.isActive());
+            poller.run();
+            assertFalse(
+                "failure 3 must RELEASE pressure — a build that is not succeeding with merges "
+                    + "already deferred must not hold them hostage (defect #28b escape valve)",
+                DerivedCatchUpPressure.isActive()
+            );
+            poller.run();
+            assertFalse("further failures must not re-claim", DerivedCatchUpPressure.isActive());
+        } finally {
+            poller.close();
+        }
+    }
+
+    /**
+     * Defect #28b: the valve re-arms automatically. A successful capped round
+     * resets the failure streak and re-claims pressure for the ongoing
+     * catch-up burst.
+     */
+    public void testPressureReArmsOnSuccessAfterFailureRelease() throws Exception {
+        AtomicReference<DerivedSourceSnapshot> snap = new AtomicReference<>(snapshot(100L));
+        // builds 1-3: fail (valve releases at 3) — build 4: capped success (re-arm)
+        DerivedPullFormat format = scriptedFormat(
+            snap,
+            build -> build <= 3 ? result(false, Map.of()) : result(true, Map.of("capped", true, "capped_watermark", 50L))
+        );
+        DerivedShardPoller poller = new DerivedShardPoller(mockPrimaryShard(), format, TimeValue.timeValueSeconds(30), noopThreadPool, -1L);
+        try {
+            poller.run();
+            poller.run();
+            poller.run();
+            assertFalse("valve must have released after 3 consecutive failures", DerivedCatchUpPressure.isActive());
+            poller.run(); // capped success: failure streak resets, catch-up continues
+            assertTrue("a capped success after the valve released must re-arm pressure", DerivedCatchUpPressure.isActive());
+        } finally {
+            poller.close();
+        }
+    }
 }

@@ -97,6 +97,7 @@ base64 = "0.22"
 
 [dev-dependencies]
 criterion = { workspace = true }
+tikv-jemallocator = { workspace = true }
 tempfile = { workspace = true }
 rand = "=0.8.6"
 proptest = { workspace = true }

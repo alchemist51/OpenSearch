@@ -11,6 +11,15 @@
 //! The bridge-agnostic API lives in [`api`]. The FFM bridge (`ffm.rs`) exports
 //! `extern "C"` functions for JDK FFM.
 
+// Production links through the umbrella crate (dataformat-native/rust/lib),
+// whose #[global_allocator] is jemalloc. Unit tests of THIS crate must run on
+// the same allocator or every resident-based code path (memory_guard gates,
+// purge machinery) silently reads ~0 from jemalloc stats and the tests
+// vacuously skip — which is exactly how the defect #28a gate tests never ran.
+#[cfg(test)]
+#[global_allocator]
+static TEST_GLOBAL_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// Column name for the shard-global row identifier used by Query-Then-Fetch.
 /// Stored as Int64 in parquet, computed from position in the indexed path.
 ///

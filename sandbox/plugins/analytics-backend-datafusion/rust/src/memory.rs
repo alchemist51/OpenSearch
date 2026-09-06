@@ -209,11 +209,22 @@ impl MemoryPool for DynamicLimitPool {
         // budget is only counted after the allocation actually succeeds below.
         let mut exempted = false;
         let limit = self.dynamic_limit.load(Ordering::Acquire);
+        // Defect #28a: resident is a WHOLE-PROCESS measurement, so the gate
+        // thresholds must derive from the node-level native budget
+        // (node.native_memory.limit), never from this pool's own limit —
+        // otherwise unrelated native baseline (source parquet machinery, read
+        // caches) crossing a fraction of ONE pool's limit permanently rejects
+        // that pool's unspillable reservations (sort-completion starvation:
+        // observed as an MV build livelock at total idle). Unset node limit
+        // (gate_base == 0) disables the resident gates; the reservation CAS
+        // below and the spill machinery remain the component-scoped bound —
+        // the parent-breaker idiom: total-vs-total, component-vs-component.
+        let gate_base = crate::memory_guard::rss_gate_base();
         let resident = crate::memory_guard::cached_resident_bytes();
-        if resident > 0 && limit >= 16 * 1024 * 1024 {
+        if resident > 0 && gate_base >= 16 * 1024 * 1024 {
             let thresholds = crate::memory_guard::get_thresholds();
-            let critical_bytes = (limit as f64 * thresholds.execution_critical) as usize;
-            let spill_bytes = (limit as f64 * thresholds.execution_spill) as usize;
+            let critical_bytes = (gate_base as f64 * thresholds.execution_critical) as usize;
+            let spill_bytes = (gate_base as f64 * thresholds.execution_spill) as usize;
             let resident_usize = resident as usize;
 
             // Critical (95%): hard reject — OOM imminent, protect the node.
@@ -289,7 +300,7 @@ impl MemoryPool for DynamicLimitPool {
         // Only attempt override if the allocation is plausible (won't overflow).
         if used.checked_add(additional).is_some() {
             if crate::memory_guard::should_override(
-                limit,
+                gate_base as usize,
                 crate::memory_guard::OverrideContext::Execution,
             ) {
                 // jemalloc confirms headroom — allow the grow
@@ -308,7 +319,8 @@ impl MemoryPool for DynamicLimitPool {
 
         // Both pool and jemalloc confirm pressure. Check if RSS is critical —
         // if so, cancel the query rather than spilling (spill can't help at 95%+).
-        if crate::memory_guard::should_cancel_query(limit) {
+        // Same node-budget base as the pre-CAS gates (defect #28a); unset → never.
+        if crate::memory_guard::should_cancel_query(gate_base as usize) {
             native_bridge_common::log_info!(
                 "Memory CANCEL: RSS exceeds critical threshold for consumer [{}]. Cancelling query to protect node.",
                 reservation.consumer().name()
@@ -571,38 +583,6 @@ mod tests {
         assert_eq!(pool.reserved(), 100_000);
     }
 
-    #[test]
-    fn test_hard_guard_rejects_when_rss_exceeds_critical() {
-        // Create a pool with a limit smaller than the current process RSS.
-        // A Rust test process typically uses 50-200MB RSS, so 20MB should
-        // always trigger the hard guard (RSS > 95% of 20MB = 19MB).
-        let (pool, handle) = new_pool(20 * 1024 * 1024); // 20MB
-
-        let resident = crate::memory_guard::cached_resident_bytes();
-        if resident <= 0 {
-            return; // jemalloc not available in this test env
-        }
-
-        let critical_bytes = (20.0 * 1024.0 * 1024.0 * 0.95) as i64;
-        if resident < critical_bytes {
-            return; // RSS unexpectedly low — skip rather than false-fail
-        }
-
-        let consumer = MemoryConsumer::new("hard_guard_test");
-        let mut reservation = consumer.register(&pool);
-
-        // The hard guard fires before the CAS — even a tiny grow should be rejected
-        let result = reservation.try_grow(1024);
-        assert!(
-            result.is_err(),
-            "try_grow should fail when RSS ({}) exceeds critical threshold (95% of 20MB)",
-            resident
-        );
-        assert!(
-            handle.tripped_count() >= 1,
-            "tripped_count should increment on hard guard rejection"
-        );
-    }
 
     #[test]
     fn test_hard_guard_passes_when_rss_below_critical() {

@@ -126,6 +126,9 @@ public class NativeBridgeModule extends Plugin {
         this.currentNativeLimitBytes = ResourceTrackerSettings.NODE_NATIVE_MEMORY_LIMIT_SETTING.get(settings).getBytes();
         this.currentThresholdPercent = JEMALLOC_PURGE_THRESHOLD_PERCENT.get(settings);
         NativeArenaPurger.init(computeThresholdBytes(), JEMALLOC_PURGE_INTERVAL.get(settings).millis());
+        // Push the raw node budget too — the base for the native pools'
+        // resident-vs-threshold protection gates (defect #28a).
+        NativeArenaPurger.setNodeMemoryLimitBytes(currentNativeLimitBytes);
 
         // Register the heap profiler MBean first — this is pure Java and always works
         java.util.List<String> allowedDirs = new java.util.ArrayList<>();
@@ -160,6 +163,7 @@ public class NativeBridgeModule extends Plugin {
                 .addSettingsUpdateConsumer(ResourceTrackerSettings.NODE_NATIVE_MEMORY_LIMIT_SETTING, limitValue -> {
                     this.currentNativeLimitBytes = limitValue.getBytes();
                     NativeArenaPurger.setThresholdBytes(computeThresholdBytes());
+                    NativeArenaPurger.setNodeMemoryLimitBytes(currentNativeLimitBytes);
                 });
         } catch (Throwable t) {
             logger.warn("Native allocator config unavailable — native library may not be loaded", t);

@@ -44,6 +44,7 @@ public final class NativeArenaPurger {
     private static final MethodHandle SET_THRESHOLD;
     private static final MethodHandle SET_INTERVAL;
     private static final MethodHandle GET_PURGE_COUNT;
+    private static final MethodHandle SET_NODE_LIMIT;
 
     static {
         SymbolLookup lookup = NativeLibraryLoader.symbolLookup();
@@ -58,6 +59,7 @@ public final class NativeArenaPurger {
         SET_THRESHOLD = linker.downcallHandle(lookup.find("native_jemalloc_set_purge_threshold").orElseThrow(), longToLong);
         SET_INTERVAL = linker.downcallHandle(lookup.find("native_jemalloc_set_purge_interval").orElseThrow(), longToLong);
         GET_PURGE_COUNT = linker.downcallHandle(lookup.find("native_jemalloc_get_purge_count").orElseThrow(), voidToLong);
+        SET_NODE_LIMIT = linker.downcallHandle(lookup.find("native_set_node_memory_limit").orElseThrow(), longToLong);
     }
 
     private NativeArenaPurger() {}
@@ -91,6 +93,27 @@ public final class NativeArenaPurger {
             logger.info("jemalloc purge threshold updated to {} MB", bytes / (1024 * 1024));
         } catch (Throwable t) {
             logger.warn("Failed to set purge threshold", t);
+        }
+    }
+
+    /**
+     * Pushes the raw {@code node.native_memory.limit} value (bytes; 0 = unset)
+     * to the native layer. This is the base for every resident-vs-threshold
+     * protection gate (spill / critical / cancel) in the native memory pools:
+     * jemalloc resident is a whole-process measurement, so gates must compare
+     * it against the node-level budget — never a single pool's limit (defect
+     * #28a). When unset the resident gates are disabled and pools enforce
+     * their limits purely via reservation accounting.
+     */
+    public static void setNodeMemoryLimitBytes(long bytes) {
+        try {
+            long rc = (long) SET_NODE_LIMIT.invokeExact(bytes);
+            if (rc != 0) {
+                logger.warn("native_set_node_memory_limit returned {}", rc);
+            }
+            logger.info("node native memory limit pushed to native layer: {} MB", bytes / (1024 * 1024));
+        } catch (Throwable t) {
+            logger.warn("Failed to set node native memory limit", t);
         }
     }
 

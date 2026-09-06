@@ -69,6 +69,15 @@ public final class DerivedShardPoller implements Runnable, Closeable {
     /** Backoff: 1s base, x2 per consecutive failure, cap 60s, reset on success. */
     private static final long BACKOFF_BASE_MS = 1000L;
     private static final long BACKOFF_CAP_MS = 60_000L;
+    /**
+     * Defect #28b: consecutive-failure count at which held catch-up pressure is
+     * released instead of held. A build failing repeatedly with merges already
+     * deferred is not starved by merges — holding pressure forever deadlocks
+     * (merges deferred -> baseline stays high -> builds keep failing -> lag
+     * never drops -> pressure never releases). Three failures ≈ 3-7s of
+     * backoff, long past any in-flight merge draining.
+     */
+    private static final long CATCH_UP_PRESSURE_RELEASE_FAILURES = 3L;
 
     // ── Catch-up pressure (defect #26) ───────────────────────────────────
     /** Guards {@link #catchUpPressureHeld} against the run()/close() race. */
@@ -188,7 +197,20 @@ public final class DerivedShardPoller implements Runnable, Closeable {
                 // otherwise new merges are admitted during every retry gap and
                 // re-fill the pool before the build's next attempt (the
                 // observed catch-up livelock). In-flight merges drain.
-                holdCatchUpPressure();
+                //
+                // Defect #28b escape valve: pressure that cannot make progress
+                // must not hold merges hostage. After K consecutive failures
+                // the build is demonstrably not succeeding with merges already
+                // deferred — deferral is not what it needs, and consolidation
+                // may be (fewer, larger inputs shrink the native baseline and
+                // the next round's scan footprint; the observed self-heal
+                // mechanism of the pre-#26 runs). Release; a later successful
+                // round with lag remaining re-arms pressure automatically.
+                if (failures >= CATCH_UP_PRESSURE_RELEASE_FAILURES) {
+                    releaseCatchUpPressure();
+                } else {
+                    holdCatchUpPressure();
+                }
                 schedule(TimeValue.timeValueMillis(backoffMs));
                 return; // skip the default schedule below
             }
@@ -431,7 +453,13 @@ public final class DerivedShardPoller implements Runnable, Closeable {
             );
             // Defect #26: a failed build means lag remains and the next
             // attempt needs the pool — hold pressure across the retry.
-            holdCatchUpPressure();
+            // Defect #28b escape valve: after K consecutive failures, release
+            // instead (see the exception path above for rationale).
+            if (buildFailures >= CATCH_UP_PRESSURE_RELEASE_FAILURES) {
+                releaseCatchUpPressure();
+            } else {
+                holdCatchUpPressure();
+            }
             return false;
         }
     }
