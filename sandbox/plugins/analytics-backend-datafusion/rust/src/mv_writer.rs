@@ -370,10 +370,30 @@ pub fn mv_search_v2(state_files: &[String], select_final_sql: &str) -> Result<St
             .await
             .map_err(|e| format!("register {f}: {e}"))?;
         }
-        let union_sql = (0..state_files.len())
-            .map(|i| format!("SELECT * FROM mv_{i}"))
-            .collect::<Vec<_>>()
-            .join(" UNION ALL ");
+        // Merged generations carry the stock merge's appended row-id remap
+        // column (`__row_id__`) while fresh build generations do not, so a
+        // positional `SELECT *` union across generations is heterogeneous.
+        // Mirror the production read path (which projects state columns by
+        // NAME): project each file's schema minus the row-id column.
+        let mut selects: Vec<String> = Vec::with_capacity(state_files.len());
+        for i in 0..state_files.len() {
+            let table = ctx
+                .table(&format!("mv_{i}"))
+                .await
+                .map_err(|e| format!("table mv_{i}: {e}"))?;
+            let cols: Vec<String> = table
+                .schema()
+                .fields()
+                .iter()
+                .filter(|f| f.name() != "__row_id__")
+                .map(|f| format!("\"{}\"", f.name()))
+                .collect();
+            if cols.is_empty() {
+                return Err(format!("mv_search_v2: state file '{}' has no state columns", state_files[i]));
+            }
+            selects.push(format!("SELECT {} FROM mv_{i}", cols.join(", ")));
+        }
+        let union_sql = selects.join(" UNION ALL ");
         let sql = select_final_sql.replace("__MV_STATES__", &format!("({union_sql})"));
         let df = ctx
             .sql(&sql)

@@ -39,7 +39,7 @@ import java.util.regex.Pattern;
  * state schema, no target index — and the system derives the source's MV
  * settings ({@link MVViewsService.Provider}), auto-creates the colocated
  * target with the state mapping + single hidden provenance field
- * ({@link MVViewsService.TargetCreator}), and the ship/fold pipeline runs
+ * ({@link MVViewsService.TargetCreator}), and the pull/fold pipeline runs
  * exactly as if both indices had been created by hand.
  */
 @ThreadLeakFilters(filters = MVViewsIT.NativeThreadFilter.class)
@@ -56,11 +56,16 @@ public class MVViewsIT extends OpenSearchIntegTestCase {
     }
 
     private static final String SOURCE = "payments";
+    private static final String REPO = "mv-views-repo";
+    private java.nio.file.Path repoPath;
     /** Generated name: {@code <source>_mv_<definition>} (decision 23, unnamed view). */
     private static final String GENERATED_TARGET = "payments_mv_payments";
 
     @Override
     protected Settings nodeSettings(int nodeOrdinal) {
+        if (repoPath == null) {
+            repoPath = randomRepoPath().toAbsolutePath();
+        }
         return Settings.builder()
             .put(super.nodeSettings(nodeOrdinal))
             .put(FeatureFlags.PLUGGABLE_DATAFORMAT_EXPERIMENTAL_FLAG, true)
@@ -69,6 +74,9 @@ public class MVViewsIT extends OpenSearchIntegTestCase {
             // write pool with the target's apply (same-pool deadlock — see
             // MVSeparateIndexPocIT's note).
             .put(OpenSearchExecutors.NODE_PROCESSORS_SETTING.getKey(), 2)
+            // The pull protocol reads sealed source generations from the
+            // source's remote segment store — same fixture as the pull ITs.
+            .put(remoteStoreClusterSettings(REPO, repoPath))
             .build();
     }
 
@@ -103,14 +111,19 @@ public class MVViewsIT extends OpenSearchIntegTestCase {
             .get();
         ensureGreen(SOURCE);
 
-        // Provider must have derived the composite+MV source settings.
+        // Provider must have derived the pull-only composite source settings.
         Settings sourceSettings = client().admin().indices().prepareGetSettings(SOURCE).get().getIndexToSettings().get(SOURCE);
         assertEquals("composite", sourceSettings.get("index.pluggable.dataformat"));
-        assertTrue(
-            "materialized_view must be derived into the formats",
-            sourceSettings.getAsList("index.composite.secondary_data_formats").contains("materialized_view")
+        assertEquals("parquet", sourceSettings.get("index.composite.primary_data_format"));
+        assertEquals(
+            "pull-only source stores parquet+lucene; no MV format participates on the source",
+            java.util.List.of("lucene"),
+            sourceSettings.getAsList("index.composite.secondary_data_formats")
         );
-        assertEquals(java.util.List.of(GENERATED_TARGET), sourceSettings.getAsList(MVConstants.SHIP_TARGETS_SETTING));
+        assertTrue(
+            "pull-only source must not declare legacy ship targets",
+            sourceSettings.getAsList("index.mv.ship_targets").isEmpty()
+        );
 
         // Target must be auto-created (cluster-manager listener) — with the
         // derived state mapping and colocation.
@@ -144,23 +157,27 @@ public class MVViewsIT extends OpenSearchIntegTestCase {
         assertTrue("single hidden provenance field (decision 21)", properties.containsKey("_mv_source_generation"));
         assertFalse("dropped provenance fields must be gone", properties.containsKey("_mv_source_index"));
 
-        // And the pipeline actually runs: ingest -> refresh -> state shipped
-        // to the AUTO-CREATED target with a searchable apply ack. (The
-        // composite target has no classic _search path; the ship-ack log is
-        // the same proof the main POC IT uses.)
-        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger("org.opensearch.mv.MVStateShipper"))) {
+        // And the pipeline actually runs: ingest -> refresh -> the target's
+        // poller pulls, folds, and PUBLISHES a state generation. The publish
+        // INFO log is the pull-path proof (the ship path no longer exists);
+        // publication is asynchronous (poller interval), so wait for it.
+        try (
+            MockLogAppender appender = MockLogAppender.createForLoggers(
+                LogManager.getLogger("org.opensearch.mv.pull.MVDerivedArtifactBuilder")
+            )
+        ) {
             appender.addExpectation(
                 new MockLogAppender.SeenEventExpectation(
-                    "state shipped to the auto-created target",
-                    "org.opensearch.mv.MVStateShipper",
+                    "state generation published on the auto-created target",
+                    "org.opensearch.mv.pull.MVDerivedArtifactBuilder",
                     Level.INFO,
-                    "*-> [" + GENERATED_TARGET + "][0] (acked searchable)*"
+                    "*mv_pull published generation=*"
                 )
             );
             client().prepareIndex(SOURCE).setSource("service", "api", "status", "200", "latency_ms", 30).get();
             client().prepareIndex(SOURCE).setSource("service", "api", "status", "200", "latency_ms", 70).get();
             client().admin().indices().prepareRefresh(SOURCE).get();
-            appender.assertAllExpectationsMatched();
+            assertBusy(appender::assertAllExpectationsMatched, 30, java.util.concurrent.TimeUnit.SECONDS);
         }
     }
 }

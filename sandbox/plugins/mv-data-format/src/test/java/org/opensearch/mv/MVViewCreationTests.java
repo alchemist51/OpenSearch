@@ -40,7 +40,7 @@ public class MVViewCreationTests extends OpenSearchTestCase {
         assertEquals("composite", s.get("index.pluggable.dataformat"));
         assertEquals("parquet", s.get("index.composite.primary_data_format"));
         assertEquals(List.of("lucene"), s.getAsList("index.composite.secondary_data_formats"));
-        assertEquals(MVDataFormat.NAME, s.get(DerivedIndexBinding.KEY_DATA_FORMAT));
+        assertEquals(MVConstants.DERIVED_CATEGORY, s.get(DerivedIndexBinding.KEY_DATA_FORMAT));
         assertEquals("clickbench", s.get(MVConstants.COLOCATE_WITH_SETTING));
         assertEquals(descriptorJson, s.get(MVConstants.DESCRIPTOR_SETTING));
         // state_fields == compiled state column names (the durable Arrow<->mapping bridge)

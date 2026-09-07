@@ -13,7 +13,7 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.derived.pull.spi.DerivedArtifactBuilder;
 import org.opensearch.index.engine.derived.pull.spi.DerivedPullFormat;
 import org.opensearch.index.engine.derived.pull.spi.DerivedSourceReader;
-import org.opensearch.mv.MVDataFormat;
+import org.opensearch.mv.MVConstants;
 
 /**
  * MV-specific implementation of the generic {@link DerivedPullFormat} SPI.
@@ -26,13 +26,11 @@ import org.opensearch.mv.MVDataFormat;
  *
  * <p>The format ID is the DERIVED DATA-FORMAT CATEGORY
  * {@code materialized_view} — the value the target index declares in the
- * canonical {@code index.derived.data_format} setting. The physical state
- * artifact ({@code mv_state}) is resolved separately through the
- * {@code DataFormatRegistry} and is never listed in the target's
- * {@code index.composite.secondary_data_formats}. The target's primary format
- * remains {@code parquet} (which provides field capabilities such as
- * COLUMNAR_STORAGE for {@code _doc_count}); {@code lucene} may remain an
- * ordinary secondary.</p>
+ * canonical {@code index.derived.data_format} setting. The category is pure
+ * control-plane routing: there is NO physical MV data format. State
+ * artifacts are stock parquet generations owned by the target's composite
+ * primary ({@code parquet}); {@code lucene} may remain an ordinary
+ * secondary.</p>
  */
 public final class MVDerivedPullFormat implements DerivedPullFormat {
 
@@ -46,9 +44,9 @@ public final class MVDerivedPullFormat implements DerivedPullFormat {
     public String formatId() {
         // The derived category (== index.derived.data_format on the target).
         // NodeDerivedPullService keys its registry and resolves eligibility by
-        // this value. It is NOT the physical state-artifact format name
-        // (mv_state) — that is resolved via the DataFormatRegistry.
-        return MVDataFormat.NAME; // "materialized_view"
+        // this value. It is routing only — the physical state artifact is a
+        // stock parquet file owned by the target's composite primary.
+        return MVConstants.DERIVED_CATEGORY;
     }
 
     @Override

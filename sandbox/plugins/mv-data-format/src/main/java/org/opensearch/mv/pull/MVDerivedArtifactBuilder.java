@@ -25,7 +25,6 @@ import org.opensearch.mv.MVCompiledDefinition;
 import org.opensearch.mv.MVConstants;
 import org.opensearch.mv.MVDefinitionResolver;
 import org.opensearch.mv.MVGroupByOrdering;
-import org.opensearch.mv.MVStateDataFormat;
 
 import java.io.IOException;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -416,7 +415,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             // Publish (commit artifact to shard metadata)
             long tPublish = System.nanoTime();
             shard.publishDerivedArtifact(
-                MVStateDataFormat.INSTANCE,
+                MVConstants.STATE_ARTIFACT_FORMAT,
                 artifact.fileSet(),
                 Map.of(MVWatermark.key(shard.shardId().id()), next.encode())
             );
@@ -494,9 +493,12 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         Path outputRoot,
         long writerGeneration
     ) throws IOException {
-        Path formatDirectory = outputRoot.resolve(MVStateDataFormat.NAME);
+        // State artifacts are STOCK PARQUET files owned by the target's
+        // composite primary: same directory, checksum strategy, catalog
+        // keying, and upload path as any parquet generation.
+        Path formatDirectory = outputRoot.resolve(MVConstants.STATE_ARTIFACT_FORMAT);
         Files.createDirectories(formatDirectory);
-        String fileName = MVConstants.mvFileName(writerGeneration);
+        String fileName = MVConstants.stateFileName(writerGeneration);
         Path completed = formatDirectory.resolve(fileName);
         Path temporary = formatDirectory.resolve(fileName + ".tmp-" + UUID.randomUUID());
 

@@ -45,7 +45,7 @@ public class MVGetViewActionTests extends OpenSearchTestCase {
         String json = toJson(resp);
         assertTrue(json.contains("\"found\":true"));
         assertTrue(json.contains("\"source_index\":\"clickbench\""));
-        assertTrue(json.contains("\"data_format\":\"" + MVDataFormat.NAME + "\""));
+        assertTrue(json.contains("\"data_format\":\"" + MVConstants.DERIVED_CATEGORY + "\""));
         assertTrue(json.contains("\"descriptor_present\":true"));
         assertTrue(json.contains("\"definition\":\"descriptor\""));
         assertTrue(json.contains("\"group_keys\""));

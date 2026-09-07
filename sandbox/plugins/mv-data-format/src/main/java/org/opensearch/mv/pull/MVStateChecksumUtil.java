@@ -13,7 +13,7 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.store.FileMetadata;
 import org.opensearch.index.store.FormatChecksumStrategy;
-import org.opensearch.mv.MVStateDataFormat;
+import org.opensearch.mv.MVConstants;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -51,11 +51,12 @@ final class MVStateChecksumUtil {
      * @return the computed CRC32, or -1 if registration failed (non-fatal)
      */
     static long computeAndRegister(Path completedFile, String fileName, long writerGeneration, IndexShard shard) {
-        FormatChecksumStrategy strategy = shard.getChecksumStrategies().get(MVStateDataFormat.NAME);
+        FormatChecksumStrategy strategy = shard.getChecksumStrategies().get(MVConstants.STATE_ARTIFACT_FORMAT);
         if (strategy == null) {
-            // Strategy not registered (should not happen after the plugin fix,
-            // but fail-open — the generic fallback will still work, just O(n)).
-            logger.warn("CHECKSUM_REGISTER_SKIP file=[{}] reason=no_strategy_for_mv_state", fileName);
+            // Strategy not registered (should not happen — parquet registers a
+            // PrecomputedChecksumStrategy), but fail-open: the generic fallback
+            // will still work, just O(n).
+            logger.warn("CHECKSUM_REGISTER_SKIP file=[{}] reason=no_strategy_for_parquet", fileName);
             MVBuildMetrics.INSTANCE.recordChecksumMiss();
             return -1;
         }
@@ -70,7 +71,7 @@ final class MVStateChecksumUtil {
         }
 
         // Register with the FileMetadata overload so the strategy owns key derivation.
-        FileMetadata fm = new FileMetadata(MVStateDataFormat.NAME, fileName);
+        FileMetadata fm = new FileMetadata(MVConstants.STATE_ARTIFACT_FORMAT, fileName);
         strategy.registerChecksum(fm, checksum, writerGeneration);
 
         logger.debug(

@@ -24,13 +24,13 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.composite.CompositeDataFormatPlugin;
+import org.opensearch.mv.MVConstants;
 import org.opensearch.mv.AggregateSpec;
 import org.opensearch.mv.GroupKey;
 import org.opensearch.mv.MVCompiledDefinition;
 import org.opensearch.mv.MVCreateViewAction;
 import org.opensearch.mv.MVCreateViewRequest;
 import org.opensearch.mv.MVCreateViewResponse;
-import org.opensearch.mv.MVDataFormat;
 import org.opensearch.mv.MVDataFormatPlugin;
 import org.opensearch.mv.MVDefinitionDescriptor;
 import org.opensearch.mv.MVDefinitionDescriptor.AggregateDescriptor;
@@ -38,7 +38,6 @@ import org.opensearch.mv.MVDefinitionDescriptor.GroupKeyDescriptor;
 import org.opensearch.mv.MVDefinitionResolver;
 import org.opensearch.mv.MVDefinitionValidator;
 import org.opensearch.mv.MVNativeBridge;
-import org.opensearch.mv.MVStateDataFormat;
 import org.opensearch.mv.MVValidateAction;
 import org.opensearch.mv.MVValidateRequest;
 import org.opensearch.mv.MVValidateResponse;
@@ -654,10 +653,13 @@ public class MVDynamicDefinitionIT extends OpenSearchIntegTestCase {
                         .put("index.composite.primary_data_format", "parquet")
                         .putList("index.composite.secondary_data_formats", "lucene")
                         .put("index.derived.enabled", true)
-                        .put(DerivedIndexBinding.KEY_DATA_FORMAT, MVDataFormat.NAME)
-                        .put("index.mv.definition", "pull_count_sum")
+                        .put(DerivedIndexBinding.KEY_DATA_FORMAT, MVConstants.DERIVED_CATEGORY)
                         .putList("index.mv.state_fields", "RegionID", "cnt", "adv")
-                        .put("index.mv.state_merge_enabled", true)
+                        // GROUP BY ordering contract declared as the standard index
+                        // sort (read-side contract metadata; merges stay vetoed).
+                        .putList("index.sort.field", "RegionID")
+                        .putList("index.sort.order", "asc")
+                        .putList("index.sort.missing", "_first")
                         .put(MVPullSettings.PULL_INTERVAL.getKey(), "100ms")
                         .put(DerivedIndexBinding.KEY_SOURCE_NAME, source)
                         .put(DerivedIndexBinding.KEY_DEFINITION_ID, "pull_count_sum")
@@ -852,7 +854,7 @@ public class MVDynamicDefinitionIT extends OpenSearchIntegTestCase {
                 .getCatalogSnapshot()
         ) {
             List<String> files = ref.get()
-                .getSearchableFiles(MVStateDataFormat.NAME)
+                .getSearchableFiles(MVConstants.STATE_ARTIFACT_FORMAT)
                 .stream()
                 .flatMap(fileSet -> fileSet.files().stream().map(file -> Path.of(fileSet.directory()).resolve(file).toString()))
                 .sorted()

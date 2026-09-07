@@ -741,7 +741,7 @@ public class CatalogSnapshotManager implements Closeable {
      * policy's commit doc-count (CombinedCatalogSnapshotDeletionPolicy).
      * TODO: replace the name set with DataFormat.exemptFromRowParity().
      */
-    public static final java.util.Set<String> ROW_PARITY_EXEMPT_FORMATS = java.util.Set.of("materialized_view", "mv_state");
+    public static final java.util.Set<String> ROW_PARITY_EXEMPT_FORMATS = java.util.Set.of();
 
     private void verifyPerSegmentCrossFormatRowCountParity(List<Segment> segments) {
         for (Segment seg : segments) {

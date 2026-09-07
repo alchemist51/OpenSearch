@@ -29,44 +29,31 @@ public final class MVConstants {
 
     private MVConstants() {}
 
-    /** Directory name under the shard data path; also the format name. */
-    public static final String DIR = MVDataFormat.NAME;
+    /**
+     * The DERIVED DATA-FORMAT CATEGORY value an MV target declares in
+     * {@code index.derived.data_format}. This is pure control-plane ROUTING:
+     * it keys pull-service eligibility ({@code DerivedPullFormat#formatId()})
+     * and the analytics MV-serving dispatch. It is NOT a physical data format —
+     * MV state artifacts are stock {@link #STATE_ARTIFACT_FORMAT} files owned
+     * by the target's composite primary.
+     */
+    public static final String DERIVED_CATEGORY = "materialized_view";
 
     /**
-     * Source index setting listing the target MV indices; non-empty enables the
-     * ship path. Multiple targets share ONE finalized state batch via
-     * {@link MVRefCountedStateBatch} — the flush commits only when EVERY
-     * target has acked (the invariant holds per target).
+     * The physical format that owns MV state artifacts: the target's composite
+     * PRIMARY format. State generations are plain parquet files living in the
+     * shard's parquet directory, cataloged/checksummed/uploaded by the stock
+     * machinery — nothing MV-specific below the publish call.
      */
-    public static final String SHIP_TARGETS_SETTING = "index.mv.ship_targets";
+    public static final String STATE_ARTIFACT_FORMAT = "parquet";
 
     /**
      * User-facing MV declaration (decisions 20/22/23): list of
      * {@code definition} or {@code definition:targetName} entries on the
-     * SOURCE index. Everything else (formats, ship targets, the target index
-     * itself) is derived — see {@link MVViewsService}.
+     * SOURCE index. Everything else (formats, the target index itself) is
+     * derived — see {@link MVViewsService}.
      */
     public static final String VIEWS_SETTING = "index.mv.views";
-
-    /**
-     * @deprecated Retained for backwards-compatible settings parsing only. MV
-     *             search serving is now dispatched through the canonical
-     *             DERIVED DATA-FORMAT CATEGORY ({@code index.derived.data_format})
-     *             resolved against the {@code DataFormatRegistry}, not this
-     *             boolean read-gate. Setting it has no effect on dispatch.
-     */
-    @Deprecated
-    public static final String SERVE_STATE_SETTING = "index.mv.serve_state";
-
-    /**
-     * Selects the DataFusion STATE-to-STATE strategy for an {@code mv_state}
-     * format. This does not schedule or enable merges: candidate selection,
-     * scheduling, and global enablement remain owned by the standard
-     * data-format merge framework. Cursor certification still gates candidate
-     * eligibility. When false, the engine uses the DataFusion recompute
-     * strategy over the primary Parquet merge output.
-     */
-    public static final String STATE_MERGE_SETTING = "index.mv.state_merge_enabled";
 
     /**
      * Ordered logical names for columns in each MV state row. This is the durable
@@ -100,15 +87,6 @@ public final class MVConstants {
 
     /** Marks a target as a first-class derived index with replication-only writes and no active translog. */
     public static final String DERIVED_INDEX_SETTING = org.opensearch.index.engine.DerivedIndexEngine.DERIVED_INDEX_SETTING;
-    /**
-     * Commit user-data key prefix for each target/source-shard exact durable
-     * claim: {@code mv.cursor.<sourceIndex>.<sourceShard>} maps to a
-     * compatibility generation/floor cursor plus encoded above-floor ranges.
-     */
-    public static final String CURSOR_KEY_PREFIX = "mv.cursor.";
-
-    /** Source commit user-data key containing exact sequence coverage of known no-op operations. */
-    public static final String SOURCE_NOOP_COVERAGE_KEY = "mv.source.noop_coverage";
 
     /**
      * Target index setting naming the SOURCE index whose primaries this
@@ -117,8 +95,20 @@ public final class MVConstants {
      */
     public static final String COLOCATE_WITH_SETTING = "index.mv.colocate_with";
 
-    /** MV state file name for a writer generation (Parquet at rest — Arrow is in-memory only). */
-    public static String mvFileName(long writerGeneration) {
-        return "_mv_poc_" + Long.toHexString(writerGeneration) + ".mv.parquet";
+    /**
+     * MV state artifact name for a reserved writer generation (Parquet at
+     * rest — Arrow is in-memory only).
+     *
+     * <p>Mirrors the stock parquet writer's naming convention
+     * ({@code _parquet_file_generation_<hex-gen>.parquet}, see
+     * {@code ParquetIndexingEngine.buildParquetFileName}) with a {@code _mv}
+     * marker in the prefix slot so state generations are grep-distinguishable
+     * from doc-sourced files while remaining ordinary parquet catalog entries.
+     * The convention is duplicated as a string here deliberately: plugins do
+     * not reach into sibling plugin classloaders, and the catalog resolves
+     * files by (directory, name) — the name shape is debug-facing only.
+     */
+    public static String stateFileName(long writerGeneration) {
+        return "_parquet_file_generation_mv_" + Long.toHexString(writerGeneration) + ".parquet";
     }
 }

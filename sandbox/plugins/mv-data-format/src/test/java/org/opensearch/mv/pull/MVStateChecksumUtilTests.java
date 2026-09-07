@@ -10,7 +10,7 @@ package org.opensearch.mv.pull;
 
 import org.opensearch.index.store.FileMetadata;
 import org.opensearch.index.store.PrecomputedChecksumStrategy;
-import org.opensearch.mv.MVStateDataFormat;
+import org.opensearch.mv.MVConstants;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -91,7 +91,7 @@ public class MVStateChecksumUtilTests extends OpenSearchTestCase {
         PrecomputedChecksumStrategy strategy = new PrecomputedChecksumStrategy();
 
         // Register a checksum for an mv_state file
-        FileMetadata fm = new FileMetadata(MVStateDataFormat.NAME, "mv_gen_42.arrow");
+        FileMetadata fm = new FileMetadata(MVConstants.STATE_ARTIFACT_FORMAT, "mv_gen_42.arrow");
         long registeredChecksum = 0xDEADBEEFL;
         strategy.registerChecksum(fm, registeredChecksum, 42L);
 
@@ -103,7 +103,7 @@ public class MVStateChecksumUtilTests extends OpenSearchTestCase {
         org.apache.lucene.store.ByteBuffersDirectory dir = new org.apache.lucene.store.ByteBuffersDirectory();
         // Write a file with DIFFERENT content to prove the strategy returns
         // the registered value, not the file scan.
-        String key = fm.serialize(); // "mv_state/mv_gen_42.arrow"
+        String key = fm.serialize(); // "parquet/mv_gen_42.arrow"
         try (var out = dir.createOutput(key, org.apache.lucene.store.IOContext.DEFAULT)) {
             out.writeBytes("different-content".getBytes(StandardCharsets.UTF_8), 17);
         }
@@ -127,7 +127,7 @@ public class MVStateChecksumUtilTests extends OpenSearchTestCase {
 
         // Use a ByteBuffersDirectory so the strategy can actually read the file
         org.apache.lucene.store.ByteBuffersDirectory dir = new org.apache.lucene.store.ByteBuffersDirectory();
-        String fileName = "mv_state/mv_gen_7.arrow";
+        String fileName = MVConstants.STATE_ARTIFACT_FORMAT + "/mv_gen_7.arrow";
         try (var out = dir.createOutput(fileName, org.apache.lucene.store.IOContext.DEFAULT)) {
             out.writeBytes(payload, payload.length);
         }
@@ -153,7 +153,7 @@ public class MVStateChecksumUtilTests extends OpenSearchTestCase {
 
         byte[] payload = "some-content".getBytes(StandardCharsets.UTF_8);
         org.apache.lucene.store.ByteBuffersDirectory dir = new org.apache.lucene.store.ByteBuffersDirectory();
-        String key = "mv_state/mv_gen_1.arrow";
+        String key = MVConstants.STATE_ARTIFACT_FORMAT + "/mv_gen_1.arrow";
         try (var out = dir.createOutput(key, org.apache.lucene.store.IOContext.DEFAULT)) {
             out.writeBytes(payload, payload.length);
         }
@@ -162,7 +162,7 @@ public class MVStateChecksumUtilTests extends OpenSearchTestCase {
         long scanned = strategy.computeChecksum(dir, key);
 
         // Write path registers a different value with a real generation
-        FileMetadata fm = new FileMetadata(MVStateDataFormat.NAME, "mv_gen_1.arrow");
+        FileMetadata fm = new FileMetadata(MVConstants.STATE_ARTIFACT_FORMAT, "mv_gen_1.arrow");
         strategy.registerChecksum(fm, 999L, 5L);
 
         // Must return the write-path value, not the scan

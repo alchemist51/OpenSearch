@@ -52,6 +52,38 @@ public class DerivedIndexEngine extends DataFormatAwareEngine {
     }
 
     /**
+     * Derived targets do NOT background-merge their published artifacts (yet).
+     * State generations are sorted by the definition's group keys and folded
+     * at read time; the stock format merger does not know that sort contract,
+     * and a non-sort-preserving merge would silently break the sorted-scan
+     * advertisement and the fold's ordering assumptions. This is an
+     * unconditional engine-level veto — deliberately not a setting — so the
+     * stock merger can never touch the sort contract. Sorted-merge
+     * unification (admitting merges when the target declares its sort
+     * contract as a standard index sort and the format merge path is proven
+     * sort-preserving end-to-end, including footer {@code SortingColumn}
+     * re-stamping) is a separate later phase. Source indices are unaffected.
+     */
+    @Override
+    protected boolean backgroundMergesEnabled() {
+        return false;
+    }
+
+    /**
+     * Derived targets adopt whole state artifacts; they never hold doc-level
+     * operations, so there is no version map to restore at engine creation.
+     * The durable recovery cursor is the certified source watermark in commit
+     * userData, not a per-document {@code _seq_no} — and the adopted state
+     * files carry no {@code _seq_no} column, so the doc-level restore scan
+     * would fail on their schema (it was only ever a no-op before state
+     * artifacts shared the primary format's fileset).
+     */
+    @Override
+    protected boolean restoresVersionMapFromDocuments() {
+        return false;
+    }
+
+    /**
      * Executes one target-side apply through the normal sequence-number,
      * listener, writer, refresh, and catalog machinery while granting the
      * otherwise unavailable derived-write capability to the current thread.

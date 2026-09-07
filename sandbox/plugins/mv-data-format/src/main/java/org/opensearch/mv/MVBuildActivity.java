@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>Direction of stall is a design decision for MVs: <b>merges stall, live
  * ingestion never does</b> — the inverse of Lucene's stall (which throttles
- * indexing when merges lag). {@code MVIndexingEngine#isMergeEligible} consults
+ * indexing when merges lag). merge-admission gating consults
  * this signal, so while a build round is active BOTH selection paths (scheduled
  * and force) admit no new merges for the shard. Deferred candidates need no
  * queue: every publication re-triggers the scheduler, and the final round of a
@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * maintains for its registered merges (defect #22).
  *
  * <p>Static registry keyed by target coordinates for the same reason as
- * {@link MVTargetCursorLedger}: the pull-path builder and the per-shard engine
+ * the deleted cursor ledger: the pull-path builder and merge admission
  * instance have no shared wiring in the POC plugin.
  */
 public final class MVBuildActivity {

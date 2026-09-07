@@ -20,7 +20,7 @@ public class MVViewsServiceProviderTests extends OpenSearchTestCase {
         assertEquals("composite", additional.get("index.pluggable.dataformat"));
         assertEquals("parquet", additional.get("index.composite.primary_data_format"));
         assertEquals(List.of("lucene"), additional.getAsList("index.composite.secondary_data_formats"));
-        assertFalse("pull-only source must not activate legacy ship targets", additional.hasValue(MVConstants.SHIP_TARGETS_SETTING));
+        assertFalse("pull-only source must not activate legacy ship targets", additional.hasValue("index.mv.ship_targets"));
         assertFalse("definition belongs to the derived target binding", additional.hasValue(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID));
     }
 

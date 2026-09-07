@@ -966,11 +966,11 @@ public class DataFusionPlugin extends Plugin
 
     @Override
     public List<String> getSupportedFormats() {
-        // Include mv_state so the planner selects DataFusion for MV target indices.
+        // MV targets are selected via their composite PRIMARY format (parquet).
         // ShardScanInstructionHandler routes derived materialized-view targets
         // (index.derived.data_format=materialized_view) to the MV-only session,
-        // which loads catalog-selected Arrow state directly into a MemTable.
-        return List.of(SUPPORTED_FORMAT, "mv_state");
+        // which loads catalog-selected state parquet directly.
+        return List.of(SUPPORTED_FORMAT);
     }
 
     @Override

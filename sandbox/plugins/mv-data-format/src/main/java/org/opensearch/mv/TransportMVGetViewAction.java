@@ -58,7 +58,7 @@ public class TransportMVGetViewAction extends HandledTransportAction<MVGetViewRe
         }
         Settings settings = target.getSettings();
         String dataFormat = DerivedIndexBinding.dataFormatCategory(settings);
-        if (MVDataFormat.NAME.equals(dataFormat) == false) {
+        if (MVConstants.DERIVED_CATEGORY.equals(dataFormat) == false) {
             // Not an MV derived target.
             return MVGetViewResponse.notFound(name);
         }

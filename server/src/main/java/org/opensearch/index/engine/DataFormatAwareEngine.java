@@ -524,7 +524,9 @@ public class DataFormatAwareEngine implements Indexer {
             );
 
             // Restore version map and checkpoint tracker after recovery.
-            restoreVersionMapAndCheckpointTracker();
+            if (restoresVersionMapFromDocuments()) {
+                restoreVersionMapAndCheckpointTracker();
+            }
 
             // Merge failure cleanup: cleans up unreferenced files and acts as a safety net
             // for refreshLock. The preMergeCommitHook acquires refreshLock on the merge thread;
@@ -1453,6 +1455,14 @@ public class DataFormatAwareEngine implements Indexer {
         if (upgrade || upgradeOnlyAncientSegments || onlyExpungeDeletes) {
             return;
         }
+        if (backgroundMergesEnabled() == false) {
+            // The engine-level merge veto covers ALL admission paths. A
+            // derived target's adopted artifacts carry a sort contract the
+            // stock merger does not honor — a user force-merge must be as
+            // impossible as a scheduled one (see DerivedIndexEngine).
+            logger.debug("forceMerge blocked — engine vetoes merges");
+            return;
+        }
         if (isFrozenForTiering()) {
             logger.debug("forceMerge blocked — engine is frozen for tiering");
             return;
@@ -2071,7 +2081,7 @@ public class DataFormatAwareEngine implements Indexer {
     }
 
     @Override
-    public void publishDerivedArtifact(DataFormat dataFormat, WriterFileSet fileSet, Map<String, String> userDataUpdates)
+    public void publishDerivedArtifact(String dataFormatName, WriterFileSet fileSet, Map<String, String> userDataUpdates)
         throws IOException {
         ensureOpen();
         if (fileSet.writerGeneration() <= 0L) {
@@ -2096,7 +2106,7 @@ public class DataFormatAwareEngine implements Indexer {
                     );
                 }
                 List<Segment> nextSegments = new ArrayList<>(current.getSegments());
-                nextSegments.add(Segment.builder(fileSet.writerGeneration()).addSearchableFiles(dataFormat, fileSet).build());
+                nextSegments.add(Segment.builder(fileSet.writerGeneration()).addSearchableFiles(dataFormatName, fileSet).build());
                 Map<String, String> nextUserData = new HashMap<>(current.getUserData());
                 nextUserData.putAll(Map.copyOf(userDataUpdates));
                 catalogSnapshotManager.commitNewSnapshot(nextSegments, nextUserData);
@@ -2314,7 +2324,36 @@ public class DataFormatAwareEngine implements Indexer {
         }
     }
 
+    /**
+     * Engine-level background-merge admission. Subclasses that must not merge —
+     * e.g. {@link DerivedIndexEngine} while its artifacts carry a sort contract
+     * the stock format merger does not honor — override this to {@code false}.
+     * This is an ENGINE property (like the write surface), not a data-format
+     * property: format identity must not carry merge policy.
+     */
+    protected boolean backgroundMergesEnabled() {
+        return true;
+    }
+
+    /**
+     * Whether engine creation restores the version map and local checkpoint
+     * tracker by scanning committed documents above the persisted checkpoint
+     * (a doc-level {@code _seq_no} range query through the document lookup
+     * provider). Engines whose catalog holds adopted artifacts rather than
+     * doc-level operations — e.g. {@link DerivedIndexEngine}, whose state
+     * generations carry no {@code _seq_no} column and whose durable cursor is
+     * the watermark in commit userData — override this to {@code false}: there
+     * are no operations to restore, and the scan would fail on the artifact
+     * schema.
+     */
+    protected boolean restoresVersionMapFromDocuments() {
+        return true;
+    }
+
     private void triggerPossibleMerges() {
+        if (backgroundMergesEnabled() == false) {
+            return;
+        }
         if (Booleans.parseBoolean(System.getProperty(MERGE_ENABLED_PROPERTY, Boolean.TRUE.toString())) == false) {
             logger.debug("Pluggable dataformat merge is disabled via system property [{}], skipping merge", MERGE_ENABLED_PROPERTY);
             return;

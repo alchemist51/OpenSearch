@@ -49,18 +49,18 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
         DataFusionService dataFusionService = plugin.getDataFusionService();
         DataFormatRegistry registry = plugin.getDataFormatRegistry();
 
-        // Dispatch through the DERIVED DATA-FORMAT CATEGORY: if the index declares
-        // index.derived.data_format and it resolves to a registered target-artifact
-        // format, always use the MV-only path regardless of whether a DatafusionReader
-        // can be acquired. This replaces the index.mv.serve_state boolean and the
-        // hardcoded "mv_state" format-list special cases.
+        // Dispatch through the DERIVED DATA-FORMAT CATEGORY: an index declaring
+        // index.derived.data_format serves PARTIAL AGGREGATE STATE and must
+        // take the MV-only session (fold-at-read semantics), never the raw
+        // row path. The category is control-plane routing only — the physical
+        // state artifacts are stock files of the target's composite PRIMARY
+        // format (parquet), so no registry artifact resolution is involved.
+        // (Single derived category today; revisit dispatch when a second
+        // category with different serving semantics exists.)
         String derivedCategory = org.opensearch.cluster.metadata.DerivedIndexBinding.dataFormatCategory(
             context.getIndexSettings().getSettings()
         );
-        org.opensearch.index.engine.dataformat.DataFormat derivedArtifact = derivedCategory == null
-            ? null
-            : registry.derivedTargetArtifact(derivedCategory);
-        boolean mvServing = derivedArtifact != null;
+        boolean mvServing = derivedCategory != null;
 
         DatafusionReader dfReader = null;
         if (!mvServing) {
@@ -116,9 +116,12 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
                 }
             } else {
                 // MV-only path: resolve state file paths from catalog, then create session
-                // with Arrow data registered directly. The physical artifact format name
-                // comes from the derived category resolution (never a hardcoded string).
-                java.util.List<String> stateFilePaths = resolveMVStateFiles(context, derivedArtifact.name());
+                // with Arrow data registered directly. State artifacts are cataloged under
+                // the target's composite PRIMARY format name (stock parquet).
+                java.util.List<String> stateFilePaths = resolveMVStateFiles(
+                    context,
+                    context.getIndexSettings().getSettings().get("index.composite.primary_data_format", "parquet")
+                );
                 java.util.List<String> stateFields = resolveMVStateFields(context);
                 sessionCtxHandle = NativeBridge.createMVOnlySessionContext(
                     runtimePtr,

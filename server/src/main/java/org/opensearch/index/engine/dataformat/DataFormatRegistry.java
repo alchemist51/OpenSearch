@@ -50,17 +50,6 @@ public class DataFormatRegistry {
 
     private final Map<String, DataFormat> dataFormats;
 
-    /**
-     * Map from a DERIVED DATA-FORMAT CATEGORY (e.g. {@code "materialized_view"})
-     * to the single physical target-artifact {@link DataFormat} that backs it
-     * (e.g. {@code mv_state}). Built by scanning registered
-     * {@link DerivedDataFormat}s whose {@link DerivedDataFormat#isDerivedTargetArtifact()}
-     * is {@code true}. This is the authoritative resolution used by the composite
-     * store, pull eligibility, and search dispatch — none of which may string-match
-     * a format name in {@code primary/secondary_data_formats}.
-     */
-    private final Map<String, DataFormat> derivedTargetArtifactByCategory;
-
     /** The single registered document lookup provider (engine-backed get-by-id execution), or {@code null} if none. */
     private final DocumentLookupProvider documentLookupProvider;
 
@@ -113,30 +102,6 @@ public class DataFormatRegistry {
         this.dataFormatPluginRegistry = Map.copyOf(dataFormatPlugiRegistry);
         this.dataFormats = Map.copyOf(dataFormats);
         this.readerManagerBuilders = Map.copyOf(readerManagerBuilders);
-
-        // Build the derived-category -> target-artifact resolution. Each derived
-        // category may have at most one target-side state artifact.
-        Map<String, DataFormat> derivedTargetArtifacts = new HashMap<>();
-        for (DataFormat format : dataFormats.values()) {
-            if (format instanceof DerivedDataFormat) {
-                DerivedDataFormat derived = (DerivedDataFormat) format;
-                if (derived.isDerivedTargetArtifact()) {
-                    DataFormat prev = derivedTargetArtifacts.putIfAbsent(derived.category(), format);
-                    if (prev != null) {
-                        throw new IllegalArgumentException(
-                            "Multiple derived target artifacts registered for category ["
-                                + derived.category()
-                                + "]: ["
-                                + prev.name()
-                                + "] and ["
-                                + format.name()
-                                + "]"
-                        );
-                    }
-                }
-            }
-        }
-        this.derivedTargetArtifactByCategory = Map.copyOf(derivedTargetArtifacts);
 
         List<DocumentLookupProvider> lookupProviders = pluginsService.filterPlugins(DocumentLookupProvider.class);
         if (lookupProviders.size() > 1) {
@@ -195,33 +160,7 @@ public class DataFormatRegistry {
         return format;
     }
 
-    /**
-     * Resolves the physical target-artifact {@link DataFormat} for a DERIVED
-     * DATA-FORMAT CATEGORY (the value of {@code index.derived.data_format}),
-     * or {@code null} if the category is {@code null} or not registered.
-     *
-     * <p>This is the sanctioned way to go from the category on a derived target
-     * index to the format the composite store manages and search serves — it
-     * replaces any string match of {@code mv_state} against the
-     * {@code secondary_data_formats} list.
-     *
-     * @param category the derived category identifier
-     * @return the target-artifact data format, or {@code null}
-     */
-    public DataFormat derivedTargetArtifact(String category) {
-        return category == null ? null : derivedTargetArtifactByCategory.get(category);
-    }
 
-    /**
-     * Whether {@code category} is a registered derived data-format category
-     * (i.e. some plugin contributed a target-artifact format for it).
-     *
-     * @param category the derived category identifier
-     * @return true if registered
-     */
-    public boolean isRegisteredDerivedCategory(String category) {
-        return category != null && derivedTargetArtifactByCategory.containsKey(category);
-    }
 
     /**
      * Returns the plugin registered for the given format name, or {@code null} if not found.

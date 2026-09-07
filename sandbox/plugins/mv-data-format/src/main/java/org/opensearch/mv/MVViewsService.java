@@ -162,7 +162,7 @@ public final class MVViewsService {
             // Stage 5 REST create path (PUT /_mv/views/{name}) are byte-identical.
             // This (legacy named) path additionally carries the definition id/name for
             // BWC; the REST path is descriptor-only and self-contained.
-            Settings targetSettings = MVViewCreation.commonTargetSettings(source, sourceShards)
+            Settings targetSettings = MVViewCreation.commonTargetSettings(source, sourceShards, compiledDef.groupByOrdering())
                 .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID, view.definition())
                 // Stage 4: persisted self-contained descriptor (authoritative,
                 // resolved first by MVDefinitionResolver).

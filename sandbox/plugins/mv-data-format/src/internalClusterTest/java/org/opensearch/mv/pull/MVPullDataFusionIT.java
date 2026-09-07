@@ -22,10 +22,9 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.composite.CompositeDataFormatPlugin;
-import org.opensearch.mv.MVDataFormat;
+import org.opensearch.mv.MVConstants;
 import org.opensearch.mv.MVDataFormatPlugin;
 import org.opensearch.mv.MVNativeBridge;
-import org.opensearch.mv.MVStateDataFormat;
 import org.opensearch.parquet.ParquetDataFormatPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.PluginsService;
@@ -211,28 +210,22 @@ public class MVPullDataFusionIT extends OpenSearchIntegTestCase {
         assertBusy(() -> assertStateFilesEqual(expected, beforePostRestart + 7), 60, java.util.concurrent.TimeUnit.SECONDS);
         assertBusy(() -> assertReplicaStateEqual(expected, beforePostRestart + 7), 60, java.util.concurrent.TimeUnit.SECONDS);
 
-        // Compact immutable per-range files through the certified DataFusion state fold.
-        // The catalog switch must preserve W and exact answers, and releasing the old
-        // snapshot must reclaim every superseded Arrow artifact.
-        PublishedState beforeCompaction = publishedState(primaryNodeName(MV));
-        assertTrue("test must publish multiple immutable ranges before compaction", beforeCompaction.files().size() > 1);
-        for (int compactionPass = 0; compactionPass < 4 && publishedState(primaryNodeName(MV)).files().size() > 1; compactionPass++) {
-            var forceMerge = client().admin().indices().prepareForceMerge(MV).setMaxNumSegments(1).setFlush(true).get();
-            assertEquals("mv_state compaction must not fail a shard", 0, forceMerge.getFailedShards());
-        }
-        assertBusy(
-            () -> assertEquals("compaction must publish one mv_state file", 1, publishedState(primaryNodeName(MV)).files().size()),
-            60,
-            java.util.concurrent.TimeUnit.SECONDS
-        );
-        assertEquals("compaction must not advance W", beforeCompaction.watermark(), publishedState(primaryNodeName(MV)).watermark());
+        // Immutable per-range files accumulate; the derived target's engine-level
+        // merge veto means a user force-merge is a synchronous NO-OP: no shard
+        // failure, no consolidation, watermark untouched, every published
+        // artifact stays live, answers stay exact.
+        PublishedState beforeForceMerge = publishedState(primaryNodeName(MV));
+        assertTrue("test must publish multiple immutable ranges", beforeForceMerge.files().size() > 1);
+        var forceMerge = client().admin().indices().prepareForceMerge(MV).setMaxNumSegments(1).setFlush(true).get();
+        assertEquals("vetoed force-merge must not fail a shard", 0, forceMerge.getFailedShards());
         assertBusy(() -> assertStateFilesEqual(expected, beforePostRestart + 7), 60, java.util.concurrent.TimeUnit.SECONDS);
+        PublishedState afterForceMerge = publishedState(primaryNodeName(MV));
+        assertEquals("force-merge must be a no-op on a derived target", beforeForceMerge.files().size(), afterForceMerge.files().size());
+        assertEquals("vetoed force-merge must not advance W", beforeForceMerge.watermark(), afterForceMerge.watermark());
+        for (String artifact : beforeForceMerge.files()) {
+            assertTrue("no published mv state artifact may be superseded: " + artifact, java.nio.file.Files.exists(Path.of(artifact)));
+        }
         assertBusy(() -> assertReplicaStateEqual(expected, beforePostRestart + 7), 60, java.util.concurrent.TimeUnit.SECONDS);
-        assertBusy(() -> {
-            for (String superseded : beforeCompaction.files()) {
-                assertFalse("superseded mv_state artifact must be deleted: " + superseded, java.nio.file.Files.exists(Path.of(superseded)));
-            }
-        }, 60, java.util.concurrent.TimeUnit.SECONDS);
     }
 
     private void createSourceAndTarget() throws Exception {
@@ -276,10 +269,14 @@ public class MVPullDataFusionIT extends OpenSearchIntegTestCase {
                         // Canonical derived data-format category — the single control-plane
                         // signal for a materialized-view target. mv_state is NOT a secondary
                         // format and serve_state is no longer used.
-                        .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DATA_FORMAT, MVDataFormat.NAME)
+                        .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DATA_FORMAT, MVConstants.DERIVED_CATEGORY)
                         .put("index.derived.definition_id", "pull_count_sum")
                         .putList("index.mv.state_fields", "RegionID", "cnt", "adv")
-                        .put("index.mv.state_merge_enabled", true)
+                        // GROUP BY ordering contract declared as the standard index
+                        // sort (read-side contract metadata; merges stay vetoed).
+                        .putList("index.sort.field", "RegionID")
+                        .putList("index.sort.order", "asc")
+                        .putList("index.sort.missing", "_first")
                         .put(MVPullSettings.PULL_INTERVAL.getKey(), "100ms")
                         // Public settings only; MetadataCreateIndexService enriches private binding
                         // (UUID, topology, mapping mode). The deprecated index.mv_pull.source_index
@@ -304,14 +301,21 @@ public class MVPullDataFusionIT extends OpenSearchIntegTestCase {
      * count, and the watermark never regresses.
      */
     @LockFeatureFlag(STREAM_TRANSPORT)
-    public void testNaturalMergesUnderContinuousLoad() throws Exception {
+    public void testDerivedTargetNeverMergesEvenWithMergesEnabled() throws Exception {
+        // The redesign directive: derived targets NEVER merge — an engine-level
+        // veto (DerivedIndexEngine.backgroundMergesEnabled() == false), not a
+        // setting. State generations are sorted by the definition's group keys;
+        // the stock parquet merger does not know that contract, so admission is
+        // structurally impossible. This test FALSIFIES the veto under the most
+        // adversarial configuration: the global dataformat merge property ON
+        // (source-side merges fully admitted) and continuous publication load.
         enableDataformatMerges();
         try {
             createSourceAndTarget();
 
             Map<Long, long[]> expected = new HashMap<>();
             long docs = 0;
-            int maxObservedFiles = 0;
+            int lastObservedFiles = 0;
             final int waves = 18;
             final int docsPerWave = 8;
             for (int wave = 0; wave < waves; wave++) {
@@ -325,22 +329,23 @@ public class MVPullDataFusionIT extends OpenSearchIntegTestCase {
                     docs++;
                 }
                 // Seal a source generation; target rounds pull it, publishing
-                // a small MV generation — and each target refresh gives the
-                // scheduler a natural merge opportunity mid-load.
+                // a small MV generation — and each target refresh hands the
+                // scheduler a would-be merge opportunity that the engine veto
+                // must reject.
                 client().admin().indices().prepareRefresh(SOURCE).get();
                 PublishedState observed = publishedStateOrNull(primaryNodeName(MV));
                 if (observed != null) {
-                    maxObservedFiles = Math.max(maxObservedFiles, observed.files().size());
+                    // The veto: the live generation count must NEVER decrease
+                    // (a decrease = a merge was admitted past the veto).
+                    assertTrue(
+                        "derived-target merge veto violated: live=" + observed.files().size() + " previously=" + lastObservedFiles,
+                        observed.files().size() >= lastObservedFiles
+                    );
+                    lastObservedFiles = observed.files().size();
                     assertTrue(
                         "watermark must never regress under load",
                         observed.watermark() == null || observed.watermark().seqNo() <= docs - 1
                     );
-                }
-                if (wave % 6 == 5) {
-                    // Mid-load exactness checkpoint: merges racing ingestion
-                    // must never change answers.
-                    final long docsSoFar = docs;
-                    assertBusy(() -> assertStateFilesEqual(expected, docsSoFar), 60, java.util.concurrent.TimeUnit.SECONDS);
                 }
             }
 
@@ -348,19 +353,24 @@ public class MVPullDataFusionIT extends OpenSearchIntegTestCase {
             final long totalDocs = docs;
             assertBusy(() -> assertStateFilesEqual(expected, totalDocs), 90, java.util.concurrent.TimeUnit.SECONDS);
 
-            // Natural merges must consolidate: strictly fewer live files than
-            // publications occurred (each wave published >= 1 generation).
-            final int peak = Math.max(maxObservedFiles, 1);
-            assertBusy(() -> {
-                PublishedState state = publishedState(primaryNodeName(MV));
-                assertTrue(
-                    "TieredPolicy merges must consolidate generations: live=" + state.files().size() + " waves=" + waves + " peak=" + peak,
-                    state.files().size() < waves
-                );
-            }, 90, java.util.concurrent.TimeUnit.SECONDS);
+            // Generations accumulate one file per publication — no consolidation.
+            final int filesAfterDrain = publishedState(primaryNodeName(MV)).files().size();
+            assertTrue("publications must accumulate unmerged generations: " + filesAfterDrain, filesAfterDrain > 1);
 
-            // Post-merge: answers still exact, replicas consistent.
+            // A user force-merge is vetoed identically (no shard failure, no
+            // consolidation): the veto covers ALL admission paths.
+            var forceMerge = client().admin().indices().prepareForceMerge(MV).setMaxNumSegments(1).setFlush(true).get();
+            assertEquals("vetoed force-merge must not fail a shard", 0, forceMerge.getFailedShards());
+            // The veto is synchronous admission — nothing was scheduled, so a
+            // stable file count is asserted after one more full exactness pass.
             assertBusy(() -> assertStateFilesEqual(expected, totalDocs), 60, java.util.concurrent.TimeUnit.SECONDS);
+            assertEquals(
+                "force-merge must be a no-op on a derived target",
+                filesAfterDrain,
+                publishedState(primaryNodeName(MV)).files().size()
+            );
+
+            // Post-drain: answers exact, replicas consistent, all generations live.
             assertBusy(() -> assertReplicaStateEqual(expected, totalDocs), 60, java.util.concurrent.TimeUnit.SECONDS);
         } finally {
             disableDataformatMerges();
@@ -375,207 +385,6 @@ public class MVPullDataFusionIT extends OpenSearchIntegTestCase {
     @SuppressForbidden(reason = "restore pluggable dataformat merge property after test")
     private static void disableDataformatMerges() {
         System.clearProperty("opensearch.pluggable.dataformat.merge.enabled");
-    }
-
-    /**
-     * Defect #22 round: a HEAVY force-merge wave (many registered merges,
-     * mid-wave natural follow-up registrations from onMergeFinished) must
-     * leave the scheduler fully eligible — no stranded merging claims, no
-     * restart required. Pre-fix signature on the 302-gen corpus: the first
-     * wave plateaued (selection returned nothing) until a node restart wiped
-     * the in-memory merging sets. Post-fix invariants under test:
-     * <ol>
-     *   <li>the wave consolidates to ONE file with repeated invocations making
-     *       progress in the SAME process lifetime;</li>
-     *   <li>after the wave, continued ingestion publishes new generations and
-     *       a SECOND wave consolidates them again — eligibility survived;</li>
-     *   <li>answers are exact after every phase and compaction never advances
-     *       the watermark.</li>
-     * </ol>
-     */
-    @LockFeatureFlag(STREAM_TRANSPORT)
-    public void testForceMergeWaveThenContinuedEligibility() throws Exception {
-        enableDataformatMerges();
-        try {
-            createSourceAndTarget();
-
-            // Phase 1: accumulate generations (each wave seals a source
-            // generation; the poller publishes at least one MV generation).
-            Map<Long, long[]> expected = new HashMap<>();
-            long docs = 0;
-            final int waves = 14;
-            for (int wave = 0; wave < waves; wave++) {
-                for (int i = 0; i < 6; i++) {
-                    long region = (wave + i) % 5;
-                    long adv = 1 + (i % 4);
-                    client().prepareIndex(SOURCE).setSource("RegionID", region, "AdvEngineID", adv).get();
-                    expected.computeIfAbsent(region, r -> new long[2]);
-                    expected.get(region)[0] += 1;
-                    expected.get(region)[1] += adv;
-                    docs++;
-                }
-                client().admin().indices().prepareRefresh(SOURCE).get();
-            }
-            final long phase1Docs = docs;
-            assertBusy(() -> assertStateFilesEqual(expected, phase1Docs), 90, java.util.concurrent.TimeUnit.SECONDS);
-
-            // Phase 2: the heavy wave. Repeated invocations must make progress
-            // to ONE file in this process lifetime (pre-fix: stranded claims
-            // from the first invocation starved every later selection).
-            MVWatermark watermarkBeforeWave = publishedState(primaryNodeName(MV)).watermark();
-            for (int pass = 0; pass < 4 && publishedState(primaryNodeName(MV)).files().size() > 1; pass++) {
-                var forceMerge = client().admin().indices().prepareForceMerge(MV).setMaxNumSegments(1).setFlush(true).get();
-                assertEquals("force-merge wave must not fail a shard", 0, forceMerge.getFailedShards());
-            }
-            assertBusy(
-                () -> assertEquals("wave must consolidate to one mv_state file", 1, publishedState(primaryNodeName(MV)).files().size()),
-                90,
-                java.util.concurrent.TimeUnit.SECONDS
-            );
-            assertEquals("compaction must not advance W", watermarkBeforeWave, publishedState(primaryNodeName(MV)).watermark());
-            assertBusy(() -> assertStateFilesEqual(expected, phase1Docs), 60, java.util.concurrent.TimeUnit.SECONDS);
-
-            // Phase 3: continued eligibility WITHOUT restart — new generations
-            // publish and a second wave consolidates them again.
-            for (int wave = 0; wave < 6; wave++) {
-                for (int i = 0; i < 5; i++) {
-                    long region = (wave + i) % 3;
-                    client().prepareIndex(SOURCE).setSource("RegionID", region, "AdvEngineID", 2).get();
-                    expected.computeIfAbsent(region, r -> new long[2]);
-                    expected.get(region)[0] += 1;
-                    expected.get(region)[1] += 2;
-                    docs++;
-                }
-                client().admin().indices().prepareRefresh(SOURCE).get();
-            }
-            final long phase3Docs = docs;
-            assertBusy(() -> assertStateFilesEqual(expected, phase3Docs), 90, java.util.concurrent.TimeUnit.SECONDS);
-            assertTrue(
-                "continued ingestion must publish new generations after the wave",
-                publishedState(primaryNodeName(MV)).files().size() > 1
-            );
-
-            MVWatermark watermarkBeforeSecondWave = publishedState(primaryNodeName(MV)).watermark();
-            for (int pass = 0; pass < 4 && publishedState(primaryNodeName(MV)).files().size() > 1; pass++) {
-                var forceMerge = client().admin().indices().prepareForceMerge(MV).setMaxNumSegments(1).setFlush(true).get();
-                assertEquals("second wave must not fail a shard", 0, forceMerge.getFailedShards());
-            }
-            assertBusy(
-                () -> assertEquals(
-                    "second wave must consolidate again — eligibility must survive the first wave",
-                    1,
-                    publishedState(primaryNodeName(MV)).files().size()
-                ),
-                90,
-                java.util.concurrent.TimeUnit.SECONDS
-            );
-            assertEquals("second compaction must not advance W", watermarkBeforeSecondWave, publishedState(primaryNodeName(MV)).watermark());
-            assertBusy(() -> assertStateFilesEqual(expected, phase3Docs), 60, java.util.concurrent.TimeUnit.SECONDS);
-            assertBusy(() -> assertReplicaStateEqual(expected, phase3Docs), 60, java.util.concurrent.TimeUnit.SECONDS);
-        } finally {
-            disableDataformatMerges();
-        }
-    }
-
-    /**
-     * Defect #23 round: merges stall, live MV ingestion never does. The test
-     * holds an EXTRA build-pressure claim on the target shard (claims are
-     * counted, so the builder's own per-round mark/clear rides on top), then
-     * drives continuous ingestion with the merge property enabled:
-     * <ol>
-     *   <li>while the claim is held, every merge trigger fires but selection
-     *       rejects all candidates through {@code isMergeEligible} — the live
-     *       generation count NEVER decreases, while ingestion keeps publishing
-     *       (builds are never stalled);</li>
-     *   <li>releasing the claim and publishing once more re-admits merges via
-     *       the existing publication trigger — generations consolidate;</li>
-     *   <li>answers stay exact throughout.</li>
-     * </ol>
-     */
-    @LockFeatureFlag(STREAM_TRANSPORT)
-    public void testMergesDeferredWhileBuildPressureHeld() throws Exception {
-        enableDataformatMerges();
-        boolean claimHeld = false;
-        try {
-            createSourceAndTarget();
-
-            // Hold the extra claim BEFORE any generation exists so no merge
-            // can ever be admitted during the load phase.
-            org.opensearch.mv.MVBuildActivity.markActive(MV, 0);
-            claimHeld = true;
-
-            Map<Long, long[]> expected = new HashMap<>();
-            long docs = 0;
-            final int waves = 12;
-            int lastObservedFiles = 0;
-            for (int wave = 0; wave < waves; wave++) {
-                for (int i = 0; i < 6; i++) {
-                    long region = (wave + i) % 4;
-                    long adv = 1 + (i % 3);
-                    client().prepareIndex(SOURCE).setSource("RegionID", region, "AdvEngineID", adv).get();
-                    expected.computeIfAbsent(region, r -> new long[2]);
-                    expected.get(region)[0] += 1;
-                    expected.get(region)[1] += adv;
-                    docs++;
-                }
-                client().admin().indices().prepareRefresh(SOURCE).get();
-                PublishedState observed = publishedStateOrNull(primaryNodeName(MV));
-                if (observed != null) {
-                    // The merge gate: while build pressure is held, the live
-                    // generation count must never decrease (a decrease = a
-                    // merge was admitted through the gate).
-                    assertTrue(
-                        "no merge may be admitted while build pressure is held: live=" + observed.files().size()
-                            + " previously=" + lastObservedFiles,
-                        observed.files().size() >= lastObservedFiles
-                    );
-                    lastObservedFiles = observed.files().size();
-                }
-            }
-
-            // Ingestion was never stalled: full catch-up with exact answers
-            // while the claim is STILL held.
-            final long loadDocs = docs;
-            assertBusy(() -> assertStateFilesEqual(expected, loadDocs), 90, java.util.concurrent.TimeUnit.SECONDS);
-            int filesUnderPressure = publishedState(primaryNodeName(MV)).files().size();
-            assertTrue("load must accumulate unmerged generations under pressure: " + filesUnderPressure, filesUnderPressure > 1);
-
-            // Release the claim. The retry is the existing publication trigger:
-            // one more small wave publishes, its trigger runs selection with
-            // pressure clear, and the deferred backlog consolidates.
-            org.opensearch.mv.MVBuildActivity.clearActive(MV, 0);
-            claimHeld = false;
-            for (int i = 0; i < 4; i++) {
-                long region = i % 2;
-                client().prepareIndex(SOURCE).setSource("RegionID", region, "AdvEngineID", 1).get();
-                expected.computeIfAbsent(region, r -> new long[2]);
-                expected.get(region)[0] += 1;
-                expected.get(region)[1] += 1;
-                docs++;
-            }
-            client().admin().indices().prepareRefresh(SOURCE).get();
-
-            final long totalDocs = docs;
-            final int peakFiles = filesUnderPressure;
-            assertBusy(() -> assertStateFilesEqual(expected, totalDocs), 90, java.util.concurrent.TimeUnit.SECONDS);
-            assertBusy(() -> {
-                PublishedState state = publishedState(primaryNodeName(MV));
-                assertTrue(
-                    "released pressure must re-admit merges via the publication trigger: live=" + state.files().size()
-                        + " peakUnderPressure=" + peakFiles,
-                    state.files().size() < peakFiles
-                );
-            }, 90, java.util.concurrent.TimeUnit.SECONDS);
-
-            // Post-consolidation: answers exact, replicas consistent.
-            assertBusy(() -> assertStateFilesEqual(expected, totalDocs), 60, java.util.concurrent.TimeUnit.SECONDS);
-            assertBusy(() -> assertReplicaStateEqual(expected, totalDocs), 60, java.util.concurrent.TimeUnit.SECONDS);
-        } finally {
-            if (claimHeld) {
-                org.opensearch.mv.MVBuildActivity.clearActive(MV, 0);
-            }
-            disableDataformatMerges();
-        }
     }
 
     /** Like {@link #publishedState} but returns null while nothing is published yet. */
@@ -669,7 +478,7 @@ public class MVPullDataFusionIT extends OpenSearchIntegTestCase {
                 .getCatalogSnapshot()
         ) {
             java.util.List<String> files = ref.get()
-                .getSearchableFiles(MVStateDataFormat.NAME)
+                .getSearchableFiles(MVConstants.STATE_ARTIFACT_FORMAT)
                 .stream()
                 .flatMap(fileSet -> fileSet.files().stream().map(file -> Path.of(fileSet.directory()).resolve(file).toString()))
                 .sorted()

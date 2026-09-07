@@ -1339,6 +1339,19 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         getIndexer().publishDerivedArtifact(dataFormat, fileSet, userDataUpdates);
     }
 
+    /** Name-keyed variant — see {@link org.opensearch.index.engine.exec.Indexer#publishDerivedArtifact(String, org.opensearch.index.engine.exec.WriterFileSet, Map)}. */
+    public void publishDerivedArtifact(
+        String dataFormatName,
+        org.opensearch.index.engine.exec.WriterFileSet fileSet,
+        Map<String, String> userDataUpdates
+    ) throws IOException {
+        verifyNotClosed();
+        if (routingEntry().primary() == false) {
+            throw new IllegalStateException("derived artifacts may only be published on a primary shard [" + shardId + "]");
+        }
+        getIndexer().publishDerivedArtifact(dataFormatName, fileSet, userDataUpdates);
+    }
+
     private Engine.IndexResult applyIndexOperation(
         Indexer indexer,
         long seqNo,

@@ -177,6 +177,23 @@ public interface Indexer
      */
     default void publishDerivedArtifact(DataFormat dataFormat, WriterFileSet fileSet, Map<String, String> userDataUpdates)
         throws IOException {
+        publishDerivedArtifact(dataFormat.name(), fileSet, userDataUpdates);
+    }
+
+    /**
+     * Name-keyed variant of {@link #publishDerivedArtifact(DataFormat, WriterFileSet, Map)}.
+     * The catalog keys searchable files by format NAME, so an external producer (e.g. the
+     * derived-pull artifact builder) can publish under a stock format ("parquet") without
+     * holding that format plugin's {@code DataFormat} class — plugins must not reach into
+     * sibling plugin classloaders for what is ultimately a string key.
+     *
+     * @param dataFormatName name of the format that owns the artifact (must be a format
+     *        managed by this engine's index, e.g. its composite primary)
+     * @param fileSet immutable files and row metadata for one reserved generation
+     * @param userDataUpdates metadata (for example an upstream watermark) bound to the artifact
+     */
+    default void publishDerivedArtifact(String dataFormatName, WriterFileSet fileSet, Map<String, String> userDataUpdates)
+        throws IOException {
         throw new UnsupportedOperationException("derived artifact publication not supported on " + getClass().getSimpleName());
     }
 

@@ -41,7 +41,8 @@ import java.util.Map;
  *       {@code index.composite.primary_data_format} = parquet,
  *       {@code index.composite.secondary_data_formats} = [lucene]</li>
  *   <li>{@code index.derived.data_format} = {@code materialized_view}
- *       (the canonical derived category)</li>
+ *       (the canonical derived category — control-plane ROUTING only; state
+ *       artifacts are stock parquet generations of the composite primary)</li>
  *   <li>{@code index.mv.descriptor} = the serialized, self-contained descriptor JSON</li>
  *   <li>{@code index.mv.state_fields} = the compiled state-column names</li>
  *   <li>{@code index.mv.colocate_with} = source index</li>
@@ -75,9 +76,10 @@ public final class MVViewCreation {
         MVCompiledDefinition compiledDef,
         String descriptorJson
     ) {
-        return commonTargetSettings(sourceIndex, sourceShards).put(MVConstants.DESCRIPTOR_SETTING, descriptorJson)
-            .putList(MVConstants.STATE_FIELDS_SETTING, compiledDef.stateColumnNames())
-            .build();
+        return commonTargetSettings(sourceIndex, sourceShards, compiledDef.groupByOrdering()).put(
+            MVConstants.DESCRIPTOR_SETTING,
+            descriptorJson
+        ).putList(MVConstants.STATE_FIELDS_SETTING, compiledDef.stateColumnNames()).build();
     }
 
     /**
@@ -85,8 +87,18 @@ public final class MVViewCreation {
      * the legacy named-definition auto-creation path. Callers add the
      * descriptor / state_fields (and, for the legacy path, the definition name)
      * before {@code build()}.
+     *
+     * <p>The definition's {@link MVGroupByOrdering} is declared as the target's
+     * standard index sort ({@code index.sort.field} = group keys, ASC, missing
+     * {@code _first} = NULLS FIRST). This is the SINGLE declaration of the
+     * state-row sort contract on the index: the read path's sorted-scan
+     * advertisement and any future sort-aware machinery key off it. It does
+     * NOT admit background merges — derived targets carry an unconditional
+     * engine-level merge veto ({@code DerivedIndexEngine}); sorted-merge
+     * unification against this declared contract is a separate later phase.
      */
-    static Settings.Builder commonTargetSettings(String sourceIndex, int sourceShards) {
+    static Settings.Builder commonTargetSettings(String sourceIndex, int sourceShards, MVGroupByOrdering ordering) {
+        List<String> sortFields = ordering.columnNames();
         return Settings.builder()
             .put(DerivedIndexBinding.KEY_SOURCE_NAME, sourceIndex)
             .put("index.number_of_shards", sourceShards)
@@ -102,8 +114,12 @@ public final class MVViewCreation {
             .put("index.composite.primary_data_format", "parquet")
             .putList("index.composite.secondary_data_formats", "lucene")
             // Canonical DERIVED DATA-FORMAT CATEGORY.
-            .put(DerivedIndexBinding.KEY_DATA_FORMAT, MVDataFormat.NAME)
-            .put(MVConstants.COLOCATE_WITH_SETTING, sourceIndex);
+            .put(DerivedIndexBinding.KEY_DATA_FORMAT, MVConstants.DERIVED_CATEGORY)
+            .put(MVConstants.COLOCATE_WITH_SETTING, sourceIndex)
+            // The GROUP BY ordering contract as the standard index sort.
+            .putList("index.sort.field", sortFields)
+            .putList("index.sort.order", sortFields.stream().map(f -> "asc").toList())
+            .putList("index.sort.missing", sortFields.stream().map(f -> "_first").toList());
     }
 
     /**

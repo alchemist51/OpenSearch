@@ -9,51 +9,37 @@
 package org.opensearch.mv;
 
 import org.opensearch.index.IndexModule;
-import org.opensearch.index.IndexSettings;
-import org.opensearch.index.engine.dataformat.DataFormat;
-import org.opensearch.index.engine.dataformat.DataFormatDescriptor;
-import org.opensearch.index.engine.dataformat.DataFormatPlugin;
-import org.opensearch.index.engine.dataformat.DataFormatRegistry;
-import org.opensearch.index.engine.dataformat.IndexingEngineConfig;
-import org.opensearch.index.engine.dataformat.IndexingExecutionEngine;
-import org.opensearch.index.engine.dataformat.ReaderManagerConfig;
 import org.opensearch.index.engine.derived.pull.NodeDerivedPullService;
-import org.opensearch.index.engine.exec.EngineReaderManager;
-import org.opensearch.index.mapper.MappedFieldType;
-import org.opensearch.index.store.PrecomputedChecksumStrategy;
-import org.opensearch.index.store.checksum.GenericCRC32ChecksumHandler;
 import org.opensearch.mv.pull.MVBuildRuntime;
 import org.opensearch.mv.pull.MVDerivedPullFormat;
 import org.opensearch.mv.pull.MVPullSettings;
 import org.opensearch.plugins.ActionPlugin.ActionHandler;
 import org.opensearch.plugins.Plugin;
-import org.opensearch.plugins.SearchBackEndPlugin;
 
-import java.util.Map;
-import java.util.function.Supplier;
 
 /**
- * Unified materialized-view plugin. Registers both the derived
- * "materialized_view" source format and the "mv_state" target format.
- * Provides the pull-based build service for {@code mv_state} targets
- * through the generic {@link NodeDerivedPullService} SPI.
+ * Unified materialized-view plugin — CONTROL PLANE + PULL PIPELINE ONLY.
  *
- * <p>This plugin consolidates the former mv-data-format, mv-pull-engine,
- * and mv-state-format modules into a single deployable unit. The generic
- * SPI interfaces ({@code DerivedPullFormat}, {@code DerivedSourceReader},
- * etc.) remain in the server module; only MV-specific implementations
- * live here.</p>
+ * <p>This plugin registers NO data formats and NO indexing engine. An MV
+ * target is a standard derived index ({@code index.derived.enabled=true})
+ * on the stock composite store (primary {@code parquet}, secondary
+ * {@code lucene}); its state artifacts are plain parquet generations
+ * published through the generic
+ * {@code IndexShard#publishDerivedArtifact(String, WriterFileSet, Map)}
+ * seam and owned end-to-end (catalog, checksum, upload, recovery) by the
+ * stock machinery.
  *
- * <p><b>One plugin, two formats:</b> {@code materialized_view} is the
- * source-side format (captures aggregates from raw data); {@code mv_state}
- * is the target-side format (folds shipped/pulled state). Both are
- * {@link org.opensearch.index.engine.dataformat.DerivedDataFormat}
- * subclasses.</p>
+ * <p>What lives here is exclusively MV-domain logic: the definition
+ * compiler/validator and its REST control plane, the pull checkpoint
+ * protocol (target-driven request/reply against the source primary), the
+ * DataFusion fold runtime, noop/coverage tracking, watermark accounting,
+ * and shard colocation. The derived data-format CATEGORY value
+ * ({@code index.derived.data_format=materialized_view}) survives purely as
+ * control-plane routing — pull-service eligibility and analytics MV-serving
+ * dispatch key off it; it resolves to no physical format.</p>
  */
 public class MVDataFormatPlugin extends Plugin
     implements
-        DataFormatPlugin,
-        SearchBackEndPlugin<MVReaderManager.MVReader>,
         org.opensearch.plugins.ClusterPlugin,
         org.opensearch.plugins.ActionPlugin,
         org.opensearch.plugins.ExtensiblePlugin,
@@ -240,12 +226,6 @@ public class MVDataFormatPlugin extends Plugin
     @Override
     public java.util.List<org.opensearch.common.settings.Setting<?>> getSettings() {
         java.util.List<org.opensearch.common.settings.Setting<?>> base = java.util.List.of(
-            org.opensearch.common.settings.Setting.listSetting(
-                MVConstants.SHIP_TARGETS_SETTING,
-                java.util.List.of(),
-                java.util.function.Function.identity(),
-                org.opensearch.common.settings.Setting.Property.IndexScope
-            ),
             org.opensearch.common.settings.Setting.simpleString(
                 MVConstants.COLOCATE_WITH_SETTING,
                 org.opensearch.common.settings.Setting.Property.IndexScope
@@ -259,18 +239,6 @@ public class MVDataFormatPlugin extends Plugin
                 false,
                 org.opensearch.common.settings.Setting.Property.IndexScope,
                 org.opensearch.common.settings.Setting.Property.Final
-            ),
-            org.opensearch.common.settings.Setting.boolSetting(
-                MVConstants.STATE_MERGE_SETTING,
-                false,
-                org.opensearch.common.settings.Setting.Property.IndexScope,
-                org.opensearch.common.settings.Setting.Property.Dynamic
-            ),
-            org.opensearch.common.settings.Setting.boolSetting(
-                MVConstants.SERVE_STATE_SETTING,
-                false,
-                org.opensearch.common.settings.Setting.Property.IndexScope,
-                org.opensearch.common.settings.Setting.Property.Dynamic
             ),
             org.opensearch.common.settings.Setting.listSetting(
                 MVConstants.STATE_FIELDS_SETTING,
@@ -322,9 +290,6 @@ public class MVDataFormatPlugin extends Plugin
         java.util.List<ActionHandler<? extends org.opensearch.action.ActionRequest, ? extends org.opensearch.core.action.ActionResponse>>
         getActions() {
         return java.util.List.of(
-            new ActionHandler<>(MVShipStateAction.INSTANCE, MVShipStateTransportHandler.class),
-            new ActionHandler<>(MVCursorAction.INSTANCE, MVCursorTransportHandler.class),
-            new ActionHandler<>(MVSourceCommitAction.INSTANCE, MVSourceCommitTransportHandler.class),
             // Checkpoint request: target request-driven checkpoint fetch from source.
             new ActionHandler<>(MVCheckpointRequestAction.INSTANCE, MVCheckpointRequestTransportHandler.class),
             // Stage 5: MV definition control plane (validate + view CRUD).
@@ -355,148 +320,6 @@ public class MVDataFormatPlugin extends Plugin
     @Override
     public java.util.List<org.opensearch.action.support.ActionFilter> getActionFilters() {
         return derivedIndexActionFilter == null ? java.util.List.of() : java.util.List.of(derivedIndexActionFilter);
-    }
-
-    @Override
-    public DataFormat getDataFormat() {
-        return MVDataFormat.INSTANCE;
-    }
-
-    @Override
-    public java.util.List<DataFormat> getAdditionalDataFormats() {
-        return java.util.List.of(MVStateDataFormat.INSTANCE);
-    }
-
-    @Override
-    public IndexingExecutionEngine<?, ?> indexingEngine(IndexingEngineConfig config) {
-        java.util.List<String> shipTargets = config.indexSettings().getSettings().getAsList(MVConstants.SHIP_TARGETS_SETTING);
-        // ONE definition carrier pair: the persisted descriptor (authoritative,
-        // self-contained) or the canonical derived-binding id. No silent
-        // default — an MV-participating index declaring NEITHER is a
-        // configuration bug and must fail loudly, not fold a toy definition.
-        String definition = config.indexSettings().getSettings().get(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID);
-        String descriptorJson = config.indexSettings().getSettings().get(MVConstants.DESCRIPTOR_SETTING);
-        boolean hasDescriptor = descriptorJson != null && descriptorJson.isEmpty() == false;
-        if ((definition == null || definition.isEmpty()) && hasDescriptor == false) {
-            throw new IllegalStateException(
-                "mv engine: index ["
-                    + config.indexSettings().getIndex().getName()
-                    + "] participates in MV but declares no definition — set "
-                    + org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID
-                    + " or a persisted descriptor (targets created via /_mv/views carry the descriptor automatically)"
-            );
-        }
-
-        // Source vs target is decided by the canonical DERIVED DATA-FORMAT
-        // CATEGORY, not by scanning primary/secondary format lists for mv_state.
-        // A target declares index.derived.data_format=materialized_view; a
-        // source declares MV ship targets (index.mv.ship_targets).
-        String derivedCategory = org.opensearch.cluster.metadata.DerivedIndexBinding.dataFormatCategory(
-            config.indexSettings().getSettings()
-        );
-        boolean isMvStateTarget = MVDataFormat.NAME.equals(derivedCategory);
-
-        MVDefinitionSpec spec;
-        org.opensearch.index.engine.dataformat.DataFormat format;
-        if (isMvStateTarget && (shipTargets == null || shipTargets.isEmpty())) {
-            // Target side: fold definition + mv_state format. Descriptor-only
-            // targets (REST /_mv/views) synthesize the fold spec from the
-            // persisted descriptor — the descriptor IS the definition.
-            if (definition == null || definition.isEmpty()) {
-                spec = MVDefinitionSpec.foldOf(MVDefinitionResolver.resolve(config.indexSettings().getSettings()));
-            } else {
-                spec = MVDefinitionSpec.fold(definition);
-            }
-            format = MVStateDataFormat.INSTANCE;
-        } else {
-            // Source side: named source definition and materialized_view
-            // format. Ship sources have no descriptor carrier — the id is
-            // required here.
-            if (definition == null || definition.isEmpty()) {
-                throw new IllegalStateException(
-                    "mv engine: source index ["
-                        + config.indexSettings().getIndex().getName()
-                        + "] declares ship targets but no "
-                        + org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_DEFINITION_ID
-                );
-            }
-            spec = MVDefinitionSpec.source(definition);
-            format = MVDataFormat.INSTANCE;
-        }
-
-        // Stage 4: resolve the target-side merge definition through the shared
-        // MVDefinitionResolver (persisted descriptor first, else legacy
-        // compiledFor). A tampered / oversize / unparseable / disagreeing
-        // descriptor throws — we fail closed to a null merge definition so the
-        // engine disables state merge rather than merging with wrong fold
-        // semantics. Only consulted on the target-merge branch.
-        MVCompiledDefinition mergeDefinition = null;
-        if (isMvStateTarget && (shipTargets == null || shipTargets.isEmpty())) {
-            try {
-                mergeDefinition = MVDefinitionResolver.resolve(config.indexSettings().getSettings());
-            } catch (RuntimeException e) {
-                org.apache.logging.log4j.LogManager.getLogger(MVDataFormatPlugin.class)
-                    .error(
-                        "mv merge: definition resolution failed for target [{}]; state merge disabled for its shards",
-                        config.indexSettings().getIndex().getName(),
-                        e
-                    );
-                mergeDefinition = null;
-            }
-        }
-
-        return new MVIndexingEngine(
-            config.store().shardPath(),
-            config.indexSettings().getIndex().getName(),
-            spec,
-            format,
-            MVDefinitionResolver.definitionLabel(config.indexSettings().getSettings()),
-            shipTargets == null ? java.util.List.of() : shipTargets,
-            () -> client,
-            () -> clusterService,
-            config.indexSettings().getSettings().getAsBoolean(MVConstants.STATE_MERGE_SETTING, false),
-            routingSnapshotService != null ? routingSnapshotService::current : () -> TargetRoutingSnapshot.EMPTY,
-            mergeDefinition,
-            mvNativeRuntimePtr
-        );
-    }
-
-    @Override
-    public Map<String, Supplier<DataFormatDescriptor>> getFormatDescriptors(IndexSettings indexSettings, DataFormatRegistry registry) {
-        // Register descriptors for BOTH formats from this single plugin.
-        // mv_state uses PrecomputedChecksumStrategy so that CRC32 checksums
-        // registered at write time (after native build or compaction) are served
-        // in O(1) by the upload/recovery path. Without this, every publish and
-        // every restart CRC32-scans the entire mv_state catalog (219 GB @ gen-38).
-        return Map.of(
-            MVDataFormat.NAME,
-            () -> new DataFormatDescriptor(MVDataFormat.NAME, new GenericCRC32ChecksumHandler()),
-            MVStateDataFormat.NAME,
-            () -> new DataFormatDescriptor(MVStateDataFormat.NAME, new PrecomputedChecksumStrategy())
-        );
-    }
-
-    @Override
-    public void assignCapabilities(MappedFieldType fieldType, IndexSettings indexSettings, DataFormatRegistry dataFormatRegistry) {
-        // Derived format: claims no field capabilities ever.
-    }
-
-    // ---- SearchBackEndPlugin (reader lifecycle for both formats) ----
-
-    @Override
-    public String name() {
-        return MVDataFormat.NAME;
-    }
-
-    @Override
-    public java.util.List<String> getSupportedFormats() {
-        // Support both materialized_view and mv_state formats
-        return java.util.List.of(MVDataFormat.NAME, MVStateDataFormat.NAME);
-    }
-
-    @Override
-    public EngineReaderManager<?> createReaderManager(ReaderManagerConfig settings) {
-        return new MVReaderManager();
     }
 
     /** Accessor for integration tests that verify poller lifecycle. */
