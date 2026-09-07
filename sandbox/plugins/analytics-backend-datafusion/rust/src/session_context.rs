@@ -502,6 +502,15 @@ pub async unsafe fn create_mv_only_session_context(
     }
     config.options_mut().execution.target_partitions = query_config.target_partitions;
     config.options_mut().execution.batch_size = query_config.batch_size;
+    // Mirror the shard-scan context: form file groups by statistics so the
+    // per-file sort order advertised by the MV ListingTable (footer-stamped
+    // generations) survives into the scan's output_ordering — concatenating
+    // multiple sorted files in one group would otherwise force DataFusion to
+    // drop the ordering claim and fold with hash aggregation.
+    config
+        .options_mut()
+        .execution
+        .split_file_groups_by_statistics = true;
 
     let state_builder = SessionStateBuilder::new()
         .with_config(config)

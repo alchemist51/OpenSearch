@@ -229,8 +229,59 @@ pub async fn register_mv_state_listing_table(
         .iter()
         .map(|p| ListingTableUrl::parse(p.as_str()))
         .collect::<std::result::Result<_, _>>()?;
-    let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-        .with_file_extension(".mv.parquet");
+    // `target_partitions` on the LISTING OPTIONS (not the session config) gates
+    // the sort-aware path twice in DF54's ListingTable::scan: it sets the initial
+    // file-group count, and the statistics split is only accepted when
+    // `new_groups.len() <= options.target_partitions`. Overlapping MV generations
+    // cannot chain into one sorted group — each needs its own — so the ordered
+    // path requires target_partitions >= file count (default is 1, which silently
+    // downgrades every fold to hash aggregation). We take max(session value,
+    // file count): more groups than cores is fine, the scheduler multiplexes.
+    //
+    // `collect_stat` MUST stay false: DF54 computes per-file statistics by NAME
+    // against the table schema, and MV state files carry writer-alias column
+    // names — every aggregate column resolves to all-null statistics, which
+    // null-fills the scanned values (empirically: 9 e2e tests return null sums
+    // with it enabled). It is also unnecessary: row-group/page pruning reads
+    // footer metadata through the expr adapter, not listing-level statistics.
+    let session_tp = ctx
+        .state()
+        .config()
+        .options()
+        .execution
+        .target_partitions;
+    let listing_tp = session_tp.max(state_file_paths.len()).max(1);
+    let mut listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+        .with_file_extension(".mv.parquet")
+        .with_collect_stat(false)
+        .with_target_partitions(listing_tp);
+
+    // Advertise the per-file sort order when EVERY file's parquet footer
+    // carries identical SortingColumn metadata (stamped by the build and
+    // merge writers). Sorted-input advertisement lets DataFusion fold group
+    // keys with streaming (sorted) aggregation instead of re-hashing all
+    // state rows. Fail-safe: any file without matching metadata (e.g. a
+    // generation written before stamping existed) means no advertisement —
+    // a false ordering claim would silently corrupt aggregation results.
+    if let Some(sort_cols) = unanimous_footer_sort_order(state_file_paths)? {
+        let sort_exprs: Vec<datafusion::logical_expr::SortExpr> = sort_cols
+            .iter()
+            .map(|sc| {
+                let pos = sc.column_idx as usize;
+                let logical_name = state_fields.get(pos).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "register_mv_state_listing_table: footer sort column ordinal {} has no \
+                         state_fields entry",
+                        pos
+                    ))
+                })?;
+                Ok(datafusion::prelude::col(format!("\"{}\"", logical_name))
+                    .sort(!sc.descending, sc.nulls_first))
+            })
+            .collect::<Result<_>>()?;
+        listing_options = listing_options.with_file_sort_order(vec![sort_exprs]);
+    }
+
     let listing_config = ListingTableConfig::new_with_multi_paths(urls)
         .with_listing_options(listing_options)
         .with_schema(Arc::clone(&table_schema))
@@ -240,6 +291,46 @@ pub async fn register_mv_state_listing_table(
     let table = ListingTable::try_new(listing_config)?;
     ctx.register_table(register_name, Arc::new(table))?;
     Ok(())
+}
+
+/// Reads the parquet footer `SortingColumn` metadata of every state file.
+/// Returns Some(order) only when every file (and every row group within each
+/// file) declares the identical order; None otherwise.
+fn unanimous_footer_sort_order(
+    state_file_paths: &[String],
+) -> Result<Option<Vec<parquet::file::metadata::SortingColumn>>> {
+    let mut agreed: Option<Vec<parquet::file::metadata::SortingColumn>> = None;
+    for path in state_file_paths {
+        let file = std::fs::File::open(path).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "unanimous_footer_sort_order: failed to open '{}': {}",
+                path, e
+            ))
+        })?;
+        let reader =
+            parquet::file::reader::SerializedFileReader::new(file).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "unanimous_footer_sort_order: failed to read footer of '{}': {}",
+                    path, e
+                ))
+            })?;
+        use parquet::file::reader::FileReader;
+        let meta = reader.metadata();
+        if meta.num_row_groups() == 0 {
+            continue; // empty file constrains nothing
+        }
+        for rg in 0..meta.num_row_groups() {
+            match meta.row_group(rg).sorting_columns() {
+                Some(cols) if !cols.is_empty() => match &agreed {
+                    None => agreed = Some(cols.clone()),
+                    Some(prev) if prev == cols => {}
+                    Some(_) => return Ok(None), // disagreement -> no claim
+                },
+                _ => return Ok(None), // unstamped row group -> no claim
+            }
+        }
+    }
+    Ok(agreed)
 }
 
 #[cfg(test)]
@@ -422,7 +513,14 @@ mod e2e_tests {
     }
 
     async fn ctx_with(paths: Vec<String>) -> SessionContext {
-        let ctx = SessionContext::new();
+        // Mirror production config: group files by statistics so the
+        // advertised per-file sort order survives into the scan.
+        let mut config = datafusion::prelude::SessionConfig::new();
+        config
+            .options_mut()
+            .execution
+            .split_file_groups_by_statistics = true;
+        let ctx = SessionContext::new_with_config(config);
         register_mv_state_listing_table(&ctx, "mv", &paths, table_schema(), &state_fields())
             .await
             .unwrap();
@@ -611,5 +709,73 @@ mod e2e_tests {
         assert!(read_schema_from_first_file(&[]).unwrap().is_none());
         let legacy = read_schema_from_first_file(&["x.mv.arrow".to_string()]).unwrap_err().to_string();
         assert!(legacy.contains("no longer supported"), "{legacy}");
+    }
+
+    // ====================================================================
+    // Sort-order advertisement (streaming fold)
+    // ====================================================================
+
+    /// Writes a generation with SortingColumn footer metadata, rows pre-sorted
+    /// by (event_bucket, URL) — the group-key prefix used by the fold tests.
+    fn write_sorted_gen(
+        dir: &std::path::Path,
+        name: &str,
+        schema: &SchemaRef,
+        batch: RecordBatch,
+    ) -> String {
+        use parquet::file::metadata::SortingColumn;
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let props = WriterProperties::builder()
+            .set_sorting_columns(Some(vec![
+                SortingColumn { column_idx: 0, descending: false, nulls_first: true },
+                SortingColumn { column_idx: 1, descending: false, nulls_first: true },
+            ]))
+            .build();
+        let mut w = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    /// FALSIFICATION: with every file stamped, a group-by on the sort-key
+    /// prefix must plan as ordered (streaming) aggregation — and stay exact.
+    #[tokio::test]
+    async fn stamped_files_fold_with_sorted_aggregation() {
+        let dir = TempDir::new().unwrap();
+        let ps = physical_schema_i64();
+        // Rows sorted by (event_bucket, URL) within each file.
+        let p1 = write_sorted_gen(dir.path(), "g0.mv.parquet", &ps, gen_batch(&ps, &[100, 100, 200], &["/a", "/b", "/a"], &[1, 2, 3], &[1, 1, 1]));
+        let p2 = write_sorted_gen(dir.path(), "g1.mv.parquet", &ps, gen_batch(&ps, &[100, 200], &["/a", "/b"], &[10, 20], &[1, 1]));
+        let ctx = ctx_with(vec![p1, p2]).await;
+        // Correctness of the fold on the sorted key prefix.
+        let b = sql_rows(&ctx, "SELECT event_bucket, SUM(\"sum_Adv\") AS s FROM mv GROUP BY event_bucket ORDER BY event_bucket").await;
+        assert_eq!(b[0].num_rows(), 2);
+        assert_eq!(i64_at(&b, "s", 0), 13); // bucket 100: 1+2+10
+        assert_eq!(i64_at(&b, "s", 1), 23); // bucket 200: 3+20
+        // Plan evidence: aggregation runs in an ordered input mode, not pure hashing.
+        let explain = sql_rows(&ctx, "EXPLAIN SELECT event_bucket, SUM(\"sum_Adv\") FROM mv GROUP BY event_bucket").await;
+        let plan = format!("{}", arrow::util::pretty::pretty_format_batches(&explain).unwrap());
+        assert!(
+            plan.contains("ordering_mode=Sorted") || plan.contains("ordering_mode=PartiallySorted"),
+            "expected sorted-input aggregation in plan:\n{plan}"
+        );
+    }
+
+    /// FAIL-SAFE: if any file lacks the footer stamp, no ordering is claimed.
+    #[tokio::test]
+    async fn mixed_stamped_unstamped_makes_no_ordering_claim() {
+        let dir = TempDir::new().unwrap();
+        let ps = physical_schema_i64();
+        let p1 = write_sorted_gen(dir.path(), "g0.mv.parquet", &ps, gen_batch(&ps, &[100], &["/a"], &[1], &[1]));
+        let p2 = write_gen(dir.path(), "g1.mv.parquet", &ps, gen_batch(&ps, &[200], &["/a"], &[2], &[1])); // unstamped
+        assert!(unanimous_footer_sort_order(&[p1.clone(), p2.clone()]).unwrap().is_none());
+        // And the fold still works (hash mode), exact.
+        let ctx = ctx_with(vec![p1, p2]).await;
+        let b = sql_rows(&ctx, "SELECT SUM(\"sum_Adv\") AS s FROM mv").await;
+        assert_eq!(i64_at(&b, "s", 0), 3);
+        let explain = sql_rows(&ctx, "EXPLAIN SELECT event_bucket, SUM(\"sum_Adv\") FROM mv GROUP BY event_bucket").await;
+        let plan = format!("{}", arrow::util::pretty::pretty_format_batches(&explain).unwrap());
+        assert!(!plan.contains("ordering_mode=Sorted"), "must not claim ordering:\n{plan}");
     }
 }
