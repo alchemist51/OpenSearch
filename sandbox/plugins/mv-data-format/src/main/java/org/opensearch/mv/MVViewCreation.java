@@ -103,6 +103,13 @@ public final class MVViewCreation {
             .putList("index.composite.secondary_data_formats", "lucene")
             // Canonical DERIVED DATA-FORMAT CATEGORY.
             .put(DerivedIndexBinding.KEY_DATA_FORMAT, MVDataFormat.NAME)
+            // Always wire the specialized sort-preserving state-merge strategy
+            // (DataFusionMVStateMergeStrategy). Scheduling and admission stay
+            // with the standard data-format merge framework; the global
+            // opensearch.pluggable.dataformat.merge.enabled property remains
+            // the ONLY merge gate. Without this stamp the engine constructs
+            // with no merger and TieredPolicy has nothing to execute.
+            .put(MVConstants.STATE_MERGE_SETTING, true)
             .put(MVConstants.COLOCATE_WITH_SETTING, sourceIndex);
     }
 
