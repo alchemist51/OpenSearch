@@ -251,8 +251,17 @@ pub async fn register_mv_state_listing_table(
         .execution
         .target_partitions;
     let listing_tp = session_tp.max(state_file_paths.len()).max(1);
+    // State generations are STOCK parquet since the engine redesign — published
+    // by the composite target's parquet engine as
+    // `_parquet_file_generation_mv_<hex>.parquet` (MVConstants). DF applies
+    // `ends_with(file_extension)` to every listed file EVEN for exact-file
+    // URLs (datafusion-datasource url.rs), so the old `.mv.parquet` filter
+    // (the deleted MVWriter's naming) silently dropped all generations and
+    // served an empty table. `.parquet` matches both the stock naming and any
+    // legacy `.mv.parquet` files; the catalog snapshot — not this filter — is
+    // the discovery authority, and the existence check above fails closed.
     let mut listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-        .with_file_extension(".mv.parquet")
+        .with_file_extension(".parquet")
         .with_collect_stat(false)
         .with_target_partitions(listing_tp);
 
@@ -555,6 +564,25 @@ mod e2e_tests {
         assert_eq!(i64_at(&b, "c", 0), 2);
         assert_eq!(i64_at(&b, "s", 1), 20);
         assert_eq!(i64_at(&b, "s", 2), 30);
+    }
+
+    /// REGRESSION (redesign A/B 2026-09-07): generations published by the stock
+    /// parquet engine are named `_parquet_file_generation_mv_<hex>.parquet`
+    /// (MVConstants) — NOT the deleted MVWriter's `*.mv.parquet`. DF applies
+    /// `ends_with(file_extension)` to exact-file URLs too, so a stale
+    /// `.mv.parquet` listing filter silently dropped every generation and the
+    /// table read as EMPTY (schema resolved, zero rows — 0/32 on the A/B node).
+    /// This test folds across files carrying the exact production naming.
+    #[tokio::test]
+    async fn fold_across_generations_with_production_stock_parquet_naming() {
+        let dir = TempDir::new().unwrap();
+        let ps = physical_schema_i64();
+        let p1 = write_gen(dir.path(), "_parquet_file_generation_mv_1.parquet", &ps, gen_batch(&ps, &[100, 200], &["/a", "/b"], &[10, 20], &[1, 2]));
+        let p2 = write_gen(dir.path(), "_parquet_file_generation_mv_2a.parquet", &ps, gen_batch(&ps, &[100, 300], &["/a", "/c"], &[5, 30], &[1, 3]));
+        let ctx = ctx_with(vec![p1, p2]).await;
+        let b = sql_rows(&ctx, "SELECT SUM(\"sum_Adv\") AS s, SUM(\"count_Adv\") AS c FROM mv").await;
+        assert_eq!(i64_at(&b, "s", 0), 65); // 10+20+5+30: zero rows here = listing filter regression
+        assert_eq!(i64_at(&b, "c", 0), 7);
     }
 
     /// Heterogeneous generations: a later gen stores Int16 aggregate state —
