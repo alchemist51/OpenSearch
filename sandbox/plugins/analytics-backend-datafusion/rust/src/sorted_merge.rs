@@ -99,6 +99,23 @@ pub fn merge_sorted_parquet_files(
         let buffered = BufWriter::new(file);
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(Default::default()))
+            // Preserve the sort-order stamp across merges: the output is
+            // sorted by the same spec the inputs were, so re-declare it in
+            // the footer for the read path's streaming-fold advertisement.
+            .set_sorting_columns(Some(
+                sort.iter()
+                    .map(|s| {
+                        let idx = schema.index_of(&s.column).map_err(|e| {
+                            format!("sorted_merge: sort column '{}' not in output schema: {e}", s.column)
+                        })?;
+                        Ok(parquet::file::metadata::SortingColumn {
+                            column_idx: idx as i32,
+                            descending: s.descending,
+                            nulls_first: s.nulls_first,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            ))
             .build();
         let mut writer = ArrowWriter::try_new(buffered, schema, Some(props))
             .map_err(|e| format!("sorted_merge parquet writer: {e}"))?;

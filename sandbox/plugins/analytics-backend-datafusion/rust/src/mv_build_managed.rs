@@ -528,6 +528,21 @@ pub fn build_streaming_parquet_artifact(
             let buffered = BufWriter::new(file);
             let props = WriterProperties::builder()
                 .set_compression(Compression::ZSTD(Default::default()))
+                // Stamp the file's sort order into the parquet footer
+                // (standard SortingColumn metadata). The read path advertises
+                // this to DataFusion so folds over the group keys can use
+                // streaming (sorted) aggregation instead of re-hashing.
+                .set_sorting_columns(Some(
+                    ordering
+                        .keys
+                        .iter()
+                        .map(|k| parquet::file::metadata::SortingColumn {
+                            column_idx: k.field_index as i32,
+                            descending: k.direction != 0,
+                            nulls_first: k.null_placement == 0,
+                        })
+                        .collect(),
+                ))
                 .build();
             let mut writer = ArrowWriter::try_new(buffered, schema.clone(), Some(props))
                 .map_err(|e| format!("mv_build_streaming parquet writer: {e}"))?;
