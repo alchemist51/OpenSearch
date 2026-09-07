@@ -548,7 +548,7 @@ pub async unsafe fn create_mv_only_session_context(
     if has_mv_data {
         // Read only the first file's schema header (~few KB). O(1) memory.
         let physical_schema =
-            crate::mv_state_table_provider::read_schema_from_first_file(state_file_paths)?
+            crate::mv_expr_adapter::read_schema_from_first_file(state_file_paths)?
                 .ok_or_else(|| {
                     DataFusionError::Execution(
                         "create_mv_only_session_context: state files had no Arrow schema"
@@ -562,22 +562,35 @@ pub async unsafe fn create_mv_only_session_context(
             &register_name,
             &Arc::new(arrow::datatypes::Schema::empty()),
         );
-        let (table_schema, physical_projection) =
+        let (table_schema, _file0_projection) =
             mv_table_schema(&physical_schema, &logical_schema, state_fields)?;
 
-        let file_paths: Vec<String> = state_file_paths.iter().map(|s| s.to_string()).collect();
-
-        let provider = crate::mv_state_table_provider::MvStateTableProvider::new(
+        // STANDARD LISTING PATH: register a stock ListingTable over the state
+        // files with the MV expr adapter carrying the schema-evolution
+        // contract (positional relabel, lossless widening, null-fill). The
+        // parquet opener rewrites projections AND predicates through the
+        // adapter BEFORE building pruning predicates, so filters get
+        // row-group/page statistics pruning, and repartitioning provides
+        // sub-file parallelism — none of which the previous custom provider
+        // (`MvStateTableProvider`) supported (it advertised
+        // filter-pushdown Unsupported, a leftover from the Arrow-IPC era).
+        // `mv_table_schema` still validates file-0 compatibility (positional
+        // label overlay, widening rules, duplicate names) and derives the
+        // logical table schema; per-file cast/null-fill decisions now happen
+        // in the expr adapter at scan time.
+        let urls_registered = crate::mv_expr_adapter::register_mv_state_listing_table(
+            &ctx,
+            register_name.as_str(),
+            state_file_paths,
             Arc::clone(&table_schema),
-            file_paths.clone(),
-            physical_projection,
-            Arc::clone(&physical_schema),
-        );
-        ctx.register_table(register_name.as_str(), Arc::new(provider))?;
+            state_fields,
+        )
+        .await;
+        urls_registered?;
         native_bridge_common::log_info!(
-            "create_mv_only_session_context: registered streaming MV table '{}' from {} state files (lazy, no batches loaded)",
+            "create_mv_only_session_context: registered MV ListingTable '{}' over {} state files (standard parquet scan: statistics pruning + pushdown + sub-file repartitioning)",
             register_name,
-            file_paths.len()
+            state_file_paths.len()
         );
     } else {
         let logical_schema = widen_schema_from_plan(
