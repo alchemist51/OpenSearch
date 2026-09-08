@@ -51,6 +51,13 @@ public class MVReadServiceTests extends OpenSearchTestCase {
         assertEquals(10L, result.rows().get(0).get("count"));
     }
 
+    public void testNormalizeArrowTextForXContent() {
+        org.apache.arrow.vector.util.Text text = new org.apache.arrow.vector.util.Text("/page1");
+        Object normalized = MVReadService.normalizeArrowValue(text);
+        assertEquals(String.class, normalized.getClass());
+        assertEquals("/page1", normalized);
+    }
+
     public void testBuildInputSchemaJsonFromDefinition() {
         // Verify that a compiled definition can produce a valid schema JSON.
         MVCompiledDefinition def = MVCompiledDefinition.of(

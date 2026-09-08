@@ -11,12 +11,15 @@ package org.opensearch.mv;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 /**
  * FFM (Foreign Function and Memory) bridge for MV native operations.
@@ -49,11 +52,26 @@ public final class MVNativeBridge {
     /**
      * Initialize the FFM method handles. Called once from MVEnginePlugin.createComponents
      * after the native library is loaded by the analytics-backend-datafusion plugin.
+     *
+     * <p>Uses {@link SymbolLookup#libraryLookup(Path, Arena)} with the path from
+     * {@code native.lib.path} system property — this works across classloaders because
+     * it's bound to a physical file path, unlike {@code SymbolLookup.loaderLookup()}
+     * which only sees libraries loaded by the calling class's classloader.</p>
      */
     public static void init() {
         try {
+            String nativeLibPath = System.getProperty("native.lib.path");
+            if (nativeLibPath == null || nativeLibPath.isBlank()) {
+                logger.warn("MVNativeBridge: native.lib.path not set — MV query/compact disabled");
+                return;
+            }
+            Path libPath = Path.of(nativeLibPath);
+            if (!Files.exists(libPath)) {
+                logger.warn("MVNativeBridge: native library not found at [{}] — MV query/compact disabled", nativeLibPath);
+                return;
+            }
             Linker linker = Linker.nativeLinker();
-            SymbolLookup lookup = SymbolLookup.loaderLookup();
+            SymbolLookup lookup = SymbolLookup.libraryLookup(libPath, Arena.global());
 
             // df_mv_query_state
             var queryOpt = lookup.find("df_mv_query_state");

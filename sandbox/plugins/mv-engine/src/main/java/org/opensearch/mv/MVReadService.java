@@ -197,12 +197,19 @@ public class MVReadService {
         for (int row = 0; row < batch.getRowCount(); row++) {
             Map<String, Object> rowMap = new HashMap<>();
             for (int col = 0; col < vectors.size(); col++) {
-                Object value = vectors.get(col).getObject(row);
+                Object value = normalizeArrowValue(vectors.get(col).getObject(row));
                 rowMap.put(fieldNames.get(col), value);
             }
             rows.add(rowMap);
         }
         return new MVQueryResult(fieldNames, rows, batch.getRowCount());
+    }
+
+    static Object normalizeArrowValue(Object value) {
+        if (value instanceof org.apache.arrow.vector.util.Text text) {
+            return text.toString();
+        }
+        return value;
     }
 
     /**

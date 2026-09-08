@@ -14,6 +14,7 @@
 opensearchplugin {
   description = 'POC: materialized-view definition layer — definition storage, compilation, and target creation.'
   classname = 'org.opensearch.mv.MVEnginePlugin'
+  extendedPlugins = ['arrow-base']
 }
 
 java { sourceCompatibility = JavaVersion.toVersion(25); targetCompatibility = JavaVersion.toVersion(25) }
