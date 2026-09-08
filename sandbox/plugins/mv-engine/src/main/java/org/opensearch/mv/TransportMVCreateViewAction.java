@@ -16,6 +16,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.remote.GetMVCheckpointTransportHandler;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
 
@@ -30,6 +31,13 @@ public class TransportMVCreateViewAction extends HandledTransportAction<MVCreate
 
     private final MVDefinitionClusterService definitionService;
 
+    /** Captured at Guice injection time for the hydrator lifecycle listener. */
+    private static volatile TransportService injectedTransportService;
+
+    static TransportService getInjectedTransportService() {
+        return injectedTransportService;
+    }
+
     @Inject
     public TransportMVCreateViewAction(
         TransportService transportService,
@@ -39,6 +47,12 @@ public class TransportMVCreateViewAction extends HandledTransportAction<MVCreate
         super(MVCreateViewAction.NAME, transportService, actionFilters, MVCreateViewRequest::new,
             org.opensearch.threadpool.ThreadPool.Names.MANAGEMENT);
         this.definitionService = definitionService;
+        injectedTransportService = transportService;
+
+        // ── Register GetMVCheckpoint transport handler (defect-#19 fix pattern) ──
+        // TransportService is Guice-injected here; register the raw transport handler
+        // that the target hydrator calls to fetch source-side checkpoints.
+        GetMVCheckpointTransportHandler.register(transportService);
     }
 
     @Override

@@ -35,20 +35,26 @@ import org.opensearch.transport.TransportService;
 public final class GetMVCheckpointTransportHandler implements TransportRequestHandler<GetMVCheckpointRequest> {
 
     private static final Logger logger = LogManager.getLogger(GetMVCheckpointTransportHandler.class);
+    private static volatile boolean registered = false;
 
     private GetMVCheckpointTransportHandler() {}
 
     /**
      * Register this handler on the given transport service. Call once at node startup
      * (from the plugin's createComponents or equivalent wiring site).
+     * Safe to call multiple times — subsequent calls are no-ops.
      */
-    public static void register(TransportService transportService) {
+    public static synchronized void register(TransportService transportService) {
+        if (registered) {
+            return;
+        }
         transportService.registerRequestHandler(
             MVCheckpointService.ACTION_GET_CHECKPOINT,
             ThreadPool.Names.GENERIC,
             GetMVCheckpointRequest::new,
             new GetMVCheckpointTransportHandler()
         );
+        registered = true;
         logger.info("Registered GetMVCheckpoint transport handler on action={}", MVCheckpointService.ACTION_GET_CHECKPOINT);
     }
 

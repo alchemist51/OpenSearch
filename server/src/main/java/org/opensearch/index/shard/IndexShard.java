@@ -5763,6 +5763,22 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     }
 
     /**
+     * Add an internal refresh listener dynamically (after engine construction).
+     * Used by the MV source-side POC to register the MV state refresh listener
+     * when mv_definitions are added to a source index after the shard has already started.
+     *
+     * @opensearch.internal
+     */
+    public void addInternalRefreshListener(org.apache.lucene.search.ReferenceManager.RefreshListener listener) {
+        internalRefreshListener.add(listener);
+        Indexer indexer = getIndexerOrNull();
+        if (indexer instanceof DataFormatAwareEngine dataFormatAwareEngine) {
+            dataFormatAwareEngine.addRefreshListener(listener);
+        }
+        logger.info("[{}] Dynamic internal refresh listener added: {}", shardId, listener.getClass().getSimpleName());
+    }
+
+    /**
      * Add a listener for refreshes.
      *
      * @param location the location to listen for

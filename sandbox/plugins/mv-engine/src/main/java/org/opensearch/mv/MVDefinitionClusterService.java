@@ -272,6 +272,19 @@ public class MVDefinitionClusterService {
 
                 @Override
                 public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                    // ── POC: no close/open needed ──
+                    // The MV definition is now in IndexMetadata.customData("mv_definitions").
+                    // The next writer rotation (on the next ingest + refresh cycle) will
+                    // pick up the definition via MVWriterConfigRegistry.compileSpecs().
+                    // Close/open is unnecessary for the create-view-then-ingest flow and
+                    // causes translog recovery crashes when the Rust finalizeWriter is
+                    // called on an MV-registered writer with 0 rows.
+                    // Production will use a dynamic writer-level MV builder registration
+                    // (IndexSettings update listener or writer-pool rotation) so that
+                    // definitions added to an already-ingesting source are picked up
+                    // within one refresh interval without destructive close/open.
+                    logger.info("MV definition [{}] applied to source index [{}] metadata — next writer rotation will activate builders",
+                        mvId, sourceIndex);
                     listener.onResponse(new PutResult(mvId, sourceIndex, targetIndex, descriptorJson));
                 }
             }
