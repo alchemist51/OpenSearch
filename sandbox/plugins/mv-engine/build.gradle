@@ -1,0 +1,29 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+/*
+ * MV definition-layer plugin: stores MV definitions as JSON in
+ * IndexMetadata.customData on BOTH source and target indices, written
+ * atomically in ONE ClusterStateUpdateTask. No native code; no pull/ship/merge.
+ */
+opensearchplugin {
+  description = 'POC: materialized-view definition layer — definition storage, compilation, and target creation.'
+  classname = 'org.opensearch.mv.MVEnginePlugin'
+}
+
+java { sourceCompatibility = JavaVersion.toVersion(25); targetCompatibility = JavaVersion.toVersion(25) }
+
+dependencies {
+  compileOnly project(':server')
+  testImplementation project(':test:framework')
+}
+
+tasks.named('compileTestJava').configure {
+  sourceCompatibility = JavaVersion.toVersion(25)
+  targetCompatibility = JavaVersion.toVersion(25)
+}
