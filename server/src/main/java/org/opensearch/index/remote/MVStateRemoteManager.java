@@ -182,6 +182,21 @@ public class MVStateRemoteManager {
         return latestGen + 1;
     }
 
+    /**
+     * Download a data file from remote store as an InputStream.
+     * Used by the target hydrator (RemoteStoreReplicationSource idiom).
+     *
+     * @param shardId  shard ID string
+     * @param mvId     materialized view identifier
+     * @param fileName data file name
+     * @return input stream of the file content
+     */
+    public InputStream downloadDataFile(String shardId, String mvId, String fileName) throws IOException {
+        BlobPath dataPath = resolvePath(shardId, mvId, DataType.DATA);
+        BlobContainer dataContainer = blobContainerProvider.blobContainer(dataPath);
+        return dataContainer.readBlob(fileName);
+    }
+
     private BlobPath resolvePath(String shardId, String mvId, DataType dataType) {
         MVStatePathInput.Builder builder = MVStatePathInput.builder();
         builder.mvId(mvId);

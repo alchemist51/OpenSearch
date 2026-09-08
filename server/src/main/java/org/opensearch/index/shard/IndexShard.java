@@ -4960,6 +4960,34 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             );
         }
 
+        // ── MV source-side refresh listener (upload sealed partials to remote) ───
+        // Conditionally registered when IndexMetadata customData contains mv_definitions,
+        // indicating this shard has MV definitions that produce partial state files.
+        // Mirror the RemoteStoreRefreshListener conditional pattern above.
+        if (shardRouting.primary()) {
+            java.util.Map<String, String> mvDefs = indexSettings.getIndexMetadata().getCustomData("mv_definitions");
+            if (mvDefs != null && !mvDefs.isEmpty()) {
+                org.apache.lucene.search.ReferenceManager.RefreshListener mvListener =
+                    org.opensearch.index.remote.MVRefreshListenerFactory.create(
+                        shardId,
+                        shardPath().getDataPath(),
+                        indexSettings.getIndexMetadata().primaryTerm(shardId.id()),
+                        mvDefs,
+                        () -> {
+                            try {
+                                return getProcessedLocalCheckpoint();
+                            } catch (org.apache.lucene.store.AlreadyClosedException | IllegalIndexShardStateException e) {
+                                return -1L;
+                            }
+                        }
+                    );
+                if (mvListener != null) {
+                    internalRefreshListener.add(mvListener);
+                    logger.info("MV source refresh listener registered for shard={}", shardId);
+                }
+            }
+        }
+
         /*
           With segment replication enabled for primary relocation, recover replica shard initially as read only and
           change to a writeable engine during relocation handoff after a round of segment replication.

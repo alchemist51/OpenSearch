@@ -55,6 +55,8 @@ public class MVStateRefreshListener implements ReferenceManager.RefreshListener 
     private final long defMetadataVersion;
     private final Map<String, String> mvDefinitions; // mvId -> definitionHash
     private final AtomicReference<MVCheckpoint> lastCheckpoint;
+    /** Supplier for the shard's current processed local checkpoint (seqNo). */
+    private final java.util.function.LongSupplier processedCheckpointSupplier;
 
     /** Generation counters per MV, used for upload naming. */
     private final Map<String, Long> genCounters;
@@ -65,7 +67,8 @@ public class MVStateRefreshListener implements ReferenceManager.RefreshListener 
         MVStateRemoteManager remoteManager,
         long primaryTerm,
         long defMetadataVersion,
-        Map<String, String> mvDefinitions
+        Map<String, String> mvDefinitions,
+        java.util.function.LongSupplier processedCheckpointSupplier
     ) {
         this.shardId = shardId;
         this.shardDataPath = shardDataPath;
@@ -76,7 +79,22 @@ public class MVStateRefreshListener implements ReferenceManager.RefreshListener 
         this.lastCheckpoint = new AtomicReference<>(
             new MVCheckpoint(shardId, primaryTerm, -1, defMetadataVersion, Map.of())
         );
+        this.processedCheckpointSupplier = processedCheckpointSupplier;
         this.genCounters = new HashMap<>();
+    }
+
+    /**
+     * Backward-compat constructor (maxSeqNo = -1 always).
+     */
+    public MVStateRefreshListener(
+        ShardId shardId,
+        Path shardDataPath,
+        MVStateRemoteManager remoteManager,
+        long primaryTerm,
+        long defMetadataVersion,
+        Map<String, String> mvDefinitions
+    ) {
+        this(shardId, shardDataPath, remoteManager, primaryTerm, defMetadataVersion, mvDefinitions, () -> -1L);
     }
 
     /**
@@ -172,7 +190,7 @@ public class MVStateRefreshListener implements ReferenceManager.RefreshListener 
         long gen = genCounters.getOrDefault(mvId, 1L);
 
         // Upload: data files first, manifest LAST
-        long maxSeqNo = -1; // TODO: pass from engine context in future
+        long maxSeqNo = processedCheckpointSupplier.getAsLong(); // read engine's processedLocalCheckpoint
         MVStateManifest manifest = remoteManager.uploadGeneration(
             String.valueOf(shardId.id()),
             mvId,
