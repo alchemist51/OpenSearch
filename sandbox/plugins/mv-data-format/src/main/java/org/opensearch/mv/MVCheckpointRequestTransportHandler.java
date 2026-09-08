@@ -132,12 +132,35 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
             ShardId shardId = shard.shardId();
             long requestWatermark = request.targetWatermark();
 
-            // ── Read catalog snapshot ────────────────────────────────────
+            // ── Read catalog snapshot, filtered to REMOTE-VISIBLE filesets ──
+            // Defect #30: the local catalog includes parquet generations whose
+            // remote-store upload has not completed/become visible yet. Core
+            // SegRep publishes replication checkpoints from the upload-completed
+            // path — the remote metadata is the single source of truth for
+            // cross-node visibility. Mirror that invariant here: advertise a
+            // fileset (and count its seqNo range toward advertMax) only when
+            // EVERY file of the fileset is present in the shard's uploaded-to-
+            // remote map. Filtering is per-FILESET, not per-file — a partially
+            // uploaded generation must not contribute its maxSeqNo, or the
+            // target stages a range it cannot cover (the observed 2-4 doc
+            // coverage-mismatch livelock under S3 upload lag). With an FS
+            // remote store uploads are effectively instantaneous and this
+            // filter passes everything, matching prior single-node behaviour.
             Map<String, MVFileMetadata> allFileMetadata = new LinkedHashMap<>();
             long infosVersion;
             long catalogAdvertMax = -1L;
             long primaryTerm;
             boolean anyUnknownRange = false;
+            long skippedFilesets = 0L;
+
+            final java.util.Set<String> remoteVisible;
+            if (shard.indexSettings().isRemoteStoreEnabled()) {
+                remoteVisible = java.util.Set.copyOf(shard.getRemoteDirectory().getSegmentsUploadedToRemoteStore().keySet());
+            } else {
+                // Non-remote source (local-only dev): nothing to gate on —
+                // preserve pre-#30 behaviour exactly.
+                remoteVisible = null;
+            }
 
             try (GatedCloseable<CatalogSnapshot> ref = shard.getCatalogSnapshot()) {
                 CatalogSnapshot catalog = ref.get();
@@ -148,6 +171,14 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
                     for (Map.Entry<String, WriterFileSet> fsEntry : seg.dfGroupedSearchableFiles().entrySet()) {
                         if (!"parquet".equals(fsEntry.getKey())) continue;
                         WriterFileSet wfs = fsEntry.getValue();
+
+                        // Visibility gate: every file of this fileset must be
+                        // uploaded before any of it is advertised.
+                        if (!filesetRemoteVisible(wfs, fsEntry.getKey(), remoteVisible)) {
+                            skippedFilesets++;
+                            continue;
+                        }
+
                         Path dir = Path.of(wfs.directory());
                         for (String fileName : wfs.files()) {
                             long size = -1L;
@@ -173,6 +204,15 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
                         }
                     }
                 }
+            }
+            if (skippedFilesets > 0) {
+                logger.info(
+                    "CHECKPOINT_VISIBILITY_SKIP source=[{}][{}] filesets_not_yet_remote_visible={} advertMax={}",
+                    request.sourceIndex(),
+                    request.sourceShard(),
+                    skippedFilesets,
+                    catalogAdvertMax
+                );
             }
 
             // ── Unknown range = BUG: log WARN and return unavailable ─────
@@ -272,6 +312,27 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
         }
         if (fileMaxSeqNo <= targetWatermark) {
             return false;
+        }
+        return true;
+    }
+
+    /**
+     * Defect #30 visibility gate: a fileset may be advertised only when EVERY
+     * one of its files is present in the source shard's uploaded-to-remote map
+     * ({@code remoteVisible}, keyed by {@link FileMetadata#serialize}). A
+     * partially uploaded generation must not contribute files or its maxSeqNo —
+     * the target would stage a range it cannot cover. {@code remoteVisible ==
+     * null} means the source has no remote store (local-only dev): fail open,
+     * preserving pre-#30 behaviour.
+     */
+    static boolean filesetRemoteVisible(WriterFileSet wfs, String format, java.util.Set<String> remoteVisible) {
+        if (remoteVisible == null) {
+            return true;
+        }
+        for (String fileName : wfs.files()) {
+            if (!remoteVisible.contains(FileMetadata.serialize(format, fileName))) {
+                return false;
+            }
         }
         return true;
     }
