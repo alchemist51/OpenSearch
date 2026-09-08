@@ -221,7 +221,13 @@ public final class DerivedShardPoller implements Runnable, Closeable {
         // every outcome is distinguishable (capped -> hold, build failure ->
         // hold, caught-up / no-new-data -> release); the exception path above
         // is the only transition owned here.
-        if (lagRemains) {
+        // Defect #31: a builder-returned failure communicates its backoff via
+        // nextDelayOverrideMs — honor it here instead of the normal cadence.
+        if (nextDelayOverrideMs >= 0) {
+            long delayMs = nextDelayOverrideMs;
+            nextDelayOverrideMs = -1L;
+            schedule(TimeValue.timeValueMillis(delayMs));
+        } else if (lagRemains) {
             schedule(TimeValue.timeValueMillis(0));
         } else {
             schedule(interval);
@@ -247,6 +253,16 @@ public final class DerivedShardPoller implements Runnable, Closeable {
             }
         }
     }
+
+    /**
+     * Defect #31: when a round fails WITHOUT throwing (builder-returned failure,
+     * e.g. coverage-mismatch), the backoff computed in {@link #pollRound()} must
+     * reach the scheduler. The poller is single-threaded (rounds are serialized
+     * through {@link #schedule}), so a plain field is a safe side-channel:
+     * {@code pollRound()} sets it, {@link #run()} consumes it and schedules the
+     * next round at the backoff instead of the normal interval.
+     */
+    private long nextDelayOverrideMs = -1L;
 
     /** Walk the cause chain to find the deepest non-null message. */
     private static String deepestMessage(Throwable t) {
@@ -460,6 +476,10 @@ public final class DerivedShardPoller implements Runnable, Closeable {
             } else {
                 holdCatchUpPressure();
             }
+            // Defect #31: hand the computed backoff to run()'s scheduler —
+            // previously computed+logged here but never applied (run()
+            // rescheduled at the normal interval, producing a hot retry loop).
+            nextDelayOverrideMs = backoffMs;
             return false;
         }
     }
