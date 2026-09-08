@@ -23,6 +23,8 @@ import org.opensearch.index.engine.dataformat.Writer;
 import org.opensearch.index.engine.dataformat.WriterConfig;
 import org.opensearch.index.engine.exec.Segment;
 import org.opensearch.index.engine.exec.commit.IndexStoreProvider;
+import org.opensearch.index.remote.MVCheckpointService;
+import org.opensearch.index.remote.MVStateRefreshListener;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.FormatChecksumStrategy;
 import org.opensearch.index.store.PrecomputedChecksumStrategy;
@@ -282,8 +284,14 @@ public class ParquetIndexingEngine implements IndexingExecutionEngine<ParquetDat
                     int shardId = shardPath.getShardId().id();
                     long primaryTerm = indexSettings.getIndexMetadata().primaryTerm(shardId);
                     String outputBase = shardPath.getDataPath().toString();
-                    // TODO (c3 piece 4): resume generation from remote manifest listing
+                    // Gen resume: read starting generation from MVCheckpointService
+                    // (populated by MVStateRefreshListener.initFromRemote at shard open)
                     long startGen = 0;
+                    MVStateRefreshListener listener = MVCheckpointService.getListener(shardPath.getShardId());
+                    if (listener != null) {
+                        // Use the first spec's mvId to get resume gen
+                        startGen = listener.getStartGeneration(specs.get(0).mvId());
+                    }
                     RustBridge.registerMvBuilders(
                         filePath.toString(), specsJson, shardId, primaryTerm, outputBase, startGen
                     );
