@@ -17,6 +17,7 @@ pub mod ffm;
 pub mod field_config;
 pub mod memory;
 pub mod merge;
+pub mod mv_partial;
 pub mod native_settings;
 pub mod rate_limited_writer;
 pub mod writer;

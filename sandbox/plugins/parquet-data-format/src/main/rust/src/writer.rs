@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use crate::crc_writer::CrcWriter;
 use crate::memory::write_pool;
 use crate::merge::{merge_sorted_with_pool, schema::ROW_ID_COLUMN_NAME};
+use crate::mv_partial::MVPartialBuilder;
 use crate::native_settings::NativeSettings;
 use crate::writer_properties_builder::WriterPropertiesBuilder;
 use crate::{log_debug, log_error, log_info};
@@ -380,6 +381,10 @@ lazy_static! {
     /// Holds both Parquet and IPC writers via the `WriterVariant` enum.
     static ref WRITERS: DashMap<String, WriterState> = DashMap::new();
     pub static ref SETTINGS_STORE: DashMap<String, NativeSettings> = DashMap::new();
+    /// Per-writer MV partial builders. Keyed by the same temp filename as WRITERS.
+    /// Registered when a writer is created with MV definitions; removed and sealed
+    /// at finalize_writer time.
+    static ref MV_BUILDERS: DashMap<String, MVPartialBuilder> = DashMap::new();
 }
 
 pub struct NativeParquetWriter;
@@ -404,7 +409,23 @@ impl NativeParquetWriter {
         if WRITERS.remove(&temp_filename).is_some() {
             log_info!("Cleaned up writer entry for {}", temp_filename);
         }
+        // Also clean up any MV builder for this writer
+        if MV_BUILDERS.remove(&temp_filename).is_some() {
+            log_info!("Cleaned up MV builder for {}", temp_filename);
+        }
         Ok(())
+    }
+
+    /// Register MV partial builders for a writer. Called from Java via FFI
+    /// when a writer is created for an index that has MV definitions.
+    pub fn register_mv_builder(filename: &str, builder: MVPartialBuilder) {
+        let temp_filename = Self::temp_filename(filename);
+        log_info!(
+            "Registered MV builder for {} with {} MVs",
+            temp_filename,
+            builder.num_mvs()
+        );
+        MV_BUILDERS.insert(temp_filename, builder);
     }
     /// Build the temp filename by prepending "temp-" to the basename.
     fn temp_filename(filename: &str) -> String {
@@ -557,6 +578,14 @@ impl NativeParquetWriter {
                     record_batch.num_columns()
                 );
 
+                // ── MV source-side partial accumulate (c2) ──────────────
+                // Feed the materialized batch to all registered MV builders
+                // for this writer. Never fail ingest on MV transform error.
+                if let Some(mut mv_builder) = MV_BUILDERS.get_mut(&temp_filename) {
+                    mv_builder.accumulate(&record_batch);
+                }
+                // ── end MV tap ──────────────────────────────────────────
+
                 if let Some(mut state) = WRITERS.get_mut(&temp_filename) {
                     match &state.variant {
                         WriterVariant::Ipc(writer_arc) => {
@@ -606,6 +635,28 @@ impl NativeParquetWriter {
             filename,
             temp_filename
         );
+
+        // ── MV source-side seal (c2) ────────────────────────────────
+        // Seal all MV partial builders for this writer at refresh boundary.
+        // This is the same code path that finalizes segment parquet files,
+        // so partial gen boundary == refresh boundary.
+        if let Some((_, mut mv_builder)) = MV_BUILDERS.remove(&temp_filename) {
+            let seal_results = mv_builder.seal();
+            for sr in &seal_results {
+                if sr.failed {
+                    log_error!(
+                        "mv_partial seal failed for mv={} gen={}: {:?}",
+                        sr.mv_id, sr.generation, sr.fail_reason
+                    );
+                } else if sr.row_count > 0 {
+                    log_info!(
+                        "mv_partial sealed mv={} gen={} rows={} path={}",
+                        sr.mv_id, sr.generation, sr.row_count, sr.file_path
+                    );
+                }
+            }
+        }
+        // ── end MV seal ─────────────────────────────────────────────
 
         if let Some((_, state)) = WRITERS.remove(&temp_filename) {
             let WriterState {

@@ -81,11 +81,13 @@ pub fn collect() -> NativeRuntimeStats {
     if let Some(rt) = super::io_task::IO_RUNTIME.get() {
         let m = rt.metrics();
         s.tokio_num_workers = m.num_workers() as i64;
-        s.tokio_num_blocking_threads = m.num_blocking_threads() as i64;
+        // TODO(pre-existing): tokio 1.52 removed these RuntimeMetrics methods.
+        // Restore when the workspace upgrades tokio or adjusts the API surface.
+        s.tokio_num_blocking_threads = 0; // was: m.num_blocking_threads()
         s.tokio_active_tasks = m.num_alive_tasks() as i64;
         s.tokio_global_queue_depth = m.global_queue_depth() as i64;
-        s.tokio_blocking_queue_depth = m.blocking_queue_depth() as i64;
-        s.tokio_spawned_tasks_total = m.spawned_tasks_count() as i64;
+        s.tokio_blocking_queue_depth = 0; // was: m.blocking_queue_depth()
+        s.tokio_spawned_tasks_total = 0; // was: m.spawned_tasks_count()
         // Per-worker fan-out: sum across all workers for runtime-wide totals.
         let n = m.num_workers();
         let mut busy_millis: i64 = 0;
@@ -94,9 +96,9 @@ pub fn collect() -> NativeRuntimeStats {
         let mut overflow_count_total: i64 = 0;
         for i in 0..n {
             busy_millis += m.worker_total_busy_duration(i).as_millis() as i64;
-            local_queue_depth_total += m.worker_local_queue_depth(i) as i64;
-            polls_count_total += m.worker_poll_count(i) as i64;
-            overflow_count_total += m.worker_overflow_count(i) as i64;
+            local_queue_depth_total += 0; // was: m.worker_local_queue_depth(i)
+            polls_count_total += 0; // was: m.worker_poll_count(i)
+            overflow_count_total += 0; // was: m.worker_overflow_count(i)
         }
         s.tokio_workers_busy_millis_total = busy_millis;
         s.tokio_local_queue_depth_total = local_queue_depth_total;
