@@ -41,15 +41,11 @@ public class MVWriterConfigTests extends OpenSearchTestCase {
             )
         );
 
-        // Serialize the definitions map: { "mv1": { descriptor } }
+        // IndexMetadata.getCustomData("mv_definitions") returns the flat map
+        // directly: mvId -> descriptor JSON.
         XContentBuilder builder = XContentFactory.jsonBuilder();
-        builder.startObject();
-        builder.field("mv1");
         descriptor.toXContent(builder, ToXContent.EMPTY_PARAMS);
-        builder.endObject();
-        String json = builder.toString();
-
-        return Map.of(MVConstants.SOURCE_DEFINITIONS_KEY, json);
+        return Map.of("mv1", builder.toString());
     }
 
     public void testFromCustomDataProducesCorrectSpecs() throws IOException {
@@ -104,13 +100,13 @@ public class MVWriterConfigTests extends OpenSearchTestCase {
     }
 
     public void testFromCustomDataWithBlankValueReturnsEmpty() {
-        Map<String, String> customData = Map.of(MVConstants.SOURCE_DEFINITIONS_KEY, "  ");
+        Map<String, String> customData = Map.of("mv1", "  ");
         List<MVWriterConfig.MVPartialWriterSpec> specs = MVWriterConfig.fromCustomData(customData);
         assertTrue(specs.isEmpty());
     }
 
     public void testFromCustomDataWithBadJsonDoesNotThrow() {
-        Map<String, String> customData = Map.of(MVConstants.SOURCE_DEFINITIONS_KEY, "{invalid json!!!");
+        Map<String, String> customData = Map.of("mv1", "{invalid json!!!");
         // Should not throw — errors are logged and an empty list returned
         List<MVWriterConfig.MVPartialWriterSpec> specs = MVWriterConfig.fromCustomData(customData);
         assertTrue(specs.isEmpty());
@@ -152,15 +148,15 @@ public class MVWriterConfigTests extends OpenSearchTestCase {
             List.of(MVDefinitionDescriptor.AggregateDescriptor.sum("bytes", "total_bytes"))
         );
 
-        XContentBuilder builder = XContentFactory.jsonBuilder();
-        builder.startObject();
-        builder.field("mv_region");
-        desc1.toXContent(builder, ToXContent.EMPTY_PARAMS);
-        builder.field("mv_status");
-        desc2.toXContent(builder, ToXContent.EMPTY_PARAMS);
-        builder.endObject();
+        XContentBuilder builder1 = XContentFactory.jsonBuilder();
+        desc1.toXContent(builder1, ToXContent.EMPTY_PARAMS);
+        XContentBuilder builder2 = XContentFactory.jsonBuilder();
+        desc2.toXContent(builder2, ToXContent.EMPTY_PARAMS);
 
-        Map<String, String> customData = Map.of(MVConstants.SOURCE_DEFINITIONS_KEY, builder.toString());
+        Map<String, String> customData = Map.of(
+            "mv_region", builder1.toString(),
+            "mv_status", builder2.toString()
+        );
         List<MVWriterConfig.MVPartialWriterSpec> specs = MVWriterConfig.fromCustomData(customData);
 
         assertEquals(2, specs.size());

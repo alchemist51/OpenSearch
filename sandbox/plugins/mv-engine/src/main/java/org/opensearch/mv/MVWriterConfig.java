@@ -15,7 +15,6 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -57,42 +56,40 @@ public final class MVWriterConfig {
      * Extract MV definitions from the source index's customData and compile
      * them into FFI-ready specs.
      *
-     * @param customData the IndexMetadata.customData map (key = MVConstants.SOURCE_DEFINITIONS_KEY)
+     * <p>The {@code customData} parameter is the direct result of
+     * {@code IndexMetadata.getCustomData("mv_definitions")} — a flat
+     * {@code Map<String,String>} where each entry is
+     * {@code mvId → descriptorJson}. It is NOT a nested JSON object.</p>
+     *
+     * @param customData the mv_definitions map (mvId → descriptor JSON)
      * @return list of specs (empty if no MV definitions)
      */
     public static List<MVPartialWriterSpec> fromCustomData(Map<String, String> customData) {
-        if (customData == null) {
-            return Collections.emptyList();
-        }
-        String defsJson = customData.get(MVConstants.SOURCE_DEFINITIONS_KEY);
-        if (defsJson == null || defsJson.isBlank()) {
+        if (customData == null || customData.isEmpty()) {
             return Collections.emptyList();
         }
 
         List<MVPartialWriterSpec> specs = new ArrayList<>();
-        try {
-            // Parse the outer map: { "mvId1": { descriptor }, "mvId2": { descriptor }, ... }
-            try (XContentParser parser = XContentType.JSON.xContent().createParser(
-                    NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, defsJson)) {
-                parser.nextToken(); // START_OBJECT
-                while (parser.nextToken() != XContentParser.Token.END_OBJECT) {
-                    String mvId = parser.currentName();
-                    parser.nextToken(); // move to the descriptor object
-                    try {
-                        MVDefinitionDescriptor descriptor = MVDefinitionDescriptor.fromXContent(parser);
-                        MVCompiledDefinition compiled = MVCompiledDefinition.fromDescriptor(descriptor);
-                        MVPartialWriterSpec spec = compileToFFISpec(mvId, compiled);
-                        specs.add(spec);
-                        logger.info("Compiled MV definition for source-side builder: mvId={}, hash={}",
-                            mvId, compiled.hash());
-                    } catch (Exception e) {
-                        logger.error("Failed to compile MV definition mvId={}: {}", mvId, e.getMessage());
-                        // Skip — don't fail writer creation for one bad definition
-                    }
-                }
+        // Each entry in the map is mvId → descriptorJson (flat Map, not nested JSON)
+        for (Map.Entry<String, String> entry : customData.entrySet()) {
+            String mvId = entry.getKey();
+            String descriptorJson = entry.getValue();
+            if (descriptorJson == null || descriptorJson.isBlank()) {
+                logger.warn("Skipping MV definition mvId={}: empty descriptor", mvId);
+                continue;
             }
-        } catch (IOException e) {
-            logger.error("Failed to parse mv_definitions from customData: {}", e.getMessage());
+            try (XContentParser parser = XContentType.JSON.xContent().createParser(
+                    NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, descriptorJson)) {
+                MVDefinitionDescriptor descriptor = MVDefinitionDescriptor.fromXContent(parser);
+                MVCompiledDefinition compiled = MVCompiledDefinition.fromDescriptor(descriptor);
+                MVPartialWriterSpec spec = compileToFFISpec(mvId, compiled);
+                specs.add(spec);
+                logger.info("Compiled MV definition for source-side builder: mvId={}, hash={}",
+                    mvId, compiled.hash());
+            } catch (Exception e) {
+                logger.error("Failed to compile MV definition mvId={}: {}", mvId, e.getMessage());
+                // Skip — don't fail writer creation for one bad definition
+            }
         }
         return specs;
     }

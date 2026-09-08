@@ -52,7 +52,9 @@ pub enum AggFunction {
 #[derive(Debug, Clone)]
 pub struct AggSpec {
     pub function: AggFunction,
-    /// Source column index in the input RecordBatch (None for COUNT(*)).
+    /// Source field name, resolved against the first input RecordBatch.
+    pub source_field: Option<String>,
+    /// Source column index in the input RecordBatch (None for COUNT(*) or until resolved).
     pub source_col_idx: Option<usize>,
     /// Output column name(s) in the state schema.
     pub output_names: Vec<String>,
@@ -574,8 +576,52 @@ impl StringCapableMVBuilder {
         }
     }
 
+    fn resolve_input_columns(&mut self, batch: &RecordBatch) -> Result<(), String> {
+        let schema = batch.schema();
+
+        if self.spec.group_col_indices.len() != self.spec.group_col_names.len() {
+            self.spec.group_col_indices = self
+                .spec
+                .group_col_names
+                .iter()
+                .map(|name| {
+                    schema
+                        .index_of(name)
+                        .map_err(|e| format!("MV {} group field '{}' missing from input schema: {}", self.spec.mv_id, name, e))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+
+        if self.spec.group_col_indices.len() != self.spec.group_col_types.len() {
+            return Err(format!(
+                "MV {} group metadata mismatch: names={} indices={} types={}",
+                self.spec.mv_id,
+                self.spec.group_col_names.len(),
+                self.spec.group_col_indices.len(),
+                self.spec.group_col_types.len()
+            ));
+        }
+
+        for agg in &mut self.spec.agg_specs {
+            if agg.source_col_idx.is_none() {
+                if let Some(field) = agg.source_field.as_deref() {
+                    agg.source_col_idx = Some(schema.index_of(field).map_err(|e| {
+                        format!("MV {} aggregate source field '{}' missing from input schema: {}", self.spec.mv_id, field, e)
+                    })?);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn accumulate(&mut self, batch: &RecordBatch) {
         if self.failed {
+            return;
+        }
+        if let Err(e) = self.resolve_input_columns(batch) {
+            log_error!("{}", e);
+            self.failed = true;
+            self.fail_reason = Some(e);
             return;
         }
         self.batches_seen += 1;
@@ -677,6 +723,17 @@ impl StringCapableMVBuilder {
         }
         let num_groups = self.groups.len();
         let num_group_cols = self.spec.group_col_names.len();
+        if self.spec.group_col_indices.len() != num_group_cols
+            || self.spec.group_col_types.len() != num_group_cols
+        {
+            return Err(format!(
+                "MV {} group columns unresolved at seal: names={} indices={} types={}",
+                self.spec.mv_id,
+                num_group_cols,
+                self.spec.group_col_indices.len(),
+                self.spec.group_col_types.len()
+            ));
+        }
 
         let entries: Vec<_> = self.groups.drain().collect();
 
@@ -1125,21 +1182,25 @@ mod tests {
             agg_specs: vec![
                 AggSpec {
                     function: AggFunction::Count,
+                    source_field: None,
                     source_col_idx: None,
                     output_names: vec!["cnt".to_string()],
                 },
                 AggSpec {
                     function: AggFunction::Sum,
+                    source_field: Some("amount".to_string()),
                     source_col_idx: Some(1), // "amount" column
                     output_names: vec!["total_amount".to_string()],
                 },
                 AggSpec {
                     function: AggFunction::Min,
+                    source_field: Some("amount".to_string()),
                     source_col_idx: Some(1),
                     output_names: vec!["min_amount".to_string()],
                 },
                 AggSpec {
                     function: AggFunction::Max,
+                    source_field: Some("amount".to_string()),
                     source_col_idx: Some(1),
                     output_names: vec!["max_amount".to_string()],
                 },
@@ -1160,6 +1221,31 @@ mod tests {
             vec![Arc::new(region_arr), Arc::new(amount_arr)],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_json_spec_resolves_input_columns_on_first_batch() {
+        let json = r#"[{"mv_id":"json_mv","definition_hash":"h","def_version":1,
+            "group_col_names":["region"],"group_col_types":["utf8"],
+            "agg_specs":[{"function":"count","source_field":null,"output_names":["cnt"]},
+                         {"function":"sum","source_field":"amount","output_names":["total"]}],
+            "sort_key_names":["region"]}]"#;
+        let specs = parse_specs_from_json(json).unwrap();
+        assert!(specs[0].group_col_indices.is_empty());
+        assert!(specs[0].agg_specs[1].source_col_idx.is_none());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = MVPartialBuilder::new(
+            specs,
+            0,
+            1,
+            tmp.path().to_path_buf(),
+        );
+        builder.accumulate(&make_test_batch(vec!["us", "eu", "us"], vec![10, 20, 30]));
+        let results = builder.seal();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].failed, "lazy resolution failed: {:?}", results[0].fail_reason);
+        assert_eq!(results[0].row_count, 2);
     }
 
     #[test]
@@ -1362,6 +1448,7 @@ mod tests {
             group_col_types: vec![DataType::Utf8],
             agg_specs: vec![AggSpec {
                 function: AggFunction::Count,
+                source_field: None,
                 source_col_idx: None,
                 output_names: vec!["cnt".to_string()],
             }],
@@ -1377,6 +1464,7 @@ mod tests {
             agg_specs: vec![
                 AggSpec {
                     function: AggFunction::Sum,
+                    source_field: Some("amount".to_string()),
                     source_col_idx: Some(1),
                     output_names: vec!["total".to_string()],
                 },
@@ -1415,11 +1503,13 @@ mod tests {
             agg_specs: vec![
                 AggSpec {
                     function: AggFunction::Count,
+                    source_field: None,
                     source_col_idx: None,
                     output_names: vec!["cnt".to_string()],
                 },
                 AggSpec {
                     function: AggFunction::Sum,
+                    source_field: Some("amount".to_string()),
                     source_col_idx: Some(1),
                     output_names: vec!["total".to_string()],
                 },
@@ -1510,7 +1600,8 @@ pub fn parse_specs_from_json(json: &str) -> Result<Vec<MVPartialSpec>, String> {
             };
             agg_specs.push(AggSpec {
                 function,
-                source_col_idx: None, // Resolved later from schema
+                source_field: jagg.source_field.clone(),
+                source_col_idx: None, // Resolved lazily from the first RecordBatch schema.
                 output_names: jagg.output_names.clone(),
             });
         }

@@ -42,6 +42,7 @@ public class NativeParquetWriter {
     private final SetOnce<RowIdMapping> rowIdMapping = new SetOnce<>();
     private final ParquetShardStatsTracker stats;
     private volatile boolean initialized = false;
+    private volatile long rowsWritten = 0;
 
     /**
      * Creates a new NativeParquetWriter handle. Does not create the native writer —
@@ -113,6 +114,7 @@ public class NativeParquetWriter {
             stats::incNativeWriteTotal,
             stats::incNativeWriteFailures
         );
+        rowsWritten++;
     }
 
     /**
@@ -126,6 +128,13 @@ public class NativeParquetWriter {
     public ParquetFileMetadata flush() throws IOException {
         if (writerFlushed.compareAndSet(false, true)) {
             if (initialized) {
+                if (rowsWritten == 0) {
+                    // No data was written — skip finalize to avoid Rust panic on empty MV builders.
+                    // This happens during shard recovery flush of an empty writer or when a writer
+                    // is created but the shard fails before any batches land.
+                    RustBridge.cleanupWriter(filePath);
+                    return null;
+                }
                 StatsRecorder.recordOutcome(() -> {
                     RustBridge.WriterFinalizeResult result = RustBridge.finalizeWriter(filePath);
                     if (result != null) {
