@@ -15,6 +15,7 @@ import org.opensearch.arrow.allocator.ArrowNativeAllocator;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.dataformat.IndexingExecutionEngine;
+import org.opensearch.index.engine.dataformat.MVWriterConfigRegistry;
 import org.opensearch.index.engine.dataformat.Merger;
 import org.opensearch.index.engine.dataformat.RefreshInput;
 import org.opensearch.index.engine.dataformat.RefreshResult;
@@ -27,6 +28,7 @@ import org.opensearch.index.store.FormatChecksumStrategy;
 import org.opensearch.index.store.PrecomputedChecksumStrategy;
 import org.opensearch.parquet.ParquetSettings;
 import org.opensearch.parquet.bridge.NativeSettings;
+import org.opensearch.parquet.bridge.RustBridge;
 import org.opensearch.parquet.bridge.RustBridge;
 import org.opensearch.parquet.memory.ArrowBufferPool;
 import org.opensearch.parquet.merge.NativeParquetMergeStrategy;
@@ -254,7 +256,7 @@ public class ParquetIndexingEngine implements IndexingExecutionEngine<ParquetDat
         long mappingVersion = mappingVersionSupplier.get();
         Schema schema = getOrBuildSchema();
         Path filePath = buildParquetFilePath(shardPath, config.writerGeneration(), null);
-        return new ParquetWriter(
+        ParquetWriter writer = new ParquetWriter(
             filePath.toString(),
             config.writerGeneration(),
             mappingVersion,
@@ -267,6 +269,79 @@ public class ParquetIndexingEngine implements IndexingExecutionEngine<ParquetDat
             checksumStrategy,
             statsTracker
         );
+
+        // ── MV source-side wire-up (c3) ──────────────────────────────────
+        // If the source index has MV definitions, register MV partial builders
+        // with the Rust writer so partials are produced end-to-end.
+        try {
+            var customData = indexSettings.getIndexMetadata().getCustomData("mv_definitions");
+            if (customData != null && !customData.isEmpty()) {
+                var specs = MVWriterConfigRegistry.compileSpecs(customData);
+                if (!specs.isEmpty()) {
+                    String specsJson = serializeMvSpecsToJson(specs);
+                    int shardId = shardPath.getShardId().id();
+                    long primaryTerm = indexSettings.getIndexMetadata().primaryTerm(shardId);
+                    String outputBase = shardPath.getDataPath().toString();
+                    // TODO (c3 piece 4): resume generation from remote manifest listing
+                    long startGen = 0;
+                    RustBridge.registerMvBuilders(
+                        filePath.toString(), specsJson, shardId, primaryTerm, outputBase, startGen
+                    );
+                    logger.info(
+                        "Registered {} MV builders for shard={} index={}",
+                        specs.size(), shardId, indexSettings.getIndex().getName()
+                    );
+                }
+            }
+        } catch (Exception e) {
+            // Never fail writer creation for MV registration errors
+            logger.error("Failed to register MV builders: {}", e.getMessage());
+        }
+        // ── end MV wire-up ───────────────────────────────────────────────
+
+        return writer;
+    }
+
+    /**
+     * Serialize registry MVPartialWriterSpec list to JSON for FFI.
+     */
+    private static String serializeMvSpecsToJson(List<MVWriterConfigRegistry.MVPartialWriterSpec> specs) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < specs.size(); i++) {
+            var s = specs.get(i);
+            if (i > 0) sb.append(",");
+            sb.append("{\"mv_id\":\"").append(s.mvId()).append("\"");
+            sb.append(",\"definition_hash\":\"").append(s.definitionHash()).append("\"");
+            sb.append(",\"def_version\":").append(s.defVersion());
+            sb.append(",\"group_col_names\":").append(toJsonArray(s.groupColNames()));
+            sb.append(",\"group_col_types\":").append(toJsonArray(s.groupColTypes()));
+            sb.append(",\"agg_specs\":[");
+            for (int j = 0; j < s.aggSpecs().size(); j++) {
+                var a = s.aggSpecs().get(j);
+                if (j > 0) sb.append(",");
+                sb.append("{\"function\":\"").append(a.function()).append("\"");
+                if (a.sourceField() != null) {
+                    sb.append(",\"source_field\":\"").append(a.sourceField()).append("\"");
+                }
+                sb.append(",\"output_names\":").append(toJsonArray(a.outputNames()));
+                sb.append("}");
+            }
+            sb.append("]");
+            sb.append(",\"sort_key_names\":").append(toJsonArray(s.sortKeyNames()));
+            sb.append("}");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private static String toJsonArray(List<String> items) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < items.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append("\"").append(items.get(i)).append("\"");
+        }
+        sb.append("]");
+        return sb.toString();
     }
 
     /** Parquet indexing uses only native (off-heap) memory via Arrow buffers and Rust writers, no JVM heap. */

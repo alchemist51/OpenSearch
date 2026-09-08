@@ -21,6 +21,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
+import org.opensearch.index.engine.dataformat.MVWriterConfigRegistry;
+
 /**
  * Bridges MV definitions from IndexMetadata customData to the Rust parquet
  * writer's MV partial builder via the FFI writer-config path.
@@ -142,5 +144,25 @@ public final class MVWriterConfig {
             case DOUBLE -> "float64";
             case TIMESTAMP -> "timestamp_ms";
         };
+    }
+
+    /**
+     * Bridge method: compiles customData into server-level registry specs.
+     * Used by MVEnginePlugin to register with MVWriterConfigRegistry.
+     */
+    public static List<MVWriterConfigRegistry.MVPartialWriterSpec> fromCustomDataToRegistrySpecs(Map<String, String> customData) {
+        List<MVPartialWriterSpec> internalSpecs = fromCustomData(customData);
+        List<MVWriterConfigRegistry.MVPartialWriterSpec> registrySpecs = new ArrayList<>(internalSpecs.size());
+        for (MVPartialWriterSpec s : internalSpecs) {
+            List<MVWriterConfigRegistry.MVPartialWriterSpec.AggFFI> aggFFIs = new ArrayList<>(s.aggSpecs().size());
+            for (MVPartialWriterSpec.AggFFI a : s.aggSpecs()) {
+                aggFFIs.add(new MVWriterConfigRegistry.MVPartialWriterSpec.AggFFI(a.function(), a.sourceField(), a.outputNames()));
+            }
+            registrySpecs.add(new MVWriterConfigRegistry.MVPartialWriterSpec(
+                s.mvId(), s.definitionHash(), s.defVersion(),
+                s.groupColNames(), s.groupColTypes(), aggFFIs, s.sortKeyNames()
+            ));
+        }
+        return registrySpecs;
     }
 }

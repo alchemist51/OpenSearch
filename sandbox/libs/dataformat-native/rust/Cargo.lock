@@ -2910,6 +2910,7 @@ dependencies = [
  "opensearch-parquet-format",
  "parquet",
  "rayon",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

@@ -44,7 +44,8 @@ public class RemoteStoreEnums {
     @ExperimentalApi
     public enum DataCategory {
         SEGMENTS("segments", Set.of(DataType.values())),
-        TRANSLOG("translog", Set.of(DATA, METADATA));
+        TRANSLOG("translog", Set.of(DATA, METADATA)),
+        MV_STATE("mv_state", Set.of(DATA, METADATA));
 
         private final String name;
         private final Set<DataType> supportedDataTypes;

@@ -21,6 +21,7 @@ import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
+import org.opensearch.index.engine.dataformat.MVWriterConfigRegistry;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.repositories.RepositoriesService;
@@ -85,6 +86,14 @@ public class MVEnginePlugin extends Plugin implements ActionPlugin {
         Supplier<RepositoriesService> repositoriesServiceSupplier
     ) {
         MVDefinitionClusterService definitionService = new MVDefinitionClusterService(clusterService, client);
+        // Register the MV writer-spec compiler so parquet-data-format can compile
+        // MV definitions from customData into FFI-ready specs without depending on mv-engine.
+        MVWriterConfigRegistry.register(MVWriterConfig::fromCustomDataToRegistrySpecs);
         return List.of(definitionService);
+    }
+
+    @Override
+    public void close() {
+        MVWriterConfigRegistry.unregister();
     }
 }

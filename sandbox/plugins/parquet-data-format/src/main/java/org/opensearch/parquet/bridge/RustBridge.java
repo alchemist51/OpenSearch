@@ -58,6 +58,7 @@ public class RustBridge {
     private static final MethodHandle SET_MERGE_POOL_LIMIT;
     private static final MethodHandle GET_POOL_STATS;
     private static final MethodHandle REGISTER_OVERCOMMIT_CALLBACKS;
+    private static final MethodHandle REGISTER_MV_BUILDERS;
 
     static {
         SymbolLookup lib = NativeLibraryLoader.symbolLookup();
@@ -294,6 +295,18 @@ public class RustBridge {
             lib.find("parquet_register_overcommit_callbacks").orElseThrow(),
             FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS)
         );
+        REGISTER_MV_BUILDERS = linker.downcallHandle(
+            lib.find("parquet_register_mv_builders").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,   // file
+                ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,   // json specs
+                ValueLayout.JAVA_INT,                          // shard_id
+                ValueLayout.JAVA_LONG,                         // primary_term
+                ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,   // output_base
+                ValueLayout.JAVA_LONG                          // start_generation
+            )
+        );
     }
 
     public static void initLogger() {}
@@ -341,6 +354,41 @@ public class RustBridge {
         try (var call = new NativeCall()) {
             var f = call.str(file);
             call.invokeIO(CLEANUP_WRITER, f.segment(), f.len());
+        }
+    }
+
+    /**
+     * Register MV partial builders for a writer. Called after createWriter when
+     * the source index has MV definitions in customData.
+     *
+     * @param file          the Parquet file path (must match the writer)
+     * @param specsJson     JSON array of MVPartialWriterSpec objects
+     * @param shardId       shard ID
+     * @param primaryTerm   current primary term
+     * @param outputBase    base directory for partial file output
+     * @param startGen      starting generation (for resume from remote)
+     */
+    public static void registerMvBuilders(
+        String file,
+        String specsJson,
+        int shardId,
+        long primaryTerm,
+        String outputBase,
+        long startGen
+    ) throws IOException {
+        try (var call = new NativeCall()) {
+            var f = call.str(file);
+            var json = call.str(specsJson);
+            var base = call.str(outputBase);
+            call.invokeIO(
+                REGISTER_MV_BUILDERS,
+                f.segment(), f.len(),
+                json.segment(), json.len(),
+                shardId,
+                primaryTerm,
+                base.segment(), base.len(),
+                startGen
+            );
         }
     }
 

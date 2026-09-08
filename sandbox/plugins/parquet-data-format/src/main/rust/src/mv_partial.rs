@@ -1471,3 +1471,98 @@ mod tests {
         assert_eq!(total.value(1), 60); // 2000: 20+40
     }
 }
+
+// ── JSON spec parsing (c3: FFI wire-up) ───────────────────────────────────
+
+/// Parse MV specs from a JSON string passed through FFI.
+///
+/// Expected format: array of objects with fields matching MVPartialSpec.
+pub fn parse_specs_from_json(json: &str) -> Result<Vec<MVPartialSpec>, String> {
+    // Minimal JSON parsing using serde_json-style manual parsing.
+    // The parquet-data-format crate already has serde_json available through
+    // arrow's re-export. For POC, use a simple approach.
+    //
+    // Format: [{"mv_id":"...", "definition_hash":"...", "def_version":1,
+    //   "group_col_names":["a"], "group_col_types":["utf8"],
+    //   "agg_specs":[{"function":"sum","source_field":"x","output_names":["x_sum"]}],
+    //   "sort_key_names":["a"]}]
+
+    let parsed: Vec<JsonMVSpec> = serde_json::from_str(json)
+        .map_err(|e| format!("JSON parse error: {}", e))?;
+
+    let mut specs = Vec::with_capacity(parsed.len());
+    for js in parsed {
+        let group_col_types: Vec<DataType> = js
+            .group_col_types
+            .iter()
+            .map(|t| arrow_type_from_string(t))
+            .collect::<Result<_, _>>()?;
+
+        let mut agg_specs = Vec::new();
+        for jagg in &js.agg_specs {
+            let function = match jagg.function.as_str() {
+                "count" => AggFunction::Count,
+                "count_field" => AggFunction::CountField,
+                "sum" => AggFunction::Sum,
+                "min" => AggFunction::Min,
+                "max" => AggFunction::Max,
+                other => return Err(format!("Unknown agg function: {}", other)),
+            };
+            agg_specs.push(AggSpec {
+                function,
+                source_col_idx: None, // Resolved later from schema
+                output_names: jagg.output_names.clone(),
+            });
+        }
+
+        specs.push(MVPartialSpec {
+            mv_id: js.mv_id,
+            definition_hash: js.definition_hash,
+            def_version: js.def_version,
+            group_col_indices: Vec::new(), // Resolved later from schema
+            group_col_names: js.group_col_names,
+            group_col_types,
+            agg_specs,
+            sort_key_names: js.sort_key_names,
+        });
+    }
+    Ok(specs)
+}
+
+fn arrow_type_from_string(s: &str) -> Result<DataType, String> {
+    match s {
+        "utf8" => Ok(DataType::Utf8),
+        "int64" => Ok(DataType::Int64),
+        "int32" => Ok(DataType::Int32),
+        "float64" => Ok(DataType::Float64),
+        "timestamp_ms" => Ok(DataType::Timestamp(TimeUnit::Millisecond, None)),
+        other => Err(format!("Unknown arrow type: {}", other)),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct JsonMVSpec {
+    mv_id: String,
+    definition_hash: String,
+    def_version: i64,
+    group_col_names: Vec<String>,
+    group_col_types: Vec<String>,
+    agg_specs: Vec<JsonAggSpec>,
+    sort_key_names: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct JsonAggSpec {
+    function: String,
+    source_field: Option<String>,
+    output_names: Vec<String>,
+}
+
+impl MVPartialBuilder {
+    /// Set the starting generation counter for all MVs (for resume from remote).
+    pub fn set_start_generation(&mut self, gen: u64) {
+        for counter in &mut self.gen_counters {
+            *counter = gen;
+        }
+    }
+}

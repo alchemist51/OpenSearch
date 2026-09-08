@@ -1020,3 +1020,53 @@ pub unsafe extern "C" fn parquet_get_pool_stats(out_buf: *mut i64) {
         *out_buf.add(i) = *val as i64;
     }
 }
+
+// ---------------------------------------------------------------------------
+// MV partial builder registration (c3)
+// ---------------------------------------------------------------------------
+
+/// Register MV partial builders for a writer from a JSON spec string.
+///
+/// JSON format: `[{"mv_id":"...", "definition_hash":"...", "def_version":1,
+///   "group_col_names":["a","b"], "group_col_types":["utf8","int64"],
+///   "agg_specs":[{"function":"sum","source_field":"x","output_names":["x_sum"]}],
+///   "sort_key_names":["a","b"]}]`
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn parquet_register_mv_builders(
+    file_ptr: *const u8,
+    file_len: i64,
+    json_ptr: *const u8,
+    json_len: i64,
+    shard_id: i32,
+    primary_term: i64,
+    output_base_ptr: *const u8,
+    output_base_len: i64,
+    start_generation: i64,
+) -> i64 {
+    let filename = str_from_raw(file_ptr, file_len)?.to_string();
+    let json_str = str_from_raw(json_ptr, json_len)?;
+    let output_base = str_from_raw(output_base_ptr, output_base_len)?.to_string();
+
+    let specs = crate::mv_partial::parse_specs_from_json(json_str)
+        .map_err(|e| format!("parse MV specs: {}", e))?;
+
+    if specs.is_empty() {
+        return Ok(0);
+    }
+
+    let mut builder = crate::mv_partial::MVPartialBuilder::new(
+        specs,
+        shard_id,
+        primary_term,
+        std::path::PathBuf::from(output_base),
+    );
+
+    // Resume generation counters
+    if start_generation > 0 {
+        builder.set_start_generation(start_generation as u64);
+    }
+
+    NativeParquetWriter::register_mv_builder(&filename, builder);
+    Ok(0)
+}
