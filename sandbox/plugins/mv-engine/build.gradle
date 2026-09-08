@@ -20,10 +20,18 @@ java { sourceCompatibility = JavaVersion.toVersion(25); targetCompatibility = Ja
 
 dependencies {
   compileOnly project(':server')
+  compileOnly "org.apache.arrow:arrow-vector:${versions.arrow}"
+  compileOnly "org.apache.arrow:arrow-memory-core:${versions.arrow}"
+  implementation "org.apache.arrow:arrow-c-data:${versions.arrow}"
   testImplementation project(':test:framework')
 }
 
 tasks.named('compileTestJava').configure {
   sourceCompatibility = JavaVersion.toVersion(25)
   targetCompatibility = JavaVersion.toVersion(25)
+}
+
+tasks.withType(JavaCompile).configureEach {
+  // Arrow references Jackson/checkerframework annotations not on classpath — harmless warnings
+  options.compilerArgs -= '-Werror'
 }

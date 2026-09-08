@@ -80,6 +80,8 @@ public class MVEnginePlugin extends Plugin implements ActionPlugin {
     /** Active target hydrators, keyed by target shard ID. */
     private final ConcurrentHashMap<ShardId, MVTargetHydrator> activeHydrators = new ConcurrentHashMap<>();
 
+    private volatile MVReadService mvReadService;
+
     @Override
     public List<ActionHandler<? extends ActionRequest, ? extends ActionResponse>> getActions() {
         return List.of(
@@ -101,7 +103,8 @@ public class MVEnginePlugin extends Plugin implements ActionPlugin {
     ) {
         return List.of(
             new RestMVViewAction(),
-            new RestMVValidateAction()
+            new RestMVValidateAction(),
+            new RestMVQueryAction(mvReadService)
         );
     }
 
@@ -129,6 +132,10 @@ public class MVEnginePlugin extends Plugin implements ActionPlugin {
         this.repositoriesServiceSupplier = repositoriesServiceSupplier;
 
         MVDefinitionClusterService definitionService = new MVDefinitionClusterService(clusterService, client);
+
+        // Initialize the MV read service + native bridge
+        this.mvReadService = new MVReadService(clusterService);
+        MVNativeBridge.init();
 
         // Register the MV writer-spec compiler
         MVWriterConfigRegistry.register(MVWriterConfig::fromCustomDataToRegistrySpecs);

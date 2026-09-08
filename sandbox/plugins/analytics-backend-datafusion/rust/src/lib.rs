@@ -60,6 +60,8 @@ pub mod udaf;
 pub mod udf;
 pub mod udwf;
 
+pub mod mv_fold;
+
 // Path aliases — old module names still resolve unchanged.
 pub use cache::custom_cache_manager;
 pub use cache::eviction_policy;

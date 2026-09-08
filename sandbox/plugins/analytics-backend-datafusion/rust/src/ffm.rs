@@ -2056,6 +2056,120 @@ unsafe fn try_cached_can_match(
     ))
 }
 
+// ── MV query-time fold over hydrated partials ──────────────────────────
+
+/// FFI entry: query hydrated MV partials via Final aggregation.
+///
+/// Arguments (all via FFM `Linker`-style raw pointers + lengths):
+///   - `dirs_json_ptr/len`:   JSON array of directory paths (strings)
+///   - `def_sql_ptr/len`:     definition SQL (UTF-8)
+///   - `schema_json_ptr/len`: Arrow schema as JSON (serialized via serde_json)
+///   - `out_array_addr`:      address to write FFI_ArrowArray
+///   - `out_schema_addr`:     address to write FFI_ArrowSchema
+///
+/// Returns: number of rows on success, or a negative error pointer.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_query_state(
+    dirs_json_ptr: *const u8,
+    dirs_json_len: i64,
+    def_sql_ptr: *const u8,
+    def_sql_len: i64,
+    schema_json_ptr: *const u8,
+    schema_json_len: i64,
+    out_array_addr: i64,
+    out_schema_addr: i64,
+) -> i64 {
+    let dirs_json = str_from_raw(dirs_json_ptr, dirs_json_len)?;
+    let def_sql = str_from_raw(def_sql_ptr, def_sql_len)?;
+    let schema_json = str_from_raw(schema_json_ptr, schema_json_len)?;
+
+    // Parse directory list from JSON array.
+    let dirs: Vec<String> = serde_json::from_str(dirs_json)
+        .map_err(|e| format!("df_mv_query_state: invalid dirs JSON: {e}"))?;
+
+    // Parse Arrow schema from JSON. Format: {"fields":[{"name":"x","data_type":"Int64","nullable":true},...]}
+    let schema_ref = parse_schema_json(schema_json)?;
+
+    // Execute the fold.
+    let result = crate::mv_fold::mv_query_hydrated(&dirs, def_sql, schema_ref)?;
+    let rows = result.num_rows() as i64;
+
+    // Export via Arrow C-Data FFI.
+    use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+    use arrow_array::Array;
+    let struct_array: arrow_array::StructArray = result.into();
+    let data = struct_array.into_data();
+    let ffi_schema = FFI_ArrowSchema::try_from(data.data_type())
+        .map_err(|e| format!("df_mv_query_state schema export: {e}"))?;
+    let ffi_array = FFI_ArrowArray::new(&data);
+    std::ptr::write(out_array_addr as *mut FFI_ArrowArray, ffi_array);
+    std::ptr::write(out_schema_addr as *mut FFI_ArrowSchema, ffi_schema);
+
+    Ok(rows)
+}
+
+/// Parse a simple schema JSON into an Arrow SchemaRef.
+/// Format: {"fields":[{"name":"x","data_type":"Int64","nullable":true},...]}
+fn parse_schema_json(json: &str) -> Result<arrow::datatypes::SchemaRef, String> {
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+    fn parse_dt(v: &serde_json::Value) -> DataType {
+        match v {
+            serde_json::Value::String(s) => match s.as_str() {
+                "Int8" => DataType::Int8,
+                "Int16" => DataType::Int16,
+                "Int32" => DataType::Int32,
+                "Int64" => DataType::Int64,
+                "UInt8" => DataType::UInt8,
+                "UInt16" => DataType::UInt16,
+                "UInt32" => DataType::UInt32,
+                "UInt64" => DataType::UInt64,
+                "Float32" => DataType::Float32,
+                "Float64" => DataType::Float64,
+                "Utf8" => DataType::Utf8,
+                "Boolean" => DataType::Boolean,
+                _ => DataType::Utf8,
+            },
+            serde_json::Value::Object(m) => {
+                if let Some(ts) = m.get("Timestamp") {
+                    if let serde_json::Value::Array(arr) = ts {
+                        let unit = arr.first()
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Millisecond");
+                        let tu = match unit {
+                            "Second" => TimeUnit::Second,
+                            "Millisecond" => TimeUnit::Millisecond,
+                            "Microsecond" => TimeUnit::Microsecond,
+                            "Nanosecond" => TimeUnit::Nanosecond,
+                            _ => TimeUnit::Millisecond,
+                        };
+                        let tz = arr.get(1).and_then(|v| v.as_str()).map(|s| s.into());
+                        return DataType::Timestamp(tu, tz);
+                    }
+                }
+                DataType::Utf8
+            }
+            _ => DataType::Utf8,
+        }
+    }
+
+    let root: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| format!("parse_schema_json: {e}"))?;
+    let fields_arr = root.get("fields")
+        .and_then(|v| v.as_array())
+        .ok_or("parse_schema_json: missing 'fields' array")?;
+    let fields: Vec<Field> = fields_arr.iter()
+        .map(|f| {
+            let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let dt = f.get("data_type").map(parse_dt).unwrap_or(DataType::Utf8);
+            let nullable = f.get("nullable").and_then(|v| v.as_bool()).unwrap_or(true);
+            Field::new(name, dt, nullable)
+        })
+        .collect();
+    Ok(Arc::new(Schema::new(fields)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
