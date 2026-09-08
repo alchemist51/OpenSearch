@@ -42,6 +42,7 @@ public final class MVNativeBridge {
     public static final long ARROW_SCHEMA_SIZE = 256;
 
     private static volatile MethodHandle MH_QUERY_STATE;
+    private static volatile MethodHandle MH_COMPACT;
 
     private MVNativeBridge() {}
 
@@ -54,7 +55,7 @@ public final class MVNativeBridge {
             Linker linker = Linker.nativeLinker();
             SymbolLookup lookup = SymbolLookup.loaderLookup();
 
-            // df_mv_query_state(dirs_ptr, dirs_len, sql_ptr, sql_len, schema_ptr, schema_len, out_array, out_schema) -> i64
+            // df_mv_query_state
             var queryOpt = lookup.find("df_mv_query_state");
             if (queryOpt.isPresent()) {
                 MH_QUERY_STATE = linker.downcallHandle(
@@ -74,6 +75,30 @@ public final class MVNativeBridge {
                 logger.info("MVNativeBridge: df_mv_query_state bound");
             } else {
                 logger.warn("MVNativeBridge: df_mv_query_state symbol not found — MV query disabled");
+            }
+
+            // df_mv_compact
+            var compactOpt = lookup.find("df_mv_compact");
+            if (compactOpt.isPresent()) {
+                MH_COMPACT = linker.downcallHandle(
+                    compactOpt.get(),
+                    FunctionDescriptor.of(
+                        ValueLayout.JAVA_LONG,    // return: rows written or error
+                        ValueLayout.ADDRESS,      // files_json_ptr
+                        ValueLayout.JAVA_LONG,    // files_json_len
+                        ValueLayout.ADDRESS,      // output_ptr
+                        ValueLayout.JAVA_LONG,    // output_len
+                        ValueLayout.ADDRESS,      // def_sql_ptr
+                        ValueLayout.JAVA_LONG,    // def_sql_len
+                        ValueLayout.ADDRESS,      // schema_json_ptr
+                        ValueLayout.JAVA_LONG,    // schema_json_len
+                        ValueLayout.ADDRESS,      // sort_json_ptr
+                        ValueLayout.JAVA_LONG     // sort_json_len
+                    )
+                );
+                logger.info("MVNativeBridge: df_mv_compact bound");
+            } else {
+                logger.warn("MVNativeBridge: df_mv_compact symbol not found — MV compact disabled");
             }
         } catch (Exception e) {
             logger.error("MVNativeBridge: failed to init FFM bindings", e);
@@ -117,6 +142,50 @@ public final class MVNativeBridge {
             throw e;
         } catch (Throwable t) {
             throw new RuntimeException("df_mv_query_state invocation failed", t);
+        }
+    }
+
+    /**
+     * Compact hydrated MV state files into one ZSTD-compressed output file.
+     *
+     * @param filesNative  native memory segment with JSON array of input file paths
+     * @param filesLen     length of files JSON in bytes
+     * @param outputNative native memory segment with output file path
+     * @param outputLen    length of output path in bytes
+     * @param sqlNative    native memory segment with definition SQL
+     * @param sqlLen       length of SQL in bytes
+     * @param schemaNative native memory segment with Arrow schema JSON
+     * @param schemaLen    length of schema JSON in bytes
+     * @param sortNative   native memory segment with JSON array of sort key names
+     * @param sortLen      length of sort JSON in bytes
+     * @return number of rows written
+     */
+    public static long compact(
+        MemorySegment filesNative, long filesLen,
+        MemorySegment outputNative, long outputLen,
+        MemorySegment sqlNative, long sqlLen,
+        MemorySegment schemaNative, long schemaLen,
+        MemorySegment sortNative, long sortLen
+    ) {
+        if (MH_COMPACT == null) {
+            throw new UnsupportedOperationException("df_mv_compact not available — native library not loaded");
+        }
+        try {
+            long result = (long) MH_COMPACT.invokeExact(
+                filesNative, filesLen,
+                outputNative, outputLen,
+                sqlNative, sqlLen,
+                schemaNative, schemaLen,
+                sortNative, sortLen
+            );
+            if (result < 0) {
+                throw new RuntimeException("df_mv_compact returned error code: " + result);
+            }
+            return result;
+        } catch (RuntimeException | Error e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new RuntimeException("df_mv_compact invocation failed", t);
         }
     }
 }

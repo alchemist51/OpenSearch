@@ -30,10 +30,17 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * Target-side hydrator: polls source shard(s) for new MV generations via
@@ -60,6 +67,19 @@ public class MVTargetHydrator implements Closeable {
         Setting.Property.Dynamic
     );
 
+    /** File count threshold that triggers compaction for a source-shard directory. */
+    public static final Setting<Integer> COMPACT_THRESHOLD = Setting.intSetting(
+        "index.mv.compact_threshold",
+        8,
+        2,
+        Setting.Property.IndexScope,
+        Setting.Property.Dynamic
+    );
+
+    /** Pattern for compacted file names: _mv_compacted.s{shard}.g{minGen}-{maxGen}.{uuid}.parquet */
+    private static final Pattern COMPACTED_NAME_PATTERN =
+        Pattern.compile("_mv_compacted\\.s(\\d+)\\.g(\\d+)-(\\d+)\\.[^.]+\\.parquet");
+
     private final ShardId targetShardId;
     private final String mvId;
     private final String sourceIndex;
@@ -72,6 +92,11 @@ public class MVTargetHydrator implements Closeable {
 
     /** Per source-shard high-water: (term, generation). */
     private final ConcurrentHashMap<Integer, HighWater> highWaters = new ConcurrentHashMap<>();
+
+    /** Single-flight guard: source shards currently being compacted. */
+    private final Set<Integer> compactingShards = ConcurrentHashMap.newKeySet();
+
+    private volatile int compactThreshold;
 
     private volatile org.opensearch.threadpool.Scheduler.Cancellable scheduledFuture;
     private final AtomicBoolean closed = new AtomicBoolean(false);
@@ -96,6 +121,7 @@ public class MVTargetHydrator implements Closeable {
         this.threadPool = threadPool;
         this.remoteManager = remoteManager;
         this.interval = interval;
+        this.compactThreshold = 8; // default; updated by setting consumer
     }
 
     /**
@@ -134,6 +160,7 @@ public class MVTargetHydrator implements Closeable {
 
     /**
      * One poll tick: for each source shard, fetch checkpoint and download new generations.
+     * After hydration, check if any source-shard directory needs compaction.
      */
     void pollOnce() {
         if (closed.get()) {
@@ -157,8 +184,141 @@ public class MVTargetHydrator implements Closeable {
                     );
                 }
             }
+            // After hydration: check compaction eligibility for all source-shard dirs.
+            tryCompactAll();
         } catch (Exception e) {
             logger.warn("MV hydrator poll cycle failed: target={} error={}", targetShardId, e.getMessage());
+        }
+    }
+
+    /**
+     * Check all source-shard hydrated directories for compaction eligibility.
+     */
+    private void tryCompactAll() {
+        if (!Files.isDirectory(hydratedDir)) {
+            return;
+        }
+        try (var shardDirs = Files.newDirectoryStream(hydratedDir)) {
+            for (Path shardDir : shardDirs) {
+                if (!Files.isDirectory(shardDir)) continue;
+                int sourceShard;
+                try {
+                    sourceShard = Integer.parseInt(shardDir.getFileName().toString());
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+                tryCompactSourceShard(sourceShard, shardDir);
+            }
+        } catch (IOException e) {
+            logger.debug("MV hydrator compact scan failed: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Try to compact a single source-shard directory if eligible.
+     * Eligibility: file count >= threshold AND no compaction already running for this shard.
+     */
+    private void tryCompactSourceShard(int sourceShard, Path shardDir) {
+        // Single-flight guard: skip if already compacting this shard.
+        if (!compactingShards.add(sourceShard)) {
+            return;
+        }
+        try {
+            // Snapshot the CURRENT file list. Files hydrated during compaction will survive.
+            List<Path> snapshot = new ArrayList<>();
+            try (var files = Files.newDirectoryStream(shardDir, "*.parquet")) {
+                for (Path f : files) {
+                    snapshot.add(f);
+                }
+            }
+
+            if (snapshot.size() < compactThreshold) {
+                return; // not enough files
+            }
+
+            // Extract gen range from filenames for the output name.
+            long minGen = Long.MAX_VALUE;
+            long maxGen = Long.MIN_VALUE;
+            List<String> inputPaths = new ArrayList<>();
+            for (Path f : snapshot) {
+                String name = f.getFileName().toString();
+                long gen = parseGenFromFileName(name);
+                // Also check compacted gen range.
+                long[] range = parseCompactedGenRange(name);
+                if (range != null) {
+                    if (range[0] < minGen) minGen = range[0];
+                    if (range[1] > maxGen) maxGen = range[1];
+                } else if (gen > 0) {
+                    if (gen < minGen) minGen = gen;
+                    if (gen > maxGen) maxGen = gen;
+                }
+                inputPaths.add(f.toAbsolutePath().toString());
+            }
+            if (minGen == Long.MAX_VALUE) minGen = 0;
+            if (maxGen == Long.MIN_VALUE) maxGen = 0;
+
+            // Output: tmp file, then atomic rename.
+            String uuid = UUID.randomUUID().toString().substring(0, 8);
+            String tmpName = "_mv_compacted." + uuid + ".parquet.tmp";
+            String finalName = "_mv_compacted.s" + sourceShard + ".g" + minGen + "-" + maxGen + "." + uuid + ".parquet";
+            Path tmpPath = shardDir.resolve(tmpName);
+            Path finalPath = shardDir.resolve(finalName);
+
+            logger.info(
+                "MV compact starting: target={} shard={} files={} genRange={}-{}",
+                targetShardId, sourceShard, snapshot.size(), minGen, maxGen
+            );
+
+            try {
+                // Invoke native compaction. For POC, we don't have the full
+                // definition SQL and schema available here (they're stored in
+                // IndexMetadata). This is wired via a compact callback interface
+                // in the production path. For POC, the compaction is a sorted
+                // k-way merge (no fold) which only needs the sort keys.
+                // The actual native call is done via MVNativeBridge.compact() in
+                // the mv-engine plugin. Since server module can't depend on mv-engine,
+                // we use a callback pattern.
+                if (compactCallback != null) {
+                    compactCallback.compact(inputPaths, tmpPath.toAbsolutePath().toString());
+                } else {
+                    logger.debug("MV compact: no callback registered, skipping native compact");
+                    return;
+                }
+
+                // Atomic finish: rename tmp -> final.
+                Files.move(tmpPath, finalPath, StandardCopyOption.ATOMIC_MOVE);
+
+                // Delete EXACTLY the snapshot input files (files hydrated during compaction survive).
+                int deleted = 0;
+                for (Path f : snapshot) {
+                    try {
+                        Files.deleteIfExists(f);
+                        deleted++;
+                    } catch (IOException e) {
+                        logger.warn("MV compact: failed to delete input {}: {}", f, e.getMessage());
+                    }
+                }
+
+                logger.info(
+                    "MV compact done: target={} shard={} inputs={} deleted={} output={}",
+                    targetShardId, sourceShard, snapshot.size(), deleted, finalName
+                );
+            } catch (Exception e) {
+                // Failure: leave inputs untouched, delete tmp.
+                logger.warn(
+                    "MV compact failed: target={} shard={} error={}",
+                    targetShardId, sourceShard, e.getMessage()
+                );
+                try {
+                    Files.deleteIfExists(tmpPath);
+                } catch (IOException ioe) {
+                    logger.debug("MV compact: failed to delete tmp: {}", ioe.getMessage());
+                }
+            }
+        } catch (IOException e) {
+            logger.debug("MV compact: error listing shard dir {}: {}", shardDir, e.getMessage());
+        } finally {
+            compactingShards.remove(sourceShard);
         }
     }
 
@@ -288,13 +448,22 @@ public class MVTargetHydrator implements Closeable {
                 } catch (NumberFormatException e) {
                     continue;
                 }
-                // Find highest generation from file names
+                // Find highest generation from file names (partials + compacted).
                 long maxGen = 0;
                 try (var files = Files.newDirectoryStream(shardDir, "*.parquet")) {
                     for (Path f : files) {
-                        long gen = parseGenFromFileName(f.getFileName().toString());
-                        if (gen > maxGen) {
-                            maxGen = gen;
+                        String fname = f.getFileName().toString();
+                        // Check compacted gen range first.
+                        long[] range = parseCompactedGenRange(fname);
+                        if (range != null) {
+                            if (range[1] > maxGen) {
+                                maxGen = range[1];
+                            }
+                        } else {
+                            long gen = parseGenFromFileName(fname);
+                            if (gen > maxGen) {
+                                maxGen = gen;
+                            }
                         }
                     }
                 }
@@ -322,6 +491,52 @@ public class MVTargetHydrator implements Closeable {
         } catch (NumberFormatException e) {
             return 0;
         }
+    }
+
+    /**
+     * Parse compacted gen range from filename: _mv_compacted.s{shard}.g{a}-{b}.{uuid}.parquet
+     * Returns [minGen, maxGen] or null if not a compacted file name.
+     */
+    static long[] parseCompactedGenRange(String name) {
+        Matcher m = COMPACTED_NAME_PATTERN.matcher(name);
+        if (!m.matches()) return null;
+        try {
+            long minGen = Long.parseLong(m.group(2));
+            long maxGen = Long.parseLong(m.group(3));
+            return new long[] { minGen, maxGen };
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Callback interface for native compaction. Implemented in the mv-engine
+     * plugin layer which has access to MVNativeBridge and the definition metadata.
+     */
+    @FunctionalInterface
+    public interface CompactCallback {
+        /**
+         * Compact the input files into the output file.
+         * @param inputFiles absolute paths to input partial .parquet files
+         * @param outputPath absolute path for output .parquet file
+         */
+        void compact(List<String> inputFiles, String outputPath) throws Exception;
+    }
+
+    private volatile CompactCallback compactCallback;
+
+    /**
+     * Register a compaction callback. Called by the mv-engine plugin during setup.
+     */
+    public void setCompactCallback(CompactCallback callback) {
+        this.compactCallback = callback;
+    }
+
+    /**
+     * Update the compact threshold (for dynamic setting changes).
+     */
+    public void setCompactThreshold(int threshold) {
+        this.compactThreshold = threshold;
     }
 
     // ── Test accessors ──────────────────────────────────────────────────

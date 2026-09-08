@@ -61,6 +61,7 @@ pub mod udf;
 pub mod udwf;
 
 pub mod mv_fold;
+pub mod mv_compact;
 
 // Path aliases — old module names still resolve unchanged.
 pub use cache::custom_cache_manager;

@@ -266,7 +266,7 @@ async fn build_hydrated_scan(
 }
 
 /// Finds the first aggregate node matching `pred`.
-fn find_agg(
+pub fn find_agg(
     plan: &Arc<dyn ExecutionPlan>,
     pred: impl Fn(&AggregateMode) -> bool + Copy,
 ) -> Option<Arc<dyn ExecutionPlan>> {

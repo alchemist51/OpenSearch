@@ -2058,6 +2058,46 @@ unsafe fn try_cached_can_match(
 
 // ── MV query-time fold over hydrated partials ──────────────────────────
 
+/// FFI entry: compact hydrated MV partial files into one ZSTD file.
+///
+/// Arguments (all via FFM `Linker`-style raw pointers + lengths):
+///   - `files_json_ptr/len`:   JSON array of input file paths (strings)
+///   - `output_ptr/len`:       output file path (UTF-8)
+///   - `def_sql_ptr/len`:      definition SQL (UTF-8)
+///   - `schema_json_ptr/len`:  Arrow schema as JSON (source index schema)
+///   - `sort_json_ptr/len`:    JSON array of sort key column names
+///
+/// Returns: number of rows written on success, or a negative error pointer.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_compact(
+    files_json_ptr: *const u8,
+    files_json_len: i64,
+    output_ptr: *const u8,
+    output_len: i64,
+    def_sql_ptr: *const u8,
+    def_sql_len: i64,
+    schema_json_ptr: *const u8,
+    schema_json_len: i64,
+    sort_json_ptr: *const u8,
+    sort_json_len: i64,
+) -> i64 {
+    let files_json = str_from_raw(files_json_ptr, files_json_len)?;
+    let output = str_from_raw(output_ptr, output_len)?;
+    let def_sql = str_from_raw(def_sql_ptr, def_sql_len)?;
+    let schema_json = str_from_raw(schema_json_ptr, schema_json_len)?;
+    let sort_json = str_from_raw(sort_json_ptr, sort_json_len)?;
+
+    let files: Vec<String> = serde_json::from_str(files_json)
+        .map_err(|e| format!("df_mv_compact: invalid files JSON: {e}"))?;
+    let sort_keys: Vec<String> = serde_json::from_str(sort_json)
+        .map_err(|e| format!("df_mv_compact: invalid sort JSON: {e}"))?;
+    let schema_ref = parse_schema_json(schema_json)?;
+
+    let result = crate::mv_compact::mv_compact(&files, output, def_sql, schema_ref, &sort_keys)?;
+    Ok(result.rows_written as i64)
+}
+
 /// FFI entry: query hydrated MV partials via Final aggregation.
 ///
 /// Arguments (all via FFM `Linker`-style raw pointers + lengths):
