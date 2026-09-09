@@ -27,7 +27,9 @@ import org.opensearch.transport.TransportService;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
@@ -94,6 +96,17 @@ public class MVTargetHydrator implements Closeable {
     private final String mvId;
     private final String sourceIndex;
     private final Path hydratedDir;
+
+    /**
+     * Canonical on-disk directory the store layer maps the {@code mv_state} format to
+     * ({@code <shard>/mv_state}). {@code DataFormatAwareStoreDirectory}, remote-store upload and
+     * checksum resolve every catalog file of a non-default format as {@code <shard>/<format>/<name>}
+     * and never consult {@code WriterFileSet.directory()}, so a generation must physically exist
+     * here before it is published — otherwise the post-publish refresh listener fails with
+     * {@code NoSuchFileException} and the publish is rejected. Files are hard-linked from the
+     * {@code mv_hydrated/<sourceShard>/} layout (which stays the high-water/reconcile source of truth).
+     */
+    private final Path catalogDir;
     private final TransportService transportService;
     private final ClusterService clusterService;
     private final ThreadPool threadPool;
@@ -126,6 +139,7 @@ public class MVTargetHydrator implements Closeable {
         this.mvId = mvId;
         this.sourceIndex = sourceIndex;
         this.hydratedDir = targetShardDataPath.resolve("mv_hydrated");
+        this.catalogDir = targetShardDataPath.resolve(MV_STATE_FORMAT_NAME);
         this.transportService = transportService;
         this.clusterService = clusterService;
         this.threadPool = threadPool;
@@ -486,9 +500,10 @@ public class MVTargetHydrator implements Closeable {
                 );
                 return;
             }
+            Path publishDir = stageIntoCatalogDir(shardHydratedDir, fileNames);
             long targetGeneration = publisher.publish(
                 MV_STATE_FORMAT_NAME,
-                shardHydratedDir.toAbsolutePath().toString(),
+                publishDir.toAbsolutePath().toString(),
                 fileNames,
                 provenanceKey,
                 sourceGeneration,
@@ -507,6 +522,41 @@ public class MVTargetHydrator implements Closeable {
                 targetShardId, provenanceKey, sourceGeneration, e.getMessage()
             );
         }
+    }
+
+    /**
+     * Make every file of a generation visible at the canonical {@code <shard>/mv_state/<name>} path
+     * the store layer resolves, then return that directory for publication. Hard-links keep a single
+     * copy on disk; if the filesystem refuses links the file is copied. Already-staged files (a
+     * re-publish after restart) are left as-is. Idempotent.
+     *
+     * @return the canonical catalog directory to publish
+     * @throws IOException if a file cannot be linked or copied — the caller treats this as a
+     *                     publish rejection so nothing half-staged reaches the catalog
+     */
+    Path stageIntoCatalogDir(Path shardHydratedDir, Set<String> fileNames) throws IOException {
+        Files.createDirectories(catalogDir);
+        for (String name : fileNames) {
+            Path src = shardHydratedDir.resolve(name);
+            Path dst = catalogDir.resolve(name);
+            if (Files.exists(dst)) {
+                continue;
+            }
+            if (Files.exists(src) == false) {
+                throw new NoSuchFileException(src.toString());
+            }
+            try {
+                Files.createLink(dst, src);
+            } catch (UnsupportedOperationException | FileSystemException linkFailure) {
+                if (Files.exists(dst)) {
+                    continue; // concurrent stager won the race
+                }
+                Path tmp = dst.resolveSibling(dst.getFileName() + ".tmp");
+                Files.copy(src, tmp, StandardCopyOption.REPLACE_EXISTING);
+                Files.move(tmp, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            }
+        }
+        return catalogDir;
     }
 
     private void downloadFromRemote(String shardId, String mvId, String fileName, Path targetFile) throws IOException {

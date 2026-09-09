@@ -303,7 +303,8 @@ public class MVTargetHydratorTests extends OpenSearchTestCase {
         publisher.generationCounter.set(5L);
         try (MVTargetHydrator hydrator = newHydrator(createTempDir())) {
             hydrator.setCatalogPublisher(publisher);
-            hydrator.publishGeneration(0, createTempDir(), 5L, 3L, Set.of("_mv_partial.s0.t1.g5.abc.parquet"));
+            Set<String> files = Set.of("_mv_partial.s0.t1.g5.abc.parquet");
+            hydrator.publishGeneration(0, hydratedDirWith(files), 5L, 3L, files);
         }
         assertEquals("published exactly once", 1, publisher.publishCount);
         assertEquals("source generation recorded in marker", 5L, publisher.publishedSourceGeneration("mv1/0"));
@@ -336,7 +337,8 @@ public class MVTargetHydratorTests extends OpenSearchTestCase {
                 )
             );
             hydrator.setCatalogPublisher(publisher);
-            hydrator.publishGeneration(0, createTempDir(), 5L, -1L, Set.of("bad.parquet"));
+            Set<String> files = Set.of("bad.parquet");
+            hydrator.publishGeneration(0, hydratedDirWith(files), 5L, -1L, files);
             appender.assertAllExpectationsMatched();
         }
     }
@@ -348,13 +350,15 @@ public class MVTargetHydratorTests extends OpenSearchTestCase {
         try (MVTargetHydrator hydrator = newHydrator(createTempDir())) {
             hydrator.setCatalogPublisher(publisher);
             Set<String> files = Set.of("_mv_partial.s0.t1.g7.abc.parquet");
-            hydrator.publishGeneration(0, createTempDir(), 7L, 3L, files);
+            Path dir = hydratedDirWith(files);
+            hydrator.publishGeneration(0, dir, 7L, 3L, files);
             assertEquals(1, publisher.publishCount);
             // Simulate a restart re-attempting the same source generation: marker must short-circuit.
-            hydrator.publishGeneration(0, createTempDir(), 7L, 3L, files);
+            hydrator.publishGeneration(0, dir, 7L, 3L, files);
             assertEquals("second publish of same source gen must be skipped", 1, publisher.publishCount);
             // A newer generation still publishes.
-            hydrator.publishGeneration(0, createTempDir(), 8L, 3L, Set.of("_mv_partial.s0.t1.g8.def.parquet"));
+            Set<String> newer = Set.of("_mv_partial.s0.t1.g8.def.parquet");
+            hydrator.publishGeneration(0, hydratedDirWith(newer), 8L, 3L, newer);
             assertEquals(2, publisher.publishCount);
         }
     }
@@ -428,7 +432,87 @@ public class MVTargetHydratorTests extends OpenSearchTestCase {
         }
     }
 
+    // ── Publish: files must be resolvable at the canonical <shard>/mv_state path ─
+
+    /**
+     * Regression for the deploy-time defect: the store layer resolves every {@code mv_state}
+     * catalog file as {@code <shard>/mv_state/<name>} (it never consults
+     * {@code WriterFileSet.directory()}), so a generation hydrated under
+     * {@code mv_hydrated/<sourceShard>/} must be staged there before publication or the
+     * post-publish refresh listener fails with {@code NoSuchFileException}.
+     */
+    public void testPublishStagesFilesIntoCanonicalMvStateDir() throws Exception {
+        Path dataPath = createTempDir();
+        Path shardDir = dataPath.resolve("mv_hydrated").resolve("0");
+        Files.createDirectories(shardDir);
+        String name = "_mv_partial.s0.t1.g2.abc.parquet";
+        Files.writeString(shardDir.resolve(name), "row-data");
+
+        FakePublisher publisher = new FakePublisher();
+        publisher.storeRoot = dataPath; // emulate DataFormatAwareStoreDirectory resolution
+        try (MVTargetHydrator hydrator = newHydrator(dataPath)) {
+            hydrator.setCatalogPublisher(publisher);
+            hydrator.publishGeneration(0, shardDir, 2L, 3L, Set.of(name));
+        }
+        assertEquals("publish accepted by store-layer emulation", 1, publisher.publishCount);
+        assertEquals("published directory is the canonical mv_state dir",
+            dataPath.resolve("mv_state").toAbsolutePath().toString(), publisher.lastDirectory);
+        Path staged = dataPath.resolve("mv_state").resolve(name);
+        assertTrue("file physically present at <shard>/mv_state/<name>", Files.exists(staged));
+        assertEquals("staged copy has identical content", "row-data", Files.readString(staged));
+        assertTrue("hydrated original retained for high-water/reconcile", Files.exists(shardDir.resolve(name)));
+    }
+
+    /** Reconcile on a redeployed node stages every published generation into mv_state. */
+    public void testReconcileStagesIntoCanonicalMvStateDir() throws Exception {
+        Path dataPath = createTempDir();
+        Path shardDir = dataPath.resolve("mv_hydrated").resolve("0");
+        Files.createDirectories(shardDir);
+        Files.writeString(shardDir.resolve("_mv_partial.s0.t1.g1.aaa.parquet"), "d1");
+        Files.writeString(shardDir.resolve("_mv_partial.s0.t1.g2.bbb.parquet"), "d2");
+        Files.writeString(shardDir.resolve("_mv_compacted.s0.g3-3.ccc.parquet"), "d3");
+
+        FakePublisher publisher = new FakePublisher();
+        publisher.storeRoot = dataPath;
+        try (MVTargetHydrator hydrator = newHydrator(dataPath)) {
+            hydrator.setCatalogPublisher(publisher);
+            hydrator.reconcileFromDisk();
+            // Re-running is idempotent: existing staged files are left alone, nothing re-publishes.
+            hydrator.reconcileFromDisk();
+        }
+        assertEquals(3, publisher.publishCount);
+        Path stateDir = dataPath.resolve("mv_state");
+        assertTrue(Files.exists(stateDir.resolve("_mv_partial.s0.t1.g1.aaa.parquet")));
+        assertTrue(Files.exists(stateDir.resolve("_mv_partial.s0.t1.g2.bbb.parquet")));
+        assertTrue(Files.exists(stateDir.resolve("_mv_compacted.s0.g3-3.ccc.parquet")));
+    }
+
+    /** A missing hydrated input is a real rejection (WARN), not a silent partial stage. */
+    public void testPublishRejectsWhenHydratedFileMissing() throws Exception {
+        Path dataPath = createTempDir();
+        Path shardDir = dataPath.resolve("mv_hydrated").resolve("0");
+        Files.createDirectories(shardDir);
+        FakePublisher publisher = new FakePublisher();
+        publisher.storeRoot = dataPath;
+        try (MVTargetHydrator hydrator = newHydrator(dataPath)) {
+            hydrator.setCatalogPublisher(publisher);
+            hydrator.publishGeneration(0, shardDir, 9L, 3L, Set.of("_mv_partial.s0.t1.g9.missing.parquet"));
+        }
+        assertEquals("nothing reaches the catalog", 0, publisher.publishCount);
+        assertEquals("marker not advanced", -1L, publisher.publishedSourceGeneration("mv1/0"));
+    }
+
     // ── Test helpers ────────────────────────────────────────────────────
+
+    /** A hydrated shard directory containing one small file per name. */
+    private Path hydratedDirWith(Set<String> fileNames) throws IOException {
+        Path dir = createTempDir().resolve("mv_hydrated").resolve("0");
+        Files.createDirectories(dir);
+        for (String n : fileNames) {
+            Files.writeString(dir.resolve(n), "d");
+        }
+        return dir;
+    }
 
     private MVTargetHydrator newHydrator(Path targetShardDataPath) {
         return new MVTargetHydrator(
@@ -454,9 +538,12 @@ public class MVTargetHydratorTests extends OpenSearchTestCase {
         final Map<String, Long> markers = new ConcurrentHashMap<>();
         int publishCount = 0;
         String lastFormat;
+        String lastDirectory;
         long lastSourceGeneration;
         long lastTargetGeneration;
         RuntimeException failWith;
+        /** When set, emulate the store layer: every file must exist at {@code <storeRoot>/<format>/<name>}. */
+        Path storeRoot;
 
         @Override
         public long publish(String dataFormatName, String directory, Set<String> fileNames, String provenanceKey,
@@ -464,10 +551,19 @@ public class MVTargetHydratorTests extends OpenSearchTestCase {
             if (failWith != null) {
                 throw failWith;
             }
+            if (storeRoot != null) {
+                for (String f : fileNames) {
+                    Path canonical = storeRoot.resolve(dataFormatName).resolve(f);
+                    if (Files.exists(canonical) == false) {
+                        throw new java.nio.file.NoSuchFileException(canonical.toString());
+                    }
+                }
+            }
             long target = generationCounter.incrementAndGet();
             markers.merge(provenanceKey, sourceGeneration, Math::max);
             publishCount++;
             lastFormat = dataFormatName;
+            lastDirectory = directory;
             lastSourceGeneration = sourceGeneration;
             lastTargetGeneration = target;
             return target;
