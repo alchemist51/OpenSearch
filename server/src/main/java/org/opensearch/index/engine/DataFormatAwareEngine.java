@@ -96,6 +96,7 @@ import org.opensearch.index.translog.TranslogCorruptedException;
 import org.opensearch.index.translog.TranslogDeletionPolicy;
 import org.opensearch.index.translog.TranslogException;
 import org.opensearch.index.translog.TranslogManager;
+import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.index.translog.TranslogOperationHelper;
 import org.opensearch.index.translog.listener.TranslogEventListener;
 import org.opensearch.indices.pollingingest.PollingIngestStats;
@@ -180,6 +181,14 @@ public class DataFormatAwareEngine implements Indexer {
     // Throttling
     private final IndexingThrottler throttle;
     private final AtomicInteger throttleRequestCount = new AtomicInteger();
+    // Translog backpressure: when the uncommitted translog outgrows the flush threshold because the
+    // flush (which rolls and uploads the generation) cannot keep up, ingestion is throttled instead
+    // of letting the generation grow without bound (a 3.6 GB generation OOMed the remote upload).
+    private final AtomicLong translogBackpressureLastCheckNanos = new AtomicLong();
+    private final AtomicBoolean translogBackpressureActive = new AtomicBoolean(false);
+    private final AtomicBoolean translogBackpressureFlushRequested = new AtomicBoolean(false);
+    private static final long TRANSLOG_BACKPRESSURE_CHECK_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
+    private static final long TRANSLOG_BACKPRESSURE_MAX_WAIT_NANOS = TimeUnit.SECONDS.toNanos(60);
 
     @Nullable
     private final DocumentLookupProvider documentLookupProvider;
@@ -502,6 +511,14 @@ public class DataFormatAwareEngine implements Indexer {
             );
 
             // Merge
+            // A derived materialized-view target holds MV state artifacts (published through
+            // publishDerivedArtifact), not writer output: the primary merger has nothing to merge
+            // ("No files to merge" storms, 5k failures in 2 min on the 100M run) and a generic
+            // parquet merge of state files breaks the state contract (__row_id__ appended). State
+            // compaction is the MV machinery's job, so such targets never enter the merge scheduler.
+            final boolean derivedMaterializedView = "materialized_view".equals(
+                engineConfig.getIndexSettings().getSettings().get("index.derived.data_format")
+            );
             MergeHandler mergeHandler = new MergeHandler(
                 this::acquireSnapshot,
                 indexingExecutionEngine.getMerger(),
@@ -512,8 +529,12 @@ public class DataFormatAwareEngine implements Indexer {
                     long gen = writerGenerationCounter.incrementAndGet();
                     assert gen > 0 : "merge generation must be positive but was: " + gen;
                     return gen;
-                }
+                },
+                derivedMaterializedView == false
             );
+            if (derivedMaterializedView) {
+                logger.info("derived materialized-view target: background merges disabled (MV state is compacted by the MV machinery)");
+            }
 
             // Restore version map and checkpoint tracker after recovery.
             if (restoresVersionMapFromDocuments()) {
@@ -699,6 +720,9 @@ public class DataFormatAwareEngine implements Indexer {
             || index.origin() == Engine.Operation.Origin.LOCAL_RESET)
             : "DataFormatAwareEngine only supports PRIMARY, LOCAL_TRANSLOG_RECOVERY, or LOCAL_RESET origins but got: " + index.origin();
         final boolean doThrottle = index.origin().isRecovery() == false;
+        if (doThrottle) {
+            applyTranslogBackpressure();
+        }
         int rows = 0;
         try (ReleasableLock releasableLock = readLock.acquire()) {
             ensureOpen();
@@ -1458,6 +1482,96 @@ public class DataFormatAwareEngine implements Indexer {
     @Override
     public long getNativeBytesUsed() {
         return indexingExecutionEngine.getNativeBytesUsed();
+    }
+
+    /**
+     * Throttles primary indexing when the uncommitted translog outgrows the flush threshold.
+     * <p>
+     * The flush rolls and uploads the translog generation; when it cannot keep up (a starved
+     * flush thread, a slow remote store) the current generation grows without bound and the
+     * eventual upload of a multi-GB generation fails. Instead of letting that happen, ingestion
+     * pays the cost: above {@code 2 x index.translog.flush_threshold_size} the single-writer
+     * indexing throttle is engaged and a flush is requested; above {@code 4 x} the indexing
+     * thread waits (bounded) until the generation has been rolled. Sampled every 100 ms so the
+     * hot path stays cheap. Released once the uncommitted size is back under the threshold.
+     */
+    private void applyTranslogBackpressure() {
+        final long now = System.nanoTime();
+        final long last = translogBackpressureLastCheckNanos.get();
+        final boolean active = translogBackpressureActive.get();
+        if (active == false && now - last < TRANSLOG_BACKPRESSURE_CHECK_INTERVAL_NANOS) {
+            return;
+        }
+        if (active == false && translogBackpressureLastCheckNanos.compareAndSet(last, now) == false) {
+            return; // another thread is sampling
+        }
+        final long threshold = engineConfig.getIndexSettings().getFlushThresholdSize().getBytes();
+        if (threshold <= 0) {
+            return;
+        }
+        final long softCap = 2 * threshold;
+        final long hardCap = 4 * threshold;
+        long uncommitted = uncommittedTranslogBytes();
+        if (uncommitted > softCap) {
+            if (translogBackpressureActive.compareAndSet(false, true)) {
+                activateThrottling();
+                logger.warn(
+                    "translog backpressure engaged: uncommitted translog {} bytes > {} (2 x flush threshold); throttling indexing and requesting a flush",
+                    uncommitted,
+                    softCap
+                );
+            }
+            requestBackpressureFlush();
+            if (uncommitted > hardCap) {
+                final long deadline = now + TRANSLOG_BACKPRESSURE_MAX_WAIT_NANOS;
+                while (uncommitted > softCap && System.nanoTime() < deadline && isClosed.get() == false) {
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    requestBackpressureFlush();
+                    uncommitted = uncommittedTranslogBytes();
+                }
+                if (uncommitted > hardCap) {
+                    logger.warn("translog backpressure: still {} uncommitted bytes after the maximum wait; proceeding", uncommitted);
+                }
+            }
+        } else if (active && uncommitted < threshold) {
+            if (translogBackpressureActive.compareAndSet(true, false)) {
+                deactivateThrottling();
+                logger.info("translog backpressure released: uncommitted translog {} bytes < {}", uncommitted, threshold);
+            }
+        }
+    }
+
+    private long uncommittedTranslogBytes() {
+        try {
+            return translogManager.getTranslogStats().getUncommittedSizeInBytes();
+        } catch (Exception e) {
+            return 0L; // stats unavailable (engine closing): never block indexing on it
+        }
+    }
+
+    /** Runs one flush on the FLUSH pool if none is in flight; the flush rolls the translog generation. */
+    private void requestBackpressureFlush() {
+        if (translogBackpressureFlushRequested.compareAndSet(false, true)) {
+            try {
+                engineConfig.getThreadPool().executor(ThreadPool.Names.FLUSH).execute(() -> {
+                    try {
+                        flush(false, false);
+                    } catch (Exception e) {
+                        logger.warn("translog backpressure flush failed", e);
+                    } finally {
+                        translogBackpressureFlushRequested.set(false);
+                    }
+                });
+            } catch (Exception e) {
+                translogBackpressureFlushRequested.set(false);
+                logger.warn("translog backpressure could not schedule a flush", e);
+            }
+        }
     }
 
     /** {@inheritDoc} Activates write throttling when merge pressure increases. */
