@@ -518,44 +518,33 @@ public class MVTargetHydrator implements Closeable {
                 } catch (NumberFormatException e) {
                     continue;
                 }
-                java.util.Set<Long> localGens = new java.util.HashSet<>();
-                java.util.List<long[]> compacted = new java.util.ArrayList<>();
-                try (var files = Files.newDirectoryStream(shardDir, "*.parquet")) {
-                    for (Path f : files) {
-                        String fname = f.getFileName().toString();
-                        long[] range = parseCompactedGenRange(fname);
-                        if (range != null) {
-                            compacted.add(range);
-                        } else {
-                            long g = parseGenFromFileName(fname);
-                            if (g > 0) localGens.add(g);
-                        }
-                    }
-                }
-                java.util.List<String> manifests = remoteManager.listManifests(String.valueOf(sourceShard), mvId);
+                String shardKey = String.valueOf(sourceShard);
+                java.util.List<String> manifests = remoteManager.listManifests(shardKey, mvId);
                 if (manifests.isEmpty()) continue;
                 long newestTerm = MVStateManifest.parsePrimaryTerm(manifests.get(0));
+                // A generation is missing when any file its manifest names is absent locally. Names, not
+                // parsed generation numbers: the first generation's partials carry the next counter value.
                 java.util.TreeSet<Long> missing = new java.util.TreeSet<>();
                 for (String m : manifests) {
                     if (MVStateManifest.parsePrimaryTerm(m) != newestTerm) continue;
-                    long g = MVStateManifest.parseGeneration(m);
-                    boolean covered = localGens.contains(g);
-                    for (long[] r : compacted) {
-                        if (g >= r[0] && g <= r[1]) covered = true;
+                    MVStateManifest manifest = remoteManager.readManifest(shardKey, mvId, m);
+                    for (MVStateManifest.FileEntry fe : manifest.files()) {
+                        if (Files.exists(shardDir.resolve(fe.name())) == false) {
+                            missing.add(manifest.generation());
+                            break;
+                        }
                     }
-                    if (!covered) missing.add(g);
                 }
                 if (missing.isEmpty()) {
-                    logger.info("MV hydrator remote gap scan: source shard {} has no missing generations ({} manifests)", sourceShard, manifests.size());
+                    logger.info("MV hydrator remote gap scan: source shard {} complete ({} manifests, all files present)", sourceShard, manifests.size());
                     continue;
                 }
                 logger.warn("MV hydrator remote gap scan: source shard {} missing generations {} (hydrating from manifests)", sourceShard, missing);
                 for (long g : missing) {
                     if (closed.get()) return;
                     HighWater hw = highWaters.getOrDefault(sourceShard, HighWater.EMPTY);
-                    if (hydrateGenerationFromManifest(sourceShard, newestTerm, g)) {
-                        // never lower the high-water when filling an old gap
-                        if (hw.generation > g) highWaters.put(sourceShard, hw);
+                    if (hydrateGenerationFromManifest(sourceShard, newestTerm, g) && hw.generation > g) {
+                        highWaters.put(sourceShard, hw); // never lower the high-water when filling an old gap
                     }
                 }
             }
@@ -610,7 +599,7 @@ public class MVTargetHydrator implements Closeable {
                 "MV hydrated (gap fill from manifest): target={} source=[{}][{}] gen={} term={} files={} maxSeqNo={}",
                 targetShardId, sourceIndex, sourceShard, generation, primaryTerm, names.size(), manifest.maxSeqNo()
             );
-            publishGeneration(sourceShard, shardHydratedDir, generation, 0L, names);
+            publishGeneration(sourceShard, shardHydratedDir, generation, 0L, names, true);
             return true;
         } catch (Exception e) {
             logger.warn("MV hydrator: gap fill of generation {} failed: {}", generation, e.getMessage());
@@ -619,6 +608,22 @@ public class MVTargetHydrator implements Closeable {
     }
 
     void publishGeneration(int sourceShard, Path shardHydratedDir, long sourceGeneration, long numRows, Set<String> fileNames) {
+        publishGeneration(sourceShard, shardHydratedDir, sourceGeneration, numRows, fileNames, false);
+    }
+
+    /**
+     * @param forceBelowMarker publish even when {@code sourceGeneration} is at or below the catalog's
+     *                         published marker: a gap-filled generation is older than the marker by
+     *                         definition, yet it has never been published.
+     */
+    void publishGeneration(
+        int sourceShard,
+        Path shardHydratedDir,
+        long sourceGeneration,
+        long numRows,
+        Set<String> fileNames,
+        boolean forceBelowMarker
+    ) {
         CatalogPublisher publisher = this.catalogPublisher;
         if (publisher == null) {
             return;
@@ -629,7 +634,7 @@ public class MVTargetHydrator implements Closeable {
         String provenanceKey = provenanceKey(sourceShard);
         try {
             long alreadyPublished = publisher.publishedSourceGeneration(provenanceKey);
-            if (sourceGeneration <= alreadyPublished) {
+            if (sourceGeneration <= alreadyPublished && forceBelowMarker == false) {
                 logger.debug(
                     "MV catalog publish skipped (marker up to date): target={} provenance={} sourceGen={} marker={}",
                     targetShardId, provenanceKey, sourceGeneration, alreadyPublished
