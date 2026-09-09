@@ -189,6 +189,20 @@ async fn internal_search_dataframe(
 ///
 /// This is the fragment (non-row-id) execution path: row-id-requesting plans are
 /// routed to the indexed executor by `df_execute_with_context` before reaching here.
+/// Whether `execute_with_context` may answer the query with an `EmptyExec`
+/// stream instead of planning it.
+///
+/// True only for a real shard scan whose shard has no files: `object_metas`
+/// is empty AND a table name is set AND the table is NOT served by a provider
+/// registered on the session (MV-only fold sessions register a ListingTable
+/// over the MV state files and legitimately carry no `object_metas`).
+/// Hash-shuffle worker sessions carry an empty table name and never qualify.
+pub(crate) fn empty_shard_short_circuit_applies(handle: &SessionContextHandle) -> bool {
+    handle.object_metas.is_empty()
+        && !handle.table_name.is_empty()
+        && !handle.table_served_by_registered_provider
+}
+
 pub async fn execute_with_context(
     handle: SessionContextHandle,
     plan_bytes: &[u8],
@@ -264,7 +278,12 @@ pub async fn execute_with_context(
         // scan registered StreamingTables, not parquet files — but use an empty table_name. Without
         // this guard a worker's join/aggregate plan would short-circuit to EmptyExec and silently
         // return zero rows (regression caught by HashShuffleJoinIT after the #21754 empty-index merge).
-        if handle.object_metas.is_empty() && !handle.table_name.is_empty() {
+        //
+        // Also skip it when the table is served by a provider registered on the
+        // context (MV-only fold session: a ListingTable over the MV state files).
+        // Such handles carry an empty object_metas by design; short-circuiting
+        // them returned zero rows for every materialized-view query.
+        if empty_shard_short_circuit_applies(&handle) {
             use datafusion::physical_plan::empty::EmptyExec;
             use datafusion::physical_plan::ExecutionPlan;
             let plan_schema: arrow::datatypes::SchemaRef =
@@ -529,4 +548,61 @@ pub fn wrap_stream_as_handle_with_plan(
         None => crate::api::QueryStreamHandle::new(wrapped, query_context, None),
     };
     Box::into_raw(Box::new(handle)) as i64
+}
+
+#[cfg(test)]
+mod empty_shard_short_circuit_tests {
+    //! Regression: the MV-only fold session (`create_mv_only_session_context`)
+    //! registers a ListingTable over the MV state files and carries an empty
+    //! `object_metas`. Before `table_served_by_registered_provider` existed,
+    //! `execute_with_context` short-circuited every such query to `EmptyExec`
+    //! and PPL returned zero rows for the materialized view without opening a
+    //! single state file (2,604-file target, 1 ms, 0-byte batch).
+    use super::*;
+    use crate::datafusion_query_config::DatafusionQueryConfig;
+    use crate::query_tracker::{QueryTrackingContext, QueryType};
+    use datafusion::datasource::listing::ListingTableUrl;
+
+    fn handle(table_name: &str, served_by_registered_provider: bool) -> SessionContextHandle {
+        let ctx = SessionContext::new();
+        let global_pool = ctx.runtime_env().memory_pool.clone();
+        SessionContextHandle {
+            ctx,
+            table_path: ListingTableUrl::parse("file:///mv-state-virtual/").unwrap(),
+            object_metas: Arc::new(vec![]),
+            writer_generations: Arc::new(vec![]),
+            sort_fields: vec![],
+            sort_orders: vec![],
+            query_context: QueryTrackingContext::new(0, global_pool, QueryType::Shard),
+            table_name: table_name.to_string(),
+            indexed_config: None,
+            query_config: DatafusionQueryConfig::test_default(),
+            io_handle: tokio::runtime::Handle::current(),
+            aggregate_mode: crate::agg_mode::Mode::Default,
+            has_topk: false,
+            prepared_plan: None,
+            phantom_reservation: None,
+            mv_binding: None,
+            table_served_by_registered_provider: served_by_registered_provider,
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_shard_scan_short_circuits() {
+        // A real shard with no parquet files: EmptyExec is the correct answer.
+        assert!(empty_shard_short_circuit_applies(&handle("cbspan1", false)));
+    }
+
+    #[tokio::test]
+    async fn mv_only_session_never_short_circuits() {
+        // The MV-only fold session: files live in the registered ListingTable,
+        // object_metas is empty by design. Must plan and scan, never EmptyExec.
+        assert!(!empty_shard_short_circuit_applies(&handle("cbspan1_mv_mv1", true)));
+    }
+
+    #[tokio::test]
+    async fn worker_session_never_short_circuits() {
+        // Hash-shuffle worker: empty table name, scans StreamingTables.
+        assert!(!empty_shard_short_circuit_applies(&handle("", false)));
+    }
 }

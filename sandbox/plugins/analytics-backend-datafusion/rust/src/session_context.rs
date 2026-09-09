@@ -76,6 +76,14 @@ pub struct SessionContextHandle {
     /// or by `create_mv_only_session_context`. None = no binding = today's
     /// raw-only plan. See `mv_read` for the prepare-time plan surgery.
     pub(crate) mv_binding: Option<crate::mv_read::MVBinding>,
+    /// True when the query's table is served by a provider registered on `ctx`
+    /// (the MV-only fold session registers a ListingTable over the MV state
+    /// files) rather than by `object_metas`. The executor's empty-shard
+    /// shortcut (`object_metas.is_empty() && !table_name.is_empty()` =>
+    /// `EmptyExec`) must not fire for such sessions: their `object_metas` is
+    /// legitimately empty while the registered table holds the data. Without
+    /// this flag every MV query returned zero rows without touching a file.
+    pub(crate) table_served_by_registered_provider: bool,
 }
 
 /// Configuration for indexed execution with filter delegation, provided by Java.
@@ -432,6 +440,7 @@ pub async unsafe fn create_session_context(
         prepared_plan: None,
         phantom_reservation: phantom,
         mv_binding: None,
+        table_served_by_registered_provider: false,
     };
     Ok(Box::into_raw(Box::new(handle)) as i64)
 }
@@ -522,6 +531,7 @@ pub async unsafe fn create_worker_session_context(
         phantom_reservation: None,
         io_handle: tokio::runtime::Handle::current(),
         mv_binding: None,
+        table_served_by_registered_provider: false,
     };
     Ok(Box::into_raw(Box::new(handle)) as i64)
 }
@@ -706,6 +716,7 @@ pub async unsafe fn create_mv_only_session_context(
         prepared_plan: None,
         phantom_reservation: None,
         mv_binding: None,
+        table_served_by_registered_provider: true,
     };
     Ok(Box::into_raw(Box::new(handle)) as i64)
 }
@@ -1284,6 +1295,7 @@ mod tests {
             prepared_plan: None,
             phantom_reservation: None,
             mv_binding: None,
+            table_served_by_registered_provider: false,
         };
         (handle, buf)
     }
