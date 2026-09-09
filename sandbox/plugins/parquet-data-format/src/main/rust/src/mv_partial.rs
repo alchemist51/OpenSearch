@@ -186,6 +186,38 @@ struct SingleMVBuilder {
 }
 
 /// Encodes group key values into a byte vector for hash map lookup.
+/// Widen any Arrow integer-like scalar to i64. Covers every integer width the
+/// OpenSearch mappers produce (byte/short/integer/long → Int8/16/32/64, unsigned
+/// variants), Boolean (0/1), Date32/Date64 and all Timestamp units (normalized to
+/// milliseconds). Returns None for nulls and for non-integer types (Float/Utf8/...).
+fn widen_int_like(col: &dyn Array, row: usize) -> Option<i64> {
+    if col.is_null(row) {
+        return None;
+    }
+    match col.data_type() {
+        DataType::Int64 => Some(col.as_primitive::<Int64Type>().value(row)),
+        DataType::Int32 => Some(col.as_primitive::<Int32Type>().value(row) as i64),
+        DataType::Int16 => Some(col.as_primitive::<Int16Type>().value(row) as i64),
+        DataType::Int8 => Some(col.as_primitive::<Int8Type>().value(row) as i64),
+        DataType::UInt64 => i64::try_from(col.as_primitive::<UInt64Type>().value(row)).ok(),
+        DataType::UInt32 => Some(col.as_primitive::<UInt32Type>().value(row) as i64),
+        DataType::UInt16 => Some(col.as_primitive::<UInt16Type>().value(row) as i64),
+        DataType::UInt8 => Some(col.as_primitive::<UInt8Type>().value(row) as i64),
+        DataType::Boolean => Some(col.as_boolean().value(row) as i64),
+        DataType::Date32 => Some(col.as_primitive::<Date32Type>().value(row) as i64 * 86_400_000),
+        DataType::Date64 => Some(col.as_primitive::<Date64Type>().value(row)),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Some(col.as_primitive::<TimestampMillisecondType>().value(row)),
+        DataType::Timestamp(TimeUnit::Second, _) => Some(col.as_primitive::<TimestampSecondType>().value(row) * 1000),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            Some(col.as_primitive::<TimestampMicrosecondType>().value(row).div_euclid(1_000))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            Some(col.as_primitive::<TimestampNanosecondType>().value(row).div_euclid(1_000_000))
+        }
+        _ => None,
+    }
+}
+
 fn encode_group_key(batch: &RecordBatch, row: usize, group_indices: &[usize]) -> Vec<u8> {
     let mut key = Vec::with_capacity(group_indices.len() * 9);
     for &col_idx in group_indices {
@@ -197,13 +229,22 @@ fn encode_group_key(batch: &RecordBatch, row: usize, group_indices: &[usize]) ->
             // Extract value as i64 for all numeric/timestamp types.
             // For keyword/string types, encode the string bytes.
             match col.data_type() {
-                DataType::Int64 => {
-                    let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-                    key.extend_from_slice(&arr.value(row).to_le_bytes());
-                }
-                DataType::Int32 => {
-                    let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
-                    key.extend_from_slice(&(arr.value(row) as i64).to_le_bytes());
+                DataType::Int64
+                | DataType::Int32
+                | DataType::Int16
+                | DataType::Int8
+                | DataType::UInt64
+                | DataType::UInt32
+                | DataType::UInt16
+                | DataType::UInt8
+                | DataType::Boolean
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Timestamp(_, _) => {
+                    // All integer-like keys share one widened i64 encoding so that an
+                    // Int16 and an Int64 column with equal values hash identically.
+                    let v = widen_int_like(col.as_ref(), row).unwrap_or(0);
+                    key.extend_from_slice(&v.to_le_bytes());
                 }
                 DataType::Float64 => {
                     let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -220,13 +261,6 @@ fn encode_group_key(batch: &RecordBatch, row: usize, group_indices: &[usize]) ->
                     let s = arr.value(row);
                     key.extend_from_slice(&(s.len() as u64).to_le_bytes());
                     key.extend_from_slice(s.as_bytes());
-                }
-                DataType::Timestamp(TimeUnit::Millisecond, _) => {
-                    let arr = col
-                        .as_any()
-                        .downcast_ref::<TimestampMillisecondArray>()
-                        .unwrap();
-                    key.extend_from_slice(&arr.value(row).to_le_bytes());
                 }
                 _ => {
                     // Fallback: cast to string
@@ -246,24 +280,11 @@ fn extract_group_value(col: &dyn Array, row: usize) -> Option<i64> {
     if col.is_null(row) {
         return None;
     }
-    match col.data_type() {
-        DataType::Int64 => {
-            Some(col.as_any().downcast_ref::<Int64Array>().unwrap().value(row))
-        }
-        DataType::Int32 => Some(
-            col.as_any().downcast_ref::<Int32Array>().unwrap().value(row) as i64,
-        ),
-        DataType::Timestamp(TimeUnit::Millisecond, _) => Some(
-            col.as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .unwrap()
-                .value(row),
-        ),
-        _ => {
-            // For string/keyword types, we store a sentinel — the actual string
-            // is reconstructed from the hash map key at seal time. Store 0 as placeholder.
-            Some(0)
-        }
+    match widen_int_like(col, row) {
+        Some(v) => Some(v),
+        // For string/keyword types, we store a sentinel — the actual string
+        // is reconstructed from the hash map key at seal time. Store 0 as placeholder.
+        None => Some(0),
     }
 }
 
@@ -272,13 +293,10 @@ fn extract_agg_value(col: &dyn Array, row: usize) -> Option<i64> {
     if col.is_null(row) {
         return None;
     }
+    if let Some(v) = widen_int_like(col, row) {
+        return Some(v);
+    }
     match col.data_type() {
-        DataType::Int64 => {
-            Some(col.as_any().downcast_ref::<Int64Array>().unwrap().value(row))
-        }
-        DataType::Int32 => Some(
-            col.as_any().downcast_ref::<Int32Array>().unwrap().value(row) as i64,
-        ),
         DataType::Float64 => {
             // Store as bits for exact round-trip
             let v = col
@@ -288,12 +306,6 @@ fn extract_agg_value(col: &dyn Array, row: usize) -> Option<i64> {
                 .value(row);
             Some(i64::from_le_bytes(v.to_le_bytes()))
         }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => Some(
-            col.as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .unwrap()
-                .value(row),
-        ),
         _ => {
             // Unsupported type for aggregation — skip
             None
@@ -1787,6 +1799,87 @@ mod tests {
         assert_eq!(seen[&Some(1_373_882_700_000)], (4, 10, 3));
         // null EventTime -> null bucket, still aggregated
         assert_eq!(seen[&None], (2, 10, 5));
+    }
+
+    /// ClickBench maps AdvEngineID/IsRefresh/Resolution*/FlashMinor/NetMajor as `short`
+    /// (Arrow Int16). The 1% gate on 2026-09-09 showed SUM=0 and NULL MIN/MAX for all of
+    /// them because the extractors only widened Int32/Int64. Every integer width must
+    /// aggregate, and an Int16 group key must hash like an Int64 key of equal value.
+    #[test]
+    fn narrow_integer_fields_aggregate_and_group() {
+        let spec = MVPartialSpec {
+            mv_id: "narrow".to_string(),
+            definition_hash: "hash".to_string(),
+            def_version: 1,
+            group_col_indices: Vec::new(),
+            group_col_names: vec!["k16".to_string()],
+            group_col_types: vec![DataType::Int32],
+            group_spans: vec![None],
+            agg_specs: vec![
+                AggSpec { function: AggFunction::Sum, source_field: Some("v16".to_string()), source_col_idx: None, output_names: vec!["sum16".to_string()] },
+                AggSpec { function: AggFunction::Min, source_field: Some("v16".to_string()), source_col_idx: None, output_names: vec!["min16".to_string()] },
+                AggSpec { function: AggFunction::Max, source_field: Some("v16".to_string()), source_col_idx: None, output_names: vec!["max16".to_string()] },
+                AggSpec { function: AggFunction::CountField, source_field: Some("v16".to_string()), source_col_idx: None, output_names: vec!["cnt16".to_string()] },
+                AggSpec { function: AggFunction::Sum, source_field: Some("v8".to_string()), source_col_idx: None, output_names: vec!["sum8".to_string()] },
+                AggSpec { function: AggFunction::Max, source_field: Some("u32".to_string()), source_col_idx: None, output_names: vec!["maxu32".to_string()] },
+                AggSpec { function: AggFunction::Sum, source_field: Some("b".to_string()), source_col_idx: None, output_names: vec!["sumb".to_string()] },
+            ],
+            sort_key_names: vec!["k16".to_string()],
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k16", DataType::Int16, true),
+            Field::new("v16", DataType::Int16, true),
+            Field::new("v8", DataType::Int8, true),
+            Field::new("u32", DataType::UInt32, true),
+            Field::new("b", DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int16Array::from(vec![Some(7), Some(7), Some(-3), Some(7)])),
+                Arc::new(Int16Array::from(vec![Some(1024), Some(-5), Some(43), None])),
+                Arc::new(Int8Array::from(vec![Some(100), Some(27), Some(-1), Some(1)])),
+                Arc::new(UInt32Array::from(vec![Some(4_000_000_000), Some(1), Some(2), Some(3)])),
+                Arc::new(BooleanArray::from(vec![Some(true), Some(true), Some(false), None])),
+            ],
+        )
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = MVPartialBuilder::new(vec![spec], 0, 1, tmp.path().to_path_buf());
+        builder.accumulate(&batch);
+        let results = builder.seal();
+        assert!(!results[0].failed, "{:?}", results[0].fail_reason);
+        assert_eq!(results[0].row_count, 2);
+
+        let file = File::open(&results[0].file_path).unwrap();
+        let rb = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap().build().unwrap().next().unwrap().unwrap();
+        let k = rb.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let col = |i: usize| rb.column(i).as_any().downcast_ref::<Int64Array>().unwrap();
+        for r in 0..rb.num_rows() {
+            match k.value(r) {
+                7 => {
+                    assert_eq!(col(1).value(r), 1019); // 1024 + (-5); null skipped
+                    assert_eq!(col(2).value(r), -5);
+                    assert_eq!(col(3).value(r), 1024);
+                    assert_eq!(col(4).value(r), 2); // count of non-null v16
+                    assert_eq!(col(5).value(r), 128); // 100 + 27 + 1
+                    assert_eq!(col(6).value(r), 4_000_000_000); // UInt32 beyond i32::MAX widened intact
+                    assert_eq!(col(7).value(r), 2); // true + true (+ null skipped)
+                }
+                -3 => {
+                    assert_eq!(col(1).value(r), 43);
+                    assert_eq!(col(2).value(r), 43);
+                    assert_eq!(col(3).value(r), 43);
+                    assert_eq!(col(4).value(r), 1);
+                    assert_eq!(col(5).value(r), -1);
+                    assert_eq!(col(6).value(r), 2);
+                    assert_eq!(col(7).value(r), 0);
+                }
+                other => panic!("unexpected key {}", other),
+            }
+        }
     }
 
     #[test]
