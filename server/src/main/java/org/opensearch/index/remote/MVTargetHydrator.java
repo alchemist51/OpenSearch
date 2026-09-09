@@ -529,14 +529,16 @@ public class MVTargetHydrator implements Closeable {
                     if (MVStateManifest.parsePrimaryTerm(m) != newestTerm) continue;
                     MVStateManifest manifest = remoteManager.readManifest(shardKey, mvId, m);
                     for (MVStateManifest.FileEntry fe : manifest.files()) {
-                        if (Files.exists(shardDir.resolve(fe.name())) == false) {
+                        // hydrated but never staged into the catalog dir == never published (an earlier
+                        // hydrator's skip that a later gap fill downloaded but the marker check dropped)
+                        if (Files.exists(shardDir.resolve(fe.name())) == false || Files.exists(catalogDir.resolve(fe.name())) == false) {
                             missing.add(manifest.generation());
                             break;
                         }
                     }
                 }
                 if (missing.isEmpty()) {
-                    logger.info("MV hydrator remote gap scan: source shard {} complete ({} manifests, all files present)", sourceShard, manifests.size());
+                    logger.info("MV hydrator remote gap scan: source shard {} complete ({} manifests, all files hydrated and staged)", sourceShard, manifests.size());
                     continue;
                 }
                 logger.warn("MV hydrator remote gap scan: source shard {} missing generations {} (hydrating from manifests)", sourceShard, missing);
