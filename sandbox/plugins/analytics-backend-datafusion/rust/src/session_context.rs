@@ -736,6 +736,25 @@ pub(crate) struct MvColumnProjection {
     pub null_fill: bool,
 }
 
+/// Number of leading physical columns covered by the MV state contract: trailing
+/// `__name__` system columns (e.g. `__row_id__` from the generic parquet merger) that
+/// lie beyond `state_field_count` are excluded. Never strips a column the contract
+/// names, and never strips a non-system column.
+pub(crate) fn trailing_system_columns_excluded(
+    physical_schema: &arrow::datatypes::SchemaRef,
+    state_field_count: usize,
+) -> usize {
+    let mut n = physical_schema.fields().len();
+    while n > state_field_count && is_system_column(physical_schema.field(n - 1).name()) {
+        n -= 1;
+    }
+    n
+}
+
+fn is_system_column(name: &str) -> bool {
+    name.len() > 4 && name.starts_with("__") && name.ends_with("__")
+}
+
 /// Validates the physical (file-0) schema against the ordered `state_fields`
 /// contract and derives the logical table schema. `state_fields` may be equal
 /// to OR larger than the physical schema; the first `physical_count` entries
@@ -746,7 +765,22 @@ fn mv_table_schema(
     logical_schema: &arrow::datatypes::SchemaRef,
     state_fields: &[String],
 ) -> Result<(arrow::datatypes::SchemaRef, Vec<MvColumnProjection>), DataFusionError> {
-    let physical_count = physical_schema.fields().len();
+    // Trailing SYSTEM columns (`__name__`, e.g. `__row_id__`) are appended by the generic
+    // parquet merger when it compacts MV state generations of a derived target. They are
+    // not part of the MV state contract and are never referenced by a fold: exclude them
+    // from the positional overlay instead of failing the whole read.
+    let physical_count = trailing_system_columns_excluded(physical_schema, state_fields.len());
+    if physical_count < physical_schema.fields().len() {
+        native_bridge_common::log_info!(
+            "mv_table_schema: ignoring {} trailing system column(s) beyond the {} state fields: {:?}",
+            physical_schema.fields().len() - physical_count,
+            state_fields.len(),
+            physical_schema.fields()[physical_count..]
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>()
+        );
+    }
     if state_fields.len() < physical_count {
         return Err(DataFusionError::Execution(format!(
             "MV state field metadata has {} names but the Arrow state has {} columns; \
@@ -1725,5 +1759,44 @@ mod tests {
             !substrait_has_fetch_rel(&bytes),
             "Join rel → false (no TopK in shard fragment with Join)"
         );
+    }
+}
+
+#[cfg(test)]
+mod trailing_system_column_tests {
+    //! The composite engine's generic parquet merger compacts MV state generations of a
+    //! derived target and appends `__row_id__`; the merged file then has one more column
+    //! than `index.mv.state_fields`. The overlay must ignore such trailing system columns
+    //! (and only those) instead of rejecting the whole read.
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn schema(names: &[(&str, DataType)]) -> arrow::datatypes::SchemaRef {
+        Arc::new(Schema::new(names.iter().map(|(n, t)| Field::new(*n, t.clone(), true)).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn row_id_appended_by_merger_is_ignored() {
+        let physical = schema(&[("k", DataType::Int32), ("s", DataType::Int64), ("__row_id__", DataType::Int64)]);
+        assert_eq!(2, trailing_system_columns_excluded(&physical, 2));
+        let logical = schema(&[("k", DataType::Int32), ("s", DataType::Int64)]);
+        let (table, _) = mv_table_schema(&physical, &logical, &["k".to_string(), "s".to_string()]).expect("merged file must be readable");
+        assert_eq!(vec!["k", "s"], table.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn non_system_extra_column_is_still_rejected() {
+        let physical = schema(&[("k", DataType::Int32), ("s", DataType::Int64), ("extra", DataType::Int64)]);
+        assert_eq!(3, trailing_system_columns_excluded(&physical, 2));
+        let logical = schema(&[("k", DataType::Int32), ("s", DataType::Int64)]);
+        let err = mv_table_schema(&physical, &logical, &["k".to_string(), "s".to_string()]).err().expect("must fail");
+        assert!(err.to_string().contains("has 2 names but the Arrow state has 3 columns"), "{err}");
+    }
+
+    #[test]
+    fn system_column_named_by_the_contract_is_kept() {
+        // If the contract itself names a `__x__` column it is state, not a merger artefact.
+        let physical = schema(&[("k", DataType::Int32), ("__gen__", DataType::Int64)]);
+        assert_eq!(2, trailing_system_columns_excluded(&physical, 2));
     }
 }
