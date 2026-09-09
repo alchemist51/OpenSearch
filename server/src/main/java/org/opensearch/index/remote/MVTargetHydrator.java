@@ -438,37 +438,68 @@ public class MVTargetHydrator implements Closeable {
 
         // Publish hydrated files into the target engine's catalog so that
         // CatalogSnapshot.getSearchableFiles("mv_state") returns them.
+        publishGeneration(sourceShard, shardHydratedDir, entry.generation(), entry.rowCount(), fileNamesOf(entry));
+    }
+
+    /** Collect the file names for a checkpoint entry. */
+    private static Set<String> fileNamesOf(MVCheckpoint.MVPartialEntry entry) {
+        Set<String> fileNames = new HashSet<>();
+        for (MVCheckpoint.FileInfo fi : entry.files()) {
+            fileNames.add(fi.name());
+        }
+        return fileNames;
+    }
+
+    /** Provenance key identifying this MV + source shard as a derived-artifact producer. */
+    private String provenanceKey(int sourceShard) {
+        return mvId + "/" + sourceShard;
+    }
+
+    /**
+     * Publish a single hydrated source generation into the target catalog through the
+     * allocate-generation path. Skips publication only when the target's userData marker already
+     * records this (or a newer) source generation as published — the authoritative idempotency
+     * signal that survives restarts. Any rejection is logged at WARN with the exception message
+     * (never DEBUG), and a successful publish logs at INFO with both target and source generations.
+     */
+    void publishGeneration(int sourceShard, Path shardHydratedDir, long sourceGeneration, long numRows, Set<String> fileNames) {
         CatalogPublisher publisher = this.catalogPublisher;
-        if (publisher != null) {
-            try {
-                Set<String> fileNames = new HashSet<>();
-                for (MVCheckpoint.FileInfo fi : entry.files()) {
-                    fileNames.add(fi.name());
-                }
-                publisher.publish(
-                    MV_STATE_FORMAT_NAME,
-                    shardHydratedDir.toAbsolutePath().toString(),
-                    fileNames,
-                    entry.generation(),
-                    entry.rowCount(),
-                    Map.of()
-                );
-                logger.info(
-                    "MV catalog published: target={} source=[{}][{}] gen={} files={}",
-                    targetShardId, sourceIndex, sourceShard, entry.generation(), fileNames.size()
-                );
-            } catch (IllegalArgumentException e) {
-                // Generation already in catalog (idempotent restart recovery) — safe to ignore
+        if (publisher == null) {
+            return;
+        }
+        if (fileNames.isEmpty()) {
+            return;
+        }
+        String provenanceKey = provenanceKey(sourceShard);
+        try {
+            long alreadyPublished = publisher.publishedSourceGeneration(provenanceKey);
+            if (sourceGeneration <= alreadyPublished) {
                 logger.debug(
-                    "MV catalog publish skipped (already published): target={} gen={} error={}",
-                    targetShardId, entry.generation(), e.getMessage()
+                    "MV catalog publish skipped (marker up to date): target={} provenance={} sourceGen={} marker={}",
+                    targetShardId, provenanceKey, sourceGeneration, alreadyPublished
                 );
-            } catch (Exception e) {
-                logger.warn(
-                    "MV catalog publish failed: target={} gen={} error={}",
-                    targetShardId, entry.generation(), e.getMessage()
-                );
+                return;
             }
+            long targetGeneration = publisher.publish(
+                MV_STATE_FORMAT_NAME,
+                shardHydratedDir.toAbsolutePath().toString(),
+                fileNames,
+                provenanceKey,
+                sourceGeneration,
+                numRows,
+                Map.of()
+            );
+            logger.info(
+                "MV catalog published: target={} source=[{}][{}] targetGen={} sourceGen={} files={}",
+                targetShardId, sourceIndex, sourceShard, targetGeneration, sourceGeneration, fileNames.size()
+            );
+        } catch (Exception e) {
+            // A rejection here (invalid input, engine state) is real and must be visible — never
+            // masked as a benign "already published" at DEBUG the way the original code did.
+            logger.warn(
+                "MV catalog publish rejected: target={} provenance={} sourceGen={} error={}",
+                targetShardId, provenanceKey, sourceGeneration, e.getMessage()
+            );
         }
     }
 
@@ -578,21 +609,35 @@ public class MVTargetHydrator implements Closeable {
     /**
      * Callback interface for publishing hydrated files into the target engine's catalog.
      * Implemented by the mv-engine plugin which has access to the target IndexShard.
+     *
+     * <p>The engine allocates the catalog generation (the hydrator does not supply one),
+     * avoiding collisions with the target's own refresh/flush/merge generations. Idempotency
+     * is tracked via a provenance marker; use {@link #publishedSourceGeneration(String)} to
+     * learn what has already been published and skip it.</p>
      */
-    @FunctionalInterface
     public interface CatalogPublisher {
         /**
-         * Publish a set of hydrated files as a single derived-artifact generation.
+         * Publish a set of hydrated files as a single derived-artifact generation, letting the
+         * engine allocate the target catalog generation.
          *
-         * @param dataFormatName artifact format name (e.g. "mv_state")
-         * @param directory      absolute path to the directory containing the files
-         * @param fileNames      the file names within directory to publish
-         * @param generation     the writer generation to assign to this publication
-         * @param numRows        total row count across all files (0 if unknown)
+         * @param dataFormatName  artifact format name (e.g. "mv_state")
+         * @param directory       absolute path to the directory containing the files
+         * @param fileNames       the file names within directory to publish
+         * @param provenanceKey   upstream producer key ("&lt;mvId&gt;/&lt;sourceShard&gt;")
+         * @param sourceGeneration the upstream generation being published (recorded in the marker)
+         * @param numRows         total row count across all files (0 if unknown)
          * @param userDataUpdates metadata entries to merge into the catalog snapshot
+         * @return the target catalog generation the engine allocated
          */
-        void publish(String dataFormatName, String directory, Set<String> fileNames,
-                      long generation, long numRows, Map<String, String> userDataUpdates) throws IOException;
+        long publish(String dataFormatName, String directory, Set<String> fileNames,
+                      String provenanceKey, long sourceGeneration, long numRows,
+                      Map<String, String> userDataUpdates) throws IOException;
+
+        /**
+         * Returns the maximum upstream generation already published for {@code provenanceKey}
+         * on the target catalog, or {@code -1} if none.
+         */
+        long publishedSourceGeneration(String provenanceKey) throws IOException;
     }
 
     private volatile CatalogPublisher catalogPublisher;

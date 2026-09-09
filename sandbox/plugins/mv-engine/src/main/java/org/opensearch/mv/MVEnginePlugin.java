@@ -268,14 +268,34 @@ public class MVEnginePlugin extends Plugin implements ActionPlugin {
         if (existing == null) {
             // Wire catalog publisher: publishes hydrated files into the target engine's
             // catalog so that CatalogSnapshot.getSearchableFiles("mv_state") returns them.
-            hydrator.setCatalogPublisher((formatName, directory, fileNames, generation, numRows, userDataUpdates) -> {
-                indexShard.publishDerivedArtifact(
-                    formatName,
-                    new org.opensearch.index.engine.exec.WriterFileSet(
-                        directory, generation, fileNames, numRows, 0L
-                    ),
-                    userDataUpdates
-                );
+            // The engine allocates the target generation (avoiding collisions with the target's
+            // own refresh/flush generations) and records idempotency via the provenance marker.
+            hydrator.setCatalogPublisher(new MVTargetHydrator.CatalogPublisher() {
+                @Override
+                public long publish(
+                    String formatName,
+                    String directory,
+                    java.util.Set<String> fileNames,
+                    String provenanceKey,
+                    long sourceGeneration,
+                    long numRows,
+                    Map<String, String> userDataUpdates
+                ) throws java.io.IOException {
+                    return indexShard.publishDerivedArtifact(
+                        formatName,
+                        new org.opensearch.index.engine.exec.WriterFileSet(
+                            directory, 0L, fileNames, numRows, 0L
+                        ),
+                        provenanceKey,
+                        sourceGeneration,
+                        userDataUpdates
+                    );
+                }
+
+                @Override
+                public long publishedSourceGeneration(String provenanceKey) throws java.io.IOException {
+                    return indexShard.publishedSourceGeneration(provenanceKey);
+                }
             });
             hydrator.start();
             logger.info("MV hydrator started for target shard={} source={} mvId={}", indexShard.shardId(), sourceIndex, mvId);

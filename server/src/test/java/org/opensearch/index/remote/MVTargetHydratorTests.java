@@ -8,12 +8,32 @@
 
 package org.opensearch.index.remote;
 
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.index.Index;
+import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.OpenSearchTestCase;
+import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportService;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+import static org.mockito.Mockito.mock;
 
 /**
  * Unit tests for {@link MVTargetHydrator}: diff logic (generation advance,
  * term rollover, empty checkpoint), file name generation parsing, lifecycle
- * start/stop idempotence.
+ * start/stop idempotence, and catalog publish (allocate path, marker-based
+ * skip, WARN-on-rejection, and start-up reconcile).
  */
 public class MVTargetHydratorTests extends OpenSearchTestCase {
 
@@ -259,21 +279,135 @@ public class MVTargetHydratorTests extends OpenSearchTestCase {
 
     // ── CatalogPublisher callback ───────────────────────────────────────
 
-    public void testCatalogPublisherCalledWithCorrectFormatName() {
+    public void testCatalogPublisherInterfaceShape() throws IOException {
         // Verify the CatalogPublisher interface shape is callable and the format
         // name constant matches what the analytics-engine dispatch expects.
-        java.util.concurrent.atomic.AtomicReference<String> capturedFormat = new java.util.concurrent.atomic.AtomicReference<>();
-        java.util.concurrent.atomic.AtomicLong capturedGeneration = new java.util.concurrent.atomic.AtomicLong();
-        MVTargetHydrator.CatalogPublisher publisher = (formatName, directory, fileNames, generation, numRows, userData) -> {
-            capturedFormat.set(formatName);
-            capturedGeneration.set(generation);
-        };
-        try {
-            publisher.publish("mv_state", "/tmp/test", java.util.Set.of("file1.parquet"), 5L, 100L, java.util.Map.of());
-        } catch (java.io.IOException e) {
-            fail("should not throw");
+        FakePublisher publisher = new FakePublisher();
+        long targetGen = publisher.publish("mv_state", "/tmp/test", Set.of("file1.parquet"), "mv1/0", 5L, 100L, Map.of());
+        assertEquals("mv_state", publisher.lastFormat);
+        assertEquals(5L, publisher.lastSourceGeneration);
+        assertTrue("engine allocates a positive target generation", targetGen > 0);
+        assertEquals(5L, publisher.publishedSourceGeneration("mv1/0"));
+    }
+
+    // ── Publish: collision no longer rejects ────────────────────────────
+
+    /**
+     * A source generation whose number equals a pre-existing target generation must still publish:
+     * the engine allocates its own target generation, so there is no collision. Verifies the fix
+     * for defect (a) — the hydrator no longer swallows a collision.
+     */
+    public void testPublishDoesNotRejectOnSourceGenerationCollision() throws Exception {
+        FakePublisher publisher = new FakePublisher();
+        // Pre-seed the fake engine's generation counter so an allocated generation would equal
+        // the source generation number if the old (pass-through) behaviour were still in place.
+        publisher.generationCounter.set(5L);
+        try (MVTargetHydrator hydrator = newHydrator(createTempDir())) {
+            hydrator.setCatalogPublisher(publisher);
+            hydrator.publishGeneration(0, createTempDir(), 5L, 3L, Set.of("_mv_partial.s0.t1.g5.abc.parquet"));
         }
-        assertEquals("mv_state", capturedFormat.get());
-        assertEquals(5L, capturedGeneration.get());
+        assertEquals("published exactly once", 1, publisher.publishCount);
+        assertEquals("source generation recorded in marker", 5L, publisher.publishedSourceGeneration("mv1/0"));
+        assertTrue("engine-allocated target generation differs from source gen", publisher.lastTargetGeneration != 5L);
+    }
+
+    // ── Publish: rejection logged at WARN (never DEBUG) ─────────────────
+
+    public void testPublishRejectionLoggedAtWarn() throws Exception {
+        FakePublisher publisher = new FakePublisher();
+        publisher.failWith = new IllegalArgumentException("derived artifact row count must be non-negative but was [-1]");
+        try (
+            MVTargetHydrator hydrator = newHydrator(createTempDir());
+            MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(MVTargetHydrator.class))
+        ) {
+            appender.addExpectation(
+                new MockLogAppender.SeenEventExpectation(
+                    "warn on rejection",
+                    MVTargetHydrator.class.getCanonicalName(),
+                    Level.WARN,
+                    "MV catalog publish rejected*"
+                )
+            );
+            appender.addExpectation(
+                new MockLogAppender.UnseenEventExpectation(
+                    "no debug masking",
+                    MVTargetHydrator.class.getCanonicalName(),
+                    Level.DEBUG,
+                    "*already published*"
+                )
+            );
+            hydrator.setCatalogPublisher(publisher);
+            hydrator.publishGeneration(0, createTempDir(), 5L, -1L, Set.of("bad.parquet"));
+            appender.assertAllExpectationsMatched();
+        }
+    }
+
+    // ── Publish: marker prevents double publish across restart ──────────
+
+    public void testMarkerPreventsDoublePublish() throws Exception {
+        FakePublisher publisher = new FakePublisher();
+        try (MVTargetHydrator hydrator = newHydrator(createTempDir())) {
+            hydrator.setCatalogPublisher(publisher);
+            Set<String> files = Set.of("_mv_partial.s0.t1.g7.abc.parquet");
+            hydrator.publishGeneration(0, createTempDir(), 7L, 3L, files);
+            assertEquals(1, publisher.publishCount);
+            // Simulate a restart re-attempting the same source generation: marker must short-circuit.
+            hydrator.publishGeneration(0, createTempDir(), 7L, 3L, files);
+            assertEquals("second publish of same source gen must be skipped", 1, publisher.publishCount);
+            // A newer generation still publishes.
+            hydrator.publishGeneration(0, createTempDir(), 8L, 3L, Set.of("_mv_partial.s0.t1.g8.def.parquet"));
+            assertEquals(2, publisher.publishCount);
+        }
+    }
+
+    // ── Test helpers ────────────────────────────────────────────────────
+
+    private MVTargetHydrator newHydrator(Path targetShardDataPath) {
+        return new MVTargetHydrator(
+            new ShardId(new Index("target", "_na_"), 0),
+            "mv1",
+            "source",
+            targetShardDataPath,
+            mock(TransportService.class),
+            mock(ClusterService.class),
+            mock(ThreadPool.class),
+            mock(MVStateRemoteManager.class),
+            TimeValue.timeValueSeconds(1)
+        );
+    }
+
+    /**
+     * A stateful in-memory stand-in for the engine-backed CatalogPublisher: allocates a
+     * monotonically increasing target generation and maintains a per-provenance published marker,
+     * mirroring {@code DataFormatAwareEngine}'s allocate + marker semantics.
+     */
+    static final class FakePublisher implements MVTargetHydrator.CatalogPublisher {
+        final java.util.concurrent.atomic.AtomicLong generationCounter = new java.util.concurrent.atomic.AtomicLong(0);
+        final Map<String, Long> markers = new ConcurrentHashMap<>();
+        int publishCount = 0;
+        String lastFormat;
+        long lastSourceGeneration;
+        long lastTargetGeneration;
+        RuntimeException failWith;
+
+        @Override
+        public long publish(String dataFormatName, String directory, Set<String> fileNames, String provenanceKey,
+                            long sourceGeneration, long numRows, Map<String, String> userDataUpdates) throws IOException {
+            if (failWith != null) {
+                throw failWith;
+            }
+            long target = generationCounter.incrementAndGet();
+            markers.merge(provenanceKey, sourceGeneration, Math::max);
+            publishCount++;
+            lastFormat = dataFormatName;
+            lastSourceGeneration = sourceGeneration;
+            lastTargetGeneration = target;
+            return target;
+        }
+
+        @Override
+        public long publishedSourceGeneration(String provenanceKey) {
+            return markers.getOrDefault(provenanceKey, -1L);
+        }
     }
 }

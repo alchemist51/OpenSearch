@@ -5792,6 +5792,67 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     }
 
     /**
+     * Atomically publishes a prebuilt derived data-format artifact, letting the engine allocate a
+     * collision-free catalog generation, and records idempotency progress under
+     * {@code mv_state.published.<provenanceKey>}. Preferred over the explicit-generation overload
+     * for producers (e.g. the MV target hydrator) whose upstream generation numbers are unrelated
+     * to this shard's own generation sequence.
+     *
+     * @param dataFormatName          the artifact format name (e.g. {@code "mv_state"})
+     * @param fileSetWithoutGeneration the files + row count to publish; its writer generation is ignored
+     * @param provenanceKey           identifies the upstream producer (MV: {@code "<mvId>/<sourceShard>"})
+     * @param sourceGeneration        the upstream generation being published; recorded in the marker
+     * @param userDataUpdates         additional metadata entries to merge into the catalog userData
+     * @return the target catalog generation the engine allocated for this publication
+     * @throws IOException if the publish or flush fails
+     */
+    public long publishDerivedArtifact(
+        String dataFormatName,
+        org.opensearch.index.engine.exec.WriterFileSet fileSetWithoutGeneration,
+        String provenanceKey,
+        long sourceGeneration,
+        java.util.Map<String, String> userDataUpdates
+    ) throws IOException {
+        verifyNotClosed();
+        if (routingEntry().primary() == false) {
+            throw new IllegalStateException("derived artifacts may only be published on a primary shard [" + shardId + "]");
+        }
+        Indexer indexer = getIndexer();
+        if (indexer instanceof DataFormatAwareEngine dataFormatAwareEngine) {
+            return dataFormatAwareEngine.publishDerivedArtifact(
+                dataFormatName,
+                fileSetWithoutGeneration,
+                provenanceKey,
+                sourceGeneration,
+                userDataUpdates
+            );
+        } else {
+            throw new UnsupportedOperationException(
+                "publishDerivedArtifact requires a DataFormatAwareEngine but got [" + indexer.getClass().getSimpleName() + "]"
+            );
+        }
+    }
+
+    /**
+     * Returns the maximum upstream (source) generation already published for {@code provenanceKey}
+     * on this shard's catalog, or {@code -1} if none. Used by derived-artifact producers to skip
+     * already-published generations idempotently across restarts.
+     *
+     * @throws IOException if the catalog snapshot cannot be read
+     */
+    public long publishedSourceGeneration(String provenanceKey) throws IOException {
+        verifyNotClosed();
+        Indexer indexer = getIndexer();
+        if (indexer instanceof DataFormatAwareEngine dataFormatAwareEngine) {
+            return dataFormatAwareEngine.publishedSourceGeneration(provenanceKey);
+        } else {
+            throw new UnsupportedOperationException(
+                "publishedSourceGeneration requires a DataFormatAwareEngine but got [" + indexer.getClass().getSimpleName() + "]"
+            );
+        }
+    }
+
+    /**
      * Add an internal refresh listener dynamically (after engine construction).
      * Used by the MV source-side POC to register the MV state refresh listener
      * when mv_definitions are added to a source index after the shard has already started.
