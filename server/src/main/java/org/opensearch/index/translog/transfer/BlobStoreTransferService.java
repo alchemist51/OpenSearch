@@ -23,6 +23,7 @@ import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.InputStreamWithMetadata;
 import org.opensearch.common.blobstore.stream.write.WritePriority;
 import org.opensearch.common.blobstore.transfer.RemoteTransferContainer;
+import org.opensearch.common.blobstore.transfer.stream.OffsetRangeFileInputStream;
 import org.opensearch.common.blobstore.transfer.stream.OffsetRangeIndexInputStream;
 import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.core.action.ActionListener;
@@ -187,20 +188,42 @@ public class BlobStoreTransferService implements TransferService {
                 metadata = buildTransferFileMetadata(fileSnapshot.getMetadataFileInputStream());
             }
 
-            // Read content once using inputStream() to invoke any overrides (e.g., decryption)
-            byte[] fileContent;
-            try (InputStream inputStream = fileSnapshot.inputStream()) {
-                fileContent = inputStream.readAllBytes();
-            }
-            long contentLength = fileContent.length;
+            // Only the first generation doesn't have checksum
+            assert (fileSnapshot.getChecksum() != null || fileSnapshot.getName().contains("-1."));
 
             ActionListener<Void> completionListener = ActionListener.wrap(resp -> listener.onResponse(fileSnapshot), ex -> {
                 logger.error(() -> new ParameterizedMessage("Failed to upload blob {}", fileSnapshot.getName()), ex);
                 listener.onFailure(new FileTransferException(fileSnapshot, ex));
             });
 
-            // Only the first generation doesn't have checksum
-            assert (fileSnapshot.getChecksum() != null || fileSnapshot.getName().contains("-1."));
+            final java.nio.file.Path filePath = fileSnapshot.getPath();
+            if (cryptoMetadata == null && filePath != null) {
+                // Plain (unencrypted) transfer: serve the multipart streams straight from the file, like the
+                // segment upload path. Buffering the whole generation in one byte[] caps it at 2 GB — a 3.6 GB
+                // generation produced by a slow flush under a 60K docs/s ingest killed the node with
+                // "Required array size too large" in readAllBytes.
+                final long contentLength = java.nio.file.Files.size(filePath);
+                uploadBlobAsyncInternal(
+                    fileSnapshot.getName(),
+                    fileSnapshot.getName(),
+                    contentLength,
+                    blobPath,
+                    writePriority,
+                    (size, position) -> new OffsetRangeFileInputStream(filePath, size, position),
+                    fileSnapshot.getChecksum(),
+                    completionListener,
+                    metadata,
+                    cryptoMetadata
+                );
+                return;
+            }
+
+            // Encrypted transfer: read content once using inputStream() to invoke the decryption override.
+            byte[] fileContent;
+            try (InputStream inputStream = fileSnapshot.inputStream()) {
+                fileContent = inputStream.readAllBytes();
+            }
+            long contentLength = fileContent.length;
 
             // Use ByteArrayIndexInput for async upload with the content from inputStream()
             String resourceDesc = "FileSnapshot[" + fileSnapshot.getName() + "]";
