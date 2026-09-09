@@ -145,6 +145,7 @@ pub async fn execute_indexed_query(
         has_topk: false,
         prepared_plan: None,
         phantom_reservation: None,
+        mv_binding: None,
     };
     let ptr = Box::into_raw(Box::new(handle)) as i64;
 
