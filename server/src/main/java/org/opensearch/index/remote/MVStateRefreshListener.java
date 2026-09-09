@@ -18,10 +18,10 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -53,13 +53,13 @@ public class MVStateRefreshListener implements ReferenceManager.RefreshListener 
     private final MVStateRemoteManager remoteManager;
     private final long primaryTerm;
     private final long defMetadataVersion;
-    private final Map<String, String> mvDefinitions; // mvId -> definitionHash
+    private final ConcurrentHashMap<String, String> mvDefinitions; // mvId -> descriptor/hash
     private final AtomicReference<MVCheckpoint> lastCheckpoint;
     /** Supplier for the shard's current processed local checkpoint (seqNo). */
     private final java.util.function.LongSupplier processedCheckpointSupplier;
 
     /** Generation counters per MV, used for upload naming. */
-    private final Map<String, Long> genCounters;
+    private final ConcurrentHashMap<String, Long> genCounters;
 
     public MVStateRefreshListener(
         ShardId shardId,
@@ -75,12 +75,12 @@ public class MVStateRefreshListener implements ReferenceManager.RefreshListener 
         this.remoteManager = remoteManager;
         this.primaryTerm = primaryTerm;
         this.defMetadataVersion = defMetadataVersion;
-        this.mvDefinitions = Collections.unmodifiableMap(mvDefinitions);
+        this.mvDefinitions = new ConcurrentHashMap<>(mvDefinitions);
         this.lastCheckpoint = new AtomicReference<>(
             new MVCheckpoint(shardId, primaryTerm, -1, defMetadataVersion, Map.of())
         );
         this.processedCheckpointSupplier = processedCheckpointSupplier;
-        this.genCounters = new HashMap<>();
+        this.genCounters = new ConcurrentHashMap<>();
     }
 
     /**
@@ -95,6 +95,26 @@ public class MVStateRefreshListener implements ReferenceManager.RefreshListener 
         Map<String, String> mvDefinitions
     ) {
         this(shardId, shardDataPath, remoteManager, primaryTerm, defMetadataVersion, mvDefinitions, () -> -1L);
+    }
+
+    /**
+     * Merge definitions added after listener construction (multi-MV fan-out).
+     * Cluster-state updates may add views one at a time after the source shard starts.
+     */
+    public void updateDefinitions(Map<String, String> definitions) {
+        for (Map.Entry<String, String> entry : definitions.entrySet()) {
+            String previous = mvDefinitions.put(entry.getKey(), entry.getValue());
+            if (previous == null) {
+                try {
+                    long resumeGen = remoteManager.resumeGeneration(String.valueOf(shardId.id()), entry.getKey());
+                    genCounters.putIfAbsent(entry.getKey(), resumeGen);
+                    logger.info("MV definition added to live upload listener: shard={} mvId={} startGen={}", shardId, entry.getKey(), resumeGen);
+                } catch (IOException e) {
+                    genCounters.putIfAbsent(entry.getKey(), 1L);
+                    logger.warn("MV definition added but generation resume failed: shard={} mvId={} error={}", shardId, entry.getKey(), e.getMessage());
+                }
+            }
+        }
     }
 
     /**

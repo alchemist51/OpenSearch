@@ -204,9 +204,10 @@ public class MVEnginePlugin extends Plugin implements ActionPlugin {
      * dynamically when definitions are added via cluster state update.
      */
     private void tryRegisterSourceRefreshListener(IndexShard indexShard, Map<String, String> mvDefs) {
-        if (MVCheckpointService.getListener(indexShard.shardId()) != null) {
-            logger.debug("MV source refresh listener already registered for shard={}", indexShard.shardId());
-            return; // idempotent
+        MVStateRefreshListener existing = MVCheckpointService.getListener(indexShard.shardId());
+        if (existing != null) {
+            existing.updateDefinitions(mvDefs);
+            return;
         }
         org.apache.lucene.search.ReferenceManager.RefreshListener mvListener =
             MVRefreshListenerFactory.create(
@@ -289,28 +290,27 @@ public class MVEnginePlugin extends Plugin implements ActionPlugin {
             Map<String, String> mvDefs = metadata.getCustomData("mv_definitions");
             if (mvDefs != null && !mvDefs.isEmpty()) {
                 tryRegisterSourceRefreshListener(indexShard, mvDefs);
-            } else {
-                // Watch for mv_definitions to appear via cluster state updates
-                clusterService.addListener(new org.opensearch.cluster.ClusterStateListener() {
-                    @Override
-                    public void clusterChanged(org.opensearch.cluster.ClusterChangedEvent event) {
-                        if (indexShard.state() == org.opensearch.index.shard.IndexShardState.CLOSED) {
-                            clusterService.removeListener(this);
-                            return;
-                        }
-                        IndexMetadata updatedMeta = event.state().metadata().index(indexShard.shardId().getIndex());
-                        if (updatedMeta == null) {
-                            clusterService.removeListener(this);
-                            return;
-                        }
-                        Map<String, String> defs = updatedMeta.getCustomData("mv_definitions");
-                        if (defs != null && !defs.isEmpty()) {
-                            clusterService.removeListener(this);
-                            tryRegisterSourceRefreshListener(indexShard, defs);
-                        }
-                    }
-                });
             }
+            // Keep watching: views are commonly added one-by-one after the listener
+            // exists, and the live uploader must expand from mv1 to mvN.
+            clusterService.addListener(new org.opensearch.cluster.ClusterStateListener() {
+                @Override
+                public void clusterChanged(org.opensearch.cluster.ClusterChangedEvent event) {
+                    if (indexShard.state() == org.opensearch.index.shard.IndexShardState.CLOSED) {
+                        clusterService.removeListener(this);
+                        return;
+                    }
+                    IndexMetadata updatedMeta = event.state().metadata().index(indexShard.shardId().getIndex());
+                    if (updatedMeta == null) {
+                        clusterService.removeListener(this);
+                        return;
+                    }
+                    Map<String, String> defs = updatedMeta.getCustomData("mv_definitions");
+                    if (defs != null && !defs.isEmpty()) {
+                        tryRegisterSourceRefreshListener(indexShard, defs);
+                    }
+                }
+            });
 
             // ── Target-side: dynamic binding/hydrator registration ──
             // Target creation happens before the atomic binding write, so the shard-start

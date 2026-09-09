@@ -141,6 +141,32 @@ public class MVUploadCheckpointIntegrationTests extends OpenSearchTestCase {
         assertFalse("Local partial should be deleted after upload", Files.exists(partialFile));
     }
 
+    public void testDefinitionsAddedAfterListenerConstructionUploadAllMVs() throws Exception {
+        InMemoryBlobStore blobStore = new InMemoryBlobStore();
+        MVStateRemoteManager manager = createManager(blobStore);
+        Path shardDataPath = createTempDir().resolve("shard-data");
+        Files.createDirectories(shardDataPath.resolve("mv_state").resolve("mv1"));
+        Files.createDirectories(shardDataPath.resolve("mv_state").resolve("mv2"));
+
+        MVStateRefreshListener listener = new MVStateRefreshListener(
+            SHARD, shardDataPath, manager, 1L, 1L, Map.of("mv1", "hash1")
+        );
+        listener.updateDefinitions(Map.of("mv1", "hash1", "mv2", "hash2"));
+
+        Files.writeString(
+            shardDataPath.resolve("mv_state/mv1/_mv_partial.s0.t1.g1.a.parquet"), "mv1"
+        );
+        Files.writeString(
+            shardDataPath.resolve("mv_state/mv2/_mv_partial.s0.t1.g1.b.parquet"), "mv2"
+        );
+        listener.afterRefresh(true);
+
+        assertEquals(1, manager.listManifests("0", "mv1").size());
+        assertEquals(1, manager.listManifests("0", "mv2").size());
+        assertNotNull(listener.getLastCheckpoint().entries().get("mv1"));
+        assertNotNull(listener.getLastCheckpoint().entries().get("mv2"));
+    }
+
     // ── Test: no-op refresh doesn't trigger upload ──────────────────────
 
     public void testNoOpRefreshSkipped() throws Exception {
