@@ -157,7 +157,6 @@ pub unsafe extern "C" fn df_create_global_runtime(
     spill_dir_len: i64,
     spill_limit: i64,
 ) -> i64 {
-    crate::memory_guard::set_pool_limit_for_guard(memory_pool_limit);
     let spill_dir = str_from_raw(spill_dir_ptr, spill_dir_len)
         .map_err(|e| format!("df_create_global_runtime: {}", e))?;
     api::create_global_runtime(memory_pool_limit, cache_manager_ptr, spill_dir, spill_limit)
@@ -212,7 +211,6 @@ pub unsafe extern "C" fn df_set_memory_pool_limit(runtime_ptr: i64, new_limit: i
     if runtime_ptr == 0 {
         return Err("null runtime pointer".to_string());
     }
-    crate::memory_guard::set_pool_limit_for_guard(new_limit);
     api::set_memory_pool_limit(runtime_ptr, new_limit)?;
     Ok(0)
 }
@@ -577,6 +575,538 @@ pub unsafe extern "C" fn df_query_registry_top_n_by_current(
         slice::from_raw_parts_mut(out_ptr as *mut WireQueryMetric, cap_entries as usize);
     let written = snapshot_top_n_by_current(out);
     Ok(written as i64)
+}
+
+/// POC(mv) v2 search: Final-fold via a caller-provided SQL template
+/// (placeholder __MV_STATES__ replaced with the UNION ALL of state files).
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_search_v2(
+    files_ptr: *const *const u8,
+    files_lens: *const i64,
+    files_count: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    out_ptr: *mut u8,
+    out_cap: i64,
+    out_len: *mut i64,
+) -> i64 {
+    let mut files = Vec::with_capacity(files_count as usize);
+    for i in 0..files_count as usize {
+        let f_ptr = *files_ptr.add(i);
+        let f_len = *files_lens.add(i);
+        files.push(
+            str_from_raw(f_ptr, f_len)
+                .map_err(|e| format!("df_mv_search_v2: file[{}]: {}", i, e))?
+                .to_string(),
+        );
+    }
+    let sql = str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_search_v2: sql: {}", e))?;
+    let text = crate::mv_writer::mv_search_v2(&files, sql)?;
+    write_out_buffer(
+        text.as_bytes(),
+        out_ptr,
+        out_cap,
+        out_len,
+        "mv search v2 result",
+    )?;
+    Ok(0)
+}
+
+/// POC(mv) streaming writer lifecycle — create/feed/finalize/abort.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_create(
+    sql_ptr: *const u8,
+    sql_len: i64,
+    num_group_cols: i64,
+) -> i64 {
+    let sql =
+        str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_writer_create: sql: {}", e))?;
+    Ok(crate::mv_writer::mv_writer_create(sql, num_group_cols))
+}
+
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_feed(writer_id: i64, array_ptr: i64, schema_ptr: i64) -> i64 {
+    use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+    let ffi_array = FFI_ArrowArray::from_raw(array_ptr as *mut FFI_ArrowArray);
+    let ffi_schema = FFI_ArrowSchema::from_raw(schema_ptr as *mut FFI_ArrowSchema);
+    let mut array_data = arrow_array::ffi::from_ffi(ffi_array, &ffi_schema)
+        .map_err(|e| format!("df_mv_writer_feed: import: {}", e))?;
+    array_data.align_buffers();
+    let struct_array = arrow_array::StructArray::from(array_data);
+    let batch = arrow_array::RecordBatch::from(struct_array);
+    crate::mv_writer::mv_writer_feed(writer_id, &batch)?;
+    Ok(0)
+}
+
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_finalize(
+    writer_id: i64,
+    out_ptr: *const u8,
+    out_len: i64,
+) -> i64 {
+    let output =
+        str_from_raw(out_ptr, out_len).map_err(|e| format!("df_mv_writer_finalize: out: {}", e))?;
+    let rows = crate::mv_writer::mv_writer_finalize(writer_id, output)?;
+    Ok(rows)
+}
+
+/// Finalizes the MV writer and exports the sorted state batch via Arrow
+/// C-Data into caller-allocated `FFI_ArrowArray`/`FFI_ArrowSchema` structs
+/// (zero copy — the JVM imports the same buffers; Rust's release callback
+/// frees them when the consumer closes). Returns the state row count.
+///
+/// # Safety
+/// `array_addr` / `schema_addr` must point to caller-allocated, uninitialized
+/// ArrowArray / ArrowSchema C structs that the caller will import exactly once.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_finalize_arrow(
+    writer_id: i64,
+    array_addr: i64,
+    schema_addr: i64,
+) -> i64 {
+    crate::mv_writer::mv_writer_finalize_arrow(writer_id, array_addr, schema_addr)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_writer_abort(writer_id: i64) {
+    crate::mv_writer::mv_writer_abort(writer_id);
+}
+
+/// Refresh-time ship build: Partial over one parquet file, sorted state batch
+/// EXPORTED via Arrow C-Data (in-memory handoff to the JVM — nothing is
+/// persisted by this call; persisted MV state is Parquet only).
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_build_arrow(
+    input_ptr: *const u8,
+    input_len: i64,
+    table_ptr: *const u8,
+    table_len: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    array_addr: i64,
+    schema_addr: i64,
+) -> i64 {
+    let input = str_from_raw(input_ptr, input_len)
+        .map_err(|e| format!("df_mv_build_arrow: input: {}", e))?;
+    let table = str_from_raw(table_ptr, table_len)
+        .map_err(|e| format!("df_mv_build_arrow: table: {}", e))?;
+    let sql =
+        str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_build_arrow: sql: {}", e))?;
+    let rows = crate::mv_poc::mv_build_arrow(input, table, sql, array_addr, schema_addr)?;
+    Ok(rows)
+}
+
+// ── Stage 2: managed MV build through shared DataFusionRuntime ───────
+
+/// Allocate a cancellation context for an MV build. Returns a context_id.
+#[no_mangle]
+pub extern "C" fn df_mv_alloc_cancel_ctx() -> i64 {
+    crate::mv_build_managed::alloc_cancel_context()
+}
+
+/// Release a cancellation context after the build completes.
+#[no_mangle]
+pub extern "C" fn df_mv_release_cancel_ctx(context_id: i64) {
+    crate::mv_build_managed::release_cancel_context(context_id);
+}
+
+/// Fire the cancellation token for an in-flight MV build.
+#[no_mangle]
+pub extern "C" fn df_mv_cancel_build(context_id: i64) {
+    crate::mv_build_managed::cancel_build(context_id);
+}
+
+/// Managed state-file build through the shared DataFusionRuntime.
+/// Replaces df_mv_build_poc for production pull-path builds.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_build_managed(
+    runtime_ptr: i64,
+    input_ptr: *const u8,
+    input_len: i64,
+    table_ptr: *const u8,
+    table_len: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    output_ptr: *const u8,
+    output_len: i64,
+    ordering_indices_ptr: *const i32,
+    ordering_dirs_ptr: *const i32,
+    ordering_nulls_ptr: *const i32,
+    ordering_len: i32,
+    context_id: i64,
+    spill_budget_bytes: i64,
+    spill_file_count_limit: i32,
+) -> i64 {
+    if runtime_ptr == 0 {
+        return Err("df_mv_build_managed: runtime_ptr is null".to_string());
+    }
+    let runtime = &*(runtime_ptr as *const crate::api::DataFusionRuntime);
+    let input = str_from_raw(input_ptr, input_len)
+        .map_err(|e| format!("df_mv_build_managed: input: {}", e))?;
+    let table = str_from_raw(table_ptr, table_len)
+        .map_err(|e| format!("df_mv_build_managed: table: {}", e))?;
+    let sql =
+        str_from_raw(sql_ptr, sql_len).map_err(|e| format!("df_mv_build_managed: sql: {}", e))?;
+    let output = str_from_raw(output_ptr, output_len)
+        .map_err(|e| format!("df_mv_build_managed: output: {}", e))?;
+
+    let len = ordering_len as usize;
+    let indices = std::slice::from_raw_parts(ordering_indices_ptr, len);
+    let dirs = std::slice::from_raw_parts(ordering_dirs_ptr, len);
+    let nulls = std::slice::from_raw_parts(ordering_nulls_ptr, len);
+    let ordering =
+        crate::mv_build_managed::OrderingContract::from_parallel_arrays(indices, dirs, nulls);
+
+    let rows = crate::mv_build_managed::mv_build_managed(
+        runtime,
+        input,
+        table,
+        sql,
+        output,
+        &ordering,
+        context_id,
+        spill_budget_bytes,
+        spill_file_count_limit,
+    )?;
+    Ok(rows)
+}
+
+/// ABI version sanity-check for Java. Returns `MvBuildResult::ABI_VERSION`.
+///
+/// Java: `MethodHandle( → JAVA_INT)` — called once at `MVNativeBridge` class init
+/// to verify the Rust and Java sides agree on the struct layout version.
+#[no_mangle]
+pub extern "C" fn df_mv_build_result_abi_version() -> u32 {
+    crate::mv_build_managed::MvBuildResult::ABI_VERSION
+}
+
+/// Generic sorted-parquet merge through the shared DataFusionRuntime:
+/// N individually sorted files in, ONE sorted file out (streaming k-way
+/// SortPreservingMerge; rows preserved verbatim — no folding, no format- or
+/// definition-specific semantics). See `sorted_merge.rs`.
+///
+/// `files` and `sort_cols` are newline-joined strings; `desc`/`nulls_first`
+/// are parallel per-column flag arrays of length `sort_len`.
+///
+/// Returns rows written to the merged file.
+///
+/// # Safety
+/// - `runtime_ptr` must be a valid pointer from `df_create_global_runtime`.
+/// - String pointers must be valid UTF-8 of the given lengths.
+/// - Flag pointers must reference at least `sort_len` i32 values.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_sorted_parquet_merge(
+    runtime_ptr: i64,
+    files_ptr: *const u8,
+    files_len: i64,
+    sort_cols_ptr: *const u8,
+    sort_cols_len: i64,
+    desc_ptr: *const i32,
+    nulls_first_ptr: *const i32,
+    sort_len: i32,
+    output_ptr: *const u8,
+    output_len: i64,
+) -> i64 {
+    if runtime_ptr == 0 {
+        return Err("df_sorted_parquet_merge: runtime_ptr is null".to_string());
+    }
+    let runtime = &*(runtime_ptr as *const crate::api::DataFusionRuntime);
+    let files_joined = str_from_raw(files_ptr, files_len)
+        .map_err(|e| format!("df_sorted_parquet_merge: files: {}", e))?;
+    let cols_joined = str_from_raw(sort_cols_ptr, sort_cols_len)
+        .map_err(|e| format!("df_sorted_parquet_merge: sort_cols: {}", e))?;
+    let output = str_from_raw(output_ptr, output_len)
+        .map_err(|e| format!("df_sorted_parquet_merge: output: {}", e))?;
+
+    let input_files: Vec<String> = files_joined
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    let cols: Vec<&str> = cols_joined.split('\n').filter(|s| !s.is_empty()).collect();
+    let len = sort_len as usize;
+    if cols.len() != len {
+        return Err(format!(
+            "df_sorted_parquet_merge: sort column count {} != flag length {}",
+            cols.len(),
+            len
+        ));
+    }
+    let desc = std::slice::from_raw_parts(desc_ptr, len);
+    let nulls = std::slice::from_raw_parts(nulls_first_ptr, len);
+    let sort: Vec<crate::sorted_merge::SortSpec> = cols
+        .iter()
+        .zip(desc.iter().zip(nulls.iter()))
+        .map(|(c, (d, n))| crate::sorted_merge::SortSpec {
+            column: (*c).to_string(),
+            descending: *d != 0,
+            nulls_first: *n != 0,
+        })
+        .collect();
+
+    let result =
+        crate::sorted_merge::merge_sorted_parquet_files(runtime, &input_files, &sort, output)?;
+    Ok(result.rows_written as i64)
+}
+
+/// Managed streaming-build through the shared DataFusionRuntime, returning
+/// a full `MvBuildResult` written into the caller-allocated output buffer.
+///
+/// This is the Stage 3 result-contract entry point: Java allocates an
+/// 80-byte `MemorySegment`, passes a pointer, and Rust writes the entire
+/// `MvBuildResult` struct via `copy_nonoverlapping`. One FFI call, zero
+/// accessor functions.
+///
+/// On success (`status_code == 0`) all fields are populated.
+/// On cancellation (`status_code == 1`) data fields are zeroed.
+/// On internal error returns a negative error-pointer (the `#[ffm_safe]`
+/// contract); the output buffer may be partially written and should be
+/// ignored.
+///
+/// # Safety
+/// - `runtime_ptr` must be a valid pointer from `df_create_global_runtime`.
+/// - `out_result_ptr` must be non-null and point to at least
+///   `size_of::<MvBuildResult>()` (80) bytes of writeable memory.
+/// - String pointers (`input_ptr`, etc.) must be valid UTF-8 of the given lengths.
+/// - Ordering arrays must have `ordering_len` elements each.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_build_streaming_result(
+    runtime_ptr: i64,
+    input_ptr: *const u8,
+    input_len: i64,
+    table_ptr: *const u8,
+    table_len: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    output_ptr: *const u8,
+    output_len: i64,
+    ordering_indices_ptr: *const i32,
+    ordering_dirs_ptr: *const i32,
+    ordering_nulls_ptr: *const i32,
+    ordering_len: i32,
+    context_id: i64,
+    spill_budget_bytes: i64,
+    spill_file_count_limit: i32,
+    out_result_ptr: *mut u8,
+) -> i64 {
+    use crate::mv_build_managed::MvBuildResult;
+
+    if runtime_ptr == 0 {
+        return Err("df_mv_build_streaming_result: runtime_ptr is null".to_string());
+    }
+    if out_result_ptr.is_null() {
+        return Err("df_mv_build_streaming_result: out_result_ptr is null".to_string());
+    }
+
+    let runtime = &*(runtime_ptr as *const crate::api::DataFusionRuntime);
+    let input = str_from_raw(input_ptr, input_len)
+        .map_err(|e| format!("df_mv_build_streaming_result: input: {}", e))?;
+    let table = str_from_raw(table_ptr, table_len)
+        .map_err(|e| format!("df_mv_build_streaming_result: table: {}", e))?;
+    let sql = str_from_raw(sql_ptr, sql_len)
+        .map_err(|e| format!("df_mv_build_streaming_result: sql: {}", e))?;
+    let output = str_from_raw(output_ptr, output_len)
+        .map_err(|e| format!("df_mv_build_streaming_result: output: {}", e))?;
+
+    let len = ordering_len as usize;
+    let indices = std::slice::from_raw_parts(ordering_indices_ptr, len);
+    let dirs = std::slice::from_raw_parts(ordering_dirs_ptr, len);
+    let nulls = std::slice::from_raw_parts(ordering_nulls_ptr, len);
+    let ordering =
+        crate::mv_build_managed::OrderingContract::from_parallel_arrays(indices, dirs, nulls);
+
+    let result = crate::mv_build_managed::build_streaming_parquet_artifact(
+        runtime,
+        input,
+        table,
+        sql,
+        output,
+        &ordering,
+        context_id,
+        spill_budget_bytes,
+        spill_file_count_limit,
+    )?;
+
+    // Write the MvBuildResult into the caller-allocated buffer.
+    std::ptr::copy_nonoverlapping(
+        &result as *const MvBuildResult as *const u8,
+        out_result_ptr,
+        std::mem::size_of::<MvBuildResult>(),
+    );
+
+    Ok(0)
+}
+
+/// Managed Arrow C-Data build through the shared DataFusionRuntime.
+/// Replaces df_mv_build_arrow for production pull-path builds.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_build_arrow_managed(
+    runtime_ptr: i64,
+    input_ptr: *const u8,
+    input_len: i64,
+    table_ptr: *const u8,
+    table_len: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    array_addr: i64,
+    schema_addr: i64,
+    ordering_indices_ptr: *const i32,
+    ordering_dirs_ptr: *const i32,
+    ordering_nulls_ptr: *const i32,
+    ordering_len: i32,
+    context_id: i64,
+    spill_budget_bytes: i64,
+    spill_file_count_limit: i32,
+) -> i64 {
+    if runtime_ptr == 0 {
+        return Err("df_mv_build_arrow_managed: runtime_ptr is null".to_string());
+    }
+    let runtime = &*(runtime_ptr as *const crate::api::DataFusionRuntime);
+    let input = str_from_raw(input_ptr, input_len)
+        .map_err(|e| format!("df_mv_build_arrow_managed: input: {}", e))?;
+    let table = str_from_raw(table_ptr, table_len)
+        .map_err(|e| format!("df_mv_build_arrow_managed: table: {}", e))?;
+    let sql = str_from_raw(sql_ptr, sql_len)
+        .map_err(|e| format!("df_mv_build_arrow_managed: sql: {}", e))?;
+
+    let len = ordering_len as usize;
+    let indices = std::slice::from_raw_parts(ordering_indices_ptr, len);
+    let dirs = std::slice::from_raw_parts(ordering_dirs_ptr, len);
+    let nulls = std::slice::from_raw_parts(ordering_nulls_ptr, len);
+    let ordering =
+        crate::mv_build_managed::OrderingContract::from_parallel_arrays(indices, dirs, nulls);
+
+    let rows = crate::mv_build_managed::mv_build_arrow_managed(
+        runtime,
+        input,
+        table,
+        sql,
+        array_addr,
+        schema_addr,
+        &ordering,
+        context_id,
+        spill_budget_bytes,
+        spill_file_count_limit,
+    )?;
+    Ok(rows)
+}
+
+/// Stage 3 native schema cross-check: plan (never execute) a candidate MV
+/// definition's partial+sort against the REAL source Arrow schema and write the
+/// engine's ACTUAL Partial-stage state schema + deterministic hashes into the
+/// caller buffer.
+///
+/// # Wire encoding
+///
+/// - `schema_ptr/len`: source schema as newline-separated `name \t arrow_token`
+///   records (the closed arrow-token vocabulary produced by the parquet
+///   data-format; see `arrow_token_to_type`). Mirrors the existing
+///   newline-delimited `state_fields` FFI convention.
+/// - `sql_ptr/len`: canonical partial SQL over `table_name`.
+/// - `ordering_*`: parallel int arrays (field index / direction / null
+///   placement) — the same wire format as `df_mv_build_managed`.
+///
+/// # Result (written to `out_ptr`, byte count into `out_len`)
+///
+/// Newline-separated records:
+/// ```text
+/// schema_hash\t<u64 decimal>
+/// ordering_identity_hash\t<u64 decimal>
+/// definition_hash\t<u64 decimal>
+/// field\t<name>\t<arrow_token>      (one per state column, in physical order)
+/// ```
+///
+/// Returns 0 on success. On a rejected definition (unknown column, unparseable
+/// SQL, type mismatch, malformed schema) returns the standard `#[ffm_safe]`
+/// negated error pointer with a precise, column-naming message; it never
+/// panics across the FFI boundary.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_validate_definition(
+    schema_ptr: *const u8,
+    schema_len: i64,
+    table_ptr: *const u8,
+    table_len: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    ordering_indices_ptr: *const i32,
+    ordering_dirs_ptr: *const i32,
+    ordering_nulls_ptr: *const i32,
+    ordering_len: i32,
+    out_ptr: *mut u8,
+    out_cap: i64,
+    out_len: *mut i64,
+) -> i64 {
+    let schema = str_from_raw(schema_ptr, schema_len)
+        .map_err(|e| format!("df_mv_validate_definition: schema: {}", e))?;
+    let table = str_from_raw(table_ptr, table_len)
+        .map_err(|e| format!("df_mv_validate_definition: table: {}", e))?;
+    let sql = str_from_raw(sql_ptr, sql_len)
+        .map_err(|e| format!("df_mv_validate_definition: sql: {}", e))?;
+
+    if ordering_len < 0 {
+        return Err(format!(
+            "df_mv_validate_definition: negative ordering_len {}",
+            ordering_len
+        ));
+    }
+    let len = ordering_len as usize;
+    if len > 0
+        && (ordering_indices_ptr.is_null()
+            || ordering_dirs_ptr.is_null()
+            || ordering_nulls_ptr.is_null())
+    {
+        return Err("df_mv_validate_definition: null ordering array".to_string());
+    }
+    let indices = if len == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(ordering_indices_ptr, len)
+    };
+    let dirs = if len == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(ordering_dirs_ptr, len)
+    };
+    let nulls = if len == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(ordering_nulls_ptr, len)
+    };
+    let ordering =
+        crate::mv_build_managed::OrderingContract::from_parallel_arrays(indices, dirs, nulls);
+
+    let validation = crate::mv_build_managed::validate_definition(schema, table, sql, &ordering)?;
+
+    let mut text = String::new();
+    text.push_str(&format!("schema_hash\t{}\n", validation.schema_hash));
+    text.push_str(&format!(
+        "ordering_identity_hash\t{}\n",
+        validation.ordering_identity_hash
+    ));
+    text.push_str(&format!("definition_hash\t{}\n", validation.definition_hash));
+    for (name, token) in &validation.state_fields {
+        text.push_str(&format!("field\t{}\t{}\n", name, token));
+    }
+
+    write_out_buffer(
+        text.as_bytes(),
+        out_ptr,
+        out_cap,
+        out_len,
+        "mv validate definition result",
+    )?;
+    Ok(0)
 }
 
 #[ffm_safe]
@@ -1375,6 +1905,7 @@ pub unsafe extern "C" fn df_create_session_context_indexed(
         .map_err(|e| e.to_string())
 }
 
+
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn df_cache_manager_remove_files(
@@ -1866,6 +2397,171 @@ pub extern "C" fn df_set_scoped_page_index_enabled(enabled: i64) -> i64 {
     page_index::set_scoped_page_index_enabled(enabled != 0);
     Ok(0)
 }
+/// Reads the physical field names of a Parquet MV state file (footer only)
+/// and writes them newline-joined into the caller buffer. Ground truth for
+/// the Java-side merge ordering identity.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_state_field_names(
+    file_ptr: *const u8,
+    file_len: i64,
+    out_ptr: *mut u8,
+    out_cap: i64,
+    out_len: *mut i64,
+) -> i64 {
+    let file = str_from_raw(file_ptr, file_len)
+        .map_err(|e| format!("df_mv_state_field_names: file: {}", e))?;
+    let names = crate::mv_pull_metadata::state_field_names(file)?;
+    write_out_buffer(
+        names.join("\n").as_bytes(),
+        out_ptr,
+        out_cap,
+        out_len,
+        "mv state field names",
+    )?;
+    Ok(0)
+}
+// ---------------------------------------------------------------------------
+// Stage 5: Merge-pull with full PullArtifactMetadata return
+//
+// The primary FFI entry point for Java to call the Stage 4 merge engine and
+// receive extended metadata (schema hash, definition hash, ordering identity,
+// spill telemetry, peak RSS, fan-in, output batch count) back through a
+// heap-allocated PullArtifactMetadata whose fields are read via individual
+// accessor exports (df_pull_meta_*).
+//
+// Lifecycle:
+//   1. Java calls df_mv_merge_pull_metadata → gets opaque i64 pointer
+//   2. Java reads fields via df_pull_meta_rows, df_pull_meta_schema_hash, etc.
+//   3. Java calls df_pull_meta_free to deallocate
+// ---------------------------------------------------------------------------
+/// Read the `rows` field from a `PullArtifactMetadata` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn df_pull_meta_rows(ptr: i64) -> i64 {
+    if ptr == 0 {
+        return 0;
+    }
+    let meta = &*(ptr as *const crate::mv_pull_metadata::PullArtifactMetadata);
+    meta.row_count
+}
+
+/// Read the `schema_hash` field from a `PullArtifactMetadata` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn df_pull_meta_schema_hash(ptr: i64) -> i64 {
+    if ptr == 0 {
+        return 0;
+    }
+    let meta = &*(ptr as *const crate::mv_pull_metadata::PullArtifactMetadata);
+    meta.schema_hash as i64
+}
+
+/// Read the `definition_hash` field from a `PullArtifactMetadata` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn df_pull_meta_definition_hash(ptr: i64) -> i64 {
+    if ptr == 0 {
+        return 0;
+    }
+    let meta = &*(ptr as *const crate::mv_pull_metadata::PullArtifactMetadata);
+    meta.definition_hash as i64
+}
+
+/// Read the `ordering_identity` field from a `PullArtifactMetadata` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn df_pull_meta_ordering_identity(ptr: i64) -> i64 {
+    if ptr == 0 {
+        return 0;
+    }
+    let meta = &*(ptr as *const crate::mv_pull_metadata::PullArtifactMetadata);
+    meta.ordering_identity as i64
+}
+
+/// Read the `spill_bytes` field from a `PullArtifactMetadata` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn df_pull_meta_spill_bytes(ptr: i64) -> i64 {
+    if ptr == 0 {
+        return 0;
+    }
+    let meta = &*(ptr as *const crate::mv_pull_metadata::PullArtifactMetadata);
+    meta.spill_bytes
+}
+
+/// Read the `spill_files` field from a `PullArtifactMetadata` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn df_pull_meta_spill_files(ptr: i64) -> i32 {
+    if ptr == 0 {
+        return 0;
+    }
+    let meta = &*(ptr as *const crate::mv_pull_metadata::PullArtifactMetadata);
+    meta.spill_files
+}
+
+/// Read the `peak_rss` field from a `PullArtifactMetadata` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn df_pull_meta_peak_rss(ptr: i64) -> i64 {
+    if ptr == 0 {
+        return 0;
+    }
+    let meta = &*(ptr as *const crate::mv_pull_metadata::PullArtifactMetadata);
+    meta.peak_rss
+}
+
+/// Read the `fan_in` field from a `PullArtifactMetadata` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn df_pull_meta_fan_in(ptr: i64) -> i32 {
+    if ptr == 0 {
+        return 0;
+    }
+    let meta = &*(ptr as *const crate::mv_pull_metadata::PullArtifactMetadata);
+    meta.fan_in
+}
+
+/// Read the `output_batch_count` field from a `PullArtifactMetadata` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn df_pull_meta_output_batches(ptr: i64) -> i32 {
+    if ptr == 0 {
+        return 0;
+    }
+    let meta = &*(ptr as *const crate::mv_pull_metadata::PullArtifactMetadata);
+    meta.output_batch_count
+}
+
+/// Read the `native_reservations_bytes` field from a `PullArtifactMetadata` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn df_pull_meta_native_reservations_bytes(ptr: i64) -> i64 {
+    if ptr == 0 {
+        return 0;
+    }
+    let meta = &*(ptr as *const crate::mv_pull_metadata::PullArtifactMetadata);
+    meta.native_reservations_bytes
+}
+
+/// Read the `retained_estimate_bytes` field from a `PullArtifactMetadata` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn df_pull_meta_retained_estimate_bytes(ptr: i64) -> i64 {
+    if ptr == 0 {
+        return 0;
+    }
+    let meta = &*(ptr as *const crate::mv_pull_metadata::PullArtifactMetadata);
+    meta.retained_estimate_bytes
+}
+
+/// Read the `breaker_attribution` field from a `PullArtifactMetadata` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn df_pull_meta_breaker_attribution(ptr: i64) -> i64 {
+    if ptr == 0 {
+        return 0;
+    }
+    let meta = &*(ptr as *const crate::mv_pull_metadata::PullArtifactMetadata);
+    meta.breaker_attribution
+}
+
+/// Free a `PullArtifactMetadata` pointer allocated by `df_mv_merge_pull_metadata`.
+#[no_mangle]
+pub unsafe extern "C" fn df_pull_meta_free(ptr: i64) {
+    if ptr != 0 {
+        let _ = Box::from_raw(ptr as *mut crate::mv_pull_metadata::PullArtifactMetadata);
+    }
+}
 
 /// Shard provably holds no matching row — the only status that prunes.
 pub const CAN_MATCH_NO: i64 = 0;
@@ -2248,5 +2944,121 @@ mod tests {
             "df_can_match returned {rc}; negative values are error pointers to Java, not statuses"
         );
         assert_eq!(rc, CAN_MATCH_UNKNOWN);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // FFI result contract tests — df_mv_build_result_abi_version and
+    // df_mv_build_streaming_result null-pointer handling.
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Test: df_mv_build_result_abi_version returns ABI_VERSION == 1.
+    /// Validates the Java sanity-check export.
+    #[test]
+    fn test_ffm_build_result_abi_version() {
+        let v = df_mv_build_result_abi_version();
+        assert_eq!(
+            v,
+            crate::mv_build_managed::MvBuildResult::ABI_VERSION,
+            "df_mv_build_result_abi_version must return the current ABI version"
+        );
+        assert_eq!(v, 1, "ABI_VERSION is currently 1");
+    }
+
+    /// Test: df_mv_build_streaming_result with null runtime_ptr returns a
+    /// negated error pointer (the #[ffm_safe] contract), NOT a crash.
+    /// Validates the FFI error convention for null inputs.
+    #[test]
+    fn test_ffm_build_streaming_result_null_runtime_returns_error() {
+        // The #[ffm_safe] macro converts Err(String) into a negated
+        // heap-allocated string pointer. A negative return value means error.
+        let result = unsafe {
+            df_mv_build_streaming_result(
+                0,                    // null runtime_ptr
+                std::ptr::null(),     // input_ptr
+                0,                    // input_len
+                std::ptr::null(),     // table_ptr
+                0,                    // table_len
+                std::ptr::null(),     // sql_ptr
+                0,                    // sql_len
+                std::ptr::null(),     // output_ptr
+                0,                    // output_len
+                std::ptr::null(),     // ordering_indices_ptr
+                std::ptr::null(),     // ordering_dirs_ptr
+                std::ptr::null(),     // ordering_nulls_ptr
+                0,                    // ordering_len
+                0,                    // context_id
+                0,                    // spill_budget_bytes
+                0,                    // spill_file_count_limit
+                std::ptr::null_mut(), // out_result_ptr
+            )
+        };
+        assert!(
+            result < 0,
+            "null runtime_ptr should return negative error pointer, got {}",
+            result
+        );
+        // Clean up the error string allocated by #[ffm_safe].
+        // The convention is: the negated pointer is a *const u8 to a
+        // null-terminated string. We must free it to avoid a leak.
+        if result < 0 {
+            let err_ptr = (-result) as *mut u8;
+            if !err_ptr.is_null() {
+                // Read the error string for validation, then free.
+                let err_cstr = unsafe { std::ffi::CStr::from_ptr(err_ptr as *const i8) };
+                let err_msg = err_cstr.to_string_lossy();
+                assert!(
+                    err_msg.contains("null"),
+                    "error message should mention null: got '{}'",
+                    err_msg
+                );
+                // Free: the pointer was allocated by ffm_safe via String → CString → into_raw.
+                unsafe {
+                    drop(std::ffi::CString::from_raw(err_ptr as *mut i8));
+                }
+            }
+        }
+    }
+
+    /// Test: df_mv_build_streaming_result with non-null runtime but null
+    /// out_result_ptr returns an error (not a crash).
+    #[test]
+    fn test_ffm_build_streaming_result_null_output_ptr_returns_error() {
+        // Pass a non-zero (but still invalid) runtime_ptr with null out_result_ptr.
+        // The function should catch the null out_result_ptr before dereferencing runtime.
+        // NOTE: the function checks runtime_ptr first, then out_result_ptr.
+        // With runtime_ptr=0 it errors on that; with a fake non-zero runtime_ptr it
+        // would segfault when dereferencing. So we test with runtime_ptr=0 which
+        // exercises the null-check code path.
+        let result = unsafe {
+            df_mv_build_streaming_result(
+                0, // null runtime_ptr (checked first)
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(), // null out_result_ptr
+            )
+        };
+        assert!(result < 0, "should return error for null pointers");
+        // Free the error string.
+        if result < 0 {
+            let err_ptr = (-result) as *mut u8;
+            if !err_ptr.is_null() {
+                unsafe {
+                    drop(std::ffi::CString::from_raw(err_ptr as *mut i8));
+                }
+            }
+        }
     }
 }

@@ -62,6 +62,12 @@ pub mod udwf;
 
 pub mod mv_expr_adapter;
 pub mod mv_read;
+pub mod mv_build_managed;
+pub mod mv_fold;
+pub mod mv_poc;
+pub mod mv_pull_metadata;
+pub mod mv_writer;
+pub mod sorted_merge;
 
 // Path aliases — old module names still resolve unchanged.
 pub use cache::custom_cache_manager;

@@ -190,3 +190,70 @@ pub fn build_query_session_context(
     }
     ctx
 }
+
+/// Minimum wasted bytes before a view array is worth compacting (GC).
+const GC_MIN_WASTE_BYTES: usize = 10_240;
+
+/// Whether a view array's backing buffers are bloated enough to warrant a GC.
+pub(crate) fn view_needs_gc(buffers: &[arrow::buffer::Buffer], bytes_used: usize) -> bool {
+    let bytes_allocated: usize = buffers.iter().map(|b| b.len()).sum();
+    let waste = bytes_allocated.saturating_sub(bytes_used);
+    let is_significantly_bloated = bytes_allocated > 2 * bytes_used;
+    is_significantly_bloated && waste > GC_MIN_WASTE_BYTES
+}
+
+/// Compacts (garbage-collects) any bloated Utf8View / BinaryView columns in the
+/// batch so downstream writers do not persist orphaned buffer bytes. Returns the
+/// batch unchanged when no column needs compaction.
+pub fn compact_view_arrays(batch: arrow_array::RecordBatch) -> arrow_array::RecordBatch {
+    use arrow_array::Array;
+    use arrow_schema::DataType;
+    let schema = batch.schema();
+    let needs_compaction = batch
+        .columns()
+        .iter()
+        .zip(schema.fields().iter())
+        .any(|(col, field)| match field.data_type() {
+            DataType::Utf8View => {
+                let view: &arrow_array::StringViewArray = col
+                    .as_any()
+                    .downcast_ref()
+                    .expect("column must be StringViewArray when schema declares Utf8View");
+                view_needs_gc(view.data_buffers(), view.total_buffer_bytes_used())
+            }
+            DataType::BinaryView => {
+                let view: &arrow_array::BinaryViewArray = col
+                    .as_any()
+                    .downcast_ref()
+                    .expect("column must be BinaryViewArray when schema declares BinaryView");
+                view_needs_gc(view.data_buffers(), view.total_buffer_bytes_used())
+            }
+            _ => false,
+        });
+    if !needs_compaction {
+        return batch;
+    }
+    let columns: Vec<Arc<dyn arrow_array::Array>> = batch
+        .columns()
+        .iter()
+        .zip(schema.fields().iter())
+        .map(|(col, field)| match field.data_type() {
+            DataType::Utf8View => {
+                let view: &arrow_array::StringViewArray = col
+                    .as_any()
+                    .downcast_ref()
+                    .expect("column must be StringViewArray when schema declares Utf8View");
+                Arc::new(view.gc()) as Arc<dyn arrow_array::Array>
+            }
+            DataType::BinaryView => {
+                let view: &arrow_array::BinaryViewArray = col
+                    .as_any()
+                    .downcast_ref()
+                    .expect("column must be BinaryViewArray when schema declares BinaryView");
+                Arc::new(view.gc()) as Arc<dyn arrow_array::Array>
+            }
+            _ => Arc::clone(col),
+        })
+        .collect();
+    arrow_array::RecordBatch::try_new(schema, columns).expect("gc'd columns must match schema")
+}
