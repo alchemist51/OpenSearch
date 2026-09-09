@@ -40,6 +40,17 @@ public class FieldStorageResolver {
 
     private static final String LUCENE_FORMAT = "lucene";
 
+    /**
+     * Derived data-format marker ({@code MVConstants.DERIVED_DATA_FORMAT_SETTING}) and the
+     * materialized-view category. A derived MV target declares the composite lucene secondary
+     * format for engine parity but never indexes a document into it: every row it serves lives in
+     * MV state files read by the MV-only fold session. Advertising lucene storage for such an
+     * index lets the planner delegate predicates (e.g. a single keyword equality) to the empty
+     * Lucene index, which answers with no rows.
+     */
+    static final String DERIVED_DATA_FORMAT_SETTING = "index.derived.data_format";
+    static final String DERIVED_MATERIALIZED_VIEW = "materialized_view";
+
     private final Map<String, FieldStorageInfo> fieldStorage;
 
     /**
@@ -58,9 +69,12 @@ public class FieldStorageResolver {
     public FieldStorageResolver(IndexMetadata indexMetadata) {
         String indexName = indexMetadata.getIndex().getName();
         String primaryFormat = indexMetadata.getSettings().get(PRIMARY_DATA_FORMAT_SETTING, LUCENE_FORMAT);
-        // Lucene is index-viable only when it's the primary or in the secondary list.
-        boolean luceneAvailable = LUCENE_FORMAT.equals(primaryFormat)
-            || indexMetadata.getSettings().getAsList(SECONDARY_DATA_FORMATS_SETTING).contains(LUCENE_FORMAT);
+        // Lucene is index-viable only when it's the primary or in the secondary list, and never
+        // for a derived materialized-view target (its lucene format holds no documents).
+        boolean derivedMV = DERIVED_MATERIALIZED_VIEW.equals(indexMetadata.getSettings().get(DERIVED_DATA_FORMAT_SETTING));
+        boolean luceneAvailable = !derivedMV
+            && (LUCENE_FORMAT.equals(primaryFormat)
+                || indexMetadata.getSettings().getAsList(SECONDARY_DATA_FORMATS_SETTING).contains(LUCENE_FORMAT));
 
         // A mapping-less index (created empty, never written to) declares no fields — it
         // contributes nothing to the field-storage union. Aliases and index patterns legitimately

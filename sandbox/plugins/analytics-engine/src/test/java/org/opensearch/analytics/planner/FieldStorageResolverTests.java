@@ -125,7 +125,36 @@ public class FieldStorageResolverTests extends OpenSearchTestCase {
         return new FieldStorageResolver(indexMetadata);
     }
 
+    public void testDerivedMaterializedViewTargetAdvertisesNoLuceneStorage() {
+        // Regression: a derived MV target declares the lucene secondary format for engine parity
+        // but never indexes into it. Advertising lucene index storage let the planner delegate a
+        // keyword equality to the empty Lucene index, which answered with zero rows.
+        FieldStorageResolver resolver = newResolver(
+            "parquet",
+            Map.of("URL", Map.of("type", "keyword"), "cnt_advengineid", Map.of("type", "long")),
+            Settings.builder().put("index.derived.data_format", "materialized_view")
+        );
+        List<FieldStorageInfo> infos = resolver.resolve(List.of("URL", "cnt_advengineid"));
+        for (FieldStorageInfo info : infos) {
+            assertEquals(info.getFieldName() + " must have no lucene index storage", List.of(), info.getIndexFormats());
+            assertEquals(List.of("parquet"), info.getDocValueFormats());
+        }
+    }
+
+    public void testNonDerivedIndexKeepsLuceneStorage() {
+        FieldStorageResolver resolver = newResolver("parquet", Map.of("URL", Map.of("type", "keyword")));
+        assertEquals(List.of("lucene"), resolver.resolve(List.of("URL")).get(0).getIndexFormats());
+    }
+
     private static FieldStorageResolver newResolver(String primaryFormat, Map<String, Map<String, Object>> fieldMappings) {
+        return newResolver(primaryFormat, fieldMappings, Settings.builder());
+    }
+
+    private static FieldStorageResolver newResolver(
+        String primaryFormat,
+        Map<String, Map<String, Object>> fieldMappings,
+        Settings.Builder extraSettings
+    ) {
         Map<String, Object> mappingSource = Map.of("properties", fieldMappings);
 
         MappingMetadata mappingMetadata = mock(MappingMetadata.class);
@@ -135,6 +164,7 @@ public class FieldStorageResolverTests extends OpenSearchTestCase {
         when(indexMetadata.getIndex()).thenReturn(new Index("test_index", "uuid"));
         when(indexMetadata.getSettings()).thenReturn(
             Settings.builder()
+                .put(extraSettings.build())
                 .put("index.composite.primary_data_format", primaryFormat)
                 .putList("index.composite.secondary_data_formats", "lucene")
                 .build()
