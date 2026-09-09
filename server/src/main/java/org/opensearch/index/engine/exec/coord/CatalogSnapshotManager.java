@@ -297,9 +297,11 @@ public class CatalogSnapshotManager implements Closeable {
         assert refreshedSegments.stream().allMatch(s -> s.dfGroupedSearchableFiles().isEmpty() == false)
             : "every segment must have at least one format's files";
 
-        // Every WriterFileSet in every segment must have a positive row count
-        assert refreshedSegments.stream().flatMap(s -> s.dfGroupedSearchableFiles().values().stream()).allMatch(wfs -> wfs.numRows() > 0)
-            : "every WriterFileSet must have a positive row count";
+        // Every WriterFileSet in every segment must have a non-negative row count.
+        // A count of 0 means "unknown" and is legitimate for derived artifacts (e.g. MV state
+        // files hydrated from a checkpoint whose rowCount was not recorded); negative is invalid.
+        assert refreshedSegments.stream().flatMap(s -> s.dfGroupedSearchableFiles().values().stream()).allMatch(wfs -> wfs.numRows() >= 0)
+            : "every WriterFileSet must have a non-negative row count";
 
         // Cross-format per-segment row-count parity: within a single segment, every
         // format's WriterFileSet must report the same row count. This is the invariant
