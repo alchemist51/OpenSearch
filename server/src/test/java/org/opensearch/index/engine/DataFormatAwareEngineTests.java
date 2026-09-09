@@ -4511,4 +4511,135 @@ public class DataFormatAwareEngineTests extends OpenSearchTestCase {
             );
         }
     }
+
+    // ── Derived-artifact publish: engine-allocated generation + idempotency marker ──
+
+    /**
+     * A derived artifact published through the allocate-generation path must NOT collide with an
+     * existing catalog segment that happens to share the source generation number. The engine
+     * allocates a fresh target generation from its own counter and records the source generation in
+     * the {@code mv_state.published.<provenanceKey>} userData marker.
+     */
+    public void testPublishDerivedArtifactAllocatesGenerationAvoidingCollision() throws IOException {
+        try (DataFormatAwareEngine engine = createDFAEngine(store, createTempDir())) {
+            engine.translogManager().recoverFromTranslog(ignore -> 0, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+            // Produce a normal segment whose generation is the target's own gen 1.
+            engine.index(indexOp(createParsedDocWithInput("0", null)));
+            engine.refresh("seed");
+
+            long existingGen;
+            try (GatedCloseable<CatalogSnapshot> ref = engine.acquireSnapshot()) {
+                assertThat(ref.get().getSegments().size(), equalTo(1));
+                existingGen = ref.get().getSegments().get(0).generation();
+            }
+
+            // The source produced a partial at the SAME generation number as the target's existing
+            // segment. The allocate path must not reject or collide.
+            String provenanceKey = "mv1/0";
+            WriterFileSet fileSet = WriterFileSet.builder()
+                .directory(createTempDir())
+                .writerGeneration(existingGen) // deliberately colliding source gen; must be ignored
+                .addFile("_mv_partial.s0.t1.g" + existingGen + ".abc.parquet")
+                .addNumRows(7L)
+                .build();
+
+            long allocated = engine.publishDerivedArtifact("mv_state", fileSet, provenanceKey, existingGen, Map.of());
+
+            assertThat("allocated target generation must differ from the colliding source gen", allocated, greaterThan(existingGen));
+
+            try (GatedCloseable<CatalogSnapshot> ref = engine.acquireSnapshot()) {
+                CatalogSnapshot snap = ref.get();
+                assertThat("both the seeded segment and the published artifact are present", snap.getSegments().size(), equalTo(2));
+                // The mv_state artifact was stored under the engine-allocated generation.
+                boolean hasMvState = snap.getSegments()
+                    .stream()
+                    .anyMatch(s -> s.generation() == allocated && s.dfGroupedSearchableFiles().containsKey("mv_state"));
+                assertTrue("published artifact must use the engine-allocated generation", hasMvState);
+                assertThat(snap.getUserData().get("mv_state.published." + provenanceKey), equalTo(Long.toString(existingGen)));
+            }
+            assertThat(engine.publishedSourceGeneration(provenanceKey), equalTo(existingGen));
+        }
+    }
+
+    /** A row count of 0 (unknown) is legitimate for a derived artifact and must not be rejected. */
+    public void testPublishDerivedArtifactAllowsZeroRowCount() throws IOException {
+        try (DataFormatAwareEngine engine = createDFAEngine(store, createTempDir())) {
+            engine.translogManager().recoverFromTranslog(ignore -> 0, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+            WriterFileSet fileSet = WriterFileSet.builder()
+                .directory(createTempDir())
+                .writerGeneration(1L)
+                .addFile("_mv_partial.s0.t1.g3.abc.parquet")
+                .addNumRows(0L) // unknown
+                .build();
+
+            long allocated = engine.publishDerivedArtifact("mv_state", fileSet, "mv1/0", 3L, Map.of());
+            assertThat(allocated, greaterThan(0L));
+            assertThat(engine.publishedSourceGeneration("mv1/0"), equalTo(3L));
+        }
+    }
+
+    /** Negative row count is genuinely invalid input and must be rejected. */
+    public void testPublishDerivedArtifactRejectsNegativeRowCount() throws IOException {
+        try (DataFormatAwareEngine engine = createDFAEngine(store, createTempDir())) {
+            engine.translogManager().recoverFromTranslog(ignore -> 0, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+            WriterFileSet fileSet = WriterFileSet.builder()
+                .directory(createTempDir())
+                .writerGeneration(1L)
+                .addFile("f.parquet")
+                .addNumRows(-1L)
+                .build();
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> engine.publishDerivedArtifact("mv_state", fileSet, "mv1/0", 3L, Map.of())
+            );
+            assertThat(e.getMessage(), containsString("row count"));
+        }
+    }
+
+    /**
+     * The marker advances monotonically to the max published source generation across successive
+     * publishes, so a later restart can skip everything at or below it.
+     */
+    public void testPublishDerivedArtifactMarkerAdvancesMonotonically() throws IOException {
+        try (DataFormatAwareEngine engine = createDFAEngine(store, createTempDir())) {
+            engine.translogManager().recoverFromTranslog(ignore -> 0, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+            String provenanceKey = "mv1/2";
+            for (long sourceGen : new long[] { 5L, 6L, 9L }) {
+                WriterFileSet fs = WriterFileSet.builder()
+                    .directory(createTempDir())
+                    .writerGeneration(sourceGen)
+                    .addFile("_mv_partial.s2.t1.g" + sourceGen + ".u.parquet")
+                    .addNumRows(3L)
+                    .build();
+                engine.publishDerivedArtifact("mv_state", fs, provenanceKey, sourceGen, Map.of());
+            }
+            assertThat(engine.publishedSourceGeneration(provenanceKey), equalTo(9L));
+        }
+    }
+
+    /**
+     * The explicit-generation overload still rejects a duplicate generation, but with the distinct
+     * {@link DataFormatAwareEngine.DuplicateDerivedGenerationException} so callers can match it.
+     */
+    public void testExplicitGenerationPublishRejectsDuplicateWithDistinctException() throws IOException {
+        try (DataFormatAwareEngine engine = createDFAEngine(store, createTempDir())) {
+            engine.translogManager().recoverFromTranslog(ignore -> 0, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+            engine.index(indexOp(createParsedDocWithInput("0", null)));
+            engine.refresh("seed");
+            long existingGen;
+            try (GatedCloseable<CatalogSnapshot> ref = engine.acquireSnapshot()) {
+                existingGen = ref.get().getSegments().get(0).generation();
+            }
+            WriterFileSet fileSet = WriterFileSet.builder()
+                .directory(createTempDir())
+                .writerGeneration(existingGen)
+                .addFile("dup.parquet")
+                .addNumRows(1L)
+                .build();
+            expectThrows(
+                DataFormatAwareEngine.DuplicateDerivedGenerationException.class,
+                () -> engine.publishDerivedArtifact("mv_state", fileSet, Map.of())
+            );
+        }
+    }
 }

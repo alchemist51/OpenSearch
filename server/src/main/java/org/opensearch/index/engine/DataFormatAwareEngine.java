@@ -1222,7 +1222,13 @@ public class DataFormatAwareEngine implements Indexer {
                             // and available to the deletion policy when onCommit is triggered.
                             translogManager.ensureCanFlush();
                             translogManager.syncTranslog();
-                            Map<String, String> commitData = new HashMap<>();
+                            // Seed with the snapshot's existing userData so derived-artifact
+                            // progress markers (e.g. mv_state.published.<provenanceKey>) and any
+                            // other non-commit metadata survive the flush. The commit-critical
+                            // keys below are then layered on top. Without this, setUserData(commitData)
+                            // would replace userData wholesale and silently drop those markers,
+                            // breaking cross-restart idempotency for derived artifacts.
+                            Map<String, String> commitData = new HashMap<>(snapshot.getUserData());
                             commitData.put(
                                 CatalogSnapshot.LAST_COMPOSITE_WRITER_GEN_KEY,
                                 Long.toString(snapshot.getLastWriterGeneration())
@@ -1964,13 +1970,48 @@ public class DataFormatAwareEngine implements Indexer {
     }
 
     /**
+     * userData key prefix under which the maximum published <em>source</em> generation is
+     * recorded for a given derived-artifact provenance. The full key is
+     * {@code mv_state.published.<provenanceKey>} where {@code provenanceKey} identifies the
+     * upstream producer (for MV: {@code "<mvId>/<sourceShard>"}). The value is the largest
+     * source generation that has been published for that provenance, used by callers to
+     * skip already-published generations idempotently across restarts.
+     */
+    public static final String DERIVED_PUBLISHED_MARKER_PREFIX = "mv_state.published.";
+
+    /**
+     * Builds the userData marker key for a derived-artifact provenance. See
+     * {@link #DERIVED_PUBLISHED_MARKER_PREFIX}.
+     */
+    public static String derivedPublishedMarkerKey(String provenanceKey) {
+        return DERIVED_PUBLISHED_MARKER_PREFIX + provenanceKey;
+    }
+
+    /**
+     * Thrown by the explicit-generation {@link #publishDerivedArtifact(String, WriterFileSet, Map)}
+     * path when the requested writer generation collides with a generation already present in the
+     * catalog. A distinct subtype (rather than a bare {@link IllegalArgumentException}) lets callers
+     * distinguish a benign duplicate from genuinely invalid input.
+     */
+    @ExperimentalApi
+    public static class DuplicateDerivedGenerationException extends IllegalArgumentException {
+        public DuplicateDerivedGenerationException(String message) {
+            super(message);
+        }
+    }
+
+    /**
      * Atomically publishes a prebuilt derived data-format artifact (e.g. MV state files)
-     * into the catalog snapshot so that future searches see the files. Each publication
-     * creates a new {@link Segment} keyed by the artifact's writer generation.
+     * into the catalog snapshot so that future searches see the files, using an
+     * <em>explicit</em> writer generation supplied by the caller. Each publication creates
+     * a new {@link Segment} keyed by that generation.
      *
-     * <p>Idempotent: if a segment with the given writer generation already exists in the
-     * catalog, an {@link IllegalArgumentException} is thrown (the caller is expected to
-     * derive the published set from the catalog and skip already-published generations).</p>
+     * <p>If a segment with the given writer generation already exists in the catalog, a
+     * {@link DuplicateDerivedGenerationException} is thrown. Prefer
+     * {@link #publishDerivedArtifact(String, WriterFileSet, String, long, Map)}, which lets
+     * the engine allocate a collision-free generation and records idempotency in userData;
+     * this explicit-generation overload is retained for callers that manage their own
+     * generation space independent of the engine's refresh/flush sequence.</p>
      *
      * @param dataFormatName the artifact format name (e.g. {@code "mv_state"})
      * @param fileSet        the files + row count + generation to publish
@@ -1981,16 +2022,11 @@ public class DataFormatAwareEngine implements Indexer {
     public void publishDerivedArtifact(String dataFormatName, WriterFileSet fileSet, Map<String, String> userDataUpdates)
         throws IOException {
         ensureOpen();
+        validateDerivedArtifactInput(dataFormatName, fileSet);
         if (fileSet.writerGeneration() <= 0L) {
             throw new IllegalArgumentException(
                 "derived artifact writer generation must be positive but was [" + fileSet.writerGeneration() + "]"
             );
-        }
-        if (fileSet.files().isEmpty()) {
-            throw new IllegalArgumentException("derived artifact must contain at least one file");
-        }
-        if (fileSet.numRows() <= 0L) {
-            throw new IllegalArgumentException("derived artifact row count must be positive but was [" + fileSet.numRows() + "]");
         }
 
         writerGenerationCounter.accumulateAndGet(fileSet.writerGeneration(), Math::max);
@@ -2001,7 +2037,7 @@ public class DataFormatAwareEngine implements Indexer {
                 try (GatedCloseable<CatalogSnapshot> currentRef = catalogSnapshotManager.acquireSnapshot()) {
                     CatalogSnapshot current = currentRef.get();
                     if (current.getSegments().stream().anyMatch(segment -> segment.generation() == fileSet.writerGeneration())) {
-                        throw new IllegalArgumentException(
+                        throw new DuplicateDerivedGenerationException(
                             "derived artifact generation [" + fileSet.writerGeneration() + "] already exists in catalog"
                         );
                     }
@@ -2021,6 +2057,135 @@ public class DataFormatAwareEngine implements Indexer {
 
         // Give the merge scheduler a chance to compact (same as a refresh publication).
         triggerPossibleMerges();
+    }
+
+    /**
+     * Atomically publishes a prebuilt derived data-format artifact into the catalog snapshot,
+     * letting the <em>engine</em> allocate the catalog generation so it cannot collide with the
+     * target's own refresh/flush/merge generations. This is the preferred entry point for the MV
+     * target hydrator, whose upstream (source) generation numbers are unrelated to — and routinely
+     * overlap — the target's generation sequence.
+     *
+     * <p>The {@code writerGeneration} carried by {@code fileSetWithoutGeneration} is ignored: the
+     * engine assigns {@code writerGenerationCounter.incrementAndGet()} under the same locks that
+     * guard refresh, rebuilds the {@link WriterFileSet} with that generation, and records
+     * idempotency progress in catalog userData under
+     * {@link #derivedPublishedMarkerKey(String) mv_state.published.&lt;provenanceKey&gt;} =
+     * {@code max(existingMarker, sourceGeneration)}.</p>
+     *
+     * <p>Idempotency is the caller's responsibility to <em>check</em> (via the returned/observed
+     * marker) before calling; this method always publishes when invoked. Input validation rejects
+     * only genuinely invalid artifacts (empty file set, negative row count — {@code 0} means
+     * "unknown" and is accepted — or missing format name) with {@link IllegalArgumentException}.</p>
+     *
+     * @param dataFormatName          the artifact format name (e.g. {@code "mv_state"})
+     * @param fileSetWithoutGeneration the files + row count to publish; its writer generation is ignored
+     * @param provenanceKey           identifies the upstream producer (MV: {@code "<mvId>/<sourceShard>"})
+     * @param sourceGeneration        the upstream generation being published; recorded in the marker
+     * @param userDataUpdates         additional metadata entries to merge into the catalog userData
+     * @return the target catalog generation the engine allocated for this publication
+     */
+    public long publishDerivedArtifact(
+        String dataFormatName,
+        WriterFileSet fileSetWithoutGeneration,
+        String provenanceKey,
+        long sourceGeneration,
+        Map<String, String> userDataUpdates
+    ) throws IOException {
+        ensureOpen();
+        validateDerivedArtifactInput(dataFormatName, fileSetWithoutGeneration);
+        if (provenanceKey == null || provenanceKey.isEmpty()) {
+            throw new IllegalArgumentException("derived artifact provenanceKey must be non-empty");
+        }
+
+        final long allocatedGeneration;
+        try (ReleasableLock ignored = readLock.acquire()) {
+            ensureOpen();
+            refreshLock.lock();
+            try {
+                // Allocate under refreshLock so the generation cannot collide with a concurrent
+                // refresh/flush/merge, mirroring how those paths draw from the same counter.
+                allocatedGeneration = writerGenerationCounter.incrementAndGet();
+                assert allocatedGeneration > 0 : "allocated derived generation must be positive but was: " + allocatedGeneration;
+
+                WriterFileSet fileSet = WriterFileSet.builder()
+                    .directory(java.nio.file.Path.of(fileSetWithoutGeneration.directory()))
+                    .writerGeneration(allocatedGeneration)
+                    .addFiles(fileSetWithoutGeneration.files())
+                    .addNumRows(fileSetWithoutGeneration.numRows())
+                    .formatVersion(fileSetWithoutGeneration.formatVersion())
+                    .build();
+
+                try (GatedCloseable<CatalogSnapshot> currentRef = catalogSnapshotManager.acquireSnapshot()) {
+                    CatalogSnapshot current = currentRef.get();
+                    // The engine owns the counter, so a freshly incremented generation cannot already
+                    // exist; assert rather than reject to catch counter-management regressions.
+                    assert current.getSegments().stream().noneMatch(s -> s.generation() == allocatedGeneration)
+                        : "engine-allocated derived generation [" + allocatedGeneration + "] unexpectedly present in catalog";
+
+                    List<Segment> nextSegments = new ArrayList<>(current.getSegments());
+                    nextSegments.add(Segment.builder(allocatedGeneration).addSearchableFiles(dataFormatName, fileSet).build());
+
+                    Map<String, String> nextUserData = new HashMap<>(current.getUserData());
+                    nextUserData.putAll(Map.copyOf(userDataUpdates));
+                    // Record idempotency marker: max source generation published for this provenance.
+                    String markerKey = derivedPublishedMarkerKey(provenanceKey);
+                    long priorMarker = parseMarker(nextUserData.get(markerKey));
+                    nextUserData.put(markerKey, Long.toString(Math.max(priorMarker, sourceGeneration)));
+
+                    catalogSnapshotManager.commitNewSnapshot(nextSegments, nextUserData);
+                }
+            } finally {
+                refreshLock.unlock();
+            }
+        }
+
+        // Persist catalog durably so a crash does not lose the published artifact.
+        flush(true, true);
+
+        // Give the merge scheduler a chance to compact (same as a refresh publication).
+        triggerPossibleMerges();
+        return allocatedGeneration;
+    }
+
+    /**
+     * Returns the maximum source generation already published for {@code provenanceKey}, read from
+     * the current catalog userData marker, or {@code -1} if nothing has been published yet. Callers
+     * use this to skip already-published upstream generations idempotently across restarts.
+     */
+    public long publishedSourceGeneration(String provenanceKey) throws IOException {
+        ensureOpen();
+        try (GatedCloseable<CatalogSnapshot> currentRef = catalogSnapshotManager.acquireSnapshot()) {
+            return parseMarker(currentRef.get().getUserData().get(derivedPublishedMarkerKey(provenanceKey)));
+        }
+    }
+
+    private static long parseMarker(String value) {
+        if (value == null) {
+            return -1L;
+        }
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            return -1L;
+        }
+    }
+
+    /**
+     * Validates the format-independent inputs common to both publish paths. Rejects a missing
+     * format name, an empty file set, or a negative row count. A row count of {@code 0} is
+     * legitimate ("unknown") and accepted.
+     */
+    private static void validateDerivedArtifactInput(String dataFormatName, WriterFileSet fileSet) {
+        if (dataFormatName == null || dataFormatName.isEmpty()) {
+            throw new IllegalArgumentException("derived artifact format name must be non-empty");
+        }
+        if (fileSet.files().isEmpty()) {
+            throw new IllegalArgumentException("derived artifact must contain at least one file");
+        }
+        if (fileSet.numRows() < 0L) {
+            throw new IllegalArgumentException("derived artifact row count must be non-negative but was [" + fileSet.numRows() + "]");
+        }
     }
 
     @Override
