@@ -143,6 +143,9 @@ public class MVTargetHydrator implements Closeable {
         }
         // Rebuild high-water from existing hydrated files
         rebuildHighWater();
+        // Publish any generations hydrated to disk before this node came up (or before the fix):
+        // a redeployed node reconciles disk against the catalog marker and publishes the gap.
+        reconcileFromDisk();
         scheduledFuture = threadPool.scheduleWithFixedDelay(this::pollOnce, interval, ThreadPool.Names.GENERIC);
         logger.info(
             "MV hydrator started: target={} mvId={} source={} interval={}",
@@ -196,6 +199,9 @@ public class MVTargetHydrator implements Closeable {
             }
             // After hydration: check compaction eligibility for all source-shard dirs.
             tryCompactAll();
+            // Reconcile: publish any complete hydrated generations still above the catalog marker
+            // (e.g. published-then-compacted files, or generations hydrated by a prior process).
+            reconcileFromDisk();
         } catch (Exception e) {
             logger.warn("MV hydrator poll cycle failed: target={} error={}", targetShardId, e.getMessage());
         }
@@ -511,6 +517,105 @@ public class MVTargetHydrator implements Closeable {
             Files.copy(is, tempFile, StandardCopyOption.REPLACE_EXISTING);
         }
         Files.move(tempFile, targetFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    /**
+     * Reconcile hydrated generations present on disk against the catalog's published marker and
+     * publish every complete generation above the marker, oldest first. This is how a redeployed
+     * node publishes files that were hydrated before the fix (or by a prior process) but never
+     * reached the catalog.
+     *
+     * <p><b>Completeness guard.</b> A crash mid-download can leave a partially-downloaded
+     * generation on disk (some of its files present, high-water not yet advanced past it). To avoid
+     * publishing such a tail, a partial generation is considered complete only if it is strictly
+     * below the highest partial generation seen for that shard directory (the sequential downloader
+     * advances to a higher generation only after fully verifying the lower one). Compacted files are
+     * produced by an atomic rename and are therefore always complete. The marker itself provides the
+     * lower bound and idempotency, so re-running reconcile is safe.</p>
+     */
+    void reconcileFromDisk() {
+        CatalogPublisher publisher = this.catalogPublisher;
+        if (publisher == null || !Files.isDirectory(hydratedDir)) {
+            return;
+        }
+        try (var shardDirs = Files.newDirectoryStream(hydratedDir)) {
+            for (Path shardDir : shardDirs) {
+                if (!Files.isDirectory(shardDir)) continue;
+                int sourceShard;
+                try {
+                    sourceShard = Integer.parseInt(shardDir.getFileName().toString());
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+                reconcileShardFromDisk(publisher, sourceShard, shardDir);
+            }
+        } catch (IOException e) {
+            logger.debug("MV hydrator reconcile scan failed: {}", e.getMessage());
+        }
+    }
+
+    private void reconcileShardFromDisk(CatalogPublisher publisher, int sourceShard, Path shardDir) {
+        String provenanceKey = provenanceKey(sourceShard);
+        long marker;
+        try {
+            marker = publisher.publishedSourceGeneration(provenanceKey);
+        } catch (Exception e) {
+            logger.warn("MV hydrator reconcile: failed to read marker for {}: {}", provenanceKey, e.getMessage());
+            return;
+        }
+
+        // Group files by generation. Compacted files map to their max gen and are always complete.
+        java.util.TreeMap<Long, Set<String>> byGeneration = new java.util.TreeMap<>();
+        Set<Long> compactedGenerations = new HashSet<>();
+        long highestPartialGen = Long.MIN_VALUE;
+        try (var files = Files.newDirectoryStream(shardDir, "*.parquet")) {
+            for (Path f : files) {
+                String name = f.getFileName().toString();
+                long[] range = parseCompactedGenRange(name);
+                if (range != null) {
+                    long gen = range[1];
+                    byGeneration.computeIfAbsent(gen, g -> new HashSet<>()).add(name);
+                    compactedGenerations.add(gen); // atomic-renamed → complete
+                    continue;
+                }
+                long gen = parseGenFromFileName(name);
+                if (gen <= 0) {
+                    continue;
+                }
+                byGeneration.computeIfAbsent(gen, g -> new HashSet<>()).add(name);
+                if (gen > highestPartialGen) {
+                    highestPartialGen = gen;
+                }
+            }
+        } catch (IOException e) {
+            logger.debug("MV hydrator reconcile: error listing {}: {}", shardDir, e.getMessage());
+            return;
+        }
+
+        if (byGeneration.isEmpty()) {
+            return;
+        }
+
+        // The only possibly-incomplete generation is the single highest generation on disk, and
+        // only when it is a partial: a crash could have left it mid-download before high-water
+        // advanced. Any generation with a strictly-higher generation above it (partial or
+        // compacted) was necessarily fully downloaded first, and compacted files are always
+        // complete. So the in-flight tail to skip is the highest partial gen iff it is also the
+        // highest generation overall.
+        long maxGenOverall = byGeneration.lastKey();
+        long inflightTail = (highestPartialGen == maxGenOverall && compactedGenerations.contains(maxGenOverall) == false)
+            ? highestPartialGen
+            : Long.MIN_VALUE;
+
+        // Publish complete generations above the marker, oldest first (TreeMap is sorted).
+        for (Map.Entry<Long, Set<String>> e : byGeneration.entrySet()) {
+            long gen = e.getKey();
+            if (gen <= marker || gen == inflightTail) {
+                continue;
+            }
+            // rowCount unknown on the reconcile path (no checkpoint entry) → 0 = unknown.
+            publishGeneration(sourceShard, shardDir, gen, 0L, e.getValue());
+        }
     }
 
     /**

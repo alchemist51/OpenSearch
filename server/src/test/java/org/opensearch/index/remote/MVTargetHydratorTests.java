@@ -22,7 +22,6 @@ import org.opensearch.transport.TransportService;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -357,6 +356,75 @@ public class MVTargetHydratorTests extends OpenSearchTestCase {
             // A newer generation still publishes.
             hydrator.publishGeneration(0, createTempDir(), 8L, 3L, Set.of("_mv_partial.s0.t1.g8.def.parquet"));
             assertEquals(2, publisher.publishCount);
+        }
+    }
+
+    // ── Reconcile: publishes pre-existing hydrated generations ──────────
+
+    /**
+     * A node redeployed with generations already hydrated to disk (but never published) must
+     * publish them on reconcile, oldest first, guarding against a partially-downloaded tail.
+     */
+    public void testReconcilePublishesPreExistingHydratedGenerations() throws Exception {
+        Path dataPath = createTempDir();
+        Path shardDir = dataPath.resolve("mv_hydrated").resolve("0");
+        Files.createDirectories(shardDir);
+        // Three complete partial generations + one in-flight tail (highest gen) that must be skipped.
+        Files.writeString(shardDir.resolve("_mv_partial.s0.t1.g3.aaa.parquet"), "d");
+        Files.writeString(shardDir.resolve("_mv_partial.s0.t1.g4.bbb.parquet"), "d");
+        Files.writeString(shardDir.resolve("_mv_partial.s0.t1.g5.ccc.parquet"), "d");
+        Files.writeString(shardDir.resolve("_mv_partial.s0.t1.g6.ddd.parquet"), "d"); // highest → treated as in-flight
+
+        FakePublisher publisher = new FakePublisher();
+        try (MVTargetHydrator hydrator = newHydrator(dataPath)) {
+            hydrator.setCatalogPublisher(publisher);
+            hydrator.reconcileFromDisk();
+        }
+        assertEquals("only the 3 complete generations below the tail are published", 3, publisher.publishCount);
+        assertEquals("marker advanced to the highest complete generation", 5L, publisher.publishedSourceGeneration("mv1/0"));
+        assertEquals("published oldest-first ending at gen 5", 5L, publisher.lastSourceGeneration);
+    }
+
+    /** A compacted file is atomic and always complete — it publishes even as the highest gen. */
+    public void testReconcilePublishesCompactedFile() throws Exception {
+        Path dataPath = createTempDir();
+        Path shardDir = dataPath.resolve("mv_hydrated").resolve("0");
+        Files.createDirectories(shardDir);
+        Files.writeString(shardDir.resolve("_mv_compacted.s0.g1-6.deadbeef.parquet"), "d");
+
+        FakePublisher publisher = new FakePublisher();
+        try (MVTargetHydrator hydrator = newHydrator(dataPath)) {
+            hydrator.setCatalogPublisher(publisher);
+            hydrator.reconcileFromDisk();
+        }
+        assertEquals(1, publisher.publishCount);
+        assertEquals("compacted range max becomes the marker", 6L, publisher.publishedSourceGeneration("mv1/0"));
+    }
+
+    // ── Reconcile: marker prevents double publish across restart ────────
+
+    /**
+     * Reconcile run twice (simulating a restart) must publish each complete generation exactly
+     * once — the marker short-circuits the second pass.
+     */
+    public void testReconcileMarkerPreventsDoublePublishAcrossRestart() throws Exception {
+        Path dataPath = createTempDir();
+        Path shardDir = dataPath.resolve("mv_hydrated").resolve("0");
+        Files.createDirectories(shardDir);
+        Files.writeString(shardDir.resolve("_mv_partial.s0.t1.g1.aaa.parquet"), "d");
+        Files.writeString(shardDir.resolve("_mv_partial.s0.t1.g2.bbb.parquet"), "d");
+        // A compacted file so the highest generation is itself complete and publishable.
+        Files.writeString(shardDir.resolve("_mv_compacted.s0.g3-3.ccc.parquet"), "d");
+
+        FakePublisher publisher = new FakePublisher();
+        try (MVTargetHydrator hydrator = newHydrator(dataPath)) {
+            hydrator.setCatalogPublisher(publisher);
+            hydrator.reconcileFromDisk();
+            int firstPass = publisher.publishCount;
+            assertEquals("gens 1,2,3 all complete and published", 3, firstPass);
+            // Second reconcile (as if after another restart) must be a no-op.
+            hydrator.reconcileFromDisk();
+            assertEquals("marker prevents re-publishing on restart", firstPass, publisher.publishCount);
         }
     }
 
