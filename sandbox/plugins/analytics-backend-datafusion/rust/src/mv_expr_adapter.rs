@@ -419,6 +419,23 @@ mod tests {
         assert!(s.contains("CastExpr"), "timestamp->int64 cast expected: {s}");
     }
 
+    /// Regression: a KEYWORD group key is written to the Parquet state as `Utf8`, while the
+    /// plan's logical schema reports it as `Utf8View` (DataFusion's string_view default). The
+    /// value domain is identical, so this must be accepted as a lossless cast — the deployed
+    /// cbspan1_mv_mv1 target failed every PPL query on exactly this shape.
+    #[test]
+    fn utf8_group_key_widens_to_utf8_view() {
+        let logical = Arc::new(Schema::new(vec![Field::new("URL", DataType::Utf8View, true)]));
+        let physical = Arc::new(Schema::new(vec![Field::new("URL", DataType::Utf8, true)]));
+        let a = MvPhysicalExprAdapterFactory::new(vec!["URL".into()])
+            .create(logical, physical)
+            .unwrap();
+        let rewritten = a.rewrite(Arc::new(Column::new("URL", 0))).unwrap();
+        let s = format!("{rewritten:?}");
+        assert!(s.contains("CastExpr"), "utf8->utf8view cast expected: {s}");
+        assert!(s.contains("Utf8View"), "cast target must be Utf8View: {s}");
+    }
+
     #[test]
     fn absent_logical_field_null_fills() {
         let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("_mv_source_generation", 3));
