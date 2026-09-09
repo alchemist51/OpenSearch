@@ -177,7 +177,20 @@ public class LuceneReaderManager implements EngineReaderManager<LuceneReader> {
      * @return {@code true} iff both lists contain the same generations in the same (sorted) order
      */
     private boolean readersAreSame(CatalogSnapshot catalogSnapshot, DirectoryReader reader) {
-        Collection<Long> generationsReferenced = catalogSnapshot.getSegments().stream().map(Segment::generation).sorted().toList();
+        // Only LUCENE-bearing segments have a corresponding leaf in this reader. A
+        // composite/derived catalog may also contain derived-artifact-only segments
+        // (e.g. a materialized-view state file published via publishDerivedArtifact)
+        // whose generation has no Lucene component and therefore no reader leaf.
+        // Comparing against ALL segment generations would then spuriously report a
+        // mismatch on every derived publication. Filter to Lucene-bearing segments —
+        // consistent with buildGenerationToSegmentName, which already skips segments
+        // with no Lucene fileset.
+        Collection<Long> generationsReferenced = catalogSnapshot.getSegments()
+            .stream()
+            .filter(seg -> seg.dfGroupedSearchableFiles().containsKey(LuceneDataFormat.LUCENE_FORMAT_NAME))
+            .map(Segment::generation)
+            .sorted()
+            .toList();
         return generationsReferenced.equals(collectReferencedGenerations(reader));
     }
 
