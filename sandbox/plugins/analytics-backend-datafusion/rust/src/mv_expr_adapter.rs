@@ -298,6 +298,14 @@ pub async fn register_mv_state_listing_table(
     Ok(())
 }
 
+/// Test-only accessor for the footer sort-order helper.
+#[cfg(test)]
+pub fn unanimous_footer_sort_order_for_test(
+    state_file_paths: &[String],
+) -> Result<Option<Vec<parquet::file::metadata::SortingColumn>>> {
+    unanimous_footer_sort_order(state_file_paths)
+}
+
 /// Reads the parquet footer `SortingColumn` metadata of every state file.
 /// Returns Some(order) only when every file (and every row group within each
 /// file) declares the identical order; None otherwise.
