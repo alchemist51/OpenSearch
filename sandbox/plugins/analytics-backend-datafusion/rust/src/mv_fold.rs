@@ -388,6 +388,57 @@ mod tests {
         assert_eq!(found[&(300, "/c".to_string())], (1, 10), "group (300, /c) exact");
     }
 
+    #[tokio::test]
+    async fn fold_int32_group_preserves_count_state() {
+        use arrow::array::Int32Array;
+
+        let dir = TempDir::new().unwrap();
+        let shard0 = dir.path().join("0");
+        std::fs::create_dir_all(&shard0).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("CounterID", DataType::Int32, true),
+            Field::new("cnt", DataType::Int64, true),
+            Field::new("sum_client_ip", DataType::Int64, true),
+        ]));
+        for (name, counts, sums) in [
+            ("_mv_partial.g1.parquet", vec![8_i64, 3], vec![100_i64, 30]),
+            ("_mv_partial.g2.parquet", vec![5_i64, 4], vec![50_i64, 40]),
+        ] {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(vec![3922_i32, 1490])),
+                    Arc::new(Int64Array::from(counts)),
+                    Arc::new(Int64Array::from(sums)),
+                ],
+            ).unwrap();
+            let file = std::fs::File::create(shard0.join(name)).unwrap();
+            let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let source = Arc::new(Schema::new(vec![
+            Field::new("CounterID", DataType::Int32, true),
+            Field::new("ClientIP", DataType::Int32, true),
+        ]));
+        let result = mv_query_hydrated_async(
+            &[shard0.to_string_lossy().to_string()],
+            "SELECT \"CounterID\", COUNT(*) AS cnt, SUM(\"ClientIP\") AS sum_client_ip FROM mv_input GROUP BY \"CounterID\"",
+            source,
+        ).await.unwrap();
+
+        let keys = result.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let counts = result.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sums = result.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut found = std::collections::HashMap::new();
+        for row in 0..result.num_rows() {
+            found.insert(keys.value(row), (counts.value(row), sums.value(row)));
+        }
+        assert_eq!(found[&3922], (13, 150));
+        assert_eq!(found[&1490], (7, 70));
+    }
+
     /// Empty directory returns an error (not silent empty result).
     #[tokio::test]
     async fn empty_hydrated_dir_errors() {
