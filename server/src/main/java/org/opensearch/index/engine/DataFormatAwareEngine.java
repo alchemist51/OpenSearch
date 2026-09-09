@@ -193,6 +193,10 @@ public class DataFormatAwareEngine implements Indexer {
     private static final boolean TRANSLOG_BACKPRESSURE_ENABLED = Boolean.parseBoolean(
         System.getProperty("opensearch.translog.backpressure.enabled", "false")
     );
+    /** Soft cap = flush threshold × this (engage the single-writer throttle + request a flush); default 2. */
+    private static final long TRANSLOG_BACKPRESSURE_SOFT_MULTIPLIER = Long.getLong("opensearch.translog.backpressure.soft_multiplier", 2L);
+    /** Hard cap = flush threshold × this (indexing threads wait for the roll); default 4. */
+    private static final long TRANSLOG_BACKPRESSURE_HARD_MULTIPLIER = Long.getLong("opensearch.translog.backpressure.hard_multiplier", 4L);
 
     @Nullable
     private final DocumentLookupProvider documentLookupProvider;
@@ -1441,14 +1445,14 @@ public class DataFormatAwareEngine implements Indexer {
         if (threshold <= 0) {
             return;
         }
-        final long softCap = 2 * threshold;
-        final long hardCap = 4 * threshold;
+        final long softCap = TRANSLOG_BACKPRESSURE_SOFT_MULTIPLIER * threshold;
+        final long hardCap = TRANSLOG_BACKPRESSURE_HARD_MULTIPLIER * threshold;
         long uncommitted = uncommittedTranslogBytes();
         if (uncommitted > softCap) {
             if (translogBackpressureActive.compareAndSet(false, true)) {
                 activateThrottling();
                 logger.warn(
-                    "translog backpressure engaged: uncommitted translog {} bytes > {} (2 x flush threshold); throttling indexing and requesting a flush",
+                    "translog backpressure engaged: uncommitted translog {} bytes > {} (soft cap); throttling indexing and requesting a flush",
                     uncommitted,
                     softCap
                 );
