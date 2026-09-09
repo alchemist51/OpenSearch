@@ -160,6 +160,10 @@ public class MVTargetHydrator implements Closeable {
         // Publish any generations hydrated to disk before this node came up (or before the fix):
         // a redeployed node reconciles disk against the catalog marker and publishes the gap.
         reconcileFromDisk();
+        // Generations that have a remote manifest but were never downloaded (skipped by an earlier
+        // hydrator when two refreshes landed within one hydration) are invisible to the disk
+        // reconcile: scan the remote manifests once and hydrate the gaps, oldest first.
+        threadPool.executor(ThreadPool.Names.GENERIC).execute(this::reconcileGapsFromRemote);
         scheduledFuture = threadPool.scheduleWithFixedDelay(this::pollOnce, interval, ThreadPool.Names.GENERIC);
         logger.info(
             "MV hydrator started: target={} mvId={} source={} interval={}",
@@ -496,6 +500,70 @@ public class MVTargetHydrator implements Closeable {
      * signal that survives restarts. Any rejection is logged at WARN with the exception message
      * (never DEBUG), and a successful publish logs at INFO with both target and source generations.
      */
+    /**
+     * Start-up gap scan: every generation that has a manifest in the remote store but no hydrated
+     * partial file locally (and is not covered by a compacted range) is hydrated from its manifest.
+     * Runs once, off the start() path. Only the newest primary term is considered.
+     */
+    void reconcileGapsFromRemote() {
+        if (closed.get() || !Files.isDirectory(hydratedDir)) {
+            return;
+        }
+        try (var shardDirs = Files.newDirectoryStream(hydratedDir)) {
+            for (Path shardDir : shardDirs) {
+                if (!Files.isDirectory(shardDir)) continue;
+                int sourceShard;
+                try {
+                    sourceShard = Integer.parseInt(shardDir.getFileName().toString());
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+                java.util.Set<Long> localGens = new java.util.HashSet<>();
+                java.util.List<long[]> compacted = new java.util.ArrayList<>();
+                try (var files = Files.newDirectoryStream(shardDir, "*.parquet")) {
+                    for (Path f : files) {
+                        String fname = f.getFileName().toString();
+                        long[] range = parseCompactedGenRange(fname);
+                        if (range != null) {
+                            compacted.add(range);
+                        } else {
+                            long g = parseGenFromFileName(fname);
+                            if (g > 0) localGens.add(g);
+                        }
+                    }
+                }
+                java.util.List<String> manifests = remoteManager.listManifests(String.valueOf(sourceShard), mvId);
+                if (manifests.isEmpty()) continue;
+                long newestTerm = MVStateManifest.parsePrimaryTerm(manifests.get(0));
+                java.util.TreeSet<Long> missing = new java.util.TreeSet<>();
+                for (String m : manifests) {
+                    if (MVStateManifest.parsePrimaryTerm(m) != newestTerm) continue;
+                    long g = MVStateManifest.parseGeneration(m);
+                    boolean covered = localGens.contains(g);
+                    for (long[] r : compacted) {
+                        if (g >= r[0] && g <= r[1]) covered = true;
+                    }
+                    if (!covered) missing.add(g);
+                }
+                if (missing.isEmpty()) {
+                    logger.info("MV hydrator remote gap scan: source shard {} has no missing generations ({} manifests)", sourceShard, manifests.size());
+                    continue;
+                }
+                logger.warn("MV hydrator remote gap scan: source shard {} missing generations {} (hydrating from manifests)", sourceShard, missing);
+                for (long g : missing) {
+                    if (closed.get()) return;
+                    HighWater hw = highWaters.getOrDefault(sourceShard, HighWater.EMPTY);
+                    if (hydrateGenerationFromManifest(sourceShard, newestTerm, g)) {
+                        // never lower the high-water when filling an old gap
+                        if (hw.generation > g) highWaters.put(sourceShard, hw);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("MV hydrator: remote gap scan failed", e);
+        }
+    }
+
     /**
      * Hydrates one source generation from its remote manifest (gap fill for a generation the
      * checkpoint skipped). Returns true when the generation is hydrated and published, false
