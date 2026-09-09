@@ -647,15 +647,14 @@ pub async unsafe fn create_mv_only_session_context(
     let has_mv_data = !state_file_paths.is_empty();
     if has_mv_data {
         // Read only the first file's schema header (~few KB). O(1) memory.
-        let physical_schema =
-            crate::mv_expr_adapter::read_schema_from_first_file(state_file_paths)?.ok_or_else(
-                || {
-                    DataFusionError::Execution(
-                        "create_mv_only_session_context: state files had no Arrow schema"
-                            .to_string(),
-                    )
-                },
-            )?;
+        let physical_schema = crate::mv_expr_adapter::read_schema_from_first_file(
+            state_file_paths,
+        )?
+        .ok_or_else(|| {
+            DataFusionError::Execution(
+                "create_mv_only_session_context: state files had no Arrow schema".to_string(),
+            )
+        })?;
 
         let logical_schema = widen_schema_from_plan(
             &ctx,
@@ -787,8 +786,10 @@ fn mv_table_schema(
                     let physical = physical_schema.field(pos);
                     let cast_to = if logical.data_type() == physical.data_type() {
                         None
-                    } else if is_lossless_integer_widening(physical.data_type(), logical.data_type())
-                    {
+                    } else if is_lossless_integer_widening(
+                        physical.data_type(),
+                        logical.data_type(),
+                    ) {
                         Some(logical.data_type().clone())
                     } else {
                         return Err(DataFusionError::Execution(format!(
@@ -1135,6 +1136,35 @@ pub(crate) fn is_lossless_integer_widening(
         ) => true,
         _ => false,
     }
+}
+
+/// True when a physical→logical type difference is a *value-preserving,
+/// reversible* representation change — i.e. a literal typed as the LOGICAL type
+/// can be losslessly cast back to the PHYSICAL type. This is the subset of
+/// [`is_lossless_integer_widening`] for which the cast can be safely moved onto
+/// the literal side of a `col <op> lit` comparison (keeping the column in its
+/// native physical type so parquet statistics / bloom pruning stay well-typed).
+///
+/// Integer WIDENING is deliberately excluded: a logical Int64 literal need not
+/// fit in a physical Int16, so casting the literal down could overflow / change
+/// the comparison. Only the bidirectional representation changes qualify:
+/// string/binary view/offset layouts and the Timestamp(ms)↔Int64 epoch identity.
+pub(crate) fn is_reversible_representation_cast(
+    physical: &arrow::datatypes::DataType,
+    logical: &arrow::datatypes::DataType,
+) -> bool {
+    use arrow::datatypes::DataType;
+    matches!(
+        (physical, logical),
+        (
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+        ) | (
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+        ) | (DataType::Timestamp(_, _), DataType::Int64)
+            | (DataType::Int64, DataType::Timestamp(_, _))
+    )
 }
 
 #[cfg(test)]
