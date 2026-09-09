@@ -82,8 +82,7 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
         // An index declaring index.derived.data_format=materialized_view serves
         // PARTIAL AGGREGATE STATE and must take the MV-only fold session, never
         // the raw row path. Absent setting => normal path (fall through).
-        String derivedDataFormat = context.getIndexSettings().getSettings().get(DERIVED_DATA_FORMAT_SETTING);
-        boolean mvServing = MV_DATA_FORMAT_CATEGORY.equals(derivedDataFormat);
+        boolean mvServing = isDerivedMVTarget(context.getIndexSettings().getSettings());
 
         long runtimePtr = dataFusionService.getNativeRuntime().get();
         long contextId = context.getTask() != null ? context.getTask().getId() : 0L;
@@ -167,6 +166,15 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
             }
             return new DataFusionSessionState(sessionCtxHandle);
         }
+    }
+
+    /**
+     * Returns true when the index settings declare the derived materialized-view
+     * data-format category ({@code index.derived.data_format=materialized_view}),
+     * which routes the shard scan to the MV-only fold session.
+     */
+    static boolean isDerivedMVTarget(org.opensearch.common.settings.Settings settings) {
+        return MV_DATA_FORMAT_CATEGORY.equals(settings.get(DERIVED_DATA_FORMAT_SETTING));
     }
 
     /**
