@@ -833,6 +833,16 @@ fn mv_table_schema(
     Ok((Arc::clone(logical_schema), physical_projection))
 }
 
+/// Test-only re-export of [`mv_table_schema`] so the real-file repro harness in
+/// `mv_read_repro_test` can drive the exact production schema derivation.
+#[cfg(test)]
+pub(crate) fn mv_table_schema_for_test(
+    physical_schema: &arrow::datatypes::SchemaRef,
+    logical_schema: &arrow::datatypes::SchemaRef,
+    state_fields: &[String],
+) -> Result<(arrow::datatypes::SchemaRef, Vec<MvColumnProjection>), DataFusionError> {
+    mv_table_schema(physical_schema, logical_schema, state_fields)
+}
 
 /// Creates a SessionContext configured for indexed execution with filter delegation.
 /// Registers the `delegated_predicate` UDF and stores the tree shape + predicate count

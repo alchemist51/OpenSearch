@@ -72,6 +72,9 @@ pub use cache::page_index as parquet_page_cache;
 pub use cache::statistics_cache;
 
 #[cfg(test)]
+mod mv_read_repro_test;
+
+#[cfg(test)]
 mod spill_e2e_test;
 
 // End-to-end TieredObjectStore + TieredBlockCache integration tests. Located here
