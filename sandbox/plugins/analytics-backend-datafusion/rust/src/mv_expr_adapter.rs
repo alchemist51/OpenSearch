@@ -90,74 +90,180 @@ struct MvPhysicalExprAdapter {
     physical_file_schema: SchemaRef,
 }
 
+impl MvPhysicalExprAdapter {
+    /// Resolves a logical `Column` to its physical replacement expression:
+    /// the physical-position `Column` (optionally wrapped in a widening/repr
+    /// `CastExpr`), or a typed NULL literal for logical-only / absent fields.
+    fn rewrite_column(&self, logical_name: &str) -> Result<Arc<dyn PhysicalExpr>> {
+        let physical_count = self.physical_file_schema.fields().len();
+        let logical_field = self
+            .logical_file_schema
+            .field_with_name(logical_name)
+            .map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "MvPhysicalExprAdapter: column '{}' is not part of the MV logical schema",
+                    logical_name
+                ))
+            })?;
+
+        match self
+            .state_fields
+            .iter()
+            .position(|name| name == logical_name)
+        {
+            Some(pos) if pos < physical_count => {
+                let physical_field = self.physical_file_schema.field(pos);
+                let physical_col: Arc<dyn PhysicalExpr> =
+                    Arc::new(Column::new(physical_field.name(), pos));
+                if physical_field.data_type() == logical_field.data_type() {
+                    Ok(physical_col)
+                } else if is_lossless_integer_widening(
+                    physical_field.data_type(),
+                    logical_field.data_type(),
+                ) {
+                    Ok(Arc::new(CastExpr::new(
+                        physical_col,
+                        logical_field.data_type().clone(),
+                        None,
+                    )))
+                } else {
+                    Err(DataFusionError::Execution(format!(
+                        "MvPhysicalExprAdapter: state field '{}' at physical position {} \
+                         has type {:?} but query expects {:?}; only lossless integer \
+                         widening is permitted",
+                        logical_name,
+                        pos,
+                        physical_field.data_type(),
+                        logical_field.data_type(),
+                    )))
+                }
+            }
+            // state_fields entry beyond this file's physical columns, or a
+            // logical-only field (e.g. `_mv_source_generation`): null-fill.
+            _ => {
+                let null = ScalarValue::try_from(logical_field.data_type())?;
+                Ok(expressions::lit(null))
+            }
+        }
+    }
+
+    /// If a logical `Column` maps to a physical column whose type differs ONLY
+    /// by a reversible representation change (Utf8↔Utf8View, binary views,
+    /// Timestamp(ms)↔Int64), returns `(physical_col_expr, physical_type)` so a
+    /// comparison literal can be cast to the PHYSICAL type and the column left
+    /// uncast. Returns None for the identity case, integer widening, null-fill,
+    /// or non-column expressions — those keep the default column rewrite.
+    ///
+    /// Keeping the column in its native physical type is what makes parquet
+    /// row-group / page / bloom pruning well-typed: a `CAST(URL AS Utf8View)`
+    /// column defeats or type-confuses statistics extracted from the physical
+    /// Utf8 column, whereas `URL_utf8 = CAST(lit AS Utf8)` prunes natively.
+    fn physical_col_for_literal_cmp(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+    ) -> Option<(Arc<dyn PhysicalExpr>, arrow::datatypes::DataType)> {
+        let col = expr.downcast_ref::<Column>()?;
+        let logical_name = col.name();
+        let physical_count = self.physical_file_schema.fields().len();
+        let logical_field = self
+            .logical_file_schema
+            .field_with_name(logical_name)
+            .ok()?;
+        let pos = self
+            .state_fields
+            .iter()
+            .position(|name| name == logical_name)?;
+        if pos >= physical_count {
+            return None;
+        }
+        let physical_field = self.physical_file_schema.field(pos);
+        if physical_field.data_type() == logical_field.data_type() {
+            return None; // identity: no cast needed on either side
+        }
+        if crate::session_context::is_reversible_representation_cast(
+            physical_field.data_type(),
+            logical_field.data_type(),
+        ) {
+            let physical_col: Arc<dyn PhysicalExpr> =
+                Arc::new(Column::new(physical_field.name(), pos));
+            Some((physical_col, physical_field.data_type().clone()))
+        } else {
+            None
+        }
+    }
+}
+
 impl PhysicalExprAdapter for MvPhysicalExprAdapter {
     fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
         use datafusion::common::tree_node::TreeNodeRecursion;
-        let physical_count = self.physical_file_schema.fields().len();
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::{BinaryExpr, Literal};
         expr.transform_down(|e| {
+            // Optimization (mirrors DataFusion's flagged TODO in the default
+            // PhysicalExprAdapter): for `col <op> lit` where col differs from its
+            // physical column ONLY by a reversible representation cast (the
+            // steady-state Utf8→Utf8View keyword-key shape), push the cast onto
+            // the LITERAL and leave the column native. Otherwise a
+            // `CAST(col AS Utf8View) <op> Utf8(lit)` predicate reaches the parquet
+            // reader with a type-mismatched literal and a cast-wrapped column,
+            // which type-confuses row-group / page / bloom pruning on the
+            // physical Utf8 column and can prune the row group holding the key
+            // (single-equality `URL = 'x'` returned zero rows on cbspan1_mv_mv1).
+            if let Some(bin) = e.downcast_ref::<BinaryExpr>() {
+                if is_comparison_op(bin.op()) {
+                    let l = bin.left();
+                    let r = bin.right();
+                    // col <op> lit
+                    if r.downcast_ref::<Literal>().is_some() {
+                        if let Some((pcol, pty)) = self.physical_col_for_literal_cmp(l) {
+                            let cast_lit: Arc<dyn PhysicalExpr> =
+                                Arc::new(CastExpr::new(Arc::clone(r), pty, None));
+                            let new_expr: Arc<dyn PhysicalExpr> =
+                                Arc::new(BinaryExpr::new(pcol, *bin.op(), cast_lit));
+                            return Ok(Transformed::new(new_expr, true, TreeNodeRecursion::Jump));
+                        }
+                    }
+                    // lit <op> col
+                    if l.downcast_ref::<Literal>().is_some() {
+                        if let Some((pcol, pty)) = self.physical_col_for_literal_cmp(r) {
+                            let cast_lit: Arc<dyn PhysicalExpr> =
+                                Arc::new(CastExpr::new(Arc::clone(l), pty, None));
+                            let new_expr: Arc<dyn PhysicalExpr> =
+                                Arc::new(BinaryExpr::new(cast_lit, *bin.op(), pcol));
+                            return Ok(Transformed::new(new_expr, true, TreeNodeRecursion::Jump));
+                        }
+                    }
+                }
+                return Ok(Transformed::no(e));
+            }
+
             let Some(col) = e.downcast_ref::<Column>() else {
                 return Ok(Transformed::no(e));
             };
-            let logical_name = col.name();
-            let logical_field = self
-                .logical_file_schema
-                .field_with_name(logical_name)
-                .map_err(|_| {
-                    DataFusionError::Execution(format!(
-                        "MvPhysicalExprAdapter: column '{}' is not part of the MV logical schema",
-                        logical_name
-                    ))
-                })?;
-
-            // All replacements are terminal: never descend into the new node's
-            // children (the physical column names are writer aliases that are
+            // All Column replacements are terminal: never descend into the new
+            // node's children (physical column names are writer aliases that are
             // intentionally NOT part of the logical schema).
-            let replaced = |node: Arc<dyn PhysicalExpr>| {
-                Ok(Transformed::new(node, true, TreeNodeRecursion::Jump))
-            };
-
-            match self
-                .state_fields
-                .iter()
-                .position(|name| name == logical_name)
-            {
-                Some(pos) if pos < physical_count => {
-                    let physical_field = self.physical_file_schema.field(pos);
-                    let physical_col: Arc<dyn PhysicalExpr> =
-                        Arc::new(Column::new(physical_field.name(), pos));
-                    if physical_field.data_type() == logical_field.data_type() {
-                        replaced(physical_col)
-                    } else if is_lossless_integer_widening(
-                        physical_field.data_type(),
-                        logical_field.data_type(),
-                    ) {
-                        replaced(Arc::new(CastExpr::new(
-                            physical_col,
-                            logical_field.data_type().clone(),
-                            None,
-                        )))
-                    } else {
-                        Err(DataFusionError::Execution(format!(
-                            "MvPhysicalExprAdapter: state field '{}' at physical position {} \
-                             has type {:?} but query expects {:?}; only lossless integer \
-                             widening is permitted",
-                            logical_name,
-                            pos,
-                            physical_field.data_type(),
-                            logical_field.data_type(),
-                        )))
-                    }
-                }
-                // state_fields entry beyond this file's physical columns, or a
-                // logical-only field (e.g. `_mv_source_generation`): null-fill.
-                _ => {
-                    let null = ScalarValue::try_from(logical_field.data_type())?;
-                    replaced(expressions::lit(null))
-                }
-            }
+            let node = self.rewrite_column(col.name())?;
+            Ok(Transformed::new(node, true, TreeNodeRecursion::Jump))
         })
         .data()
     }
+}
+
+/// Comparison operators whose literal operand can be losslessly cast to the
+/// column's physical representation. Restricted to (in)equality and ordering —
+/// the operators parquet pruning understands.
+fn is_comparison_op(op: &datafusion::logical_expr::Operator) -> bool {
+    use datafusion::logical_expr::Operator;
+    matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -424,7 +530,10 @@ mod tests {
         let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("event_bucket", 0));
         let rewritten = adapter().rewrite(expr).unwrap();
         let s = format!("{rewritten:?}");
-        assert!(s.contains("CastExpr"), "timestamp->int64 cast expected: {s}");
+        assert!(
+            s.contains("CastExpr"),
+            "timestamp->int64 cast expected: {s}"
+        );
     }
 
     /// Regression: a KEYWORD group key is written to the Parquet state as `Utf8`, while the
@@ -433,7 +542,11 @@ mod tests {
     /// cbspan1_mv_mv1 target failed every PPL query on exactly this shape.
     #[test]
     fn utf8_group_key_widens_to_utf8_view() {
-        let logical = Arc::new(Schema::new(vec![Field::new("URL", DataType::Utf8View, true)]));
+        let logical = Arc::new(Schema::new(vec![Field::new(
+            "URL",
+            DataType::Utf8View,
+            true,
+        )]));
         let physical = Arc::new(Schema::new(vec![Field::new("URL", DataType::Utf8, true)]));
         let a = MvPhysicalExprAdapterFactory::new(vec!["URL".into()])
             .create(logical, physical)
@@ -442,6 +555,97 @@ mod tests {
         let s = format!("{rewritten:?}");
         assert!(s.contains("CastExpr"), "utf8->utf8view cast expected: {s}");
         assert!(s.contains("Utf8View"), "cast target must be Utf8View: {s}");
+    }
+
+    /// DEFECT #29 ROOT CAUSE: on a `col <op> lit` comparison where the keyword
+    /// key differs from its physical column ONLY by the Utf8→Utf8View
+    /// representation, the adapter MUST keep the column in its native physical
+    /// Utf8 type and cast the LITERAL to Utf8 — NOT wrap the column in a
+    /// `CAST(URL AS Utf8View)`. A cast-wrapped column type-confuses parquet
+    /// row-group / page / bloom pruning (stats are physical Utf8), which pruned
+    /// the row group holding the key and returned zero rows for `URL = 'x'`,
+    /// `URL >= 'x' AND URL <= 'x'`, and `URL IN ('x')` on cbspan1_mv_mv1.
+    #[test]
+    fn view_cast_column_equality_casts_literal_not_column() {
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::{lit, BinaryExpr};
+        let logical = Arc::new(Schema::new(vec![Field::new(
+            "URL",
+            DataType::Utf8View,
+            true,
+        )]));
+        let physical = Arc::new(Schema::new(vec![Field::new("URL", DataType::Utf8, true)]));
+        let a = MvPhysicalExprAdapterFactory::new(vec!["URL".into()])
+            .create(logical, physical)
+            .unwrap();
+        for op in [Operator::Eq, Operator::Lt, Operator::GtEq, Operator::NotEq] {
+            // col <op> lit
+            let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("URL", 0)),
+                op,
+                lit("http://x"),
+            ));
+            let s = format!("{:?}", a.rewrite(expr).unwrap());
+            // Column stays native Utf8 (no Utf8View target wrapping the column).
+            assert!(
+                s.contains("Column { name: \"URL\", index: 0 }"),
+                "column must remain native physical Column for {op:?}: {s}"
+            );
+            // The literal side carries the cast to the physical Utf8 type.
+            assert!(
+                s.contains("CastExpr") && s.contains("Literal"),
+                "literal must be cast for {op:?}: {s}"
+            );
+            // No Utf8View anywhere — the whole comparison is native Utf8.
+            assert!(
+                !s.contains("Utf8View"),
+                "no Utf8View cast should remain for {op:?}: {s}"
+            );
+        }
+    }
+
+    /// The literal-side optimization must NOT apply to integer widening: a
+    /// logical Int64 literal may not fit the physical Int16 column, so the
+    /// column must still be widened (cast up) and the literal left as-is.
+    #[test]
+    fn integer_widening_still_casts_column_not_literal() {
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::{lit, BinaryExpr};
+        let logical = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let physical = Arc::new(Schema::new(vec![Field::new("k", DataType::Int16, true)]));
+        let a = MvPhysicalExprAdapterFactory::new(vec!["k".into()])
+            .create(logical, physical)
+            .unwrap();
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("k", 0)),
+            Operator::Eq,
+            lit(5_i64),
+        ));
+        let s = format!("{:?}", a.rewrite(expr).unwrap());
+        // Column is widened to Int64; literal stays Int64 (no down-cast).
+        assert!(s.contains("CastExpr"), "column widening cast expected: {s}");
+        assert!(s.contains("Int64"), "widen target Int64 expected: {s}");
+    }
+
+    /// Non-comparison expressions (e.g. IS NOT NULL, function args) keep the
+    /// default column rewrite (the view cast on the column) — the literal
+    /// optimization is scoped to comparison operators only.
+    #[test]
+    fn non_comparison_keeps_column_view_cast() {
+        use datafusion::physical_expr::expressions::IsNotNullExpr;
+        let logical = Arc::new(Schema::new(vec![Field::new(
+            "URL",
+            DataType::Utf8View,
+            true,
+        )]));
+        let physical = Arc::new(Schema::new(vec![Field::new("URL", DataType::Utf8, true)]));
+        let a = MvPhysicalExprAdapterFactory::new(vec!["URL".into()])
+            .create(logical, physical)
+            .unwrap();
+        let expr: Arc<dyn PhysicalExpr> =
+            Arc::new(IsNotNullExpr::new(Arc::new(Column::new("URL", 0))));
+        let s = format!("{:?}", a.rewrite(expr).unwrap());
+        assert!(s.contains("CastExpr") && s.contains("Utf8View"), "{s}");
     }
 
     #[test]
@@ -493,7 +697,9 @@ mod tests {
 #[cfg(test)]
 mod e2e_tests {
     use super::*;
-    use arrow::array::{Int16Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray};
+    use arrow::array::{
+        Int16Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::prelude::SessionContext;
     use parquet::arrow::ArrowWriter;
@@ -537,9 +743,12 @@ mod e2e_tests {
     ) -> String {
         let path = dir.join(name);
         let file = std::fs::File::create(&path).unwrap();
-        let mut w =
-            ArrowWriter::try_new(file, schema.clone(), Some(WriterProperties::builder().build()))
-                .unwrap();
+        let mut w = ArrowWriter::try_new(
+            file,
+            schema.clone(),
+            Some(WriterProperties::builder().build()),
+        )
+        .unwrap();
         w.write(&batch).unwrap();
         w.close().unwrap();
         path.to_str().unwrap().to_string()
@@ -630,7 +839,12 @@ mod e2e_tests {
             ],
         )
         .unwrap();
-        let p1 = write_gen(dir.path(), "_mv_partial.s0.t1.g1.bbbbbbbb.parquet", &ps16, b1);
+        let p1 = write_gen(
+            dir.path(),
+            "_mv_partial.s0.t1.g1.bbbbbbbb.parquet",
+            &ps16,
+            b1,
+        );
 
         // Sanity: both file names begin with '_' (would be hidden under listing).
         assert!(std::path::Path::new(&p0)
@@ -658,7 +872,11 @@ mod e2e_tests {
         .await;
         assert_eq!(b[0].num_rows(), 3, "buckets 100/200/300");
         assert_eq!(i64_at(&b, "event_bucket", 0), 100);
-        assert_eq!(i64_at(&b, "s", 0), 15, "bucket 100: 10 (i64) + 5 (i16 widened)");
+        assert_eq!(
+            i64_at(&b, "s", 0),
+            15,
+            "bucket 100: 10 (i64) + 5 (i16 widened)"
+        );
         assert_eq!(i64_at(&b, "c", 0), 2);
         assert_eq!(i64_at(&b, "event_bucket", 1), 200);
         assert_eq!(i64_at(&b, "s", 1), 20);
