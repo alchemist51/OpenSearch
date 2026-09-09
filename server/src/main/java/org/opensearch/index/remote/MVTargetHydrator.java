@@ -419,6 +419,20 @@ public class MVTargetHydrator implements Closeable {
             return; // nothing new
         }
 
+        // The checkpoint only carries the LATEST generation. When two refreshes published while
+        // the previous generation was being hydrated (8 files, a few seconds), the generation in
+        // between would be skipped for good: the high-water jumps over it and the local reconcile
+        // never sees files it did not download (cb100m run: gen 155 missing, 34,631 mismatches).
+        // Hydrate the skipped generations from their remote manifests, oldest first, before
+        // continuing with the checkpoint generation.
+        if (checkpoint.primaryTerm() == hw.term && entry.generation() > hw.generation + 1 && hw.generation > 0) {
+            for (long gen = hw.generation + 1; gen < entry.generation(); gen++) {
+                if (hydrateGenerationFromManifest(sourceShard, checkpoint.primaryTerm(), gen) == false) {
+                    return; // retry this gap next tick; the high-water stays put so nothing is skipped
+                }
+            }
+        }
+
         // Download files from remote store
         Path shardHydratedDir = hydratedDir.resolve(String.valueOf(sourceShard));
         Files.createDirectories(shardHydratedDir);
@@ -482,6 +496,60 @@ public class MVTargetHydrator implements Closeable {
      * signal that survives restarts. Any rejection is logged at WARN with the exception message
      * (never DEBUG), and a successful publish logs at INFO with both target and source generations.
      */
+    /**
+     * Hydrates one source generation from its remote manifest (gap fill for a generation the
+     * checkpoint skipped). Returns true when the generation is hydrated and published, false
+     * when it must be retried (manifest not visible yet, download failure).
+     */
+    private boolean hydrateGenerationFromManifest(int sourceShard, long primaryTerm, long generation) {
+        String shardKey = String.valueOf(sourceShard);
+        try {
+            String prefix = String.format(
+                java.util.Locale.ROOT,
+                "mv_manifest__%020d__%020d__",
+                Long.MAX_VALUE - primaryTerm,
+                Long.MAX_VALUE - generation
+            );
+            String manifestName = null;
+            for (String name : remoteManager.listManifests(shardKey, mvId)) {
+                if (name.startsWith(prefix)) {
+                    manifestName = name;
+                    break;
+                }
+            }
+            if (manifestName == null) {
+                logger.warn("MV hydrator: gap generation {} (term {}) has no manifest in the remote store yet; retrying", generation, primaryTerm);
+                return false;
+            }
+            MVStateManifest manifest = remoteManager.readManifest(shardKey, mvId, manifestName);
+            Path shardHydratedDir = hydratedDir.resolve(shardKey);
+            Files.createDirectories(shardHydratedDir);
+            java.util.Set<String> names = new java.util.LinkedHashSet<>();
+            for (MVStateManifest.FileEntry fe : manifest.files()) {
+                Path targetFile = shardHydratedDir.resolve(fe.name());
+                if (Files.exists(targetFile) == false || Files.size(targetFile) != fe.length()) {
+                    downloadFromRemote(shardKey, mvId, fe.name(), targetFile);
+                    if (Files.size(targetFile) != fe.length()) {
+                        logger.warn("MV hydrator: gap fill size mismatch for {} expected={} actual={}", fe.name(), fe.length(), Files.size(targetFile));
+                        Files.deleteIfExists(targetFile);
+                        return false;
+                    }
+                }
+                names.add(fe.name());
+            }
+            highWaters.put(sourceShard, new HighWater(primaryTerm, generation));
+            logger.info(
+                "MV hydrated (gap fill from manifest): target={} source=[{}][{}] gen={} term={} files={} maxSeqNo={}",
+                targetShardId, sourceIndex, sourceShard, generation, primaryTerm, names.size(), manifest.maxSeqNo()
+            );
+            publishGeneration(sourceShard, shardHydratedDir, generation, 0L, names);
+            return true;
+        } catch (Exception e) {
+            logger.warn("MV hydrator: gap fill of generation {} failed: {}", generation, e.getMessage());
+            return false;
+        }
+    }
+
     void publishGeneration(int sourceShard, Path shardHydratedDir, long sourceGeneration, long numRows, Set<String> fileNames) {
         CatalogPublisher publisher = this.catalogPublisher;
         if (publisher == null) {
