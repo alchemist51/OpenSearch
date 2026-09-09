@@ -33,16 +33,25 @@ public final class MVViewCreation {
         MVCompiledDefinition compiledDef,
         String descriptorJson
     ) {
-        return commonTargetSettings(sourceIndex, sourceShards)
+        return commonTargetSettings(sourceIndex, sourceShards, compiledDef.groupByOrdering())
             .put(MVConstants.DESCRIPTOR_SETTING, descriptorJson)
             .putList(MVConstants.STATE_FIELDS_SETTING, compiledDef.stateColumnNames())
+            .put(MVConstants.STATE_MERGE_SETTING, true)
             .build();
     }
 
     /**
      * Common target settings shared by all creation paths.
+     *
+     * <p>The definition's {@link MVGroupByOrdering} is declared as the target's
+     * standard index sort ({@code index.sort.field} = group keys, ASC, missing
+     * {@code _first} = NULLS FIRST). This is the SINGLE declaration of the
+     * state-row sort contract on the index: the read path's sorted-scan
+     * advertisement keys off it, and {@code DerivedIndexEngine} admits
+     * background merges exactly when it is present.</p>
      */
-    static Settings.Builder commonTargetSettings(String sourceIndex, int sourceShards) {
+    static Settings.Builder commonTargetSettings(String sourceIndex, int sourceShards, MVGroupByOrdering ordering) {
+        List<String> sortFields = ordering.columnNames();
         return Settings.builder()
             .put(MVConstants.DERIVED_SOURCE_NAME_SETTING, sourceIndex)
             .put("index.number_of_shards", sourceShards)
@@ -55,8 +64,11 @@ public final class MVViewCreation {
             .put("index.composite.primary_data_format", "parquet")
             .putList("index.composite.secondary_data_formats", "lucene")
             .put(MVConstants.DERIVED_DATA_FORMAT_SETTING, MVConstants.DATA_FORMAT_NAME)
-            .put(MVConstants.STATE_MERGE_SETTING, true)
-            .put(MVConstants.COLOCATE_WITH_SETTING, sourceIndex);
+            .put(MVConstants.COLOCATE_WITH_SETTING, sourceIndex)
+            // The GROUP BY ordering contract as the standard index sort.
+            .putList("index.sort.field", sortFields)
+            .putList("index.sort.order", sortFields.stream().map(f -> "asc").toList())
+            .putList("index.sort.missing", sortFields.stream().map(f -> "_first").toList());
     }
 
     /**

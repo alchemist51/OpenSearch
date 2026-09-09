@@ -307,6 +307,77 @@ public class MVDefinitionLayerTests extends OpenSearchTestCase {
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
+    // ── (e) MVViewCreation target contract stamping ─────────────────────
+
+    public void testBuildTargetSettingsStampsIndexSort() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(
+                GroupKey.of("service", GroupKey.ColumnType.KEYWORD),
+                GroupKey.of("region", GroupKey.ColumnType.KEYWORD)
+            ),
+            List.of(AggregateSpec.count("cnt"), AggregateSpec.sum("latency", "lat_sum"))
+        );
+        String descriptorJson = serializeDescriptor(MVDefinitionDescriptor.fromCompiled(def));
+        Settings settings = MVViewCreation.buildTargetSettings("source_idx", 2, def, descriptorJson);
+
+        // index.sort.field must carry the ordered group keys
+        List<String> sortFields = settings.getAsList("index.sort.field");
+        assertEquals(List.of("service", "region"), sortFields);
+
+        // index.sort.order must be ASC for every key
+        List<String> sortOrders = settings.getAsList("index.sort.order");
+        assertEquals(List.of("asc", "asc"), sortOrders);
+
+        // index.sort.missing must be _first for every key
+        List<String> sortMissing = settings.getAsList("index.sort.missing");
+        assertEquals(List.of("_first", "_first"), sortMissing);
+    }
+
+    public void testBuildTargetSettingsStampsStateFields() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(GroupKey.of("region", GroupKey.ColumnType.KEYWORD)),
+            List.of(AggregateSpec.count("cnt"), AggregateSpec.sum("val", "val_sum"))
+        );
+        String descriptorJson = serializeDescriptor(MVDefinitionDescriptor.fromCompiled(def));
+        Settings settings = MVViewCreation.buildTargetSettings("src", 1, def, descriptorJson);
+
+        List<String> stateFields = settings.getAsList(MVConstants.STATE_FIELDS_SETTING);
+        assertFalse("state_fields must not be empty", stateFields.isEmpty());
+        // Group keys come first, then aggregates
+        assertEquals("region", stateFields.get(0));
+        assertTrue("state_fields must contain cnt", stateFields.contains("cnt"));
+        assertTrue("state_fields must contain val_sum", stateFields.contains("val_sum"));
+    }
+
+    public void testBuildTargetSettingsStampsDerivedDataFormat() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(GroupKey.of("k", GroupKey.ColumnType.KEYWORD)),
+            List.of(AggregateSpec.count("c"))
+        );
+        String descriptorJson = serializeDescriptor(MVDefinitionDescriptor.fromCompiled(def));
+        Settings settings = MVViewCreation.buildTargetSettings("src", 1, def, descriptorJson);
+
+        assertEquals(MVConstants.DATA_FORMAT_NAME, settings.get(MVConstants.DERIVED_DATA_FORMAT_SETTING));
+        assertEquals("true", settings.get(MVConstants.DERIVED_INDEX_SETTING));
+        assertEquals("true", settings.get(MVConstants.STATE_MERGE_SETTING));
+    }
+
+    public void testBuildTargetSettingsSingleKeySortMatchesOrdering() {
+        MVCompiledDefinition def = MVCompiledDefinition.of(
+            List.of(GroupKey.ofSpan("bucket", 300000L, "EventTime")),
+            List.of(AggregateSpec.count("cnt"))
+        );
+        String descriptorJson = serializeDescriptor(MVDefinitionDescriptor.fromCompiled(def));
+        Settings settings = MVViewCreation.buildTargetSettings("src", 1, def, descriptorJson);
+
+        // Sort field must match the ordering's column name, not the SQL expression
+        List<String> sortFields = settings.getAsList("index.sort.field");
+        assertEquals(1, sortFields.size());
+        assertEquals("bucket", sortFields.get(0));
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
     @SuppressWarnings("unchecked")
     private void assertFieldType(Map<String, Object> props, String field, String expectedType) {
         Object fieldObj = props.get(field);
