@@ -189,6 +189,10 @@ public class DataFormatAwareEngine implements Indexer {
     private final AtomicBoolean translogBackpressureFlushRequested = new AtomicBoolean(false);
     private static final long TRANSLOG_BACKPRESSURE_CHECK_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
     private static final long TRANSLOG_BACKPRESSURE_MAX_WAIT_NANOS = TimeUnit.SECONDS.toNanos(60);
+    /** Opt-in for now (-Dopensearch.translog.backpressure.enabled=true); the remote upload streams generations from disk instead. */
+    private static final boolean TRANSLOG_BACKPRESSURE_ENABLED = Boolean.parseBoolean(
+        System.getProperty("opensearch.translog.backpressure.enabled", "false")
+    );
 
     @Nullable
     private final DocumentLookupProvider documentLookupProvider;
@@ -720,7 +724,7 @@ public class DataFormatAwareEngine implements Indexer {
             || index.origin() == Engine.Operation.Origin.LOCAL_RESET)
             : "DataFormatAwareEngine only supports PRIMARY, LOCAL_TRANSLOG_RECOVERY, or LOCAL_RESET origins but got: " + index.origin();
         final boolean doThrottle = index.origin().isRecovery() == false;
-        if (doThrottle) {
+        if (doThrottle && TRANSLOG_BACKPRESSURE_ENABLED) {
             applyTranslogBackpressure();
         }
         int rows = 0;
