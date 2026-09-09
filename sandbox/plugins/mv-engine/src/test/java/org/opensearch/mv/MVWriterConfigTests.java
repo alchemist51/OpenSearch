@@ -11,6 +11,7 @@ package org.opensearch.mv;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.engine.dataformat.MVWriterConfigRegistry;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -61,6 +62,17 @@ public class MVWriterConfigTests extends OpenSearchTestCase {
         // Group keys: region (keyword/utf8) and event_bucket (timestamp_ms)
         assertEquals(List.of("region", "event_bucket"), spec.groupColNames());
         assertEquals(List.of("utf8", "timestamp_ms"), spec.groupColTypes());
+
+        // Span key derivation metadata: plain keys point at themselves with span 0,
+        // the span key points at its date source with the bucket width in ms.
+        assertEquals(List.of("region", "EventTime"), spec.groupColSources());
+        assertEquals(List.of(0L, 300000L), spec.groupSpanMs());
+
+        // ...and it survives the bridge into the server registry record.
+        List<MVWriterConfigRegistry.MVPartialWriterSpec> registrySpecs = MVWriterConfig.fromCustomDataToRegistrySpecs(customData);
+        assertEquals(1, registrySpecs.size());
+        assertEquals(List.of("region", "EventTime"), registrySpecs.get(0).groupColSources());
+        assertEquals(List.of(0L, 300000L), registrySpecs.get(0).groupSpanMs());
 
         // Sort keys = all group keys
         assertEquals(List.of("region", "event_bucket"), spec.sortKeyNames());

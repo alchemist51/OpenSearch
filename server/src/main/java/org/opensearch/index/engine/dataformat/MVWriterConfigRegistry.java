@@ -73,6 +73,13 @@ public final class MVWriterConfigRegistry {
     /**
      * FFI-ready spec for one MV, consumed by the parquet writer's native bridge.
      * Pure data record with no dependencies on mv-engine internals.
+     *
+     * <p>{@code groupColSources} and {@code groupSpanMs} are parallel to
+     * {@code groupColNames}. For a plain column key the source is the column
+     * itself and the span is {@code 0}. For a span (time-bucket) key the source
+     * is the date-typed source field the bucket is derived from and the span is
+     * the bucket width in milliseconds; the native builder computes
+     * {@code floor(ts / span) * span} per row and groups on the result.</p>
      */
     public record MVPartialWriterSpec(
         String mvId,
@@ -80,6 +87,8 @@ public final class MVWriterConfigRegistry {
         long defVersion,
         List<String> groupColNames,
         List<String> groupColTypes,
+        List<String> groupColSources,
+        List<Long> groupSpanMs,
         List<AggFFI> aggSpecs,
         List<String> sortKeyNames
     ) {

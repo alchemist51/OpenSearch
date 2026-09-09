@@ -323,6 +323,8 @@ public class ParquetIndexingEngine implements IndexingExecutionEngine<ParquetDat
             sb.append(",\"def_version\":").append(s.defVersion());
             sb.append(",\"group_col_names\":").append(toJsonArray(s.groupColNames()));
             sb.append(",\"group_col_types\":").append(toJsonArray(s.groupColTypes()));
+            sb.append(",\"group_col_sources\":").append(toJsonArray(s.groupColSources()));
+            sb.append(",\"group_span_ms\":").append(toJsonNumberArray(s.groupSpanMs()));
             sb.append(",\"agg_specs\":[");
             for (int j = 0; j < s.aggSpecs().size(); j++) {
                 var a = s.aggSpecs().get(j);
@@ -347,6 +349,16 @@ public class ParquetIndexingEngine implements IndexingExecutionEngine<ParquetDat
         for (int i = 0; i < items.size(); i++) {
             if (i > 0) sb.append(",");
             sb.append("\"").append(items.get(i)).append("\"");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private static String toJsonNumberArray(List<Long> items) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < items.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append(items.get(i));
         }
         sb.append("]");
         return sb.toString();

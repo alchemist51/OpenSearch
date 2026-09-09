@@ -62,22 +62,100 @@ pub struct AggSpec {
 
 // ── MV spec ──────────────────────────────────────────────────────────────
 
+/// A time-bucket (span) group key: the key column is derived per batch as
+/// `floor(source_ts_ms / interval_ms) * interval_ms`, which is exactly
+/// DataFusion's `date_bin(INTERVAL, source)` with the default epoch origin for
+/// non-negative timestamps — so the build-side bucket boundaries match the
+/// query-side fold expression bit-for-bit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpanKeySpec {
+    /// Date-typed source field in the input RecordBatch (Timestamp or epoch-ms Int64).
+    pub source_field: String,
+    /// Bucket width in milliseconds (> 0).
+    pub interval_ms: i64,
+}
+
 /// Compiled specification for one MV, passed from Java via writer config FFI.
 #[derive(Debug, Clone)]
 pub struct MVPartialSpec {
     pub mv_id: String,
     pub definition_hash: String,
     pub def_version: i64,
-    /// Group-key column indices in the input RecordBatch.
+    /// Group-key column indices in the (span-derived) input RecordBatch.
     pub group_col_indices: Vec<usize>,
     /// Group-key output names.
     pub group_col_names: Vec<String>,
     /// Group-key output types (arrow DataType).
     pub group_col_types: Vec<DataType>,
+    /// Per-key span derivation, parallel to `group_col_names`; `None` for a
+    /// plain column key that is looked up by name in the input schema.
+    pub group_spans: Vec<Option<SpanKeySpec>>,
     /// Aggregate specifications.
     pub agg_specs: Vec<AggSpec>,
     /// Sort-key column names (subset of group_col_names, in order).
     pub sort_key_names: Vec<String>,
+}
+
+impl MVPartialSpec {
+    /// True when at least one group key must be derived (span key).
+    pub fn has_span_keys(&self) -> bool {
+        self.group_spans.iter().any(Option::is_some)
+    }
+}
+
+/// Append one derived `Timestamp(ms)` column per span key to `batch`, named
+/// after the key, so that name-based column resolution finds it. Source
+/// columns are left untouched.
+pub fn derive_span_columns(batch: &RecordBatch, spec: &MVPartialSpec) -> Result<RecordBatch, String> {
+    let schema = batch.schema();
+    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    for (gi, span) in spec.group_spans.iter().enumerate() {
+        let Some(span) = span else { continue };
+        let name = &spec.group_col_names[gi];
+        let src_idx = schema.index_of(&span.source_field).map_err(|e| {
+            format!(
+                "MV {} span key '{}' source field '{}' missing from input schema: {}",
+                spec.mv_id, name, span.source_field, e
+            )
+        })?;
+        let bucketed = bucket_timestamps_ms(batch.column(src_idx).as_ref(), span.interval_ms)
+            .map_err(|e| format!("MV {} span key '{}': {}", spec.mv_id, name, e))?;
+        fields.push(Arc::new(Field::new(name, DataType::Timestamp(TimeUnit::Millisecond, None), true)));
+        columns.push(bucketed);
+    }
+    let derived_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    RecordBatch::try_new(derived_schema, columns).map_err(|e| format!("MV {} span derivation failed: {}", spec.mv_id, e))
+}
+
+/// `floor(ts_ms / interval_ms) * interval_ms` as `Timestamp(Millisecond, None)`,
+/// nulls preserved. Accepts any Timestamp unit, `Date64`, or epoch-ms `Int64`.
+/// Equals `date_bin(INTERVAL interval_ms, ts)` (default 1970-01-01 origin) for
+/// non-negative timestamps, and `div_euclid` keeps pre-epoch values floor-aligned.
+pub fn bucket_timestamps_ms(col: &dyn Array, interval_ms: i64) -> Result<ArrayRef, String> {
+    if interval_ms <= 0 {
+        return Err(format!("span interval must be positive, got {}", interval_ms));
+    }
+    let bucket = move |ms: i64| ms.div_euclid(interval_ms) * interval_ms;
+    let out: PrimitiveArray<TimestampMillisecondType> = match col.data_type() {
+        DataType::Timestamp(TimeUnit::Millisecond, _) => col.as_primitive::<TimestampMillisecondType>().unary(bucket),
+        DataType::Timestamp(TimeUnit::Second, _) => col.as_primitive::<TimestampSecondType>().unary(|v| bucket(v * 1000)),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            col.as_primitive::<TimestampMicrosecondType>().unary(|v| bucket(v.div_euclid(1_000)))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            col.as_primitive::<TimestampNanosecondType>().unary(|v| bucket(v.div_euclid(1_000_000)))
+        }
+        DataType::Date64 => col.as_primitive::<Date64Type>().unary(bucket),
+        DataType::Int64 => col.as_primitive::<Int64Type>().unary(bucket),
+        other => {
+            return Err(format!(
+                "unsupported span source type {:?} (expected Timestamp, Date64 or epoch-ms Int64)",
+                other
+            ))
+        }
+    };
+    Ok(Arc::new(out))
 }
 
 // ── Per-group accumulator ────────────────────────────────────────────────
@@ -579,7 +657,17 @@ impl StringCapableMVBuilder {
     fn resolve_input_columns(&mut self, batch: &RecordBatch) -> Result<(), String> {
         let schema = batch.schema();
 
-        if self.spec.group_col_indices.len() != self.spec.group_col_names.len() {
+        // Cached indices are only trusted while the names at those positions still
+        // match: a mapping update can append or reorder source fields between
+        // batches, and span-derived columns always sit after the source fields.
+        let group_cache_valid = self.spec.group_col_indices.len() == self.spec.group_col_names.len()
+            && self
+                .spec
+                .group_col_indices
+                .iter()
+                .zip(self.spec.group_col_names.iter())
+                .all(|(&idx, name)| idx < schema.fields().len() && schema.field(idx).name() == name);
+        if !group_cache_valid {
             self.spec.group_col_indices = self
                 .spec
                 .group_col_names
@@ -602,11 +690,16 @@ impl StringCapableMVBuilder {
             ));
         }
 
+        let mv_id = self.spec.mv_id.clone();
         for agg in &mut self.spec.agg_specs {
-            if agg.source_col_idx.is_none() {
-                if let Some(field) = agg.source_field.as_deref() {
+            if let Some(field) = agg.source_field.as_deref() {
+                let cache_valid = agg
+                    .source_col_idx
+                    .map(|idx| idx < schema.fields().len() && schema.field(idx).name() == field)
+                    .unwrap_or(false);
+                if !cache_valid {
                     agg.source_col_idx = Some(schema.index_of(field).map_err(|e| {
-                        format!("MV {} aggregate source field '{}' missing from input schema: {}", self.spec.mv_id, field, e)
+                        format!("MV {} aggregate source field '{}' missing from input schema: {}", mv_id, field, e)
                     })?);
                 }
             }
@@ -618,6 +711,25 @@ impl StringCapableMVBuilder {
         if self.failed {
             return;
         }
+        // Span keys do not exist in the source batch: derive them first (appended
+        // as trailing columns) so the rest of the builder sees plain key columns.
+        let derived: RecordBatch;
+        let batch: &RecordBatch = if self.spec.has_span_keys() {
+            match derive_span_columns(batch, &self.spec) {
+                Ok(b) => {
+                    derived = b;
+                    &derived
+                }
+                Err(e) => {
+                    log_error!("{}", e);
+                    self.failed = true;
+                    self.fail_reason = Some(e);
+                    return;
+                }
+            }
+        } else {
+            batch
+        };
         if let Err(e) = self.resolve_input_columns(batch) {
             log_error!("{}", e);
             self.failed = true;
@@ -1179,6 +1291,7 @@ mod tests {
             group_col_indices: vec![0], // "region" column
             group_col_names: vec!["region".to_string()],
             group_col_types: vec![DataType::Utf8],
+            group_spans: vec![None],
             agg_specs: vec![
                 AggSpec {
                     function: AggFunction::Count,
@@ -1446,6 +1559,7 @@ mod tests {
             group_col_indices: vec![0],
             group_col_names: vec!["region".to_string()],
             group_col_types: vec![DataType::Utf8],
+            group_spans: vec![None],
             agg_specs: vec![AggSpec {
                 function: AggFunction::Count,
                 source_field: None,
@@ -1461,6 +1575,7 @@ mod tests {
             group_col_indices: vec![0],
             group_col_names: vec!["region".to_string()],
             group_col_types: vec![DataType::Utf8],
+            group_spans: vec![None],
             agg_specs: vec![
                 AggSpec {
                     function: AggFunction::Sum,
@@ -1500,6 +1615,7 @@ mod tests {
             group_col_indices: vec![0],
             group_col_names: vec!["event_bucket".to_string()],
             group_col_types: vec![DataType::Timestamp(TimeUnit::Millisecond, None)],
+            group_spans: vec![None],
             agg_specs: vec![
                 AggSpec {
                     function: AggFunction::Count,
@@ -1509,7 +1625,9 @@ mod tests {
                 },
                 AggSpec {
                     function: AggFunction::Sum,
-                    source_field: Some("amount".to_string()),
+                    // Pre-resolved index must agree with the batch schema ("value" is column 1);
+                    // resolution re-validates cached indices by name on every batch.
+                    source_field: Some("value".to_string()),
                     source_col_idx: Some(1),
                     output_names: vec!["total".to_string()],
                 },
@@ -1560,6 +1678,175 @@ mod tests {
         assert_eq!(total.value(0), 90); // 1000: 10+30+50
         assert_eq!(total.value(1), 60); // 2000: 20+40
     }
+
+    /// cb100m-shaped definition: span(EventTime, 5m) + URL + CounterID. The
+    /// bucket column is NOT in the source batch — it must be derived, and the
+    /// boundaries must equal date_bin(INTERVAL '5 minutes', EventTime).
+    #[test]
+    fn span_key_derives_five_minute_buckets_from_event_time() {
+        const FIVE_MIN: i64 = 300_000;
+        let spec = MVPartialSpec {
+            mv_id: "cb_span".to_string(),
+            definition_hash: "hash".to_string(),
+            def_version: 1,
+            group_col_indices: Vec::new(),
+            group_col_names: vec!["event_bucket".to_string(), "URL".to_string(), "CounterID".to_string()],
+            group_col_types: vec![
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Utf8,
+                DataType::Int32,
+            ],
+            group_spans: vec![
+                Some(SpanKeySpec { source_field: "EventTime".to_string(), interval_ms: FIVE_MIN }),
+                None,
+                None,
+            ],
+            agg_specs: vec![
+                AggSpec {
+                    function: AggFunction::CountField,
+                    source_field: Some("AdvEngineID".to_string()),
+                    source_col_idx: None,
+                    output_names: vec!["cnt_adv".to_string()],
+                },
+                AggSpec {
+                    function: AggFunction::Sum,
+                    source_field: Some("AdvEngineID".to_string()),
+                    source_col_idx: None,
+                    output_names: vec!["sum_adv".to_string()],
+                },
+                AggSpec {
+                    function: AggFunction::Max,
+                    source_field: Some("AdvEngineID".to_string()),
+                    source_col_idx: None,
+                    output_names: vec!["max_adv".to_string()],
+                },
+            ],
+            sort_key_names: vec!["event_bucket".to_string(), "URL".to_string(), "CounterID".to_string()],
+        };
+
+        // 2013-07-15T10:04:14Z, 10:05:00Z, 10:09:59Z, 10:04:59Z (same bucket as row 0), null
+        let t0 = 1_373_882_654_000i64;
+        let event_time = TimestampMillisecondArray::from(vec![
+            Some(t0),
+            Some(1_373_882_700_000),
+            Some(1_373_882_999_000),
+            Some(1_373_882_699_000),
+            None,
+        ]);
+        let url = StringArray::from(vec!["u1", "u1", "u1", "u1", "u1"]);
+        let counter = Int32Array::from(vec![62, 62, 62, 62, 62]);
+        let adv = Int32Array::from(vec![Some(1), Some(2), Some(3), None, Some(5)]);
+        // Source column order deliberately differs from key order.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("CounterID", DataType::Int32, true),
+            Field::new("AdvEngineID", DataType::Int32, true),
+            Field::new("EventTime", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+            Field::new("URL", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(counter), Arc::new(adv), Arc::new(event_time), Arc::new(url)],
+        )
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = MVPartialBuilder::new(vec![spec], 0, 1, tmp.path().to_path_buf());
+        builder.accumulate(&batch);
+        // Second batch exercises the cached-index path on a span-derived schema.
+        builder.accumulate(&batch);
+
+        let results = builder.seal();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].failed, "seal failed: {:?}", results[0].fail_reason);
+        // Groups: [10:00 bucket], [10:05 bucket], [null bucket]
+        assert_eq!(results[0].row_count, 3);
+
+        let file = File::open(&results[0].file_path).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        let rb = &batches[0];
+        assert_eq!(rb.schema().field(0).name(), "event_bucket");
+        assert_eq!(rb.schema().field(0).data_type(), &DataType::Timestamp(TimeUnit::Millisecond, None));
+
+        let bucket = rb.column(0).as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
+        let cnt = rb.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sum = rb.column(4).as_any().downcast_ref::<Int64Array>().unwrap();
+        let max = rb.column(5).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut seen = std::collections::HashMap::new();
+        for i in 0..rb.num_rows() {
+            let key = if bucket.is_null(i) { None } else { Some(bucket.value(i)) };
+            seen.insert(key, (cnt.value(i), sum.value(i), max.value(i)));
+        }
+        // 10:00:00 bucket: rows 0 and 3 (x2 batches) -> AdvEngineID 1 and null
+        assert_eq!(seen[&Some(t0 / FIVE_MIN * FIVE_MIN)], (2, 2, 1));
+        assert_eq!(t0 / FIVE_MIN * FIVE_MIN, 1_373_882_400_000);
+        // 10:05:00 bucket: rows 1 and 2 (x2 batches) -> AdvEngineID 2, 3
+        assert_eq!(seen[&Some(1_373_882_700_000)], (4, 10, 3));
+        // null EventTime -> null bucket, still aggregated
+        assert_eq!(seen[&None], (2, 10, 5));
+    }
+
+    #[test]
+    fn bucket_timestamps_ms_matches_date_bin_semantics() {
+        let ts = TimestampMillisecondArray::from(vec![Some(0), Some(299_999), Some(300_000), Some(-1), None]);
+        let out = bucket_timestamps_ms(&ts, 300_000).unwrap();
+        let out = out.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
+        assert_eq!(out.value(0), 0);
+        assert_eq!(out.value(1), 0);
+        assert_eq!(out.value(2), 300_000);
+        assert_eq!(out.value(3), -300_000); // floor, not truncation toward zero
+        assert!(out.is_null(4));
+
+        let secs = TimestampSecondArray::from(vec![Some(1_373_882_654)]);
+        let out = bucket_timestamps_ms(&secs, 300_000).unwrap();
+        assert_eq!(
+            out.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap().value(0),
+            1_373_882_400_000
+        );
+        let epoch_ms = Int64Array::from(vec![Some(1_373_882_654_000)]);
+        let out = bucket_timestamps_ms(&epoch_ms, 300_000).unwrap();
+        assert_eq!(
+            out.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap().value(0),
+            1_373_882_400_000
+        );
+        assert!(bucket_timestamps_ms(&StringArray::from(vec!["x"]), 300_000).is_err());
+        assert!(bucket_timestamps_ms(&ts, 0).is_err());
+    }
+
+    #[test]
+    fn parse_specs_json_reads_span_metadata_and_defaults() {
+        let with_span = r#"[{"mv_id":"m","definition_hash":"h","def_version":1,
+            "group_col_names":["event_bucket","URL"],"group_col_types":["timestamp_ms","utf8"],
+            "group_col_sources":["EventTime","URL"],"group_span_ms":[300000,0],
+            "agg_specs":[{"function":"count","output_names":["cnt"]}],
+            "sort_key_names":["event_bucket","URL"]}]"#;
+        let specs = parse_specs_from_json(with_span).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert!(specs[0].has_span_keys());
+        assert_eq!(
+            specs[0].group_spans[0],
+            Some(SpanKeySpec { source_field: "EventTime".to_string(), interval_ms: 300_000 })
+        );
+        assert_eq!(specs[0].group_spans[1], None);
+
+        // Older Java without the new arrays: every key is a plain column.
+        let legacy = r#"[{"mv_id":"m","definition_hash":"h","def_version":1,
+            "group_col_names":["CounterID"],"group_col_types":["int32"],
+            "agg_specs":[{"function":"count","output_names":["cnt"]}],
+            "sort_key_names":["CounterID"]}]"#;
+        let specs = parse_specs_from_json(legacy).unwrap();
+        assert!(!specs[0].has_span_keys());
+        assert_eq!(specs[0].group_spans, vec![None]);
+
+        // A span key must be timestamp_ms and must carry a source field.
+        let bad_type = with_span.replace("\"timestamp_ms\",\"utf8\"", "\"int64\",\"utf8\"");
+        assert!(parse_specs_from_json(&bad_type).is_err());
+        let no_source = with_span.replace("\"group_col_sources\":[\"EventTime\",\"URL\"],", "");
+        assert!(parse_specs_from_json(&no_source).is_err());
+    }
 }
 
 // ── JSON spec parsing (c3: FFI wire-up) ───────────────────────────────────
@@ -1606,6 +1893,27 @@ pub fn parse_specs_from_json(json: &str) -> Result<Vec<MVPartialSpec>, String> {
             });
         }
 
+        let mut group_spans = Vec::with_capacity(js.group_col_names.len());
+        for (i, name) in js.group_col_names.iter().enumerate() {
+            let span_ms = js.group_span_ms.get(i).copied().unwrap_or(0);
+            if span_ms > 0 {
+                let source = js
+                    .group_col_sources
+                    .get(i)
+                    .filter(|src| !src.is_empty())
+                    .ok_or_else(|| format!("MV {} span key '{}' has no source field", js.mv_id, name))?;
+                if group_col_types[i] != DataType::Timestamp(TimeUnit::Millisecond, None) {
+                    return Err(format!(
+                        "MV {} span key '{}' must be timestamp_ms, got {:?}",
+                        js.mv_id, name, group_col_types[i]
+                    ));
+                }
+                group_spans.push(Some(SpanKeySpec { source_field: source.clone(), interval_ms: span_ms }));
+            } else {
+                group_spans.push(None);
+            }
+        }
+
         specs.push(MVPartialSpec {
             mv_id: js.mv_id,
             definition_hash: js.definition_hash,
@@ -1613,6 +1921,7 @@ pub fn parse_specs_from_json(json: &str) -> Result<Vec<MVPartialSpec>, String> {
             group_col_indices: Vec::new(), // Resolved later from schema
             group_col_names: js.group_col_names,
             group_col_types,
+            group_spans,
             agg_specs,
             sort_key_names: js.sort_key_names,
         });
@@ -1638,6 +1947,12 @@ struct JsonMVSpec {
     def_version: i64,
     group_col_names: Vec<String>,
     group_col_types: Vec<String>,
+    /// Parallel to `group_col_names`; absent (older Java) means every key is a plain column.
+    #[serde(default)]
+    group_col_sources: Vec<String>,
+    /// Parallel to `group_col_names`; `0`/absent means plain column, `>0` is a span width in ms.
+    #[serde(default)]
+    group_span_ms: Vec<i64>,
     agg_specs: Vec<JsonAggSpec>,
     sort_key_names: Vec<String>,
 }

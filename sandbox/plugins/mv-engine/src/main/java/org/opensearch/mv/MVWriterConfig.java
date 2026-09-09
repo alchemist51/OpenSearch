@@ -39,6 +39,10 @@ public final class MVWriterConfig {
 
     /**
      * A single MV's spec ready for FFI serialization to Rust.
+     *
+     * <p>{@code groupColSources} / {@code groupSpanMs} are parallel to
+     * {@code groupColNames}: plain keys carry their own name and span {@code 0};
+     * span keys carry the date-typed source field and the bucket width in ms.</p>
      */
     public record MVPartialWriterSpec(
         String mvId,
@@ -46,6 +50,8 @@ public final class MVWriterConfig {
         long defVersion,
         List<String> groupColNames,
         List<String> groupColTypes,
+        List<String> groupColSources,
+        List<Long> groupSpanMs,
         List<AggFFI> aggSpecs,
         List<String> sortKeyNames
     ) {
@@ -100,11 +106,23 @@ public final class MVWriterConfig {
     static MVPartialWriterSpec compileToFFISpec(String mvId, MVCompiledDefinition compiled) {
         List<String> groupColNames = new ArrayList<>();
         List<String> groupColTypes = new ArrayList<>();
+        List<String> groupColSources = new ArrayList<>();
+        List<Long> groupSpanMs = new ArrayList<>();
         List<String> sortKeyNames = new ArrayList<>();
 
         for (GroupKey key : compiled.groupKeys()) {
             groupColNames.add(key.name());
             groupColTypes.add(arrowTypeString(key.columnType()));
+            if (key.isSpanKey()) {
+                // date_bin(INTERVAL, source): the bucket column does not exist in the
+                // source batch, so the native builder derives it from the date-typed
+                // source field instead of looking the key name up in the schema.
+                groupColSources.add(key.osFieldPath());
+                groupSpanMs.add(key.spanIntervalMs());
+            } else {
+                groupColSources.add(key.name());
+                groupSpanMs.add(0L);
+            }
             sortKeyNames.add(key.name());
         }
 
@@ -128,6 +146,8 @@ public final class MVWriterConfig {
             1L,
             groupColNames,
             groupColTypes,
+            groupColSources,
+            groupSpanMs,
             aggSpecs,
             sortKeyNames
         );
@@ -157,7 +177,7 @@ public final class MVWriterConfig {
             }
             registrySpecs.add(new MVWriterConfigRegistry.MVPartialWriterSpec(
                 s.mvId(), s.definitionHash(), s.defVersion(),
-                s.groupColNames(), s.groupColTypes(), aggFFIs, s.sortKeyNames()
+                s.groupColNames(), s.groupColTypes(), s.groupColSources(), s.groupSpanMs(), aggFFIs, s.sortKeyNames()
             ));
         }
         return registrySpecs;
