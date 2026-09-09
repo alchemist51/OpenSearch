@@ -196,20 +196,30 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
     }
 
     /**
-     * Resolves the absolute paths of the catalog-published MV state files. The
-     * hydrator publishes them under the {@code mv_state} artifact format
-     * ({@code MVTargetHydrator.MV_STATE_FORMAT_NAME}), so they are visible via
-     * {@code CatalogSnapshot.getSearchableFiles("mv_state")}.
+     * Resolves the absolute paths of the catalog-published MV state files.
+     * The push-based hydrator publishes them under the {@code mv_state} artifact
+     * format; the pull-based builder ({@code MVDerivedArtifactBuilder}) publishes
+     * them as stock {@code parquet} generations of the derived target
+     * ({@code MVConstants.STATE_ARTIFACT_FORMAT}). A derived MV target holds no
+     * raw rows, so every parquet generation in its catalog is MV state; both
+     * formats are therefore admitted, {@code mv_state} first.
      */
+    static final String PULL_STATE_ARTIFACT_FORMAT = "parquet";
+
     static java.util.List<String> resolveMVStateFiles(ShardScanExecutionContext context) {
         org.opensearch.index.engine.exec.coord.CatalogSnapshot snapshot = context.getReader().catalogSnapshot();
         java.util.Collection<org.opensearch.index.engine.exec.WriterFileSet> stateSets = snapshot.getSearchableFiles(
             MV_STATE_ARTIFACT_NAME
         );
         if (stateSets == null || stateSets.isEmpty()) {
+            stateSets = snapshot.getSearchableFiles(PULL_STATE_ARTIFACT_FORMAT);
+        }
+        if (stateSets == null || stateSets.isEmpty()) {
             throw new IllegalStateException(
                 "derived materialized-view target has no ["
                     + MV_STATE_ARTIFACT_NAME
+                    + "] or ["
+                    + PULL_STATE_ARTIFACT_FORMAT
                     + "] state files in the catalog snapshot (index="
                     + context.getIndexSettings().getIndex().getName()
                     + ")"

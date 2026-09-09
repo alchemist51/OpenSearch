@@ -104,12 +104,44 @@ public class ShardScanInstructionHandlerTests extends OpenSearchTestCase {
     public void testResolveMVStateFilesThrowsWhenNoStateFiles() {
         CatalogSnapshot snapshot = mock(CatalogSnapshot.class);
         when(snapshot.getSearchableFiles("mv_state")).thenReturn(List.of());
+        when(snapshot.getSearchableFiles("parquet")).thenReturn(List.of());
         ShardScanExecutionContext ctx = contextWithSnapshot(snapshot);
         IllegalStateException e = expectThrows(
             IllegalStateException.class,
             () -> ShardScanInstructionHandler.resolveMVStateFiles(ctx)
         );
         assertTrue(e.getMessage().contains("mv_state"));
+        assertTrue(e.getMessage().contains("parquet"));
+    }
+
+    public void testResolveMVStateFilesFallsBackToPullParquetGenerations() {
+        // Pull-based MV: the builder publishes state as stock parquet generations of
+        // the derived target (MVConstants.STATE_ARTIFACT_FORMAT = "parquet"); no
+        // mv_state sets exist. The derived target holds no raw rows, so its parquet
+        // generations are the state files.
+        WriterFileSet gen1 = new WriterFileSet("/data/idx/0/parquet", 1L, Set.of("_parquet_file_generation_mv_1.parquet"), 1L, 0L);
+        WriterFileSet gen2 = new WriterFileSet("/data/idx/0/parquet", 2L, Set.of("_parquet_file_generation_mv_2.parquet"), 1L, 0L);
+        CatalogSnapshot snapshot = mock(CatalogSnapshot.class);
+        when(snapshot.getSearchableFiles("mv_state")).thenReturn(List.of());
+        when(snapshot.getSearchableFiles("parquet")).thenReturn(List.of(gen2, gen1));
+        ShardScanExecutionContext ctx = contextWithSnapshot(snapshot);
+
+        List<String> files = ShardScanInstructionHandler.resolveMVStateFiles(ctx);
+        assertEquals(
+            List.of("/data/idx/0/parquet/_parquet_file_generation_mv_1.parquet", "/data/idx/0/parquet/_parquet_file_generation_mv_2.parquet"),
+            files
+        );
+    }
+
+    public void testResolveMVStateFilesPrefersMvStateOverParquet() {
+        WriterFileSet hydrated = new WriterFileSet("/data/idx/0/mv_state", 0L, Set.of("_mv_partial.s0.t1.g0.aaa.parquet"), 1L, 0L);
+        WriterFileSet parquet = new WriterFileSet("/data/idx/0/parquet", 1L, Set.of("_parquet_file_generation_1.parquet"), 1L, 0L);
+        CatalogSnapshot snapshot = mock(CatalogSnapshot.class);
+        when(snapshot.getSearchableFiles("mv_state")).thenReturn(List.of(hydrated));
+        when(snapshot.getSearchableFiles("parquet")).thenReturn(List.of(parquet));
+        ShardScanExecutionContext ctx = contextWithSnapshot(snapshot);
+
+        assertEquals(List.of("/data/idx/0/mv_state/_mv_partial.s0.t1.g0.aaa.parquet"), ShardScanInstructionHandler.resolveMVStateFiles(ctx));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
