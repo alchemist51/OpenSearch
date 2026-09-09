@@ -16,6 +16,7 @@ import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.Booleans;
+import org.opensearch.common.CheckedSupplier;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.SetOnce;
 import org.opensearch.common.annotation.ExperimentalApi;
@@ -203,6 +204,27 @@ public class DataFormatAwareEngine implements Indexer {
     private final Lock flushLock = new ReentrantLock();
     private final ReentrantLock refreshLock = new ReentrantLock();
     private final ReentrantLock failEngineLock = new ReentrantLock();
+
+    /**
+     * Runs {@code action} with refreshes excluded, in the SAME lock order as
+     * {@link #refresh(String)} and flush (readLock, then refreshLock — both
+     * reentrant), so per-operation indexing inside the action may re-acquire
+     * the read lock safely. Used by derived-state batch replication: a whole
+     * batch applies as one unit relative to refresh, so a published or
+     * committed generation can never contain part of a batch.
+     */
+    protected final <T> T runUnderRefreshExclusion(CheckedSupplier<T, IOException> action) throws IOException {
+        try (ReleasableLock ignored = readLock.acquire()) {
+            ensureOpen();
+            refreshLock.lock();
+            try {
+                return action.get();
+            } finally {
+                refreshLock.unlock();
+            }
+        }
+    }
+
 
     // Refresh tracker
     private final LastRefreshedCheckpointListener lastRefreshedCheckpointListener;
@@ -494,7 +516,9 @@ public class DataFormatAwareEngine implements Indexer {
             );
 
             // Restore version map and checkpoint tracker after recovery.
-            restoreVersionMapAndCheckpointTracker();
+            if (restoresVersionMapFromDocuments()) {
+                restoreVersionMapAndCheckpointTracker();
+            }
 
             // Merge failure cleanup: cleans up unreferenced files and acts as a safety net
             // for refreshLock. The preMergeCommitHook acquires refreshLock on the merge thread;
@@ -567,6 +591,55 @@ public class DataFormatAwareEngine implements Indexer {
         TranslogDeletionPolicy deletionPolicy,
         TranslogEventListener translogEventListener
     ) throws IOException {
+        if (usesNoOpTranslog()) {
+            // Derived catalogs do not retain operation payloads locally: the
+            // authoritative source and exact cursor reconciliation are their
+            // recovery log. They still need the empty translog's checkpoint,
+            // however, so every forced target commit advances the persisted
+            // global checkpoint. A fully inert manager would leave that
+            // checkpoint stale, causing store recovery to roll a newer target
+            // catalog back to an older safe commit after a hard crash.
+            return new InternalTranslogManager(
+                engineConfig.getTranslogConfig(),
+                engineConfig.getPrimaryTermSupplier(),
+                () -> localCheckpointTracker == null
+                    ? engineConfig.getGlobalCheckpointSupplier().getAsLong()
+                    : localCheckpointTracker.getProcessedCheckpoint(),
+                deletionPolicy,
+                shardId,
+                readLock,
+                () -> localCheckpointTracker,
+                translogUUID,
+                translogEventListener,
+                this::ensureOpen,
+                engineConfig.getTranslogFactory(),
+                engineConfig.getStartedPrimarySupplier(),
+                TranslogOperationHelper.create(engineConfig)
+            ) {
+                @Override
+                public Translog.Location add(Translog.Operation operation) {
+                    return new Translog.Location(0, 0, 0);
+                }
+
+                @Override
+                public Translog.Operation readOperation(Translog.Location location) {
+                    return null;
+                }
+
+                @Override
+                public Translog.Snapshot newChangesSnapshot(long fromSeqNo, long toSeqNo, boolean requiredFullRange) {
+                    return Translog.EMPTY_TRANSLOG_SNAPSHOT;
+                }
+
+                @Override
+                public int restoreLocalHistoryFromTranslog(
+                    long processedCheckpoint,
+                    org.opensearch.index.translog.TranslogRecoveryRunner translogRecoveryRunner
+                ) {
+                    return 0;
+                }
+            };
+        }
         return new InternalTranslogManager(
             engineConfig.getTranslogConfig(),
             engineConfig.getPrimaryTermSupplier(),
@@ -1355,6 +1428,14 @@ public class DataFormatAwareEngine implements Indexer {
         boolean upgradeOnlyAncientSegments,
         String forceMergeUUID
     ) throws EngineException, IOException {
+        if (backgroundMergesEnabled() == false) {
+            // The engine-level merge veto covers ALL admission paths. A derived
+            // target's adopted artifacts carry a sort contract the stock merger
+            // does not honor — a user force-merge must be as impossible as a
+            // scheduled one (see DerivedIndexEngine).
+            logger.debug("forceMerge blocked — engine vetoes merges");
+            return;
+        }
         if (upgrade || upgradeOnlyAncientSegments || onlyExpungeDeletes) {
             return;
         }
@@ -2388,6 +2469,11 @@ public class DataFormatAwareEngine implements Indexer {
     }
 
     private void triggerPossibleMerges() {
+        if (backgroundMergesEnabled() == false) {
+            // Engine-level merge veto (e.g. DerivedIndexEngine whose adopted
+            // artifacts carry a sort contract the stock merger does not honor).
+            return;
+        }
         if (Booleans.parseBoolean(System.getProperty(MERGE_ENABLED_PROPERTY, Boolean.TRUE.toString())) == false) {
             logger.debug("Pluggable dataformat merge is disabled via system property [{}], skipping merge", MERGE_ENABLED_PROPERTY);
             return;
@@ -2396,6 +2482,40 @@ public class DataFormatAwareEngine implements Indexer {
             return;
         }
         mergeScheduler.triggerMerges();
+    }
+
+    /**
+     * Engine-level background-merge admission. Subclasses that must not merge —
+     * e.g. {@link DerivedIndexEngine} while its artifacts carry a sort contract
+     * the stock format merger does not honor — override this to {@code false}.
+     * This is an ENGINE property (like the write surface), not a data-format
+     * property: format identity must not carry merge policy.
+     */
+    protected boolean backgroundMergesEnabled() {
+        return true;
+    }
+
+    /**
+     * Whether engine creation restores the version map and local checkpoint
+     * tracker by scanning committed documents above the persisted checkpoint.
+     * Engines whose catalog holds adopted artifacts rather than doc-level
+     * operations — e.g. {@link DerivedIndexEngine}, whose state generations
+     * carry no {@code _seq_no} column and whose durable cursor is the watermark
+     * in commit userData — override this to {@code false}: there are no
+     * operations to restore, and the scan would fail on the artifact schema.
+     */
+    protected boolean restoresVersionMapFromDocuments() {
+        return true;
+    }
+
+    /**
+     * Whether this engine's catalog is rebuilt from an authoritative source
+     * rather than recovered from an operation-bearing translog. Derived indices
+     * override this to {@code true}: their committed catalog is the only local
+     * durability boundary and missing state is reconciled from the source cursor.
+     */
+    protected boolean usesNoOpTranslog() {
+        return false;
     }
 
     private void closeNoLock(String reason) {

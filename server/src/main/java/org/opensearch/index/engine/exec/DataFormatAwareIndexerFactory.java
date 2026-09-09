@@ -11,6 +11,7 @@ package org.opensearch.index.engine.exec;
 import org.opensearch.index.engine.DataFormatAwareEngine;
 import org.opensearch.index.engine.DataFormatAwareNRTReplicationEngine;
 import org.opensearch.index.engine.DataFormatAwareReadOnlyEngine;
+import org.opensearch.index.engine.DerivedIndexEngine;
 import org.opensearch.index.engine.EngineConfig;
 
 /**
@@ -28,6 +29,8 @@ public class DataFormatAwareIndexerFactory implements IndexerFactory {
             return new DataFormatAwareNRTReplicationEngine(config);
         } else if (config.getIndexSettings().isWarmIndex()) {
             return new DataFormatAwareReadOnlyEngine(config);
+        } else if (config.getIndexSettings().getSettings().getAsBoolean(DerivedIndexEngine.DERIVED_INDEX_SETTING, false)) {
+            return new DerivedIndexEngine(config);
         }
         return new DataFormatAwareEngine(config);
     }
