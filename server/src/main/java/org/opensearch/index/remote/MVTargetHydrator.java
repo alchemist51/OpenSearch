@@ -32,6 +32,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -79,6 +80,15 @@ public class MVTargetHydrator implements Closeable {
     /** Pattern for compacted file names: _mv_compacted.s{shard}.g{minGen}-{maxGen}.{uuid}.parquet */
     private static final Pattern COMPACTED_NAME_PATTERN =
         Pattern.compile("_mv_compacted\\.s(\\d+)\\.g(\\d+)-(\\d+)\\.[^.]+\\.parquet");
+
+    /**
+     * The artifact format name used when publishing hydrated MV state files into the
+     * target engine's catalog. Must match the derived target artifact name that the
+     * analytics-engine's ShardScanInstructionHandler dispatches on (i.e.
+     * {@code registry.derivedTargetArtifact(category).name()} where category =
+     * "materialized_view"). The pull-POC uses "mv_state" (MVStateDataFormat.NAME).
+     */
+    static final String MV_STATE_FORMAT_NAME = "mv_state";
 
     private final ShardId targetShardId;
     private final String mvId;
@@ -425,6 +435,41 @@ public class MVTargetHydrator implements Closeable {
             targetShardId, sourceIndex, sourceShard, entry.generation(),
             checkpoint.primaryTerm(), entry.files().size(), downloadedFiles, checkpoint.maxSeqNo()
         );
+
+        // Publish hydrated files into the target engine's catalog so that
+        // CatalogSnapshot.getSearchableFiles("mv_state") returns them.
+        CatalogPublisher publisher = this.catalogPublisher;
+        if (publisher != null) {
+            try {
+                Set<String> fileNames = new HashSet<>();
+                for (MVCheckpoint.FileInfo fi : entry.files()) {
+                    fileNames.add(fi.name());
+                }
+                publisher.publish(
+                    MV_STATE_FORMAT_NAME,
+                    shardHydratedDir.toAbsolutePath().toString(),
+                    fileNames,
+                    entry.generation(),
+                    entry.rowCount(),
+                    Map.of()
+                );
+                logger.info(
+                    "MV catalog published: target={} source=[{}][{}] gen={} files={}",
+                    targetShardId, sourceIndex, sourceShard, entry.generation(), fileNames.size()
+                );
+            } catch (IllegalArgumentException e) {
+                // Generation already in catalog (idempotent restart recovery) — safe to ignore
+                logger.debug(
+                    "MV catalog publish skipped (already published): target={} gen={} error={}",
+                    targetShardId, entry.generation(), e.getMessage()
+                );
+            } catch (Exception e) {
+                logger.warn(
+                    "MV catalog publish failed: target={} gen={} error={}",
+                    targetShardId, entry.generation(), e.getMessage()
+                );
+            }
+        }
     }
 
     private void downloadFromRemote(String shardId, String mvId, String fileName, Path targetFile) throws IOException {
@@ -531,10 +576,41 @@ public class MVTargetHydrator implements Closeable {
     private volatile CompactCallback compactCallback;
 
     /**
+     * Callback interface for publishing hydrated files into the target engine's catalog.
+     * Implemented by the mv-engine plugin which has access to the target IndexShard.
+     */
+    @FunctionalInterface
+    public interface CatalogPublisher {
+        /**
+         * Publish a set of hydrated files as a single derived-artifact generation.
+         *
+         * @param dataFormatName artifact format name (e.g. "mv_state")
+         * @param directory      absolute path to the directory containing the files
+         * @param fileNames      the file names within directory to publish
+         * @param generation     the writer generation to assign to this publication
+         * @param numRows        total row count across all files (0 if unknown)
+         * @param userDataUpdates metadata entries to merge into the catalog snapshot
+         */
+        void publish(String dataFormatName, String directory, Set<String> fileNames,
+                      long generation, long numRows, Map<String, String> userDataUpdates) throws IOException;
+    }
+
+    private volatile CatalogPublisher catalogPublisher;
+
+    /**
      * Register a compaction callback. Called by the mv-engine plugin during setup.
      */
     public void setCompactCallback(CompactCallback callback) {
         this.compactCallback = callback;
+    }
+
+    /**
+     * Register a catalog publisher. Called by the mv-engine plugin during setup.
+     * When set, newly hydrated generations are published into the target engine's
+     * catalog so that CatalogSnapshot.getSearchableFiles() returns them.
+     */
+    public void setCatalogPublisher(CatalogPublisher publisher) {
+        this.catalogPublisher = publisher;
     }
 
     /**

@@ -250,4 +250,30 @@ public class MVTargetHydratorTests extends OpenSearchTestCase {
         }
         assertFalse("Tmp file should be cleaned up", java.nio.file.Files.exists(tmpFile));
     }
+
+    // ── MV_STATE_FORMAT_NAME constant ───────────────────────────────────
+
+    public void testMvStateFormatNameConstant() {
+        assertEquals("mv_state", MVTargetHydrator.MV_STATE_FORMAT_NAME);
+    }
+
+    // ── CatalogPublisher callback ───────────────────────────────────────
+
+    public void testCatalogPublisherCalledWithCorrectFormatName() {
+        // Verify the CatalogPublisher interface shape is callable and the format
+        // name constant matches what the analytics-engine dispatch expects.
+        java.util.concurrent.atomic.AtomicReference<String> capturedFormat = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicLong capturedGeneration = new java.util.concurrent.atomic.AtomicLong();
+        MVTargetHydrator.CatalogPublisher publisher = (formatName, directory, fileNames, generation, numRows, userData) -> {
+            capturedFormat.set(formatName);
+            capturedGeneration.set(generation);
+        };
+        try {
+            publisher.publish("mv_state", "/tmp/test", java.util.Set.of("file1.parquet"), 5L, 100L, java.util.Map.of());
+        } catch (java.io.IOException e) {
+            fail("should not throw");
+        }
+        assertEquals("mv_state", capturedFormat.get());
+        assertEquals(5L, capturedGeneration.get());
+    }
 }

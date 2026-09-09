@@ -266,6 +266,17 @@ public class MVEnginePlugin extends Plugin implements ActionPlugin {
         );
         MVTargetHydrator existing = activeHydrators.putIfAbsent(indexShard.shardId(), hydrator);
         if (existing == null) {
+            // Wire catalog publisher: publishes hydrated files into the target engine's
+            // catalog so that CatalogSnapshot.getSearchableFiles("mv_state") returns them.
+            hydrator.setCatalogPublisher((formatName, directory, fileNames, generation, numRows, userDataUpdates) -> {
+                indexShard.publishDerivedArtifact(
+                    formatName,
+                    new org.opensearch.index.engine.exec.WriterFileSet(
+                        directory, generation, fileNames, numRows, 0L
+                    ),
+                    userDataUpdates
+                );
+            });
             hydrator.start();
             logger.info("MV hydrator started for target shard={} source={} mvId={}", indexShard.shardId(), sourceIndex, mvId);
         } else {
