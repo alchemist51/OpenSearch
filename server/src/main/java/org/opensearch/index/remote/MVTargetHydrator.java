@@ -195,6 +195,11 @@ public class MVTargetHydrator implements Closeable {
      * Check all source-shard hydrated directories for compaction eligibility.
      */
     private void tryCompactAll() {
+        // The production callback is installed by the MV engine once definition-aware
+        // compaction is wired. Until then, avoid scanning/logging every hydration tick.
+        if (compactCallback == null) {
+            return;
+        }
         if (!Files.isDirectory(hydratedDir)) {
             return;
         }
