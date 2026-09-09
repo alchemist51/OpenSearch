@@ -1099,6 +1099,19 @@ pub(crate) fn is_lossless_integer_widening(
         // Timestamp → Int64: physically identical (i64 epoch). Covers all
         // Arrow TimeUnit variants and all timezone annotations.
         (DataType::Timestamp(_, _), DataType::Int64) => true,
+        // String / binary representation changes: identical value domain, only the
+        // buffer layout differs (offset-based vs view-based, i32 vs i64 offsets).
+        // The plan's logical schema reports string columns as Utf8View (DataFusion's
+        // string_view default) while the Parquet MV state is written as Utf8, so
+        // this is the steady-state shape for every KEYWORD group key.
+        (
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+        ) => true,
+        (
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+        ) => true,
         _ => false,
     }
 }
