@@ -1,0 +1,186 @@
+{
+  "source_index": "cb100m",
+  "target_index": "cb100m_mv",
+  "poll_interval": "1s",
+  "descriptor": {
+    "descriptor_version": 1,
+    "group_keys": [
+      {
+        "name": "event_bucket",
+        "column_type": "TIMESTAMP",
+        "source_column": "EventTime",
+        "span_interval_ms": 300000
+      },
+      {
+        "name": "URL",
+        "column_type": "KEYWORD"
+      },
+      {
+        "name": "CounterID",
+        "column_type": "LONG"
+      }
+    ],
+    "aggregates": [
+      {
+        "function": "SUM",
+        "field": "AdvEngineID",
+        "alias": "sum_AdvEngineID"
+      },
+      {
+        "function": "MIN",
+        "field": "AdvEngineID",
+        "alias": "min_AdvEngineID"
+      },
+      {
+        "function": "MAX",
+        "field": "AdvEngineID",
+        "alias": "max_AdvEngineID"
+      },
+      {
+        "function": "COUNT_FIELD",
+        "field": "AdvEngineID",
+        "alias": "count_AdvEngineID"
+      },
+      {
+        "function": "SUM",
+        "field": "IsRefresh",
+        "alias": "sum_IsRefresh"
+      },
+      {
+        "function": "MIN",
+        "field": "IsRefresh",
+        "alias": "min_IsRefresh"
+      },
+      {
+        "function": "MAX",
+        "field": "IsRefresh",
+        "alias": "max_IsRefresh"
+      },
+      {
+        "function": "COUNT_FIELD",
+        "field": "IsRefresh",
+        "alias": "count_IsRefresh"
+      },
+      {
+        "function": "SUM",
+        "field": "ResolutionWidth",
+        "alias": "sum_ResolutionWidth"
+      },
+      {
+        "function": "MIN",
+        "field": "ResolutionWidth",
+        "alias": "min_ResolutionWidth"
+      },
+      {
+        "function": "MAX",
+        "field": "ResolutionWidth",
+        "alias": "max_ResolutionWidth"
+      },
+      {
+        "function": "COUNT_FIELD",
+        "field": "ResolutionWidth",
+        "alias": "count_ResolutionWidth"
+      },
+      {
+        "function": "SUM",
+        "field": "ResolutionHeight",
+        "alias": "sum_ResolutionHeight"
+      },
+      {
+        "function": "MIN",
+        "field": "ResolutionHeight",
+        "alias": "min_ResolutionHeight"
+      },
+      {
+        "function": "MAX",
+        "field": "ResolutionHeight",
+        "alias": "max_ResolutionHeight"
+      },
+      {
+        "function": "COUNT_FIELD",
+        "field": "ResolutionHeight",
+        "alias": "count_ResolutionHeight"
+      },
+      {
+        "function": "SUM",
+        "field": "ResolutionDepth",
+        "alias": "sum_ResolutionDepth"
+      },
+      {
+        "function": "MIN",
+        "field": "ResolutionDepth",
+        "alias": "min_ResolutionDepth"
+      },
+      {
+        "function": "MAX",
+        "field": "ResolutionDepth",
+        "alias": "max_ResolutionDepth"
+      },
+      {
+        "function": "COUNT_FIELD",
+        "field": "ResolutionDepth",
+        "alias": "count_ResolutionDepth"
+      },
+      {
+        "function": "SUM",
+        "field": "FlashMinor",
+        "alias": "sum_FlashMinor"
+      },
+      {
+        "function": "MIN",
+        "field": "FlashMinor",
+        "alias": "min_FlashMinor"
+      },
+      {
+        "function": "MAX",
+        "field": "FlashMinor",
+        "alias": "max_FlashMinor"
+      },
+      {
+        "function": "COUNT_FIELD",
+        "field": "FlashMinor",
+        "alias": "count_FlashMinor"
+      },
+      {
+        "function": "SUM",
+        "field": "NetMajor",
+        "alias": "sum_NetMajor"
+      },
+      {
+        "function": "MIN",
+        "field": "NetMajor",
+        "alias": "min_NetMajor"
+      },
+      {
+        "function": "MAX",
+        "field": "NetMajor",
+        "alias": "max_NetMajor"
+      },
+      {
+        "function": "COUNT_FIELD",
+        "field": "NetMajor",
+        "alias": "count_NetMajor"
+      },
+      {
+        "function": "SUM",
+        "field": "FetchTiming",
+        "alias": "sum_FetchTiming"
+      },
+      {
+        "function": "MIN",
+        "field": "FetchTiming",
+        "alias": "min_FetchTiming"
+      },
+      {
+        "function": "MAX",
+        "field": "FetchTiming",
+        "alias": "max_FetchTiming"
+      },
+      {
+        "function": "COUNT_FIELD",
+        "field": "FetchTiming",
+        "alias": "count_FetchTiming"
+      }
+    ]
+  }
+}

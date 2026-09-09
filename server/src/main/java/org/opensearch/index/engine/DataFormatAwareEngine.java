@@ -2100,6 +2100,23 @@ public class DataFormatAwareEngine implements Indexer {
      *                        (e.g. MV watermark progress); existing keys not in the map
      *                        are preserved
      */
+    /**
+     * Reserves (allocates) the next writer generation for a prebuilt derived artifact without
+     * publishing it. Derived builders that must name staged files by their target generation
+     * before the artifact exists call this first, build with the returned generation, then
+     * publish via {@link #publishDerivedArtifact(String, WriterFileSet, Map)} carrying that same
+     * generation. Draws from the same monotonic counter as refresh/flush/merge so a reserved
+     * generation can never collide with an engine-produced one.
+     *
+     * @return a fresh, positive, monotonically increasing writer generation
+     */
+    public long reserveDerivedArtifactGeneration() {
+        ensureOpen();
+        long generation = writerGenerationCounter.incrementAndGet();
+        assert generation > 0 : "reserved derived generation must be positive but was: " + generation;
+        return generation;
+    }
+
     public void publishDerivedArtifact(String dataFormatName, WriterFileSet fileSet, Map<String, String> userDataUpdates)
         throws IOException {
         ensureOpen();

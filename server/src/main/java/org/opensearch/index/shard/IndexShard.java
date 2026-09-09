@@ -5855,6 +5855,27 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     }
 
     /**
+     * Reserves the next writer generation for a prebuilt derived artifact on this primary shard.
+     * Derived builders name their staged files by the target generation before the artifact
+     * exists, then publish carrying the same generation.
+     *
+     * @return a fresh, positive, monotonically increasing writer generation
+     */
+    public long reserveDerivedArtifactGeneration() {
+        verifyNotClosed();
+        if (routingEntry().primary() == false) {
+            throw new IllegalStateException("derived artifacts may only be built on a primary shard [" + shardId + "]");
+        }
+        Indexer indexer = getIndexer();
+        if (indexer instanceof DataFormatAwareEngine dataFormatAwareEngine) {
+            return dataFormatAwareEngine.reserveDerivedArtifactGeneration();
+        }
+        throw new UnsupportedOperationException(
+            "reserveDerivedArtifactGeneration requires a DataFormatAwareEngine but got [" + indexer.getClass().getSimpleName() + "]"
+        );
+    }
+
+    /**
      * Add a listener for refreshes.
      *
      * @param location the location to listen for
