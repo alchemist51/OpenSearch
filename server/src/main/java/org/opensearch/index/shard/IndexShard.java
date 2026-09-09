@@ -5735,6 +5735,36 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     }
 
     /**
+    /**
+     * Atomically publishes a prebuilt derived data-format artifact with its progress metadata
+     * and durably flushes the resulting catalog snapshot. The artifact becomes visible to
+     * future catalog snapshot acquisitions (searches).
+     *
+     * @param dataFormatName  the artifact format name (e.g. {@code "mv_state"})
+     * @param fileSet         the files + row count + generation to publish
+     * @param userDataUpdates metadata entries to merge into the catalog snapshot's userData
+     * @throws IOException if the publish or flush fails
+     */
+    public void publishDerivedArtifact(
+        String dataFormatName,
+        org.opensearch.index.engine.exec.WriterFileSet fileSet,
+        java.util.Map<String, String> userDataUpdates
+    ) throws IOException {
+        verifyNotClosed();
+        if (routingEntry().primary() == false) {
+            throw new IllegalStateException("derived artifacts may only be published on a primary shard [" + shardId + "]");
+        }
+        Indexer indexer = getIndexer();
+        if (indexer instanceof DataFormatAwareEngine dataFormatAwareEngine) {
+            dataFormatAwareEngine.publishDerivedArtifact(dataFormatName, fileSet, userDataUpdates);
+        } else {
+            throw new UnsupportedOperationException(
+                "publishDerivedArtifact requires a DataFormatAwareEngine but got [" + indexer.getClass().getSimpleName() + "]"
+            );
+        }
+    }
+
+    /**
      * Add a listener for refreshes.
      *
      * @param location the location to listen for

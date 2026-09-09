@@ -1963,6 +1963,66 @@ public class DataFormatAwareEngine implements Indexer {
         return catalogSnapshotManager.acquireSnapshot();
     }
 
+    /**
+     * Atomically publishes a prebuilt derived data-format artifact (e.g. MV state files)
+     * into the catalog snapshot so that future searches see the files. Each publication
+     * creates a new {@link Segment} keyed by the artifact's writer generation.
+     *
+     * <p>Idempotent: if a segment with the given writer generation already exists in the
+     * catalog, an {@link IllegalArgumentException} is thrown (the caller is expected to
+     * derive the published set from the catalog and skip already-published generations).</p>
+     *
+     * @param dataFormatName the artifact format name (e.g. {@code "mv_state"})
+     * @param fileSet        the files + row count + generation to publish
+     * @param userDataUpdates metadata entries to merge into the catalog snapshot's userData
+     *                        (e.g. MV watermark progress); existing keys not in the map
+     *                        are preserved
+     */
+    public void publishDerivedArtifact(String dataFormatName, WriterFileSet fileSet, Map<String, String> userDataUpdates)
+        throws IOException {
+        ensureOpen();
+        if (fileSet.writerGeneration() <= 0L) {
+            throw new IllegalArgumentException(
+                "derived artifact writer generation must be positive but was [" + fileSet.writerGeneration() + "]"
+            );
+        }
+        if (fileSet.files().isEmpty()) {
+            throw new IllegalArgumentException("derived artifact must contain at least one file");
+        }
+        if (fileSet.numRows() <= 0L) {
+            throw new IllegalArgumentException("derived artifact row count must be positive but was [" + fileSet.numRows() + "]");
+        }
+
+        writerGenerationCounter.accumulateAndGet(fileSet.writerGeneration(), Math::max);
+        try (ReleasableLock ignored = readLock.acquire()) {
+            ensureOpen();
+            refreshLock.lock();
+            try {
+                try (GatedCloseable<CatalogSnapshot> currentRef = catalogSnapshotManager.acquireSnapshot()) {
+                    CatalogSnapshot current = currentRef.get();
+                    if (current.getSegments().stream().anyMatch(segment -> segment.generation() == fileSet.writerGeneration())) {
+                        throw new IllegalArgumentException(
+                            "derived artifact generation [" + fileSet.writerGeneration() + "] already exists in catalog"
+                        );
+                    }
+                    List<Segment> nextSegments = new ArrayList<>(current.getSegments());
+                    nextSegments.add(Segment.builder(fileSet.writerGeneration()).addSearchableFiles(dataFormatName, fileSet).build());
+                    Map<String, String> nextUserData = new HashMap<>(current.getUserData());
+                    nextUserData.putAll(Map.copyOf(userDataUpdates));
+                    catalogSnapshotManager.commitNewSnapshot(nextSegments, nextUserData);
+                }
+            } finally {
+                refreshLock.unlock();
+            }
+        }
+
+        // Persist catalog durably so a crash does not lose the published artifact.
+        flush(true, true);
+
+        // Give the merge scheduler a chance to compact (same as a refresh publication).
+        triggerPossibleMerges();
+    }
+
     @Override
     public byte[] serializeSnapshotToRemoteMetadata(CatalogSnapshot catalogSnapshot) throws IOException {
         return catalogSnapshotManager.serializeToCommitFormat(catalogSnapshot);

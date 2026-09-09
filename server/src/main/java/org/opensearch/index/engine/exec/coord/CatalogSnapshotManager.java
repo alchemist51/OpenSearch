@@ -236,6 +236,18 @@ public class CatalogSnapshotManager implements Closeable {
      * @param refreshedSegments the segments produced by the latest refresh
      */
     public synchronized void commitNewSnapshot(List<Segment> refreshedSegments) throws IOException {
+        commitNewSnapshot(refreshedSegments, latestCatalogSnapshot.getUserData());
+    }
+
+    /**
+     * Commits a new snapshot with both refreshed segments and updated user-data metadata.
+     * Used by the derived-artifact publish path to atomically install segments + progress
+     * metadata (e.g. MV watermark) in a single catalog commit.
+     *
+     * @param refreshedSegments the complete segment list for the new snapshot
+     * @param userData immutable metadata describing exactly {@code refreshedSegments}
+     */
+    public synchronized void commitNewSnapshot(List<Segment> refreshedSegments, Map<String, String> userData) throws IOException {
         if (closed.get()) {
             throw new IllegalStateException("CatalogSnapshotManager is closed");
         }
@@ -252,7 +264,7 @@ public class CatalogSnapshotManager implements Closeable {
                 latestCatalogSnapshot.getVersion() + 1,  // New changes so this version is changed.
                 refreshedSegments,
                 latestCatalogSnapshot.getLastWriterGeneration() + 1,
-                latestCatalogSnapshot.getUserData(),
+                Map.copyOf(userData),
                 latestCatalogSnapshot.getLastCommitFileName(),
                 latestCatalogSnapshot.getLastCommitGeneration(),
                 latestCatalogSnapshot.getCommitDataFormatVersion()
