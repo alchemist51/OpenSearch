@@ -51,6 +51,8 @@ public class MergeHandler {
     private final Merger merger;
     private final Logger logger;
     private final Supplier<Long> generationProvider;
+    /** False for shards whose catalog holds only derived artifacts (e.g. a materialized-view target): never select merges. */
+    private final boolean mergesEnabled;
 
     /**
      * Creates a new merge handler.
@@ -67,12 +69,30 @@ public class MergeHandler {
         MergeListener mergeListener,
         Supplier<Long> generationProvider
     ) {
+        this(snapshotSupplier, merger, shardId, mergePolicy, mergeListener, generationProvider, true);
+    }
+
+    /**
+     * @param mergesEnabled when false, {@link #findMerges()} and {@link #findForceMerges(int)} never select
+     *                      anything: used for derived materialized-view targets whose catalog generations are
+     *                      MV state artifacts that the writer-format mergers cannot (and must not) merge.
+     */
+    public MergeHandler(
+        Supplier<GatedCloseable<CatalogSnapshot>> snapshotSupplier,
+        Merger merger,
+        ShardId shardId,
+        MergePolicy mergePolicy,
+        MergeListener mergeListener,
+        Supplier<Long> generationProvider,
+        boolean mergesEnabled
+    ) {
         this.logger = Loggers.getLogger(getClass(), shardId);
         this.snapshotSupplier = snapshotSupplier;
         this.mergePolicy = mergePolicy;
         this.mergeListener = mergeListener;
         this.merger = merger;
         this.generationProvider = generationProvider;
+        this.mergesEnabled = mergesEnabled;
     }
 
     /**
@@ -82,6 +102,9 @@ public class MergeHandler {
      */
     public Collection<OneMerge> findMerges() {
         List<OneMerge> oneMerges = new ArrayList<>();
+        if (mergesEnabled == false) {
+            return oneMerges;
+        }
         try (GatedCloseable<CatalogSnapshot> catalogSnapshotRef = snapshotSupplier.get()) {
             List<Segment> segmentList = catalogSnapshotRef.get().getSegments();
             List<List<Segment>> mergeCandidates = mergePolicy.findMergeCandidates(segmentList);
@@ -103,6 +126,9 @@ public class MergeHandler {
      */
     public Collection<OneMerge> findForceMerges(int maxSegmentCount) {
         List<OneMerge> oneMerges = new ArrayList<>();
+        if (mergesEnabled == false) {
+            return oneMerges;
+        }
         try (GatedCloseable<CatalogSnapshot> catalogSnapshotRef = snapshotSupplier.get()) {
             List<Segment> segmentList = catalogSnapshotRef.get().getSegments();
             List<List<Segment>> mergeCandidates = mergePolicy.findForceMergeCandidates(segmentList, maxSegmentCount);
