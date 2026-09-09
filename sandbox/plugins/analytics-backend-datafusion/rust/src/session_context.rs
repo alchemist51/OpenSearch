@@ -754,6 +754,43 @@ pub(crate) fn build_file_sort_order(
     Some(sort_exprs)
 }
 
+/// Returns `true` when `from` can be losslessly widened/reinterpreted to `to`.
+///
+/// Permits:
+///   - Same-signedness integer width increases:
+///     - Signed:   Int8 → Int16 → Int32 → Int64
+///     - Unsigned: UInt8 → UInt16 → UInt32 → UInt64
+///   - Timestamp(any unit, any tz) → Int64: Arrow Timestamps are physically
+///     i64 (epoch value in the given unit), so reinterpretation is lossless.
+///     This arises when a `date`-typed source field (stored as
+///     `Timestamp(Millisecond, None)` in Parquet/Arrow) is used as a plain
+///     GROUP BY key — DataFusion preserves the Timestamp type in the partial
+///     aggregate state file, but the MV target mapping declares it as `long`.
+///
+/// All other conversions (narrowing, signedness change, integer-to-float,
+/// float-to-integer, string, etc.) are rejected. Consumed by the MV state-file
+/// schema-evolution contract (`mv_expr_adapter` and `mv_table_schema`).
+pub(crate) fn is_lossless_integer_widening(
+    from: &arrow::datatypes::DataType,
+    to: &arrow::datatypes::DataType,
+) -> bool {
+    use arrow::datatypes::DataType;
+    match (from, to) {
+        // Signed integer widening: width(from) < width(to)
+        (DataType::Int8, DataType::Int16 | DataType::Int32 | DataType::Int64) => true,
+        (DataType::Int16, DataType::Int32 | DataType::Int64) => true,
+        (DataType::Int32, DataType::Int64) => true,
+        // Unsigned integer widening: width(from) < width(to)
+        (DataType::UInt8, DataType::UInt16 | DataType::UInt32 | DataType::UInt64) => true,
+        (DataType::UInt16, DataType::UInt32 | DataType::UInt64) => true,
+        (DataType::UInt32, DataType::UInt64) => true,
+        // Timestamp → Int64: physically identical (i64 epoch). Covers all
+        // Arrow TimeUnit variants and all timezone annotations.
+        (DataType::Timestamp(_, _), DataType::Int64) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
