@@ -72,6 +72,10 @@ pub struct SessionContextHandle {
     /// Phantom reservation holding pool capacity for untracked memory.
     /// Dropped when the handle is closed, releasing the capacity.
     pub(crate) phantom_reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
+    /// Materialized-view coverage binding, set during MV-only session creation
+    /// or by `create_mv_only_session_context`. None = no binding = today's
+    /// raw-only plan. See `mv_read` for the prepare-time plan surgery.
+    pub(crate) mv_binding: Option<crate::mv_read::MVBinding>,
 }
 
 /// Configuration for indexed execution with filter delegation, provided by Java.
@@ -427,6 +431,7 @@ pub async unsafe fn create_session_context(
         has_topk,
         prepared_plan: None,
         phantom_reservation: phantom,
+        mv_binding: None,
     };
     Ok(Box::into_raw(Box::new(handle)) as i64)
 }
@@ -516,6 +521,7 @@ pub async unsafe fn create_worker_session_context(
         prepared_plan: None,
         phantom_reservation: None,
         io_handle: tokio::runtime::Handle::current(),
+        mv_binding: None,
     };
     Ok(Box::into_raw(Box::new(handle)) as i64)
 }
@@ -529,6 +535,304 @@ pub unsafe fn close_session_context(ptr: i64) {
         let _ = Box::from_raw(ptr as *mut SessionContextHandle);
     }
 }
+
+/// Creates a DataFusion SessionContext for MV-only serving: the catalog-selected
+/// state files are registered directly as the query table via a standard
+/// `ListingTable` carrying the MV schema-evolution expr adapter. No `ShardView`
+/// or parquet reader is needed — the session is ready to serve the fold query
+/// immediately. This is the path bound by `NativeBridge.createMVOnlySessionContext`
+/// on the Java shard-scan handler when the index carries the derived data-format
+/// setting.
+///
+/// # Safety
+/// `runtime_ptr` must be a valid pointer to a `DataFusionRuntime`.
+pub async unsafe fn create_mv_only_session_context(
+    runtime_ptr: i64,
+    table_name: &str,
+    context_id: i64,
+    has_partial_aggregate: bool,
+    query_config: DatafusionQueryConfig,
+    plan_bytes: &[u8],
+    state_file_paths: &[String],
+    state_fields: &[String],
+) -> Result<i64, DataFusionError> {
+    let runtime = &*(runtime_ptr as *const DataFusionRuntime);
+
+    let global_pool = runtime.runtime_env.memory_pool.clone();
+    let query_context = QueryTrackingContext::new(
+        context_id,
+        global_pool.clone(),
+        crate::query_tracker::QueryType::Shard,
+    );
+    let query_memory_pool = query_context
+        .memory_pool()
+        .map(|p| p as Arc<dyn MemoryPool>);
+
+    let list_file_cache = Arc::new(DefaultListFilesCache::default());
+    let mut runtime_env_builder =
+        crate::query_executor::query_runtime_env_builder(runtime, list_file_cache);
+
+    if let Some(pool) = query_memory_pool {
+        runtime_env_builder = runtime_env_builder.with_memory_pool(pool);
+    }
+
+    let runtime_env = runtime_env_builder.build().map_err(|e| {
+        error!(
+            "create_mv_only_session_context: failed to build runtime env: {}",
+            e
+        );
+        e
+    })?;
+
+    // Register local filesystem for reading state files.
+    runtime_env.register_object_store(
+        &url::Url::parse("file://").unwrap(),
+        Arc::new(object_store::local::LocalFileSystem::new()),
+    );
+
+    let has_topk = has_partial_aggregate && substrait_has_fetch_rel(plan_bytes);
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.parquet.pushdown_filters =
+        query_config.listing_table_pushdown_filters;
+    if has_topk {
+        config
+            .options_mut()
+            .execution
+            .skip_partial_aggregation_probe_ratio_threshold = 1.0;
+    }
+    config.options_mut().execution.target_partitions = query_config.target_partitions;
+    config.options_mut().execution.batch_size = query_config.batch_size;
+    // Mirror the shard-scan context: form file groups by statistics so the
+    // per-file sort order advertised by the MV ListingTable (footer-stamped
+    // generations) survives into the scan's output_ordering — concatenating
+    // multiple sorted files in one group would otherwise force DataFusion to
+    // drop the ordering claim and fold with hash aggregation.
+    config
+        .options_mut()
+        .execution
+        .split_file_groups_by_statistics = true;
+
+    let state_builder = SessionStateBuilder::new()
+        .with_config(config)
+        .with_runtime_env(Arc::from(runtime_env))
+        .with_default_features()
+        .with_physical_optimizer_rules(if has_partial_aggregate {
+            crate::agg_mode::physical_optimizer_rules_without_combine()
+        } else {
+            datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new().rules
+        });
+
+    let state = state_builder.build();
+    let ctx = SessionContext::new_with_state(state);
+
+    // Register UDFs so the Substrait consumer can resolve function names.
+    crate::udf::register_all(&ctx);
+    crate::udaf::register_all(&ctx);
+    crate::udwf::register_all(&ctx);
+
+    // This branch does not use `first_named_table_name` (removed as unreliable —
+    // see create_session_context). The Java side passes the concrete target name.
+    let register_name = table_name.to_string();
+
+    let has_mv_data = !state_file_paths.is_empty();
+    if has_mv_data {
+        // Read only the first file's schema header (~few KB). O(1) memory.
+        let physical_schema =
+            crate::mv_expr_adapter::read_schema_from_first_file(state_file_paths)?.ok_or_else(
+                || {
+                    DataFusionError::Execution(
+                        "create_mv_only_session_context: state files had no Arrow schema"
+                            .to_string(),
+                    )
+                },
+            )?;
+
+        let logical_schema = widen_schema_from_plan(
+            &ctx,
+            plan_bytes,
+            &register_name,
+            &Arc::new(arrow::datatypes::Schema::empty()),
+        );
+        // Validate file-0 compatibility (positional label overlay, widening
+        // rules, duplicate names) and derive the logical table schema. Per-file
+        // cast/null-fill decisions happen in the expr adapter at scan time.
+        let (table_schema, _file0_projection) =
+            mv_table_schema(&physical_schema, &logical_schema, state_fields)?;
+
+        crate::mv_expr_adapter::register_mv_state_listing_table(
+            &ctx,
+            register_name.as_str(),
+            state_file_paths,
+            Arc::clone(&table_schema),
+            state_fields,
+        )
+        .await?;
+        native_bridge_common::log_info!(
+            "create_mv_only_session_context: registered MV ListingTable '{}' over {} state files \
+             (standard parquet scan: statistics pruning + pushdown + sub-file repartitioning)",
+            register_name,
+            state_file_paths.len()
+        );
+    } else {
+        let logical_schema = widen_schema_from_plan(
+            &ctx,
+            plan_bytes,
+            &register_name,
+            &Arc::new(arrow::datatypes::Schema::empty()),
+        );
+        let empty_batch = arrow::record_batch::RecordBatch::new_empty(Arc::clone(&logical_schema));
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(logical_schema, vec![vec![empty_batch]])?;
+        ctx.register_table(register_name.as_str(), Arc::new(mem_table))?;
+    }
+
+    let table_path = ListingTableUrl::parse("file:///mv-state-virtual/")
+        .expect("constant ListingTableUrl 'file:///mv-state-virtual/' must parse");
+
+    let handle = SessionContextHandle {
+        ctx,
+        table_path,
+        object_metas: Arc::new(vec![]),
+        writer_generations: Arc::new(vec![]),
+        sort_fields: vec![],
+        sort_orders: vec![],
+        query_context,
+        table_name: register_name,
+        indexed_config: None,
+        query_config,
+        io_handle: tokio::runtime::Handle::current(),
+        aggregate_mode: crate::agg_mode::Mode::Default,
+        has_topk,
+        prepared_plan: None,
+        phantom_reservation: None,
+        mv_binding: None,
+    };
+    Ok(Box::into_raw(Box::new(handle)) as i64)
+}
+
+/// Describes how a single column in the physical Arrow state maps into the
+/// logical table schema. Retained for file-0 validation in
+/// `create_mv_only_session_context`; per-file cast/null-fill at scan time is
+/// performed by `mv_expr_adapter`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MvColumnProjection {
+    /// Index into the physical RecordBatch's columns. Ignored when `null_fill` is true.
+    pub physical_position: usize,
+    /// When `Some(target)`, the physical array must be cast to `target` (a lossless widening).
+    /// When `null_fill` is true, this carries the data type for the null array.
+    /// When `None`, the physical array is used zero-copy (types match exactly).
+    pub cast_to: Option<arrow::datatypes::DataType>,
+    /// When true, the logical column has no physical counterpart in the state file.
+    pub null_fill: bool,
+}
+
+/// Validates the physical (file-0) schema against the ordered `state_fields`
+/// contract and derives the logical table schema. `state_fields` may be equal
+/// to OR larger than the physical schema; the first `physical_count` entries
+/// map 1:1 to physical Arrow columns (label overlay), and any beyond that are
+/// metadata-only names that null-fill when referenced.
+fn mv_table_schema(
+    physical_schema: &arrow::datatypes::SchemaRef,
+    logical_schema: &arrow::datatypes::SchemaRef,
+    state_fields: &[String],
+) -> Result<(arrow::datatypes::SchemaRef, Vec<MvColumnProjection>), DataFusionError> {
+    let physical_count = physical_schema.fields().len();
+    if state_fields.len() < physical_count {
+        return Err(DataFusionError::Execution(format!(
+            "MV state field metadata has {} names but the Arrow state has {} columns; \
+             metadata must have at least as many entries as physical columns",
+            state_fields.len(),
+            physical_count,
+        )));
+    }
+    if state_fields.len() > physical_count {
+        native_bridge_common::log_info!(
+            "mv_table_schema: state_fields ({}) > physical columns ({}); \
+             entries beyond physical count will be null-filled if referenced by the query plan",
+            state_fields.len(),
+            physical_count
+        );
+    }
+    let unique = state_fields
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    if unique.len() != state_fields.len() {
+        return Err(DataFusionError::Execution(
+            "MV state field metadata contains duplicate names".to_string(),
+        ));
+    }
+
+    // Physical fields must be a subset of logical fields by name; logical may
+    // have MORE (null-fill for absent columns).
+    let physical_projection = logical_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(logical_position, logical)| {
+            let physical_position = state_fields.iter().position(|name| name == logical.name());
+
+            match physical_position {
+                Some(pos) if pos < physical_count => {
+                    let physical = physical_schema.field(pos);
+                    let cast_to = if logical.data_type() == physical.data_type() {
+                        None
+                    } else if is_lossless_integer_widening(physical.data_type(), logical.data_type())
+                    {
+                        Some(logical.data_type().clone())
+                    } else {
+                        return Err(DataFusionError::Execution(format!(
+                            "MV state field '{}' at physical position {} has type {:?} but query \
+                             expects {:?}; only lossless integer widening (same signedness, larger \
+                             width) is permitted",
+                            logical.name(),
+                            pos,
+                            physical.data_type(),
+                            logical.data_type()
+                        )));
+                    };
+                    Ok(MvColumnProjection {
+                        physical_position: pos,
+                        cast_to,
+                        null_fill: false,
+                    })
+                }
+                Some(pos) => {
+                    // state_fields entry exists beyond physical column range → null-fill.
+                    native_bridge_common::log_info!(
+                        "mv_table_schema: logical field '{}' matched state_fields[{}] which is \
+                         beyond physical column count ({}); null-filling as {:?}",
+                        logical.name(),
+                        pos,
+                        physical_count,
+                        logical.data_type()
+                    );
+                    Ok(MvColumnProjection {
+                        physical_position: 0,
+                        cast_to: Some(logical.data_type().clone()),
+                        null_fill: true,
+                    })
+                }
+                None => {
+                    // Logical field absent from physical state → null-fill.
+                    native_bridge_common::log_info!(
+                        "mv_table_schema: logical field '{}' at position {} absent from physical \
+                         state; null-filling as {:?}",
+                        logical.name(),
+                        logical_position,
+                        logical.data_type()
+                    );
+                    Ok(MvColumnProjection {
+                        physical_position: 0,
+                        cast_to: Some(logical.data_type().clone()),
+                        null_fill: true,
+                    })
+                }
+            }
+        })
+        .collect::<Result<Vec<_>, DataFusionError>>()?;
+    Ok((Arc::clone(logical_schema), physical_projection))
+}
+
 
 /// Creates a SessionContext configured for indexed execution with filter delegation.
 /// Registers the `delegated_predicate` UDF and stores the tree shape + predicate count
@@ -607,6 +911,14 @@ pub async fn prepare_partial_plan(
     )?;
 
     let target_schema = crate::schema_coerce::coerce_inferred_schema(stripped.schema());
+    // MV read path: when the session carries a binding, apply the prepare-time
+    // plan surgery (strict mode: REPLACE the Partial with the aliased mv-state
+    // scan; UNION with the narrowed raw branch otherwise). Runs BEFORE
+    // RelabelExec wrapping so the substituted plan is what gets relabeled.
+    let stripped = match handle.mv_binding.as_ref() {
+        Some(binding) => crate::mv_read::apply_mv_binding(&handle.ctx, stripped, binding).await?,
+        None => stripped,
+    };
     let stripped = crate::relabel_exec::wrap_if_relabel_needed(stripped, target_schema)?;
     handle.prepared_plan = Some(stripped);
     Ok(())
@@ -948,6 +1260,7 @@ mod tests {
             has_topk: false,
             prepared_plan: None,
             phantom_reservation: None,
+            mv_binding: None,
         };
         (handle, buf)
     }

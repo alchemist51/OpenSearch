@@ -1241,6 +1241,70 @@ pub unsafe extern "C" fn df_create_session_context(
         .map_err(|e| e.to_string())
 }
 
+/// MV-only session context: no ShardView / parquet reader. Creates a DataFusion
+/// SessionContext with the catalog-selected MV state files registered directly
+/// as the query table (standard ListingTable + MV expr adapter). The session is
+/// ready to serve the fold query as-is. Bound by
+/// `NativeBridge.createMVOnlySessionContext` on the Java shard-scan handler.
+///
+/// `state_paths` and `state_fields` are newline-separated UTF-8 lists.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_create_mv_only_session_context(
+    runtime_ptr: i64,
+    table_name_ptr: *const u8,
+    table_name_len: i64,
+    context_id: i64,
+    has_partial_aggregate: u8,
+    query_config_ptr: i64,
+    plan_ptr: *const u8,
+    plan_len: i64,
+    state_paths_ptr: *const u8,
+    state_paths_len: i64,
+    state_fields_ptr: *const u8,
+    state_fields_len: i64,
+) -> i64 {
+    crate::search_stats::inc_listing_table_scan();
+    let table_name = str_from_raw(table_name_ptr, table_name_len)
+        .map_err(|e| format!("df_create_mv_only_session_context: table_name: {}", e))?;
+    let state_paths_str = str_from_raw(state_paths_ptr, state_paths_len)
+        .map_err(|e| format!("df_create_mv_only_session_context: state_paths: {}", e))?;
+    let state_file_paths: Vec<String> = state_paths_str
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let state_fields_str = str_from_raw(state_fields_ptr, state_fields_len)
+        .map_err(|e| format!("df_create_mv_only_session_context: state_fields: {}", e))?;
+    let state_fields: Vec<String> = state_fields_str
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let query_config =
+        crate::datafusion_query_config::DatafusionQueryConfig::from_ffm_ptr(query_config_ptr);
+    let plan_bytes: &[u8] = if plan_len > 0 {
+        slice::from_raw_parts(plan_ptr, plan_len as usize)
+    } else {
+        &[]
+    };
+    let mgr = get_rt_manager()?;
+    mgr.io_runtime
+        .block_on(crate::task_monitors::plan_setup_monitor().instrument(
+            crate::session_context::create_mv_only_session_context(
+                runtime_ptr,
+                table_name,
+                context_id,
+                has_partial_aggregate != 0,
+                query_config,
+                plan_bytes,
+                &state_file_paths,
+                &state_fields,
+            ),
+        ))
+        .map_err(|e| e.to_string())
+}
+
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn df_create_worker_session_context(
