@@ -63,6 +63,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
     private volatile MVBuildRuntime buildRuntime;
     private volatile MVDataFusionReadEngine coverageReader;
     private volatile MVWatermark watermark;
+
     /** Compaction: background k-way merge of accumulated mv_state generations. */
 
     MVDerivedArtifactBuilder(IndexSettings indexSettings, MVPullSettings.Services services) {
@@ -101,8 +102,54 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         }
     }
 
+    /**
+     * Adaptive per-round cap. Halved (down to a floor) after a native build failed for lack of memory — the
+     * DataFusion external sort of a large catch-up round — and doubled back toward the configured
+     * {@code index.mv_pull.max_docs_per_round} after every successful round. Observed 2026-09-10: after a run of
+     * coverage retries the accumulated lag produced a 2M-document round that failed with "Not enough memory to
+     * continue external sort", and the retry only succeeded a minute later.
+     */
+    private volatile long adaptiveCapDocs = Long.MAX_VALUE;
+    private static final long ADAPTIVE_CAP_FLOOR_DOCS = Long.getLong("opensearch.mv_pull.adaptive_cap_floor_docs", 250_000L);
+
+    private static boolean isMemoryExhaustion(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            String m = c.getMessage();
+            if (m != null && (m.contains("Not enough memory") || m.contains("Resources exhausted") || m.contains("memory_limit"))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     @Override
     public BuildResult build(DerivedSourceSnapshot snapshot, Path stageDir, IndexShard shard) throws IOException {
+        long configuredCap = MVPullSettings.MAX_DOCS_PER_ROUND.get(indexSettings.getSettings());
+        long capUsed = Math.min(configuredCap, adaptiveCapDocs);
+        try {
+            BuildResult result = buildOnce(snapshot, stageDir, shard);
+            if (result != null && result.success() && adaptiveCapDocs < configuredCap) {
+                adaptiveCapDocs = Math.min(configuredCap, Math.max(ADAPTIVE_CAP_FLOOR_DOCS, adaptiveCapDocs) * 2);
+                logger.info("mv_pull ADAPTIVE_CAP shard=[{}] restored to {} docs/round (configured {})", shard.shardId(), adaptiveCapDocs, configuredCap);
+            }
+            return result;
+        } catch (Exception e) {
+            if (isMemoryExhaustion(e)) {
+                long next = Math.max(ADAPTIVE_CAP_FLOOR_DOCS, Math.min(configuredCap, capUsed) / 2);
+                adaptiveCapDocs = next;
+                logger.warn(
+                    "mv_pull ADAPTIVE_CAP shard=[{}] native build ran out of memory with {} docs/round; next round capped at {} docs: {}",
+                    shard.shardId(),
+                    capUsed,
+                    next,
+                    e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage().substring(0, Math.min(160, e.getMessage().length()))
+                );
+            }
+            throw e;
+        }
+    }
+
+    private BuildResult buildOnce(DerivedSourceSnapshot snapshot, Path stageDir, IndexShard shard) throws IOException {
         // Defect #23 admission signal: this round is about to hold native pool
         // memory (coverage scan + streaming build). While the claim is active,
         // merge-admission gating admits no new merges for this shard
@@ -179,7 +226,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         // Each chunk emits one generation; the compaction machinery folds them.
         // Memory becomes O(chunk) instead of O(full_lag).
         Settings admissionSettings = indexSettings.getSettings();
-        long maxDocsPerRound = MVPullSettings.MAX_DOCS_PER_ROUND.get(admissionSettings);
+        long maxDocsPerRound = Math.min(MVPullSettings.MAX_DOCS_PER_ROUND.get(admissionSettings), adaptiveCapDocs);
         final long snapshotWatermark = mvSnapshot.watermark();
         final long totalLag = snapshotWatermark - current.seqNo();
         final long roundWatermark;
@@ -188,8 +235,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             roundWatermark = current.seqNo() + maxDocsPerRound;
             roundCapped = true;
             logger.info(
-                "mv_pull ROUND_START_CAPPED shard=[{}] range=({}, {}] capped_from={} "
-                    + "total_lag={} max_docs_per_round={}",
+                "mv_pull ROUND_START_CAPPED shard=[{}] range=({}, {}] capped_from={} " + "total_lag={} max_docs_per_round={}",
                 shard.shardId(),
                 current.seqNo(),
                 roundWatermark,
@@ -362,8 +408,10 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
                 buildRuntime != null ? buildRuntime.runtimePtr() : -1,
                 MVBuildRuntime.MV_BUILD_MEMORY_ESTIMATE.get(indexSettings.getSettings()),
                 services.parentCircuitBreaker() != null
-                    ? services.parentCircuitBreaker().getName() + "/"
-                        + services.parentCircuitBreaker().getUsed() + "/"
+                    ? services.parentCircuitBreaker().getName()
+                        + "/"
+                        + services.parentCircuitBreaker().getUsed()
+                        + "/"
                         + services.parentCircuitBreaker().getLimit()
                     : "none",
                 current.seqNo(),
@@ -386,8 +434,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             // build path. Log ALL fields from buildStreamingArtifact at INFO
             // since these are the most important diagnostics for OOM/spill.
             logger.info(
-                "mv_pull NATIVE_BUILD_POST shard=[{}] generation={} rows={} "
-                    + "native_build_ms={} schema_hash={} definition_hash={}",
+                "mv_pull NATIVE_BUILD_POST shard=[{}] generation={} rows={} " + "native_build_ms={} schema_hash={} definition_hash={}",
                 shard.shardId(),
                 generation,
                 artifact.stateRows(),
@@ -426,12 +473,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             // AFTER publish so the upload path can serve it in O(1).
             // One sequential read of the new ~500 MB generation (~2s) — eliminates
             // repeated O(n) scans on every publish and restart recovery.
-            MVStateChecksumUtil.computeAndRegister(
-                artifact.path(),
-                artifact.path().getFileName().toString(),
-                generation,
-                shard
-            );
+            MVStateChecksumUtil.computeAndRegister(artifact.path(), artifact.path().getFileName().toString(), generation, shard);
 
             logger.info(
                 "mv_pull published generation={} rows={} range=({}, {}] watermark={} "
@@ -609,8 +651,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             }
             MVWatermark wm = MVWatermark.decode(encoded);
             logger.info(
-                "mv_pull WATERMARK_RECOVERY shard=[{}] source_shard={} key=[{}] "
-                    + "recovered={} (term={} seqNo={} gen={})",
+                "mv_pull WATERMARK_RECOVERY shard=[{}] source_shard={} key=[{}] " + "recovered={} (term={} seqNo={} gen={})",
                 shard.shardId(),
                 sourceShardId,
                 key,

@@ -66,10 +66,17 @@ public final class DerivedShardPoller implements Runnable, Closeable {
 
     // ── Consecutive failure tracking & backoff ───────────────────────────
     private final AtomicLong consecutiveFailures = new AtomicLong();
+    /** Exceptions only (build failures such as "no coverage" do not count): drives the exception-path backoff. */
+    private final AtomicLong consecutiveExceptions = new AtomicLong();
     private volatile long lastSuccessEpochMs = -1L;
-    /** Backoff: 1s base, x2 per consecutive failure, cap 60s, reset on success. */
+    /**
+     * Backoff after an EXCEPTION in a round: 1s base, x2 per consecutive exception, capped (default 10 s, was 60 s;
+     * {@code -Dopensearch.mv_pull.exception_backoff_cap_ms}), reset on success. Build failures that merely report
+     * "no coverage" while the source is still uploading do not feed this counter any more: they used to, so a single
+     * exception after twenty coverage retries slept the full 60 s and the view fell 75–82 s behind (2026-09-10).
+     */
     private static final long BACKOFF_BASE_MS = 1000L;
-    private static final long BACKOFF_CAP_MS = 60_000L;
+    private static final long BACKOFF_CAP_MS = Long.getLong("opensearch.mv_pull.exception_backoff_cap_ms", 10_000L);
     /**
      * Defect #28b: consecutive-failure count at which held catch-up pressure is
      * released instead of held. A build failing repeatedly with merges already
@@ -195,8 +202,9 @@ public final class DerivedShardPoller implements Runnable, Closeable {
         } catch (Exception e) {
             if (closed.get() == false) {
                 long failures = consecutiveFailures.incrementAndGet();
+                long exceptions = consecutiveExceptions.incrementAndGet();
                 String rootCause = deepestMessage(e);
-                long backoffMs = Math.min(BACKOFF_BASE_MS * (1L << Math.min(failures - 1, 16)), BACKOFF_CAP_MS);
+                long backoffMs = Math.min(BACKOFF_BASE_MS * (1L << Math.min(exceptions - 1, 16)), BACKOFF_CAP_MS);
                 long msSinceLastSuccess = lastSuccessEpochMs > 0 ? System.currentTimeMillis() - lastSuccessEpochMs : -1L;
                 logger.error(
                     "derived_pull [{}] ROUND_FAILURE shard=[{}] watermark={} consecutive_failures={} "
@@ -393,6 +401,7 @@ public final class DerivedShardPoller implements Runnable, Closeable {
         if (result != null && result.success()) {
             successCount.incrementAndGet();
             consecutiveFailures.set(0);
+            consecutiveExceptions.set(0);
             lastSuccessEpochMs = System.currentTimeMillis();
 
             // ── Bounded streaming: read the actual applied watermark from
