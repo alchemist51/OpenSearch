@@ -10,6 +10,7 @@ package org.opensearch.index.engine.derived.pull;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.cluster.metadata.DerivedIndexBinding;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.engine.derived.pull.spi.BuildResult;
@@ -143,6 +144,26 @@ public final class DerivedShardPoller implements Runnable, Closeable {
             );
         }
         logger.info("derived_pull [{}] poller created for shard [{}] watermark={}", formatId, targetShard.shardId(), initialWatermark);
+        // View-lag backpressure (node-local): tell the source shard's engine which seqNo this view is queryable for.
+        DerivedIndexBinding binding = DerivedIndexBinding.fromSettings(targetShard.indexSettings().getSettings());
+        if (binding != null && binding.sourceName() != null) {
+            this.lagSourceIndex = binding.sourceName();
+            this.lagSourceShard = binding.resolveSourceShard(targetShard.shardId().id());
+            DerivedViewLag.record(lagSourceIndex, lagSourceShard, targetShard.shardId().getIndexName(), initialWatermark);
+        } else {
+            this.lagSourceIndex = null;
+            this.lagSourceShard = -1;
+        }
+    }
+
+    /** Source shard this view follows, for {@link DerivedViewLag}; null when the target carries no derived binding. */
+    private final String lagSourceIndex;
+    private final int lagSourceShard;
+
+    private void publishWatermarkForLag() {
+        if (lagSourceIndex != null) {
+            DerivedViewLag.record(lagSourceIndex, lagSourceShard, targetShard.shardId().getIndexName(), currentWatermark);
+        }
     }
 
     /** Start the first poll round (zero-delay). */
@@ -176,9 +197,7 @@ public final class DerivedShardPoller implements Runnable, Closeable {
                 long failures = consecutiveFailures.incrementAndGet();
                 String rootCause = deepestMessage(e);
                 long backoffMs = Math.min(BACKOFF_BASE_MS * (1L << Math.min(failures - 1, 16)), BACKOFF_CAP_MS);
-                long msSinceLastSuccess = lastSuccessEpochMs > 0
-                    ? System.currentTimeMillis() - lastSuccessEpochMs
-                    : -1L;
+                long msSinceLastSuccess = lastSuccessEpochMs > 0 ? System.currentTimeMillis() - lastSuccessEpochMs : -1L;
                 logger.error(
                     "derived_pull [{}] ROUND_FAILURE shard=[{}] watermark={} consecutive_failures={} "
                         + "root_cause=[{}] backoff_ms={} ms_since_last_success={} exception_class={}",
@@ -299,9 +318,7 @@ public final class DerivedShardPoller implements Runnable, Closeable {
         long rangeSize = snapshot.watermark() - currentWatermark;
         long lag = Math.max(0L, snapshot.watermark() - currentWatermark);
         long failures = consecutiveFailures.get();
-        long msSinceLastSuccess = lastSuccessEpochMs > 0
-            ? System.currentTimeMillis() - lastSuccessEpochMs
-            : -1L;
+        long msSinceLastSuccess = lastSuccessEpochMs > 0 ? System.currentTimeMillis() - lastSuccessEpochMs : -1L;
         logger.info(
             "derived_pull [{}] ROUND_START shard=[{}] round={} watermark={} snapshot_max_seqno={} "
                 + "range_size={} lag={} consecutive_failures={} ms_since_last_success={}",
@@ -337,8 +354,7 @@ public final class DerivedShardPoller implements Runnable, Closeable {
             }
             long freeSpaceBytes = stageDir.toFile().getUsableSpace();
             logger.info(
-                "derived_pull [{}] STAGING shard=[{}] stage_dir={} files={} total_bytes={} "
-                    + "free_space_bytes={} download_ms={}",
+                "derived_pull [{}] STAGING shard=[{}] stage_dir={} files={} total_bytes={} " + "free_space_bytes={} download_ms={}",
                 formatId,
                 targetShard.shardId(),
                 stageDir,
@@ -391,6 +407,7 @@ public final class DerivedShardPoller implements Runnable, Closeable {
             } else {
                 currentWatermark = snapshot.watermark();
             }
+            publishWatermarkForLag();
 
             statsBuilder.counter("source_watermark", snapshot.watermark());
             statsBuilder.counter("target_watermark", currentWatermark);
@@ -402,8 +419,7 @@ public final class DerivedShardPoller implements Runnable, Closeable {
             PollRoundStats roundStats = statsBuilder.build();
             recordRoundStats(roundStats);
             logger.info(
-                "derived_pull [{}] shard [{}] published artifact={} watermark {} -> {} "
-                    + "capped={} remaining_lag={} stats={}",
+                "derived_pull [{}] shard [{}] published artifact={} watermark {} -> {} " + "capped={} remaining_lag={} stats={}",
                 formatId,
                 targetShard.shardId(),
                 result.artifactId(),
@@ -591,6 +607,9 @@ public final class DerivedShardPoller implements Runnable, Closeable {
             // Claims always resolve: a poller closed mid-catch-up (relocation,
             // shutdown) must not strand node-wide pressure (defect #26).
             releaseCatchUpPressure();
+            if (lagSourceIndex != null) {
+                DerivedViewLag.remove(lagSourceIndex, lagSourceShard, targetShard.shardId().getIndexName());
+            }
             try {
                 reader.close();
             } catch (IOException e) {

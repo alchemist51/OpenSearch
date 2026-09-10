@@ -96,12 +96,12 @@ import org.opensearch.index.translog.TranslogCorruptedException;
 import org.opensearch.index.translog.TranslogDeletionPolicy;
 import org.opensearch.index.translog.TranslogException;
 import org.opensearch.index.translog.TranslogManager;
-import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.index.translog.TranslogOperationHelper;
 import org.opensearch.index.translog.listener.TranslogEventListener;
 import org.opensearch.indices.pollingingest.PollingIngestStats;
 import org.opensearch.plugins.DocumentLookupProvider;
 import org.opensearch.search.suggest.completion.CompletionStats;
+import org.opensearch.threadpool.ThreadPool;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -194,6 +194,33 @@ public class DataFormatAwareEngine implements Indexer {
         System.getProperty("opensearch.translog.backpressure.enabled", "false")
     );
 
+    // View-lag backpressure (pull-based derived views): keep every view of this shard within a time bound. The
+    // pollers publish the seqNo they are queryable for (DerivedViewLag); this engine samples its processed
+    // checkpoint over time and derives the age of the oldest document a view is missing. Above the soft bound
+    // indexing is throttled to a single writer; above the hard bound indexing threads wait (bounded) until the
+    // view is back under the soft bound; the throttle is released under the release bound. Opt-in.
+    private static final boolean VIEW_LAG_BACKPRESSURE_ENABLED = Boolean.parseBoolean(
+        System.getProperty("opensearch.mv_pull.lag_backpressure.enabled", "false")
+    );
+    private static final double VIEW_LAG_SOFT_SECONDS = Double.parseDouble(
+        System.getProperty("opensearch.mv_pull.lag_backpressure.soft_seconds", "45")
+    );
+    private static final double VIEW_LAG_HARD_SECONDS = Double.parseDouble(
+        System.getProperty("opensearch.mv_pull.lag_backpressure.hard_seconds", "60")
+    );
+    private static final double VIEW_LAG_RELEASE_SECONDS = Double.parseDouble(
+        System.getProperty("opensearch.mv_pull.lag_backpressure.release_seconds", "30")
+    );
+    private static final long VIEW_LAG_MAX_WAIT_NANOS = TimeUnit.SECONDS.toNanos(
+        Long.getLong("opensearch.mv_pull.lag_backpressure.max_wait_seconds", 120L)
+    );
+    private final AtomicLong viewLagLastCheckNanos = new AtomicLong();
+    private final AtomicBoolean viewLagActive = new AtomicBoolean(false);
+    /** (time, processed checkpoint) ring: one sample per 500 ms at most, 20 minutes of history. */
+    private final org.opensearch.index.engine.derived.pull.DerivedViewLag.Tracker viewLagTracker =
+        new org.opensearch.index.engine.derived.pull.DerivedViewLag.Tracker(TimeUnit.MILLISECONDS.toNanos(500), 2400);
+    private volatile long viewLagLastWarnNanos;
+
     @Nullable
     private final DocumentLookupProvider documentLookupProvider;
     private final DocumentMetadataResolver documentMetadataResolver;
@@ -237,7 +264,6 @@ public class DataFormatAwareEngine implements Indexer {
             }
         }
     }
-
 
     // Refresh tracker
     private final LastRefreshedCheckpointListener lastRefreshedCheckpointListener;
@@ -726,6 +752,9 @@ public class DataFormatAwareEngine implements Indexer {
         final boolean doThrottle = index.origin().isRecovery() == false;
         if (doThrottle && TRANSLOG_BACKPRESSURE_ENABLED) {
             applyTranslogBackpressure();
+        }
+        if (doThrottle && VIEW_LAG_BACKPRESSURE_ENABLED) {
+            applyViewLagBackpressure();
         }
         int rows = 0;
         try (ReleasableLock releasableLock = readLock.acquire()) {
@@ -1556,6 +1585,105 @@ public class DataFormatAwareEngine implements Indexer {
         } catch (Exception e) {
             return 0L; // stats unavailable (engine closing): never block indexing on it
         }
+    }
+
+    /**
+     * View-lag backpressure for pull-based derived views of this shard. A rate-limited sampler (one thread, at most every
+     * 100 ms) records (now, processed checkpoint) in the tracker, reads the lowest published watermark among the views
+     * following this shard and caches the resulting staleness — the age of the oldest document that view is still
+     * missing. Every indexing thread then acts on the cached value: above {@code soft_seconds} the single-writer throttle
+     * is engaged; above {@code hard_seconds} the thread waits (bounded by {@code max_wait_seconds}, re-sampling while it
+     * waits) until the staleness is back under the soft bound; the throttle is released under {@code release_seconds}.
+     * Shards without a view are never affected.
+     */
+    private void applyViewLagBackpressure() {
+        sampleViewLag(System.nanoTime(), false);
+        double staleness = viewLagStaleness;
+        if (staleness > VIEW_LAG_SOFT_SECONDS) {
+            if (viewLagActive.compareAndSet(false, true)) {
+                activateThrottling();
+                logger.warn(
+                    "view-lag backpressure engaged: view [{}] is {} s behind shard {} (> {} s soft bound; watermark {} vs checkpoint {}); throttling indexing",
+                    viewLagSlowest,
+                    String.format(java.util.Locale.ROOT, "%.1f", staleness),
+                    shardId,
+                    VIEW_LAG_SOFT_SECONDS,
+                    viewLagWatermark,
+                    viewLagCheckpoint
+                );
+            }
+            if (staleness > VIEW_LAG_HARD_SECONDS) {
+                final long start = System.nanoTime();
+                final long deadline = start + VIEW_LAG_MAX_WAIT_NANOS;
+                while (viewLagStaleness > VIEW_LAG_SOFT_SECONDS && System.nanoTime() < deadline && isClosed.get() == false) {
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    sampleViewLag(System.nanoTime(), true);
+                }
+                final long t = System.nanoTime();
+                if (t - viewLagLastWarnNanos > TimeUnit.SECONDS.toNanos(10)) {
+                    viewLagLastWarnNanos = t;
+                    logger.warn(
+                        "view-lag backpressure hard bound: indexing waited {} ms for view [{}] (staleness now {} s, watermark {}, checkpoint {})",
+                        TimeUnit.NANOSECONDS.toMillis(t - start),
+                        viewLagSlowest,
+                        String.format(java.util.Locale.ROOT, "%.1f", viewLagStaleness),
+                        viewLagWatermark,
+                        viewLagCheckpoint
+                    );
+                }
+            }
+        } else if (viewLagActive.get() && staleness < VIEW_LAG_RELEASE_SECONDS) {
+            if (viewLagActive.compareAndSet(true, false)) {
+                deactivateThrottling();
+                logger.info(
+                    "view-lag backpressure released: view [{}] is {} s behind shard {} (< {} s)",
+                    viewLagSlowest,
+                    String.format(java.util.Locale.ROOT, "%.1f", staleness),
+                    shardId,
+                    VIEW_LAG_RELEASE_SECONDS
+                );
+            }
+        }
+    }
+
+    /** Cached result of the last sample; read by every indexing thread, written by the sampler only. */
+    private volatile double viewLagStaleness;
+    private volatile long viewLagWatermark = Long.MAX_VALUE;
+    private volatile long viewLagCheckpoint;
+    private volatile String viewLagSlowest;
+
+    /**
+     * One sample per {@link #TRANSLOG_BACKPRESSURE_CHECK_INTERVAL_NANOS} (100 ms) across all threads; {@code force}
+     * lets a waiting thread re-sample at 50 ms while the hard bound holds. No view over this shard → staleness 0.
+     */
+    private void sampleViewLag(long now, boolean force) {
+        final long last = viewLagLastCheckNanos.get();
+        if (force == false && now - last < TRANSLOG_BACKPRESSURE_CHECK_INTERVAL_NANOS) {
+            return;
+        }
+        if (viewLagLastCheckNanos.compareAndSet(last, now) == false) {
+            return; // another thread took this sample
+        }
+        final String index = shardId.getIndexName();
+        final int shard = shardId.id();
+        final long checkpoint = localCheckpointTracker.getProcessedCheckpoint();
+        final long watermark = org.opensearch.index.engine.derived.pull.DerivedViewLag.minWatermark(index, shard);
+        final double staleness;
+        synchronized (viewLagTracker) {
+            viewLagTracker.sample(now, checkpoint);
+            staleness = watermark == Long.MAX_VALUE ? 0.0 : viewLagTracker.staleness(now, watermark, checkpoint);
+        }
+        viewLagCheckpoint = checkpoint;
+        viewLagWatermark = watermark;
+        viewLagSlowest = watermark == Long.MAX_VALUE
+            ? null
+            : org.opensearch.index.engine.derived.pull.DerivedViewLag.slowestView(index, shard);
+        viewLagStaleness = staleness;
     }
 
     /** Runs one flush on the FLUSH pool if none is in flight; the flush rolls the translog generation. */
