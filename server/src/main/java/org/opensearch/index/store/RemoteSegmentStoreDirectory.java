@@ -32,6 +32,9 @@ import org.opensearch.common.UUIDs;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.annotation.InternalApi;
 import org.opensearch.common.annotation.PublicApi;
+import org.opensearch.common.blobstore.AsyncMultiStreamBlobContainer;
+import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.blobstore.stream.read.listener.ReadContextListener;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.io.VersionedCodecStreamWrapper;
 import org.opensearch.common.logging.Loggers;
@@ -59,6 +62,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -72,6 +76,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 
 /**
@@ -1091,6 +1096,40 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     // Visible for testing
     public Map<String, UploadedSegmentMetadata> getSegmentsUploadedToRemoteStore() {
         return Collections.unmodifiableMap(this.segmentsUploadedToRemoteStore);
+    }
+
+    /**
+     * Downloads the uploaded file {@code localFilename} to {@code destination} using up to {@code maxConcurrentStreams} part
+     * streams in parallel (on the remote-recovery pool) when the repository exposes the object's parts
+     * ({@link AsyncMultiStreamBlobContainer}); fails the listener with {@link UnsupportedOperationException} otherwise so the
+     * caller can fall back to {@link #copyFrom}. The listener receives the file name on success.
+     */
+    public void copyToParallel(
+        String localFilename,
+        Path destination,
+        ThreadPool threadPool,
+        int maxConcurrentStreams,
+        ActionListener<String> listener
+    ) {
+        String remoteFilename = getExistingRemoteFilename(localFilename);
+        if (remoteFilename == null) {
+            listener.onFailure(new NoSuchFileException(localFilename));
+            return;
+        }
+        BlobContainer container = remoteDataDirectory.getBlobContainer();
+        if ((container instanceof AsyncMultiStreamBlobContainer) == false) {
+            listener.onFailure(new UnsupportedOperationException("repository does not support multi-part reads"));
+            return;
+        }
+        ReadContextListener readListener = new ReadContextListener(
+            remoteFilename,
+            destination,
+            listener,
+            threadPool,
+            UnaryOperator.identity(),
+            maxConcurrentStreams
+        );
+        ((AsyncMultiStreamBlobContainer) container).readBlobAsync(remoteFilename, readListener);
     }
 
     public int getSegmentsUploadedToRemoteStoreSize() {

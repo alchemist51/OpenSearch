@@ -103,9 +103,9 @@ final class MVRemoteSource {
             }
 
             try {
-                // Try to copy from remote using the cached metadata
-                try (var dir = new org.apache.lucene.store.NIOFSDirectory(destDir)) {
-                    dir.copyFrom(remote, fileName, fileName.replace('/', '$'), org.apache.lucene.store.IOContext.DEFAULT);
+                if (downloadParallel(remote, fileName, localFile) == false) {
+                    // Try to copy from remote using the cached metadata (single stream)
+                    copySingleStream(remote, fileName, destDir, localFile);
                 }
                 downloaded.add(localFile);
             } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
@@ -123,17 +123,10 @@ final class MVRemoteSource {
                         }
                         downloaded.add(localFile);
                     } catch (Exception retryEx) {
-                        logger.warn(
-                            "mv_pull NAME_ADDRESSED_MISS file=[{}] after re-init: {}",
-                            fileName,
-                            retryEx.getMessage()
-                        );
+                        logger.warn("mv_pull NAME_ADDRESSED_MISS file=[{}] after re-init: {}", fileName, retryEx.getMessage());
                     }
                 } else {
-                    logger.warn(
-                        "mv_pull NAME_ADDRESSED_MISS file=[{}] (re-init already attempted)",
-                        fileName
-                    );
+                    logger.warn("mv_pull NAME_ADDRESSED_MISS file=[{}] (re-init already attempted)", fileName);
                 }
             }
         }
@@ -142,6 +135,78 @@ final class MVRemoteSource {
 
     long getMetadataCacheRefreshes() {
         return metadataCacheRefreshes;
+    }
+
+    /** Files at least this large are downloaded part-wise in parallel (S3 multipart objects expose their parts). */
+    private static final long PARALLEL_DOWNLOAD_MIN_BYTES = Long.getLong(
+        "opensearch.mv_pull.download.parallel_min_bytes",
+        32L * 1024 * 1024
+    );
+    private static final int PARALLEL_DOWNLOAD_STREAMS = Integer.getInteger("opensearch.mv_pull.download.streams", 8);
+    private static final long PARALLEL_DOWNLOAD_TIMEOUT_SECONDS = Long.getLong("opensearch.mv_pull.download.timeout_seconds", 900L);
+
+    private void copySingleStream(RemoteSegmentStoreDirectory remote, String fileName, Path destDir, Path localFile) throws IOException {
+        long start = System.nanoTime();
+        try (var dir = new org.apache.lucene.store.NIOFSDirectory(destDir)) {
+            dir.copyFrom(remote, fileName, fileName.replace('/', '$'), org.apache.lucene.store.IOContext.DEFAULT);
+        }
+        long bytes = Files.exists(localFile) ? Files.size(localFile) : -1L;
+        long ms = Math.max(1L, (System.nanoTime() - start) / 1_000_000L);
+        if (bytes >= PARALLEL_DOWNLOAD_MIN_BYTES) {
+            logger.info(
+                "mv_pull DOWNLOAD file=[{}] bytes={} ms={} MB/s={} streams=1",
+                fileName,
+                bytes,
+                ms,
+                String.format(java.util.Locale.ROOT, "%.0f", bytes / 1e6 / (ms / 1000.0))
+            );
+        }
+    }
+
+    /**
+     * Downloads {@code fileName} into {@code localFile} with several concurrent part streams when the file is large and the
+     * repository's blob container supports async multi-part reads (S3 does for multipart-uploaded objects). Returns false when
+     * the parallel path does not apply or failed before writing anything, so the caller falls back to the single stream.
+     */
+    private boolean downloadParallel(RemoteSegmentStoreDirectory remote, String fileName, Path localFile) {
+        if (PARALLEL_DOWNLOAD_STREAMS <= 1) {
+            return false;
+        }
+        RemoteSegmentStoreDirectory.UploadedSegmentMetadata meta = remote.getSegmentsUploadedToRemoteStore().get(fileName);
+        if (meta == null || meta.getLength() < PARALLEL_DOWNLOAD_MIN_BYTES) {
+            return false;
+        }
+        long start = System.nanoTime();
+        try {
+            org.opensearch.action.support.PlainActionFuture<String> done = org.opensearch.action.support.PlainActionFuture.newFuture();
+            remote.copyToParallel(fileName, localFile, services.threadPool(), PARALLEL_DOWNLOAD_STREAMS, done);
+            done.actionGet(PARALLEL_DOWNLOAD_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS);
+            long ms = Math.max(1L, (System.nanoTime() - start) / 1_000_000L);
+            long bytes = Files.size(localFile);
+            logger.info(
+                "mv_pull DOWNLOAD file=[{}] bytes={} ms={} MB/s={} streams={}",
+                fileName,
+                bytes,
+                ms,
+                String.format(java.util.Locale.ROOT, "%.0f", bytes / 1e6 / (ms / 1000.0)),
+                PARALLEL_DOWNLOAD_STREAMS
+            );
+            return true;
+        } catch (Exception e) {
+            if (e instanceof UnsupportedOperationException || e.getCause() instanceof UnsupportedOperationException) {
+                return false; // repository without multi-part reads: plain single stream, no warning
+            }
+            logger.warn(
+                "mv_pull parallel download of [{}] failed after {} ms, falling back to a single stream: {}",
+                fileName,
+                (System.nanoTime() - start) / 1_000_000L,
+                e.getMessage()
+            );
+            try {
+                Files.deleteIfExists(localFile);
+            } catch (IOException ignored) {}
+            return false;
+        }
     }
 
     long getNameAddressedDownloads() {
