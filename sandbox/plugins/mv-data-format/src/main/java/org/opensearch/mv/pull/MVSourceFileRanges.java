@@ -69,9 +69,12 @@ public final class MVSourceFileRanges {
      *         {@code executor} the first time a file is asked for).
      */
     public long[] rangeOf(String key, Path file, Executor executor) {
+        if (ENABLED == false || failures.get() >= MAX_FAILURES) {
+            return null;
+        }
         long[] known = ranges.get(key);
         if (known != null) {
-            return known;
+            return known[1] >= 0 ? known : null;   // {-1,-1} = scan failed once: stay UNKNOWN, never retry
         }
         if (Files.exists(file) && pending.add(key)) {
             executor.execute(() -> {
@@ -87,7 +90,11 @@ public final class MVSourceFileRanges {
                         (System.nanoTime() - start) / 1_000_000L
                     );
                 } catch (Exception e) {
-                    logger.warn("mv_pull FILE_RANGE failed for [{}]: {}", key, e.getMessage());
+                    ranges.put(key, new long[] { -1L, -1L });
+                    long n = failures.incrementAndGet();
+                    if (n <= 5 || n == MAX_FAILURES) {
+                        logger.warn("mv_pull FILE_RANGE failed for [{}] (failure {}{}): {}", key, n, n == MAX_FAILURES ? ", disabling range scans" : "", e.getMessage());
+                    }
                 } finally {
                     pending.remove(key);
                 }
@@ -95,6 +102,11 @@ public final class MVSourceFileRanges {
         }
         return null;
     }
+
+    private static final boolean ENABLED = Boolean.parseBoolean(System.getProperty("opensearch.mv_pull.source_file_ranges.enabled", "true"));
+    /** After this many failed scans the service stops scheduling new ones (the scan is an optimisation, never a dependency). */
+    private static final long MAX_FAILURES = Long.getLong("opensearch.mv_pull.source_file_ranges.max_failures", 50L);
+    private final java.util.concurrent.atomic.AtomicLong failures = new java.util.concurrent.atomic.AtomicLong();
 
     /** Drops entries for files that no longer exist locally (merged away); called opportunistically by the handler. */
     public void retainOnly(Set<String> liveKeys) {

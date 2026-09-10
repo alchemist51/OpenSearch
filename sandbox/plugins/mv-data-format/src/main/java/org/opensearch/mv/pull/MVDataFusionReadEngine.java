@@ -224,7 +224,13 @@ final class MVDataFusionReadEngine implements Closeable {
         Path link = staged.resolve("000000.parquet");
         Files.deleteIfExists(link);
         Files.createSymbolicLink(link, file.toAbsolutePath());
-        String sql = String.format(Locale.ROOT, "SELECT MIN(\"_seq_no\"), MAX(\"_seq_no\") FROM %s", INPUT_TABLE);
+        // The native bridge executes the PARTIAL aggregate of the plan and hands its rows back; an ungrouped MIN/MAX over
+        // one file plans as a single-mode aggregate ("no Partial aggregate in plan"), so group by a constant.
+        String sql = String.format(
+            Locale.ROOT,
+            "SELECT g, MIN(\"_seq_no\"), MAX(\"_seq_no\") FROM (SELECT 1 AS g, \"_seq_no\" FROM %s) AS t GROUP BY g",
+            INPUT_TABLE
+        );
         try (org.apache.arrow.memory.RootAllocator allocator = new org.apache.arrow.memory.RootAllocator()) {
             try (
                 org.apache.arrow.c.ArrowArray array = org.apache.arrow.c.ArrowArray.allocateNew(allocator);
@@ -244,7 +250,7 @@ final class MVDataFusionReadEngine implements Closeable {
                     long min = Long.MAX_VALUE, max = -1L;
                     List<org.apache.arrow.vector.FieldVector> vectors = batch.getFieldVectors();
                     for (int row = 0; row < batch.getRowCount(); row++) {
-                        Object lo = vectors.get(0).getObject(row), hi = vectors.get(1).getObject(row);
+                        Object lo = vectors.get(1).getObject(row), hi = vectors.get(2).getObject(row);
                         if (lo instanceof Number n) min = Math.min(min, n.longValue());
                         if (hi instanceof Number n) max = Math.max(max, n.longValue());
                     }
