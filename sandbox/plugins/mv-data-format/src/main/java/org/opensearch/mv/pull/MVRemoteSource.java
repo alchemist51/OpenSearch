@@ -117,9 +117,10 @@ final class MVRemoteSource {
                     try {
                         cachedMetadata = remote.init();
                         metadataCacheRefreshes++;
-                        // Retry the download
-                        try (var dir = new org.apache.lucene.store.NIOFSDirectory(destDir)) {
-                            dir.copyFrom(remote, fileName, fileName.replace('/', '$'), org.apache.lucene.store.IOContext.DEFAULT);
+                        // Retry the download through the same parallel-first path: the file that misses right after a
+                        // source merge is typically the multi-GB merged output, and a single stream costs 65-82 s for it.
+                        if (downloadParallel(remote, fileName, localFile) == false) {
+                            copySingleStream(remote, fileName, destDir, localFile);
                         }
                         downloaded.add(localFile);
                     } catch (Exception retryEx) {
@@ -196,11 +197,15 @@ final class MVRemoteSource {
             if (e instanceof UnsupportedOperationException || e.getCause() instanceof UnsupportedOperationException) {
                 return false; // repository without multi-part reads: plain single stream, no warning
             }
+            StringBuilder chain = new StringBuilder();
+            for (Throwable t = e; t != null && chain.length() < 600; t = t.getCause()) {
+                chain.append(chain.length() == 0 ? "" : " <- ").append(t.getClass().getSimpleName()).append(": ").append(t.getMessage());
+            }
             logger.warn(
                 "mv_pull parallel download of [{}] failed after {} ms, falling back to a single stream: {}",
                 fileName,
                 (System.nanoTime() - start) / 1_000_000L,
-                e.getMessage()
+                chain
             );
             try {
                 Files.deleteIfExists(localFile);
