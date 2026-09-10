@@ -343,6 +343,34 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
         }
     }
 
+    public void testCopyToParallelFailsFastWhenAPartFails() throws Exception {
+        populateMetadata();
+        remoteSegmentStoreDirectory.init();
+        RemoteSegmentStoreDirectory.UploadedSegmentMetadata meta = remoteSegmentStoreDirectory.getSegmentsUploadedToRemoteStore()
+            .get("_0.si");
+        final int length = (int) meta.getLength();
+        org.opensearch.common.blobstore.BlobContainer container = mock(org.opensearch.common.blobstore.BlobContainer.class);
+        when(remoteDataDirectory.getBlobContainer()).thenReturn(container);
+        when(container.readBlob(eq(meta.getUploadedFilename()), anyLong(), anyLong())).thenAnswer(inv -> {
+            long pos = inv.getArgument(1);
+            if (pos > 0) {
+                throw new java.io.IOException("range read failed");
+            }
+            long len = inv.getArgument(2);
+            return new java.io.ByteArrayInputStream(new byte[(int) len]);
+        });
+        Path dir = createTempDir();
+        org.opensearch.action.support.PlainActionFuture<String> done = org.opensearch.action.support.PlainActionFuture.newFuture();
+        remoteSegmentStoreDirectory.copyToParallel("_0.si", dir.resolve("_0.si"), threadPool, 4, Math.max(1L, length / 5), done);
+        Exception e = expectThrows(Exception.class, () -> done.actionGet(30, TimeUnit.SECONDS));
+        assertNotNull(org.opensearch.ExceptionsHelper.unwrap(e, java.io.IOException.class));
+        assertBusy(() -> {
+            try (java.util.stream.Stream<Path> files = Files.list(dir)) {
+                assertEquals(0L, files.count()); // partial temp file removed
+            }
+        });
+    }
+
     public void testCopyToParallelUnknownFile() {
         org.opensearch.action.support.PlainActionFuture<String> done = org.opensearch.action.support.PlainActionFuture.newFuture();
         remoteSegmentStoreDirectory.copyToParallel("_0.si", createTempDir().resolve("_0.si"), threadPool, 4, done);

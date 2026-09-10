@@ -24,7 +24,6 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.Version;
-import org.opensearch.action.support.GroupedActionListener;
 import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.CheckedFunction;
@@ -1142,17 +1141,16 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             return;
         }
         final java.util.concurrent.atomic.AtomicInteger nextPart = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicInteger remaining = new java.util.concurrent.atomic.AtomicInteger(parts);
         final java.util.concurrent.atomic.AtomicBoolean failed = new java.util.concurrent.atomic.AtomicBoolean();
-        final ActionListener<Collection<Void>> allParts = ActionListener.wrap(ignored -> {
-            Files.move(tmp, destination, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-            listener.onResponse(localFilename);
-        }, e -> {
-            try {
-                Files.deleteIfExists(tmp);
-            } catch (IOException ignored) {}
-            listener.onFailure(e);
-        });
-        final GroupedActionListener<Void> grouped = new GroupedActionListener<>(allParts, parts);
+        final java.util.function.Consumer<Exception> fail = e -> {
+            if (failed.compareAndSet(false, true)) { // first failure wins; workers stop at the next part boundary
+                try {
+                    Files.deleteIfExists(tmp);
+                } catch (IOException ignored) {}
+                listener.onFailure(e);
+            }
+        };
         final int workers = Math.max(1, Math.min(maxConcurrentStreams, parts));
         final java.util.concurrent.Executor executor = threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY);
         for (int w = 0; w < workers; w++) {
@@ -1182,12 +1180,14 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                                 );
                             }
                         }
-                        grouped.onResponse(null);
+                        if (remaining.decrementAndGet() == 0 && failed.get() == false) {
+                            channel.force(false);
+                            Files.move(tmp, destination, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+                            listener.onResponse(localFilename);
+                        }
                     }
                 } catch (Exception e) {
-                    if (failed.compareAndSet(false, true)) {
-                        grouped.onFailure(e);
-                    }
+                    fail.accept(e);
                 }
             });
         }
