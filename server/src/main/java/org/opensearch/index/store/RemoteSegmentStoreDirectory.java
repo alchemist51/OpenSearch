@@ -24,6 +24,7 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.Version;
+import org.opensearch.action.support.GroupedActionListener;
 import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.CheckedFunction;
@@ -32,9 +33,7 @@ import org.opensearch.common.UUIDs;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.annotation.InternalApi;
 import org.opensearch.common.annotation.PublicApi;
-import org.opensearch.common.blobstore.AsyncMultiStreamBlobContainer;
 import org.opensearch.common.blobstore.BlobContainer;
-import org.opensearch.common.blobstore.stream.read.listener.ReadContextListener;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.io.VersionedCodecStreamWrapper;
 import org.opensearch.common.logging.Loggers;
@@ -61,6 +60,7 @@ import org.opensearch.threadpool.ThreadPool;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -76,7 +76,6 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 
 /**
@@ -1098,11 +1097,14 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         return Collections.unmodifiableMap(this.segmentsUploadedToRemoteStore);
     }
 
+    /** Byte range fetched per request by {@link #copyToParallel}. */
+    private static final long PARALLEL_PART_BYTES = 32L * 1024 * 1024;
+
     /**
-     * Downloads the uploaded file {@code localFilename} to {@code destination} using up to {@code maxConcurrentStreams} part
-     * streams in parallel (on the remote-recovery pool) when the repository exposes the object's parts
-     * ({@link AsyncMultiStreamBlobContainer}); fails the listener with {@link UnsupportedOperationException} otherwise so the
-     * caller can fall back to {@link #copyFrom}. The listener receives the file name on success.
+     * Downloads the uploaded file {@code localFilename} to {@code destination} with up to {@code maxConcurrentStreams} concurrent
+     * byte-range reads (32 MB each, on the remote-recovery pool) into a temp file that is moved into place on completion. Needs
+     * only object reads (no part metadata), so it works with any repository that serves ranged reads. The listener receives the
+     * file name on success; the first failure is reported once and the partial file is removed.
      */
     public void copyToParallel(
         String localFilename,
@@ -1111,25 +1113,84 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         int maxConcurrentStreams,
         ActionListener<String> listener
     ) {
-        String remoteFilename = getExistingRemoteFilename(localFilename);
-        if (remoteFilename == null) {
+        copyToParallel(localFilename, destination, threadPool, maxConcurrentStreams, PARALLEL_PART_BYTES, listener);
+    }
+
+    // Visible for testing (part size)
+    void copyToParallel(
+        String localFilename,
+        Path destination,
+        ThreadPool threadPool,
+        int maxConcurrentStreams,
+        long partBytes,
+        ActionListener<String> listener
+    ) {
+        final String remoteFilename = getExistingRemoteFilename(localFilename);
+        final UploadedSegmentMetadata meta = segmentsUploadedToRemoteStore.get(localFilename);
+        if (remoteFilename == null || meta == null) {
             listener.onFailure(new NoSuchFileException(localFilename));
             return;
         }
-        BlobContainer container = remoteDataDirectory.getBlobContainer();
-        if ((container instanceof AsyncMultiStreamBlobContainer) == false) {
-            listener.onFailure(new UnsupportedOperationException("repository does not support multi-part reads"));
+        final long length = meta.getLength();
+        final BlobContainer container = remoteDataDirectory.getBlobContainer();
+        final int parts = (int) Math.max(1L, (length + partBytes - 1) / partBytes);
+        final Path tmp = destination.resolveSibling("." + destination.getFileName() + ".part-" + UUIDs.randomBase64UUID());
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(tmp.toFile(), "rw")) {
+            raf.setLength(length);
+        } catch (IOException e) {
+            listener.onFailure(e);
             return;
         }
-        ReadContextListener readListener = new ReadContextListener(
-            remoteFilename,
-            destination,
-            listener,
-            threadPool,
-            UnaryOperator.identity(),
-            maxConcurrentStreams
-        );
-        ((AsyncMultiStreamBlobContainer) container).readBlobAsync(remoteFilename, readListener);
+        final java.util.concurrent.atomic.AtomicInteger nextPart = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicBoolean failed = new java.util.concurrent.atomic.AtomicBoolean();
+        final ActionListener<Collection<Void>> allParts = ActionListener.wrap(ignored -> {
+            Files.move(tmp, destination, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            listener.onResponse(localFilename);
+        }, e -> {
+            try {
+                Files.deleteIfExists(tmp);
+            } catch (IOException ignored) {}
+            listener.onFailure(e);
+        });
+        final GroupedActionListener<Void> grouped = new GroupedActionListener<>(allParts, parts);
+        final int workers = Math.max(1, Math.min(maxConcurrentStreams, parts));
+        final java.util.concurrent.Executor executor = threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY);
+        for (int w = 0; w < workers; w++) {
+            executor.execute(() -> {
+                try (
+                    java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(tmp, java.nio.file.StandardOpenOption.WRITE)
+                ) {
+                    byte[] buffer = new byte[1 << 20];
+                    int part;
+                    while (failed.get() == false && (part = nextPart.getAndIncrement()) < parts) {
+                        long offset = (long) part * partBytes;
+                        long size = Math.min(partBytes, length - offset);
+                        try (InputStream in = container.readBlob(remoteFilename, offset, size)) {
+                            long written = 0;
+                            int n;
+                            while (written < size && (n = in.read(buffer, 0, (int) Math.min(buffer.length, size - written))) > 0) {
+                                java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(buffer, 0, n);
+                                long pos = offset + written;
+                                while (bb.hasRemaining()) {
+                                    pos += channel.write(bb, pos);
+                                }
+                                written += n;
+                            }
+                            if (written != size) {
+                                throw new IOException(
+                                    "short read of " + remoteFilename + " part " + part + ": " + written + " of " + size + " bytes"
+                                );
+                            }
+                        }
+                        grouped.onResponse(null);
+                    }
+                } catch (Exception e) {
+                    if (failed.compareAndSet(false, true)) {
+                        grouped.onFailure(e);
+                    }
+                }
+            });
+        }
     }
 
     public int getSegmentsUploadedToRemoteStoreSize() {

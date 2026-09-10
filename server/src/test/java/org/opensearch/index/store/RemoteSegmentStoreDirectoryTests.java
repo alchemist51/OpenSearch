@@ -52,7 +52,9 @@ import org.junit.Before;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -310,6 +312,46 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
         when(remoteDataDirectory.openInput(startsWith("_0.si"), anyLong(), eq(IOContext.DEFAULT))).thenReturn(indexInput);
 
         assertEquals(indexInput, remoteSegmentStoreDirectory.openInput("_0.si", IOContext.DEFAULT));
+    }
+
+    public void testCopyToParallelReassemblesRangesInOrder() throws Exception {
+        populateMetadata();
+        remoteSegmentStoreDirectory.init();
+        RemoteSegmentStoreDirectory.UploadedSegmentMetadata meta = remoteSegmentStoreDirectory.getSegmentsUploadedToRemoteStore()
+            .get("_0.si");
+        final int length = (int) meta.getLength();
+        final byte[] content = new byte[length];
+        random().nextBytes(content);
+        org.opensearch.common.blobstore.BlobContainer container = mock(org.opensearch.common.blobstore.BlobContainer.class);
+        when(remoteDataDirectory.getBlobContainer()).thenReturn(container);
+        final java.util.concurrent.atomic.AtomicInteger reads = new java.util.concurrent.atomic.AtomicInteger();
+        when(container.readBlob(eq(meta.getUploadedFilename()), anyLong(), anyLong())).thenAnswer(inv -> {
+            long pos = inv.getArgument(1);
+            long len = inv.getArgument(2);
+            reads.incrementAndGet();
+            return new java.io.ByteArrayInputStream(content, (int) pos, (int) len);
+        });
+        Path dest = createTempDir().resolve("_0.si");
+        org.opensearch.action.support.PlainActionFuture<String> done = org.opensearch.action.support.PlainActionFuture.newFuture();
+        long partBytes = Math.max(1L, length / 7);
+        remoteSegmentStoreDirectory.copyToParallel("_0.si", dest, threadPool, 4, partBytes, done);
+        assertEquals("_0.si", done.actionGet(30, TimeUnit.SECONDS));
+        assertArrayEquals(content, Files.readAllBytes(dest));
+        assertEquals((int) ((length + partBytes - 1) / partBytes), reads.get());
+        try (java.util.stream.Stream<Path> siblings = Files.list(dest.getParent())) {
+            assertEquals(1L, siblings.count()); // temp part file moved into place
+        }
+    }
+
+    public void testCopyToParallelUnknownFile() {
+        org.opensearch.action.support.PlainActionFuture<String> done = org.opensearch.action.support.PlainActionFuture.newFuture();
+        remoteSegmentStoreDirectory.copyToParallel("_0.si", createTempDir().resolve("_0.si"), threadPool, 4, done);
+        Exception e = expectThrows(Exception.class, () -> done.actionGet(5, TimeUnit.SECONDS));
+        assertTrue(
+            e.toString(),
+            org.opensearch.ExceptionsHelper.unwrapCause(e) instanceof NoSuchFileException
+                || org.opensearch.ExceptionsHelper.unwrap(e, NoSuchFileException.class) != null
+        );
     }
 
     public void testOpenInputNoSuchFile() {
