@@ -205,6 +205,7 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
             // run (2026-09-10). Keep only files present in the remote directory's uploaded set, and when neither that set
             // nor the requester's watermark changed since the previous reply to this target, answer nothing-new instead.
             long uploadedFingerprint = -1L;
+            final int catalogFiles = allFileMetadata.size();
             try {
                 org.opensearch.index.store.RemoteSegmentStoreDirectory remoteDir = shard.getRemoteDirectory();
                 if (remoteDir != null) {
@@ -251,10 +252,17 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
 
             // ── Filter files to (requestWatermark, advertMax] ────────────
             Map<String, MVFileMetadata> scopedFiles = new LinkedHashMap<>();
+            int withRange = 0, prunedByRange = 0;
+            long prunedBytes = 0L, sentBytes = 0L;
             for (Map.Entry<String, MVFileMetadata> entry : allFileMetadata.entrySet()) {
                 MVFileMetadata meta = entry.getValue();
+                if (meta.maxSeqNo() != MVFileMetadata.SEQ_UNKNOWN) withRange++;
                 if (includeFile(meta.minSeqNo(), meta.maxSeqNo(), requestWatermark, advertMax)) {
                     scopedFiles.put(entry.getKey(), meta);
+                    sentBytes += Math.max(0L, meta.sizeBytes());
+                } else {
+                    prunedByRange++;
+                    prunedBytes += Math.max(0L, meta.sizeBytes());
                 }
             }
 
@@ -288,7 +296,8 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
             );
 
             logger.info(
-                "CHECKPOINT_REPLY source=[{}][{}] target=[{}][{}] files={} noops={} advertMax={} watermark={}",
+                "CHECKPOINT_REPLY source=[{}][{}] target=[{}][{}] files={} noops={} advertMax={} watermark={} "
+                    + "PRUNE catalog={} uploaded={} with_range={} pruned={} pruned_bytes={} sent_bytes={}",
                 request.sourceIndex(),
                 request.sourceShard(),
                 request.targetIndex(),
@@ -296,7 +305,13 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
                 scopedFiles.size(),
                 scopedNoops.length,
                 advertMax,
-                requestWatermark
+                requestWatermark,
+                catalogFiles,
+                allFileMetadata.size(),
+                withRange,
+                prunedByRange,
+                prunedBytes,
+                sentBytes
             );
 
             return new MVCheckpointRequestAction.Response(checkpoint);
