@@ -1131,7 +1131,10 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             return;
         }
         final long length = meta.getLength();
-        final BlobContainer container = remoteDataDirectory.getBlobContainer();
+        // Data-format blobs (e.g. parquet) live in a sibling container of segments/data: route like every other read.
+        final BlobContainer container = remoteDataDirectory.getFormatBlobRouter()
+            .map(router -> router.containerFor(router.resolveFormat(remoteFilename)))
+            .orElse(remoteDataDirectory.getBlobContainer());
         final int parts = (int) Math.max(1L, (length + partBytes - 1) / partBytes);
         final Path tmp = destination.resolveSibling("." + destination.getFileName() + ".part-" + UUIDs.randomBase64UUID());
         try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(tmp.toFile(), "rw")) {
