@@ -11,19 +11,15 @@ package org.opensearch.mv;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.support.ActionFilters;
-import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.inject.Inject;
-import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.index.IndexService;
 import org.opensearch.index.engine.exec.Segment;
 import org.opensearch.index.engine.exec.WriterFileSet;
 import org.opensearch.index.engine.exec.coord.CatalogSnapshot;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.store.FileMetadata;
 import org.opensearch.indices.IndicesService;
-import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
@@ -68,6 +64,9 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
     private final java.util.concurrent.ConcurrentHashMap<ShardId, Long> minRequestedWatermarks =
         new java.util.concurrent.ConcurrentHashMap<>();
 
+    /** Per target: {uploaded-file-set fingerprint, requester watermark} of the last checkpoint we replied with. */
+    private final java.util.concurrent.ConcurrentHashMap<String, long[]> lastReplyByTarget = new java.util.concurrent.ConcurrentHashMap<>();
+
     @Inject
     public MVCheckpointRequestTransportHandler(
         org.opensearch.threadpool.ThreadPool threadPool,
@@ -94,14 +93,8 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
 
     /** Route to the node holding the SOURCE shard's active primary (relocation-safe). */
     @Override
-    protected org.opensearch.cluster.routing.ShardIterator shards(
-        org.opensearch.cluster.ClusterState state,
-        InternalRequest request
-    ) {
-        return state.routingTable()
-            .index(request.request().sourceIndex())
-            .shard(request.request().sourceShard())
-            .primaryShardIt();
+    protected org.opensearch.cluster.routing.ShardIterator shards(org.opensearch.cluster.ClusterState state, InternalRequest request) {
+        return state.routingTable().index(request.request().sourceIndex()).shard(request.request().sourceShard()).primaryShardIt();
     }
 
     @Override
@@ -122,10 +115,7 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
         IndexShard shard = indicesService.indexServiceSafe(requestShardId.getIndex()).getShard(requestShardId.id());
         if (!shard.routingEntry().primary() || !shard.routingEntry().active()) {
             // Relocation race: surface as retryable failure, never a silent nothing-new.
-            throw new org.opensearch.action.NoShardAvailableActionException(
-                requestShardId,
-                "source primary not active on routed node"
-            );
+            throw new org.opensearch.action.NoShardAvailableActionException(requestShardId, "source primary not active on routed node");
         }
         {
 
@@ -163,9 +153,15 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
                             // coverage from the source scan (MVSourceSeqCoverage), so scoping
                             // correctness is preserved; only the file-level pre-filter is relaxed.
                             String remoteKey = FileMetadata.serialize(fsEntry.getKey(), fileName);
-                            allFileMetadata.put(remoteKey, new MVFileMetadata(
-                                size, MVFileMetadata.SEQ_UNKNOWN, MVFileMetadata.SEQ_UNKNOWN, MVFileMetadata.CRC32_UNKNOWN
-                            ));
+                            allFileMetadata.put(
+                                remoteKey,
+                                new MVFileMetadata(
+                                    size,
+                                    MVFileMetadata.SEQ_UNKNOWN,
+                                    MVFileMetadata.SEQ_UNKNOWN,
+                                    MVFileMetadata.CRC32_UNKNOWN
+                                )
+                            );
                         }
                     }
                 }
@@ -188,6 +184,57 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
             }
 
             long advertMax = catalogAdvertMax;
+
+            // ── Advertise only what the remote store already holds ───────
+            // The catalog lists every searchable local parquet file, but the pull builder downloads from the remote
+            // store: a file that is still uploading (every flush, and 2–3 GB after a merge) cost the builder a failed
+            // "no coverage" round every ~0.35 s — 2,000–2,700 failed rounds and a third of the ingest wall per 100M-document
+            // run (2026-09-10). Keep only files present in the remote directory's uploaded set, and when neither that set
+            // nor the requester's watermark changed since the previous reply to this target, answer nothing-new instead.
+            long uploadedFingerprint = -1L;
+            try {
+                org.opensearch.index.store.RemoteSegmentStoreDirectory remoteDir = shard.getRemoteDirectory();
+                if (remoteDir != null) {
+                    java.util.Set<String> uploaded = remoteDir.getSegmentsUploadedToRemoteStore().keySet();
+                    Map<String, MVFileMetadata> onlyUploaded = new LinkedHashMap<>();
+                    long fp = 17L;
+                    for (Map.Entry<String, MVFileMetadata> entry : allFileMetadata.entrySet()) {
+                        if (uploaded.contains(entry.getKey())) {
+                            onlyUploaded.put(entry.getKey(), entry.getValue());
+                            fp = fp * 31L + entry.getKey().hashCode();
+                        }
+                    }
+                    if (onlyUploaded.size() < allFileMetadata.size()) {
+                        logger.debug(
+                            "CHECKPOINT_FILTER source=[{}][{}] uploaded={} of {} parquet files",
+                            request.sourceIndex(),
+                            request.sourceShard(),
+                            onlyUploaded.size(),
+                            allFileMetadata.size()
+                        );
+                    }
+                    allFileMetadata = onlyUploaded;
+                    uploadedFingerprint = fp;
+                }
+            } catch (Exception e) {
+                logger.debug("CHECKPOINT_FILTER unavailable (remote directory): {}", e.getMessage());
+            }
+            if (allFileMetadata.isEmpty()) {
+                return MVCheckpointRequestAction.Response.unavailable();
+            }
+            String targetKey = request.targetIndex() + "/" + request.targetShard();
+            long[] previous = lastReplyByTarget.get(targetKey);
+            if (previous != null && previous[0] == uploadedFingerprint && previous[1] == requestWatermark && uploadedFingerprint != -1L) {
+                logger.debug(
+                    "CHECKPOINT_UNCHANGED source=[{}][{}] target=[{}] watermark={} (same uploaded files as the previous reply)",
+                    request.sourceIndex(),
+                    request.sourceShard(),
+                    targetKey,
+                    requestWatermark
+                );
+                return MVCheckpointRequestAction.Response.unavailable();
+            }
+            lastReplyByTarget.put(targetKey, new long[] { uploadedFingerprint, requestWatermark });
 
             // ── Filter files to (requestWatermark, advertMax] ────────────
             Map<String, MVFileMetadata> scopedFiles = new LinkedHashMap<>();
