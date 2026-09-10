@@ -152,13 +152,26 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
                             // unknown max as "include" and the pull builder re-derives exact
                             // coverage from the source scan (MVSourceSeqCoverage), so scoping
                             // correctness is preserved; only the file-level pre-filter is relaxed.
+                            // Per-file _seq_no range: computed once per file in the background (MVSourceFileRanges) and
+                            // advertised when known so includeFile() drops files whose rows the builder already applied
+                            // (merge outputs). UNKNOWN until then — includeFile() treats an unknown max as "include" and
+                            // the builder re-derives exact coverage from the source scan, so correctness never depends on it.
                             String remoteKey = FileMetadata.serialize(fsEntry.getKey(), fileName);
+                            long minSeq = MVFileMetadata.SEQ_UNKNOWN, maxSeq = MVFileMetadata.SEQ_UNKNOWN;
+                            org.opensearch.mv.pull.MVSourceFileRanges rangesSvc = org.opensearch.mv.pull.MVSourceFileRanges.get();
+                            if (rangesSvc != null) {
+                                long[] r = rangesSvc.rangeOf(remoteKey, dir.resolve(fileName), threadPool.generic());
+                                if (r != null && r[1] >= 0) {
+                                    minSeq = r[0];
+                                    maxSeq = r[1];
+                                }
+                            }
                             allFileMetadata.put(
                                 remoteKey,
                                 new MVFileMetadata(
                                     size,
-                                    MVFileMetadata.SEQ_UNKNOWN,
-                                    MVFileMetadata.SEQ_UNKNOWN,
+                                    minSeq,
+                                    maxSeq,
                                     MVFileMetadata.CRC32_UNKNOWN
                                 )
                             );

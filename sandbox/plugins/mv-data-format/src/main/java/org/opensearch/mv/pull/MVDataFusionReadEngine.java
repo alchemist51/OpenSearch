@@ -213,6 +213,49 @@ final class MVDataFusionReadEngine implements Closeable {
     record CoverageTotals(long totalRows, long observedMaxSeqNo) {
     }
 
+    /**
+     * MIN/MAX of {@code _seq_no} over ONE parquet file (reads that column only). Used on the source node to annotate
+     * checkpoint files with their sequence range so a builder can skip files whose rows it has already applied
+     * (merge outputs). Returns {min, max}, or {-1, -1} for an empty file.
+     */
+    long[] fileSeqNoRange(Path file, String stageName) throws IOException {
+        Path staged = stagingRoot.resolve("range-" + stageName);
+        Files.createDirectories(staged);
+        Path link = staged.resolve("000000.parquet");
+        Files.deleteIfExists(link);
+        Files.createSymbolicLink(link, file.toAbsolutePath());
+        String sql = String.format(Locale.ROOT, "SELECT MIN(\"_seq_no\"), MAX(\"_seq_no\") FROM %s", INPUT_TABLE);
+        try (org.apache.arrow.memory.RootAllocator allocator = new org.apache.arrow.memory.RootAllocator()) {
+            try (
+                org.apache.arrow.c.ArrowArray array = org.apache.arrow.c.ArrowArray.allocateNew(allocator);
+                org.apache.arrow.c.ArrowSchema schema = org.apache.arrow.c.ArrowSchema.allocateNew(allocator)
+            ) {
+                try {
+                    MVNativeBridge.buildArrow(staged.toString(), INPUT_TABLE, sql, array.memoryAddress(), schema.memoryAddress());
+                } catch (RuntimeException noRows) {
+                    if (noRows.getMessage() != null && noRows.getMessage().contains("partial produced no batches")) {
+                        return new long[] { -1L, -1L };
+                    }
+                    throw noRows;
+                }
+                try (
+                    org.apache.arrow.vector.VectorSchemaRoot batch = org.apache.arrow.c.Data.importVectorSchemaRoot(allocator, array, schema, null)
+                ) {
+                    long min = Long.MAX_VALUE, max = -1L;
+                    List<org.apache.arrow.vector.FieldVector> vectors = batch.getFieldVectors();
+                    for (int row = 0; row < batch.getRowCount(); row++) {
+                        Object lo = vectors.get(0).getObject(row), hi = vectors.get(1).getObject(row);
+                        if (lo instanceof Number n) min = Math.min(min, n.longValue());
+                        if (hi instanceof Number n) max = Math.max(max, n.longValue());
+                    }
+                    return max < 0 ? new long[] { -1L, -1L } : new long[] { min, max };
+                }
+            }
+        } finally {
+            cleanupStaged(staged);
+        }
+    }
+
     static CoverageTotals reduceCoverageRows(
         int rowCount,
         java.util.function.IntFunction<Object> countAt,
