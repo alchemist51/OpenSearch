@@ -946,6 +946,88 @@ pub unsafe extern "C" fn df_mv_build_streaming_result(
     Ok(0)
 }
 
+/// Definition-aware compaction of pull state artifacts through the shared
+/// DataFusionRuntime: N sorted parquet state files in, ONE state file out with
+/// the identical Partial-stage schema, ordering and footer contract (see
+/// `mv_build_managed::compact_state_parquet_artifact`).
+///
+/// `source_schema` is the newline-separated `name\tarrow_token` wire used by
+/// `df_mv_validate_definition`; `files` is a newline-joined list of absolute
+/// parquet paths. Writes an `MvBuildResult` into `out_result_ptr` exactly as
+/// `df_mv_build_streaming_result` does.
+///
+/// # Safety
+/// - `runtime_ptr` must be a valid pointer from `df_create_global_runtime`.
+/// - `out_result_ptr` must be non-null and point to at least
+///   `size_of::<MvBuildResult>()` bytes of writeable memory.
+/// - String pointers must be valid UTF-8 of the given lengths.
+/// - Ordering arrays must have `ordering_len` elements each.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_mv_compact_state_result(
+    runtime_ptr: i64,
+    schema_ptr: *const u8,
+    schema_len: i64,
+    table_ptr: *const u8,
+    table_len: i64,
+    sql_ptr: *const u8,
+    sql_len: i64,
+    files_ptr: *const u8,
+    files_len: i64,
+    output_ptr: *const u8,
+    output_len: i64,
+    ordering_indices_ptr: *const i32,
+    ordering_dirs_ptr: *const i32,
+    ordering_nulls_ptr: *const i32,
+    ordering_len: i32,
+    context_id: i64,
+    out_result_ptr: *mut u8,
+) -> i64 {
+    use crate::mv_build_managed::MvBuildResult;
+
+    if runtime_ptr == 0 {
+        return Err("df_mv_compact_state_result: runtime_ptr is null".to_string());
+    }
+    if out_result_ptr.is_null() {
+        return Err("df_mv_compact_state_result: out_result_ptr is null".to_string());
+    }
+    let runtime = &*(runtime_ptr as *const crate::api::DataFusionRuntime);
+    let schema = str_from_raw(schema_ptr, schema_len)
+        .map_err(|e| format!("df_mv_compact_state_result: schema: {}", e))?;
+    let table = str_from_raw(table_ptr, table_len)
+        .map_err(|e| format!("df_mv_compact_state_result: table: {}", e))?;
+    let sql = str_from_raw(sql_ptr, sql_len)
+        .map_err(|e| format!("df_mv_compact_state_result: sql: {}", e))?;
+    let files_joined = str_from_raw(files_ptr, files_len)
+        .map_err(|e| format!("df_mv_compact_state_result: files: {}", e))?;
+    let output = str_from_raw(output_ptr, output_len)
+        .map_err(|e| format!("df_mv_compact_state_result: output: {}", e))?;
+    let files: Vec<String> = files_joined
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    let len = ordering_len as usize;
+    let indices = std::slice::from_raw_parts(ordering_indices_ptr, len);
+    let dirs = std::slice::from_raw_parts(ordering_dirs_ptr, len);
+    let nulls = std::slice::from_raw_parts(ordering_nulls_ptr, len);
+    let ordering =
+        crate::mv_build_managed::OrderingContract::from_parallel_arrays(indices, dirs, nulls);
+
+    let result = crate::mv_build_managed::compact_state_parquet_artifact(
+        runtime, schema, table, sql, &files, output, &ordering, context_id,
+    )?;
+
+    std::ptr::copy_nonoverlapping(
+        &result as *const MvBuildResult as *const u8,
+        out_result_ptr,
+        std::mem::size_of::<MvBuildResult>(),
+    );
+
+    Ok(0)
+}
+
 /// Managed Arrow C-Data build through the shared DataFusionRuntime.
 /// Replaces df_mv_build_arrow for production pull-path builds.
 #[ffm_safe]

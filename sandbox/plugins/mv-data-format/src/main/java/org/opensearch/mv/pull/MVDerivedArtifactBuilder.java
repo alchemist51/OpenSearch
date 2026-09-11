@@ -130,7 +130,12 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             BuildResult result = buildOnce(snapshot, stageDir, shard);
             if (result != null && result.success() && adaptiveCapDocs < configuredCap) {
                 adaptiveCapDocs = Math.min(configuredCap, Math.max(ADAPTIVE_CAP_FLOOR_DOCS, adaptiveCapDocs) * 2);
-                logger.info("mv_pull ADAPTIVE_CAP shard=[{}] restored to {} docs/round (configured {})", shard.shardId(), adaptiveCapDocs, configuredCap);
+                logger.info(
+                    "mv_pull ADAPTIVE_CAP shard=[{}] restored to {} docs/round (configured {})",
+                    shard.shardId(),
+                    adaptiveCapDocs,
+                    configuredCap
+                );
             }
             return result;
         } catch (Exception e) {
@@ -142,7 +147,9 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
                     shard.shardId(),
                     capUsed,
                     next,
-                    e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage().substring(0, Math.min(160, e.getMessage().length()))
+                    e.getMessage() == null
+                        ? e.getClass().getSimpleName()
+                        : e.getMessage().substring(0, Math.min(160, e.getMessage().length()))
                 );
             }
             throw e;
@@ -420,13 +427,22 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
                 effectivelyCapped
             );
             long tNativeBuild = System.nanoTime();
-            ManagedArtifact artifact = buildManagedArtifact(
-                stagedParquet,
-                MVConstants.INPUT_TABLE,
-                filteredSql,
-                shard.shardPath().getDataPath(),
-                generation
-            );
+            // One native job per shard at a time: a compaction of this shard's
+            // generations (MVStateCompactionMerger) shares this lock.
+            java.util.concurrent.locks.ReentrantLock buildLock = MVShardBuildLock.forShard(shard.shardId());
+            buildLock.lock();
+            final ManagedArtifact artifact;
+            try {
+                artifact = buildManagedArtifact(
+                    stagedParquet,
+                    MVConstants.INPUT_TABLE,
+                    filteredSql,
+                    shard.shardPath().getDataPath(),
+                    generation
+                );
+            } finally {
+                buildLock.unlock();
+            }
             long nativeBuildNanos = System.nanoTime() - tNativeBuild;
 
             // ── NATIVE_BUILD_POST log (instrumentation point 4) ──────

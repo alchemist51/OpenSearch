@@ -42,6 +42,7 @@ public final class MVNativeBridge {
     private static final MethodHandle MV_STATE_FIELD_NAMES;
     private static final MethodHandle SORTED_PARQUET_MERGE;
     private static final MethodHandle MV_BUILD_STREAMING_RESULT;
+    private static final MethodHandle MV_COMPACT_STATE_RESULT;
     private static final MethodHandle MV_BUILD_RESULT_ABI_VERSION;
     private static final MethodHandle MV_CREATE_GLOBAL_RUNTIME;
     private static final MethodHandle MV_CLOSE_GLOBAL_RUNTIME;
@@ -209,14 +210,13 @@ public final class MVNativeBridge {
         );
         // Stage 3: Streaming build with full MvBuildResult struct output.
         // i64 df_mv_build_streaming_result(runtime_ptr,
-        //   input_ptr, input_len, table_ptr, table_len, sql_ptr, sql_len,
-        //   output_ptr, output_len,
-        //   ordering_indices_ptr, ordering_dirs_ptr, ordering_nulls_ptr, ordering_len,
-        //   context_id, spill_budget_bytes, spill_file_count_limit,
-        //   out_result_ptr)
+        // input_ptr, input_len, table_ptr, table_len, sql_ptr, sql_len,
+        // output_ptr, output_len,
+        // ordering_indices_ptr, ordering_dirs_ptr, ordering_nulls_ptr, ordering_len,
+        // context_id, spill_budget_bytes, spill_file_count_limit,
+        // out_result_ptr)
         MV_BUILD_STREAMING_RESULT = linker.downcallHandle(
-            lib.find("df_mv_build_streaming_result")
-                .orElseThrow(() -> new IllegalStateException("df_mv_build_streaming_result not found")),
+            lib.find("df_mv_build_streaming_result").orElseThrow(() -> new IllegalStateException("df_mv_build_streaming_result not found")),
             FunctionDescriptor.of(
                 ValueLayout.JAVA_LONG,
                 ValueLayout.JAVA_LONG,       // runtime_ptr
@@ -235,6 +235,35 @@ public final class MVNativeBridge {
                 ValueLayout.JAVA_LONG,        // context_id
                 ValueLayout.JAVA_LONG,        // spill_budget_bytes
                 ValueLayout.JAVA_INT,         // spill_file_count_limit
+                ValueLayout.ADDRESS           // out_result_ptr (MvBuildResult*)
+            )
+        );
+        // Definition-aware compaction of pull state artifacts (same MvBuildResult struct output).
+        // i64 df_mv_compact_state_result(runtime_ptr,
+        // schema_ptr, schema_len, table_ptr, table_len, sql_ptr, sql_len,
+        // files_ptr, files_len, output_ptr, output_len,
+        // ordering_indices_ptr, ordering_dirs_ptr, ordering_nulls_ptr, ordering_len,
+        // context_id, out_result_ptr)
+        MV_COMPACT_STATE_RESULT = linker.downcallHandle(
+            lib.find("df_mv_compact_state_result").orElseThrow(() -> new IllegalStateException("df_mv_compact_state_result not found")),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,       // runtime_ptr
+                ValueLayout.ADDRESS,          // schema_ptr
+                ValueLayout.JAVA_LONG,        // schema_len
+                ValueLayout.ADDRESS,          // table_ptr
+                ValueLayout.JAVA_LONG,        // table_len
+                ValueLayout.ADDRESS,          // sql_ptr
+                ValueLayout.JAVA_LONG,        // sql_len
+                ValueLayout.ADDRESS,          // files_ptr (newline-joined)
+                ValueLayout.JAVA_LONG,        // files_len
+                ValueLayout.ADDRESS,          // output_ptr
+                ValueLayout.JAVA_LONG,        // output_len
+                ValueLayout.ADDRESS,          // ordering_indices_ptr (int[])
+                ValueLayout.ADDRESS,          // ordering_dirs_ptr (int[])
+                ValueLayout.ADDRESS,          // ordering_nulls_ptr (int[])
+                ValueLayout.JAVA_INT,         // ordering_len
+                ValueLayout.JAVA_LONG,        // context_id
                 ValueLayout.ADDRESS           // out_result_ptr (MvBuildResult*)
             )
         );
@@ -264,11 +293,10 @@ public final class MVNativeBridge {
         );
         // Stage 3: native schema cross-check for a candidate MV definition.
         // i64 df_mv_validate_definition(schema_ptr, schema_len, table_ptr, table_len,
-        //   sql_ptr, sql_len, ordering_indices_ptr, ordering_dirs_ptr, ordering_nulls_ptr,
-        //   ordering_len, out_ptr, out_cap, out_len)
+        // sql_ptr, sql_len, ordering_indices_ptr, ordering_dirs_ptr, ordering_nulls_ptr,
+        // ordering_len, out_ptr, out_cap, out_len)
         MV_VALIDATE_DEFINITION = linker.downcallHandle(
-            lib.find("df_mv_validate_definition")
-                .orElseThrow(() -> new IllegalStateException("df_mv_validate_definition not found")),
+            lib.find("df_mv_validate_definition").orElseThrow(() -> new IllegalStateException("df_mv_validate_definition not found")),
             FunctionDescriptor.of(
                 ValueLayout.JAVA_LONG,
                 ValueLayout.ADDRESS,          // schema_ptr (newline/tab source schema)
@@ -718,6 +746,70 @@ public final class MVNativeBridge {
                 contextId,
                 spillBudgetBytes,
                 spillFileCountLimit,
+                outResultBuf
+            );
+        }
+    }
+
+    /**
+     * Definition-aware compaction of pull state artifacts: N sorted parquet
+     * state files in, ONE state file out with the identical Partial-stage
+     * schema, ordering and footer contract. The result struct is the same
+     * {@code MvBuildResult} the streaming build writes (see
+     * {@code df_mv_compact_state_result}).
+     *
+     * @param runtimePtr      shared DataFusionRuntime pointer
+     * @param sourceSchema    newline/tab-encoded SOURCE schema (arrow tokens) the SQL is planned against
+     * @param tableName       DataFusion table name the SQL is written against
+     * @param sql             the definition's canonical partial SQL (unfiltered)
+     * @param stateFiles      absolute paths of the state artifacts to compact
+     * @param outputFile      path of the compacted artifact (written atomically by the caller's rename)
+     * @param orderingIndices full group-by ordering: state-field indices
+     * @param orderingDirs    parallel direction tokens
+     * @param orderingNulls   parallel null-placement tokens
+     * @param contextId       cancellation context id
+     * @param outResultBuf    caller-allocated {@code MvBuildResult} buffer
+     */
+    public static void compactStateArtifactNative(
+        long runtimePtr,
+        String sourceSchema,
+        String tableName,
+        String sql,
+        java.util.List<String> stateFiles,
+        String outputFile,
+        int[] orderingIndices,
+        int[] orderingDirs,
+        int[] orderingNulls,
+        long contextId,
+        MemorySegment outResultBuf
+    ) {
+        try (var call = new NativeCall()) {
+            var schema = call.str(sourceSchema);
+            var table = call.str(tableName);
+            var query = call.str(sql);
+            var files = call.str(String.join("\n", stateFiles));
+            var out = call.str(outputFile);
+            var indices = call.ints(orderingIndices);
+            var dirs = call.ints(orderingDirs);
+            var nulls = call.ints(orderingNulls);
+            call.invoke(
+                MV_COMPACT_STATE_RESULT,
+                runtimePtr,
+                schema.segment(),
+                schema.len(),
+                table.segment(),
+                table.len(),
+                query.segment(),
+                query.len(),
+                files.segment(),
+                files.len(),
+                out.segment(),
+                out.len(),
+                indices,
+                dirs,
+                nulls,
+                orderingIndices.length,
+                contextId,
                 outResultBuf
             );
         }

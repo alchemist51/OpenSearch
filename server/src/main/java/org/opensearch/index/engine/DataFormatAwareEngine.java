@@ -44,6 +44,7 @@ import org.opensearch.index.engine.dataformat.FlushInput;
 import org.opensearch.index.engine.dataformat.IndexingEngineConfig;
 import org.opensearch.index.engine.dataformat.IndexingExecutionEngine;
 import org.opensearch.index.engine.dataformat.MergeResult;
+import org.opensearch.index.engine.dataformat.Merger;
 import org.opensearch.index.engine.dataformat.ReaderManagerConfig;
 import org.opensearch.index.engine.dataformat.RefreshInput;
 import org.opensearch.index.engine.dataformat.RefreshResult;
@@ -57,6 +58,7 @@ import org.opensearch.index.engine.dataformat.merge.MergeFailedEngineException;
 import org.opensearch.index.engine.dataformat.merge.MergeHandler;
 import org.opensearch.index.engine.dataformat.merge.MergeScheduler;
 import org.opensearch.index.engine.dataformat.merge.OneMerge;
+import org.opensearch.index.engine.derived.pull.spi.DerivedStateMergers;
 import org.opensearch.index.engine.exec.CatalogSnapshotLifecycleListener;
 import org.opensearch.index.engine.exec.CombinedCatalogSnapshotDeletionPolicy;
 import org.opensearch.index.engine.exec.DocumentLookupSupport;
@@ -545,13 +547,29 @@ public class DataFormatAwareEngine implements Indexer {
             // publishDerivedArtifact), not writer output: the primary merger has nothing to merge
             // ("No files to merge" storms, 5k failures in 2 min on the 100M run) and a generic
             // parquet merge of state files breaks the state contract (__row_id__ appended). State
-            // compaction is the MV machinery's job, so such targets never enter the merge scheduler.
+            // compaction is the MV machinery's job: when the owning plugin registers a
+            // definition-aware state merger (DerivedStateMergers) the scheduler runs THAT merger
+            // over the published generations; otherwise such targets never enter the merge scheduler.
             final boolean derivedMaterializedView = "materialized_view".equals(
                 engineConfig.getIndexSettings().getSettings().get("index.derived.data_format")
             );
+            Merger handlerMerger = indexingExecutionEngine.getMerger();
+            boolean handlerMergesEnabled = derivedMaterializedView == false;
+            if (derivedMaterializedView) {
+                Optional<Merger> stateMerger = DerivedStateMergers.create(
+                    "materialized_view",
+                    engineConfig.getIndexSettings(),
+                    shardId,
+                    store.shardPath().getDataPath()
+                );
+                if (stateMerger.isPresent()) {
+                    handlerMerger = stateMerger.get();
+                    handlerMergesEnabled = true;
+                }
+            }
             MergeHandler mergeHandler = new MergeHandler(
                 this::acquireSnapshot,
-                indexingExecutionEngine.getMerger(),
+                handlerMerger,
                 shardId,
                 dataFormatAwareMergePolicy,
                 dataFormatAwareMergePolicy,
@@ -560,10 +578,17 @@ public class DataFormatAwareEngine implements Indexer {
                     assert gen > 0 : "merge generation must be positive but was: " + gen;
                     return gen;
                 },
-                derivedMaterializedView == false
+                handlerMergesEnabled
             );
             if (derivedMaterializedView) {
-                logger.info("derived materialized-view target: background merges disabled (MV state is compacted by the MV machinery)");
+                if (handlerMergesEnabled) {
+                    logger.info(
+                        "derived materialized-view target: background compaction enabled through [{}]",
+                        handlerMerger.getClass().getSimpleName()
+                    );
+                } else {
+                    logger.info("derived materialized-view target: background merges disabled (no state merger registered)");
+                }
             }
 
             // Restore version map and checkpoint tracker after recovery.
@@ -2718,6 +2743,9 @@ public class DataFormatAwareEngine implements Indexer {
                     refreshListener.afterRefresh(true);
                 }
             }
+            // The cached segment/doc stats are otherwise only rebuilt on refresh or flush; a
+            // derived target refreshes only when it publishes, so keep them truthful here.
+            statsCache.forceRefresh();
         } catch (Exception ex) {
             try {
                 logger.error(() -> new ParameterizedMessage("Merge failed while registering merged files in Snapshot"), ex);

@@ -175,13 +175,25 @@ public class CatalogSnapshotManager implements Closeable {
             );
         }
 
-        // Row count conservation: merged output must have the same total rows as the inputs
-        if (!assertRowCountConservation(segmentsToRemove, segmentToAdd)) {
-            long inputRows = segmentsToRemove.stream()
-                .flatMap(s -> s.dfGroupedSearchableFiles().values().stream())
-                .mapToLong(WriterFileSet::numRows)
-                .sum();
-            long outputRows = segmentToAdd.dfGroupedSearchableFiles().values().stream().mapToLong(WriterFileSet::numRows).sum();
+        // Row count conservation: merged output must have the same total rows as the inputs —
+        // unless the merge folds rows by design (state compaction), where fewer rows is the
+        // expected outcome and only MORE rows than the inputs is impossible.
+        long inputRows = segmentsToRemove.stream()
+            .flatMap(s -> s.dfGroupedSearchableFiles().values().stream())
+            .mapToLong(WriterFileSet::numRows)
+            .sum();
+        long outputRows = segmentToAdd.dfGroupedSearchableFiles().values().stream().mapToLong(WriterFileSet::numRows).sum();
+        if (mergeResult.foldsRows()) {
+            if (outputRows > inputRows) {
+                throw new IllegalStateException(
+                    "Folding merge produced more rows than its inputs: input segments have "
+                        + inputRows
+                        + " total rows but merged output has "
+                        + outputRows
+                        + " rows"
+                );
+            }
+        } else if (!assertRowCountConservation(segmentsToRemove, segmentToAdd)) {
             throw new IllegalStateException(
                 "Merged segment row count mismatch: input segments have "
                     + inputRows

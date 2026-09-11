@@ -68,6 +68,16 @@ public final class MVDefinitionValidator {
 
     private MVDefinitionValidator() {}
 
+    /**
+     * The newline/tab-encoded SOURCE schema ({@code name\tarrow_token}) the
+     * definition SQL is planned against, derived from the source index's
+     * mapping exactly as view validation derives it. Used by compaction, which
+     * must plan the same SQL on a node that holds no source data.
+     */
+    public static String sourceSchemaWire(org.opensearch.cluster.metadata.IndexMetadata sourceMetadata) {
+        return buildSourceSchemaWire(TransportMVValidateAction.sourceOsTypes(sourceMetadata));
+    }
+
     /** One physical state column reported by the engine: name + arrow token. */
     public record StateField(String name, String arrowToken) {
         public StateField {
@@ -195,11 +205,11 @@ public final class MVDefinitionValidator {
             StateField nf = nr.fields.get(i);
 
             // 2. Group-key name + order — ONLY for plain-column keys. A DERIVED
-            //    (expression) group key is named by the engine after its
-            //    Partial-stage expression (e.g. "mv_input.EventTime / Int64(300000)"),
-            //    NOT the user-visible SELECT alias — exactly like aggregate state
-            //    columns. Its name is therefore engine-internal and intentionally
-            //    not name-compared; its position and type family still are.
+            // (expression) group key is named by the engine after its
+            // Partial-stage expression (e.g. "mv_input.EventTime / Int64(300000)"),
+            // NOT the user-visible SELECT alias — exactly like aggregate state
+            // columns. Its name is therefore engine-internal and intentionally
+            // not name-compared; its position and type family still are.
             if (i < numGroupKeys && def.groupKeys().get(i).isPlainColumn() && expectedNames.get(i).equals(nf.name()) == false) {
                 mismatches.add(
                     String.format(
@@ -365,7 +375,8 @@ public final class MVDefinitionValidator {
     }
 
     /** Parsed native validation result document. */
-    private record NativeResult(List<StateField> fields, long schemaHash, long orderingIdentityHash, long definitionHash) {}
+    private record NativeResult(List<StateField> fields, long schemaHash, long orderingIdentityHash, long definitionHash) {
+    }
 
     private static NativeResult parseNativeResult(String text) {
         Objects.requireNonNull(text, "native result text");

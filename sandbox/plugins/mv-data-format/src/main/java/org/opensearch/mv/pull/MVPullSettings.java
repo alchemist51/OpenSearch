@@ -89,6 +89,21 @@ public final class MVPullSettings {
         Setting.Property.Dynamic
     );
 
+    /**
+     * Engine-driven compaction of published state generations: when {@code true}
+     * (default) the target's merge scheduler runs the definition-aware
+     * {@link MVStateCompactionMerger} over its generations with the ordinary
+     * tiered merge policy; when {@code false} the target keeps one segment per
+     * generation. Read by the server engine by key
+     * ({@code DerivedStateMergers.INDEX_SETTING_KEY}); registered here.
+     */
+    public static final Setting<Boolean> COMPACTION_ENABLED = Setting.boolSetting(
+        org.opensearch.index.engine.derived.pull.spi.DerivedStateMergers.INDEX_SETTING_KEY,
+        true,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
     // ── Bounded streaming rounds ─────────────────────────────────────────
 
     /**
@@ -177,7 +192,8 @@ public final class MVPullSettings {
             MAX_OPS_ESTIMATE_PER_ROUND,
             MAX_CARDINALITY_ESTIMATE_PER_ROUND,
             MAX_NATIVE_PRESSURE_FRACTION,
-            MAX_GENERATIONS_BEFORE_COMPACT
+            MAX_GENERATIONS_BEFORE_COMPACT,
+            COMPACTION_ENABLED
         );
     }
 
@@ -195,8 +211,7 @@ public final class MVPullSettings {
      * </ul>
      */
     public record Services(ClusterService clusterService, ThreadPool threadPool, Supplier<RepositoriesService> repositoriesService,
-        long dataFusionRuntimePtr, CircuitBreaker parentCircuitBreaker,
-        org.opensearch.transport.client.Client client) {
+        long dataFusionRuntimePtr, CircuitBreaker parentCircuitBreaker, org.opensearch.transport.client.Client client) {
         /**
          * Backward-compatible constructor without Stage 2 services or client.
          * Used by tests and legacy code paths that don't need managed builds.
@@ -208,8 +223,13 @@ public final class MVPullSettings {
         /**
          * Constructor without client — for existing call sites that don't need checkpoint request RPC.
          */
-        public Services(ClusterService clusterService, ThreadPool threadPool, Supplier<RepositoriesService> repositoriesService,
-            long dataFusionRuntimePtr, CircuitBreaker parentCircuitBreaker) {
+        public Services(
+            ClusterService clusterService,
+            ThreadPool threadPool,
+            Supplier<RepositoriesService> repositoriesService,
+            long dataFusionRuntimePtr,
+            CircuitBreaker parentCircuitBreaker
+        ) {
             this(clusterService, threadPool, repositoriesService, dataFusionRuntimePtr, parentCircuitBreaker, null);
         }
 

@@ -16,7 +16,6 @@ import org.opensearch.mv.pull.MVPullSettings;
 import org.opensearch.plugins.ActionPlugin.ActionHandler;
 import org.opensearch.plugins.Plugin;
 
-
 /**
  * Unified materialized-view plugin — CONTROL PLANE + PULL PIPELINE ONLY.
  *
@@ -182,6 +181,17 @@ public class MVDataFormatPlugin extends Plugin
             client
         );
         MVDerivedPullFormat mvFormat = new MVDerivedPullFormat(mvServices);
+        // Engine-driven compaction of pull targets: the target's merge scheduler
+        // hands published generations to the definition-aware state merger.
+        org.opensearch.index.engine.derived.pull.spi.DerivedStateMergers.register(
+            mvFormat.formatId(),
+            (indexSettings, shardId, shardDataPath) -> new org.opensearch.mv.pull.MVStateCompactionMerger(
+                indexSettings,
+                shardId,
+                shardDataPath,
+                mvServices
+            )
+        );
         this.pullService = new NodeDerivedPullService(threadPool, java.util.List.of(mvFormat));
         this.pullService.start();
 

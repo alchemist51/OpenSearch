@@ -648,6 +648,331 @@ fn collect_spill_metrics(plan: &dyn ExecutionPlan) -> (u64, u32) {
     (total_bytes, total_files)
 }
 
+/// Definition-aware COMPACTION of pull state artifacts: N parquet state files
+/// (each one build round's Partial-stage output, sorted by the group ordering)
+/// in, ONE state file out — same schema, same ordering, same footer contract as
+/// `build_streaming_parquet_artifact`, so the target's read, upload and
+/// recovery paths cannot tell a compacted generation from a built one.
+///
+/// Plan: `definition SQL` is planned against a SCHEMA-ONLY table (as in
+/// `validate_definition`) so the Partial half names the state columns and the
+/// Final half supplies the state-consuming aggregate expressions. The state
+/// files are scanned, aliased positionally to the Partial names, folded by
+/// `AggregateMode::PartialReduce` (state in, state out — SUM/COUNT states add,
+/// MIN/MAX states take the extreme, AVG's count+sum add), renamed back to the
+/// Partial names, sorted by the full ordering and streamed to parquet.
+///
+/// Never folds to answers: the output stays a partial state, exactly what the
+/// query-time fold expects. Returns the same `MvBuildResult` instrumentation
+/// as the build path; `schema_hash` is that of the written schema.
+#[allow(clippy::too_many_arguments)]
+pub fn compact_state_parquet_artifact(
+    runtime: &DataFusionRuntime,
+    source_schema_encoded: &str,
+    table_name: &str,
+    sql: &str,
+    state_files: &[String],
+    output_file: &str,
+    ordering: &OrderingContract,
+    context_id: i64,
+) -> Result<MvBuildResult, String> {
+    use datafusion::datasource::MemTable;
+    use datafusion::physical_plan::expressions::{CastExpr, Column};
+    use datafusion::physical_plan::projection::ProjectionExec;
+    use datafusion::physical_plan::PhysicalExpr;
+
+    fn is_string_like(t: &DataType) -> bool {
+        matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
+    }
+    fn is_binary_like(t: &DataType) -> bool {
+        matches!(t, DataType::Binary | DataType::LargeBinary | DataType::BinaryView)
+    }
+
+    if state_files.is_empty() {
+        return Err("mv_compact: no state files".to_string());
+    }
+    let wall_start = std::time::Instant::now();
+    let start_rss = crate::memory_guard::cached_resident_bytes();
+    let input_schema = parse_source_schema(source_schema_encoded)?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("mv_compact runtime: {e}"))?;
+    let token = get_cancel_token(context_id);
+    let definition_hash = compute_definition_hash_u64(ordering);
+    let ordering_hash = compute_ordering_hash_u64(ordering);
+
+    rt.block_on(async {
+        // Single partition: one PartialReduce must see ALL state rows or a
+        // group split across partitions never combines. The parquet reader is
+        // asked for the planned (non-view) string/binary types so the state
+        // scan matches the Partial schema without casts.
+        let config = SessionConfig::new()
+            .with_target_partitions(1)
+            .set_bool("datafusion.execution.parquet.schema_force_view_types", false);
+        // The SHARED runtime (memory pool, spill directory, caches): the node's
+        // memory guard gates every pool on jemalloc-resident bytes measured
+        // against the shared pool's limit, so a compaction must draw from the
+        // same budget as a round build. The Java caller keeps the two from
+        // running at the same time and bounds the input rows to what fits.
+        let state = SessionStateBuilder::new()
+            .with_config(config)
+            .with_runtime_env(Arc::new(runtime.runtime_env.clone()))
+            .with_default_features()
+            .with_physical_optimizer_rules(
+                crate::agg_mode::physical_optimizer_rules_without_combine(),
+            )
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        // 1. Schema-only table so the definition SQL plans exactly as at build time.
+        let empty = MemTable::try_new(Arc::clone(&input_schema), vec![vec![]])
+            .map_err(|e| format!("mv_compact schema table: {e}"))?;
+        ctx.register_table(table_name, Arc::new(empty))
+            .map_err(|e| format!("mv_compact register: {e}"))?;
+
+        let compact_future = async {
+            let physical = ctx
+                .sql(sql)
+                .await
+                .map_err(|e| format!("mv_compact plan sql: {e}"))?
+                .create_physical_plan()
+                .await
+                .map_err(|e| format!("mv_compact physical: {e}"))?;
+            let final_node = find_agg_mode(&physical, |m| {
+                matches!(
+                    m,
+                    AggregateMode::Final
+                        | AggregateMode::FinalPartitioned
+                        | AggregateMode::Single
+                        | AggregateMode::SinglePartitioned
+                )
+            })
+            .ok_or("mv_compact: no Final/Single aggregate in plan")?;
+            let final_agg = final_node
+                .downcast_ref::<AggregateExec>()
+                .ok_or("mv_compact: downcast Final")?;
+            // The Partial half names the state columns; Single-mode plans have
+            // no separate Partial, so rebuild the aggregate in Partial mode.
+            let partial_schema: SchemaRef =
+                match find_agg_mode(&physical, |m| matches!(m, AggregateMode::Partial)) {
+                    Some(p) => p.schema(),
+                    None => AggregateExec::try_new(
+                        AggregateMode::Partial,
+                        final_agg.group_expr().clone(),
+                        final_agg.aggr_expr().to_vec(),
+                        final_agg.filter_expr().to_vec(),
+                        Arc::clone(final_agg.input()),
+                        final_agg.input_schema(),
+                    )
+                    .map_err(|e| format!("mv_compact partial probe: {e}"))?
+                    .schema(),
+                };
+
+            // 2. State scan over the N parquet artifacts.
+            let scan: Arc<dyn ExecutionPlan> = ctx
+                .read_parquet(state_files.to_vec(), ParquetReadOptions::default())
+                .await
+                .map_err(|e| format!("mv_compact read_parquet: {e}"))?
+                .create_physical_plan()
+                .await
+                .map_err(|e| format!("mv_compact scan plan: {e}"))?;
+            let scan_schema = scan.schema();
+            if scan_schema.fields().len() != partial_schema.fields().len() {
+                return Err(format!(
+                    "mv_compact: state arity {} != partial arity {} — the files do not belong to this definition",
+                    scan_schema.fields().len(),
+                    partial_schema.fields().len()
+                ));
+            }
+            // 3. Positional alias to the Partial names. The parquet reader may
+            //    surface string/binary columns as their view or large variants
+            //    (reader defaults), so those are CAST back to the planned type;
+            //    any other type difference means the files are not this
+            //    definition's and is refused.
+            let mut alias_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::with_capacity(partial_schema.fields().len());
+            for (i, (sf, pf)) in scan_schema
+                .fields()
+                .iter()
+                .zip(partial_schema.fields().iter())
+                .enumerate()
+            {
+                let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new(sf.name(), i));
+                let expr: Arc<dyn PhysicalExpr> = if sf.data_type() == pf.data_type() {
+                    col
+                } else if is_string_like(sf.data_type()) && is_string_like(pf.data_type())
+                    || is_binary_like(sf.data_type()) && is_binary_like(pf.data_type())
+                {
+                    Arc::new(CastExpr::new(col, pf.data_type().clone(), None))
+                } else {
+                    return Err(format!(
+                        "mv_compact: state col {i} ({}) type {:?} != partial type {:?}",
+                        sf.name(),
+                        sf.data_type(),
+                        pf.data_type()
+                    ));
+                };
+                alias_exprs.push((expr, pf.name().clone()));
+            }
+            let aliased: Arc<dyn ExecutionPlan> = Arc::new(
+                ProjectionExec::try_new(alias_exprs, scan)
+                    .map_err(|e| format!("mv_compact alias: {e}"))?,
+            );
+            // 4. PartialReduce: merge accumulator states by group key, emit states.
+            let reduce: Arc<dyn ExecutionPlan> = Arc::new(
+                AggregateExec::try_new(
+                    AggregateMode::PartialReduce,
+                    final_agg.group_expr().clone(),
+                    final_agg.aggr_expr().to_vec(),
+                    final_agg.filter_expr().to_vec(),
+                    aliased,
+                    final_agg.input_schema(),
+                )
+                .map_err(|e| format!("mv_compact PartialReduce: {e}"))?,
+            );
+            // 5. Rename outputs back to the Partial names and re-check types so
+            //    the written schema is byte-for-byte the build's schema.
+            let reduce_schema = reduce.schema();
+            if reduce_schema.fields().len() != partial_schema.fields().len() {
+                return Err(format!(
+                    "mv_compact: reduce arity {} != partial arity {}",
+                    reduce_schema.fields().len(),
+                    partial_schema.fields().len()
+                ));
+            }
+            let rename_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = partial_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, pf)| {
+                    (
+                        Arc::new(Column::new(reduce_schema.field(i).name(), i)) as Arc<dyn PhysicalExpr>,
+                        pf.name().clone(),
+                    )
+                })
+                .collect();
+            let renamed: Arc<dyn ExecutionPlan> = Arc::new(
+                ProjectionExec::try_new(rename_exprs, reduce)
+                    .map_err(|e| format!("mv_compact rename: {e}"))?,
+            );
+            for (i, (rf, pf)) in renamed
+                .schema()
+                .fields()
+                .iter()
+                .zip(partial_schema.fields().iter())
+                .enumerate()
+            {
+                if rf.data_type() != pf.data_type() {
+                    return Err(format!(
+                        "mv_compact: reduced col {i} ({}) type {:?} != partial type {:?}",
+                        pf.name(),
+                        rf.data_type(),
+                        pf.data_type()
+                    ));
+                }
+            }
+            // 6. Full-ordering sort, exactly as the build path.
+            let sort_exprs = ordering.to_physical_sort_exprs(&renamed.schema());
+            let sort_exec: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(sort_exprs, renamed));
+
+            // 7. Stream sorted batches to parquet with the build's writer contract.
+            let schema = sort_exec.schema();
+            let schema_hash = compute_schema_hash_u64(&schema);
+            let mut stream = execute_stream(sort_exec.clone(), ctx.task_ctx())
+                .map_err(|e| format!("mv_compact execute: {e}"))?;
+            let file = File::create(output_file)
+                .map_err(|e| format!("mv_compact create {output_file}: {e}"))?;
+            let buffered = BufWriter::new(file);
+            let props = WriterProperties::builder()
+                .set_compression(Compression::ZSTD(Default::default()))
+                .set_sorting_columns(Some(
+                    ordering
+                        .keys
+                        .iter()
+                        .map(|k| parquet::file::metadata::SortingColumn {
+                            column_idx: k.field_index as i32,
+                            descending: k.direction != 0,
+                            nulls_first: k.null_placement == 0,
+                        })
+                        .collect(),
+                ))
+                .build();
+            let mut writer = ArrowWriter::try_new(buffered, schema.clone(), Some(props))
+                .map_err(|e| format!("mv_compact parquet writer: {e}"))?;
+            let mut row_count: u64 = 0;
+            let mut output_batch_count: u32 = 0;
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result.map_err(|e| format!("mv_compact stream batch: {e}"))?;
+                if batch.num_rows() > 0 {
+                    let batch = crate::helper::compact_view_arrays(batch);
+                    writer
+                        .write(&batch)
+                        .map_err(|e| format!("mv_compact write batch: {e}"))?;
+                    row_count += batch.num_rows() as u64;
+                    output_batch_count += 1;
+                }
+            }
+            writer
+                .close()
+                .map_err(|e| format!("mv_compact finish: {e}"))?;
+            if row_count == 0 {
+                return Err("mv_compact: produced no rows".to_string());
+            }
+            let (spill_bytes, spill_file_count) = collect_spill_metrics(sort_exec.as_ref());
+            let end_rss = crate::memory_guard::cached_resident_bytes();
+            let peak_rss_bytes = std::cmp::max(start_rss, end_rss) as u64;
+            Ok(MvBuildResult::ok(
+                row_count,
+                schema_hash,
+                definition_hash,
+                ordering_hash,
+                spill_bytes,
+                spill_file_count,
+                output_batch_count,
+                peak_rss_bytes,
+                wall_start.elapsed().as_micros() as u64,
+            ))
+        };
+
+        let result = match token {
+            Some(ref tok) => {
+                tokio::select! {
+                    biased;
+                    _ = tok.cancelled() => {
+                        let _ = std::fs::remove_file(output_file);
+                        Ok(MvBuildResult::error(MvBuildResult::STATUS_CANCELLED))
+                    }
+                    res = compact_future => res,
+                }
+            }
+            None => compact_future.await,
+        };
+        if result.is_err() {
+            let _ = std::fs::remove_file(output_file);
+        }
+        result
+    })
+}
+
+/// Finds the first aggregate node whose mode matches `pred`; returns the plan
+/// node (callers downcast to read its expressions).
+fn find_agg_mode(
+    plan: &Arc<dyn ExecutionPlan>,
+    pred: impl Fn(&AggregateMode) -> bool + Copy,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    if let Some(agg) = plan.downcast_ref::<AggregateExec>() {
+        if pred(agg.mode()) {
+            return Some(Arc::clone(plan));
+        }
+    }
+    for child in plan.children() {
+        if let Some(found) = find_agg_mode(child, pred) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Stage 3: Managed state-file build with streaming Parquet output.
 /// Replaces the Stage 2 mv_build_managed.
 pub fn mv_build_managed(

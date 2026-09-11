@@ -201,9 +201,7 @@ public final class MVBuildRuntime implements Closeable {
             }
             if (statusCode != MvBuildResultLayout.STATUS_OK) {
                 MVBuildMetrics.INSTANCE.recordBuildFailed();
-                throw new IOException(
-                    "mv_pull streaming build failed with status_code=" + statusCode
-                );
+                throw new IOException("mv_pull streaming build failed with status_code=" + statusCode);
             }
 
             // Decode all fields from the native result
@@ -283,6 +281,129 @@ public final class MVBuildRuntime implements Closeable {
             activeContextId.set(0);
             MVNativeBridge.releaseCancellationContext(contextId);
             releaseBreaker("buildStreamingArtifact");
+        }
+    }
+
+    /**
+     * Definition-aware compaction: folds N published state artifacts into ONE
+     * artifact with the identical Partial-stage schema, ordering and footer
+     * contract (native {@code df_mv_compact_state_result}). Runs through the
+     * same shared runtime, breaker reservation and cancellation context as
+     * {@link #buildStreamingArtifact}, so a compaction is accounted like a build.
+     *
+     * @param sourceSchema newline/tab-encoded SOURCE schema the SQL is planned against
+     * @param tableName    DataFusion table name the SQL is written against
+     * @param sql          the definition's canonical partial SQL (unfiltered)
+     * @param stateFiles   absolute paths of the state artifacts to compact
+     * @param outputFile   path of the compacted artifact
+     * @param ordering     the full GROUP BY ordering contract
+     * @return ArtifactResult with row count and hashes of the compacted artifact
+     */
+    public ArtifactResult compactStateArtifact(
+        String sourceSchema,
+        String tableName,
+        String sql,
+        java.util.List<String> stateFiles,
+        String outputFile,
+        MVGroupByOrdering ordering
+    ) throws IOException {
+        Objects.requireNonNull(ordering, "ordering");
+        if (stateFiles == null || stateFiles.isEmpty()) {
+            throw new IllegalArgumentException("stateFiles must not be empty");
+        }
+        ensureOpen();
+
+        reserveBreaker("compactStateArtifact");
+
+        MVCompiledDefinition.OrderingFFIMetadata ffi = MVCompiledDefinition.OrderingFFIMetadata.from(ordering);
+        long contextId = MVNativeBridge.allocateCancellationContext();
+        activeContextId.set(contextId);
+
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment resultBuf = arena.allocate(MvBuildResultLayout.NATIVE_ALLOC_SIZE);
+
+            MVNativeBridge.compactStateArtifactNative(
+                runtimePtr,
+                sourceSchema,
+                tableName,
+                sql,
+                stateFiles,
+                outputFile,
+                ffi.fieldIndices(),
+                ffi.directionTokens(),
+                ffi.nullPlacementTokens(),
+                contextId,
+                resultBuf
+            );
+
+            MvBuildResultLayout.validate(resultBuf);
+            int statusCode = MvBuildResultLayout.statusCode(resultBuf);
+            if (statusCode == MvBuildResultLayout.STATUS_CANCELLED) {
+                throw new IOException("mv_pull compaction was cancelled");
+            }
+            if (statusCode != MvBuildResultLayout.STATUS_OK) {
+                throw new IOException("mv_pull compaction failed with status_code=" + statusCode);
+            }
+
+            long rows = MvBuildResultLayout.rowCount(resultBuf);
+            long schemaHash = MvBuildResultLayout.schemaHash(resultBuf);
+            long definitionHash = MvBuildResultLayout.definitionHash(resultBuf);
+            long orderingHash = MvBuildResultLayout.orderingHash(resultBuf);
+            long spillBytesVal = MvBuildResultLayout.spillBytes(resultBuf);
+            int spillFileCountVal = MvBuildResultLayout.spillFileCount(resultBuf);
+            int outputBatchCount = MvBuildResultLayout.outputBatchCount(resultBuf);
+            long peakRssBytes = MvBuildResultLayout.peakRssBytes(resultBuf);
+            long buildDurationUs = MvBuildResultLayout.buildDurationUs(resultBuf);
+            if (rows <= 0L) {
+                throw new IOException("mv_pull compaction produced no state rows");
+            }
+
+            long expectedOrderingHash = ordering.orderingIdentityHash();
+            if (orderingHash != expectedOrderingHash) {
+                throw new MvBuildOrderingMismatchException(
+                    "Ordering identity hash mismatch after compaction: native="
+                        + Long.toHexString(orderingHash)
+                        + " java="
+                        + Long.toHexString(expectedOrderingHash)
+                );
+            }
+
+            logger.info(
+                "mv_pull COMPACT_FFI_POST inputs={} rows={} spill_bytes={} spill_files={} output_batches={} "
+                    + "peak_rss_bytes={} duration_us={} schema_hash={} definition_hash={}",
+                stateFiles.size(),
+                rows,
+                spillBytesVal,
+                spillFileCountVal,
+                outputBatchCount,
+                peakRssBytes,
+                buildDurationUs,
+                Long.toHexString(schemaHash),
+                Long.toHexString(definitionHash)
+            );
+            MVBuildMetrics.INSTANCE.recordSpill(spillBytesVal, spillFileCountVal);
+            MVBuildMetrics.INSTANCE.recordRss(peakRssBytes);
+
+            return new ArtifactResult(
+                rows,
+                schemaHash,
+                definitionHash,
+                orderingHash,
+                spillBytesVal,
+                spillFileCountVal,
+                outputBatchCount,
+                peakRssBytes,
+                buildDurationUs,
+                statusCode
+            );
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("mv_pull compaction failed", e);
+        } finally {
+            activeContextId.set(0);
+            MVNativeBridge.releaseCancellationContext(contextId);
+            releaseBreaker("compactStateArtifact");
         }
     }
 
@@ -497,18 +618,8 @@ public final class MVBuildRuntime implements Closeable {
      * @param buildDurationUs    wall-clock build duration in microseconds
      * @param statusCode         native status code (0=OK, 1=cancelled, etc.)
      */
-    public record ArtifactResult(
-        long rowCount,
-        long schemaHash,
-        long definitionHash,
-        long orderingHash,
-        long spillBytes,
-        int spillFileCount,
-        int outputBatchCount,
-        long peakRssBytes,
-        long buildDurationUs,
-        int statusCode
-    ) {
+    public record ArtifactResult(long rowCount, long schemaHash, long definitionHash, long orderingHash, long spillBytes,
+        int spillFileCount, int outputBatchCount, long peakRssBytes, long buildDurationUs, int statusCode) {
         public ArtifactResult {
             if (statusCode == MvBuildResultLayout.STATUS_OK && rowCount <= 0) {
                 throw new IllegalArgumentException("rowCount must be positive for OK status, got " + rowCount);
