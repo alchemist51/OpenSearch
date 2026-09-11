@@ -878,6 +878,7 @@ pub fn compact_state_parquet_artifact(
             // 7. Stream sorted batches to parquet with the build's writer contract.
             let schema = sort_exec.schema();
             let schema_hash = compute_schema_hash_u64(&schema);
+            let plan_us = wall_start.elapsed().as_micros() as u64;
             let mut stream = execute_stream(sort_exec.clone(), ctx.task_ctx())
                 .map_err(|e| format!("mv_compact execute: {e}"))?;
             let file = File::create(output_file)
@@ -901,26 +902,51 @@ pub fn compact_state_parquet_artifact(
                 .map_err(|e| format!("mv_compact parquet writer: {e}"))?;
             let mut row_count: u64 = 0;
             let mut output_batch_count: u32 = 0;
+            // Stage timing: the scan, the fold (a blocking hash aggregate) and the sort (blocking)
+            // all complete before the FIRST sorted batch is handed out; everything after that is
+            // the parquet write. Per-operator compute times come from the plan's metrics below.
+            let mut first_batch_us: u64 = 0;
+            let mut write_us: u64 = 0;
             while let Some(batch_result) = stream.next().await {
                 let batch = batch_result.map_err(|e| format!("mv_compact stream batch: {e}"))?;
+                if first_batch_us == 0 {
+                    first_batch_us = wall_start.elapsed().as_micros() as u64;
+                }
                 if batch.num_rows() > 0 {
                     let batch = crate::helper::compact_view_arrays(batch);
+                    let t_w = std::time::Instant::now();
                     writer
                         .write(&batch)
                         .map_err(|e| format!("mv_compact write batch: {e}"))?;
+                    write_us += t_w.elapsed().as_micros() as u64;
                     row_count += batch.num_rows() as u64;
                     output_batch_count += 1;
                 }
             }
+            let t_c = std::time::Instant::now();
             writer
                 .close()
                 .map_err(|e| format!("mv_compact finish: {e}"))?;
+            write_us += t_c.elapsed().as_micros() as u64;
             if row_count == 0 {
                 return Err("mv_compact: produced no rows".to_string());
             }
             let (spill_bytes, spill_file_count) = collect_spill_metrics(sort_exec.as_ref());
             let end_rss = crate::memory_guard::cached_resident_bytes();
             let peak_rss_bytes = std::cmp::max(start_rss, end_rss) as u64;
+            let total_us = wall_start.elapsed().as_micros() as u64;
+            // Sidecar with the stage split (read, logged and removed by the Java caller). Best effort.
+            {
+                let mut ops: Vec<(String, u64, u64)> = Vec::new();
+                collect_operator_metrics(sort_exec.as_ref(), &mut ops);
+                let mut text = format!(
+                    "plan_us={plan_us}\nfirst_batch_us={first_batch_us}\nwrite_us={write_us}\ntotal_us={total_us}\nrows_out={row_count}\nspill_bytes={spill_bytes}\npeak_rss_bytes={peak_rss_bytes}\n"
+                );
+                for (name, compute_us, rows) in ops {
+                    text.push_str(&format!("op={name} compute_us={compute_us} output_rows={rows}\n"));
+                }
+                let _ = std::fs::write(format!("{output_file}.stages"), text);
+            }
             Ok(MvBuildResult::ok(
                 row_count,
                 schema_hash,
@@ -930,7 +956,7 @@ pub fn compact_state_parquet_artifact(
                 spill_file_count,
                 output_batch_count,
                 peak_rss_bytes,
-                wall_start.elapsed().as_micros() as u64,
+                total_us,
             ))
         };
 
@@ -952,6 +978,22 @@ pub fn compact_state_parquet_artifact(
         }
         result
     })
+}
+
+/// Per-operator compute time and output rows of an executed plan tree (pre-order):
+/// `(operator name, elapsed_compute in µs, output rows)`. Used for the compaction's
+/// stage split (scan / fold / sort) alongside the wall-clock markers.
+fn collect_operator_metrics(plan: &dyn ExecutionPlan, out: &mut Vec<(String, u64, u64)>) {
+    if let Some(metrics) = plan.metrics() {
+        let compute_us = metrics.elapsed_compute().unwrap_or(0) as u64 / 1000;
+        let rows = metrics.output_rows().unwrap_or(0) as u64;
+        out.push((plan.name().to_string(), compute_us, rows));
+    } else {
+        out.push((plan.name().to_string(), 0, 0));
+    }
+    for child in plan.children() {
+        collect_operator_metrics(child.as_ref(), out);
+    }
 }
 
 /// Finds the first aggregate node whose mode matches `pred`; returns the plan

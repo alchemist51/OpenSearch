@@ -383,6 +383,7 @@ public final class MVBuildRuntime implements Closeable {
             );
             MVBuildMetrics.INSTANCE.recordSpill(spillBytesVal, spillFileCountVal);
             MVBuildMetrics.INSTANCE.recordRss(peakRssBytes);
+            logCompactionStages(outputFile, stateFiles.size(), rows);
 
             return new ArtifactResult(
                 rows,
@@ -404,6 +405,61 @@ public final class MVBuildRuntime implements Closeable {
             activeContextId.set(0);
             MVNativeBridge.releaseCancellationContext(contextId);
             releaseBreaker("compactStateArtifact");
+        }
+    }
+
+    /**
+     * Logs the compaction's stage split written by the native side next to the output
+     * ({@code <output>.stages}): plan time, time to the first sorted batch (= scan + fold +
+     * sort, all blocking), parquet write time, and per-operator compute from the executed
+     * plan's metrics. Best effort; the sidecar is removed afterwards.
+     */
+    private static void logCompactionStages(String outputFile, int inputs, long rowsOut) {
+        java.nio.file.Path side = java.nio.file.Path.of(outputFile + ".stages");
+        try {
+            if (java.nio.file.Files.exists(side) == false) {
+                return;
+            }
+            java.util.Map<String, Long> kv = new java.util.LinkedHashMap<>();
+            java.util.List<String> ops = new java.util.ArrayList<>();
+            for (String line : java.nio.file.Files.readAllLines(side)) {
+                if (line.startsWith("op=")) {
+                    ops.add(line.substring(3).replace(" compute_us=", ":").replace(" output_rows=", ":"));
+                } else {
+                    int eq = line.indexOf('=');
+                    if (eq > 0) {
+                        try {
+                            kv.put(line.substring(0, eq), Long.parseLong(line.substring(eq + 1).trim()));
+                        } catch (NumberFormatException ignored) {
+                            // best effort
+                        }
+                    }
+                }
+            }
+            long total = kv.getOrDefault("total_us", 0L), plan = kv.getOrDefault("plan_us", 0L), first = kv.getOrDefault(
+                "first_batch_us",
+                0L
+            ), write = kv.getOrDefault("write_us", 0L);
+            logger.info(
+                "mv_pull COMPACT_STAGES inputs={} rows_out={} plan_ms={} scan_fold_sort_ms={} write_ms={} total_ms={} spill_bytes={} peak_rss_bytes={} ops=[{}]",
+                inputs,
+                rowsOut,
+                plan / 1000,
+                Math.max(0L, first - plan) / 1000,
+                write / 1000,
+                total / 1000,
+                kv.getOrDefault("spill_bytes", 0L),
+                kv.getOrDefault("peak_rss_bytes", 0L),
+                String.join(" ", ops)
+            );
+        } catch (Exception e) {
+            logger.debug("mv_pull COMPACT_STAGES unavailable: {}", e.toString());
+        } finally {
+            try {
+                java.nio.file.Files.deleteIfExists(side);
+            } catch (java.io.IOException ignored) {
+                // best effort
+            }
         }
     }
 
