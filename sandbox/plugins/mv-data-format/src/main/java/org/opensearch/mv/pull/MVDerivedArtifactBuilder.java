@@ -799,6 +799,9 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
                 rttMs,
                 resp.detail()
             );
+            if (resp.applied() && resp.remoteSynced()) {
+                services.threadPool().generic().execute(() -> trimOutbox(f, pub));
+            }
             if (resp.applied() == false && resp.appliedWatermark() < pub.toInclusive()) {
                 services.threadPool().generic().execute(() -> resyncFollower(f, followerShardId, sourceShardId, resp.appliedWatermark()));
             }
@@ -814,6 +817,22 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         ));
     }
 
+    /** The follower has published AND uploaded its own copy: the outbox copy is now redundant — delete it. */
+    private void trimOutbox(Follower f, MVBuilderOutbox.Publication pub) {
+        try {
+            f.outbox.trim(pub);
+            logger.info(
+                "mv_pull OUTBOX_TRIM follower=[{}] to={} deleted=[{}, {}]",
+                f.index,
+                pub.toInclusive(),
+                pub.stateBlob(),
+                pub.manifestBlob()
+            );
+        } catch (Exception e) {
+            logger.warn("mv_pull OUTBOX_TRIM_FAILED follower=[{}] to={}: {}", f.index, pub.toInclusive(), e.toString());
+        }
+    }
+
     /** Resend, in order and synchronously on the generic pool, every publication the follower has not applied yet. */
     private void resyncFollower(Follower f, int followerShardId, int sourceShardId, long appliedWatermark) {
         org.opensearch.transport.client.Client client = services.client();
@@ -825,6 +844,9 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
                     org.opensearch.mv.MVBuilderPublishAction.INSTANCE,
                     new org.opensearch.mv.MVBuilderPublishAction.Request(f.index, followerShardId, f.sourceIndexUuid, sourceShardId, p)
                 ).actionGet(org.opensearch.common.unit.TimeValue.timeValueSeconds(120));
+                if (r.applied() && r.remoteSynced()) {
+                    trimOutbox(f, p);
+                }
                 if (r.applied() == false) {
                     logger.warn(
                         "mv_pull PUSH_RESYNC_STOPPED follower=[{}] at=({}, {}] detail={} applied_wm={}",

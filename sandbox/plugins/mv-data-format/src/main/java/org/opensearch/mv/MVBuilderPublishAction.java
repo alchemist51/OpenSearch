@@ -111,12 +111,19 @@ public final class MVBuilderPublishAction extends ActionType<MVBuilderPublishAct
         private final long appliedWatermark;
         private final long publishMillis;
         private final String detail;
+        /** True when the follower's own copy of the generation is confirmed in its remote directory — the leader may trim the outbox. */
+        private final boolean remoteSynced;
 
         public Response(boolean applied, long appliedWatermark, long publishMillis, String detail) {
+            this(applied, appliedWatermark, publishMillis, detail, false);
+        }
+
+        public Response(boolean applied, long appliedWatermark, long publishMillis, String detail, boolean remoteSynced) {
             this.applied = applied;
             this.appliedWatermark = appliedWatermark;
             this.publishMillis = publishMillis;
             this.detail = detail;
+            this.remoteSynced = remoteSynced;
         }
 
         public Response(StreamInput in) throws IOException {
@@ -124,6 +131,7 @@ public final class MVBuilderPublishAction extends ActionType<MVBuilderPublishAct
             this.appliedWatermark = in.readZLong();
             this.publishMillis = in.readVLong();
             this.detail = in.readOptionalString();
+            this.remoteSynced = in.readBoolean();
         }
 
         @Override
@@ -132,10 +140,15 @@ public final class MVBuilderPublishAction extends ActionType<MVBuilderPublishAct
             out.writeZLong(appliedWatermark);
             out.writeVLong(publishMillis);
             out.writeOptionalString(detail);
+            out.writeBoolean(remoteSynced);
         }
 
         public boolean applied() {
             return applied;
+        }
+
+        public boolean remoteSynced() {
+            return remoteSynced;
         }
 
         public long appliedWatermark() {

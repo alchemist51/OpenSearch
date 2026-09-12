@@ -180,8 +180,14 @@ public final class MVBuilderOutbox {
         if (repository instanceof BlobStoreRepository == false) {
             throw new IllegalStateException("mv_builder outbox: repository [" + repositoryName + "] is not a blob store repository");
         }
-        BlobContainer c = ((BlobStoreRepository) repository).blobStore().blobContainer(path(sourceIndexUuid, sourceShardId, followerIndex));
-        return new MVBuilderOutbox(c);
+        BlobStoreRepository blobStoreRepository = (BlobStoreRepository) repository;
+        // Under the repository's base path (the remote store prefix), beside the source's own segments.
+        BlobPath path = blobStoreRepository.basePath()
+            .add(ROOT)
+            .add(sourceIndexUuid)
+            .add(Integer.toString(sourceShardId))
+            .add(followerIndex);
+        return new MVBuilderOutbox(blobStoreRepository.blobStore().blobContainer(path));
     }
 
     // ── writer side (leader) ────────────────────────────────────────────────
@@ -221,6 +227,20 @@ public final class MVBuilderOutbox {
         container.writeBlobAtomic(pub.manifestBlob(), new java.io.ByteArrayInputStream(json), json.length, false);
         container.writeBlobAtomic(LATEST, new java.io.ByteArrayInputStream(json), json.length, false);
         return pub;
+    }
+
+    /**
+     * Delete a publication's state file and manifest once the follower has published it
+     * AND uploaded its own copy to its remote directory (leader-side, on that ack).
+     * {@code latest.json} is kept so a follower at the newest watermark still reads "nothing new".
+     */
+    public void trim(Publication pub) throws IOException {
+        container.deleteBlobsIgnoringIfNotExists(List.of(pub.stateBlob(), pub.manifestBlob()));
+    }
+
+    /** Names of the blobs currently in this outbox (smoke-test and status use). */
+    public List<String> listBlobs() throws IOException {
+        return new ArrayList<>(container.listBlobs().keySet());
     }
 
     // ── reader side (follower) ──────────────────────────────────────────────

@@ -127,6 +127,13 @@ public final class MVHydrateArtifactBuilder implements DerivedArtifactBuilder {
         long publishNanos = System.nanoTime() - tPublish;
         APPLIED.put(shard.shardId(), next.seqNo());
         MVStateChecksumUtil.computeAndRegister(completed, fileName, generation, shard);
+        // The remote-store refresh listener uploads on refresh; MV targets run with refresh_interval=-1 and the
+        // publish's own flush can race the catalog commit, so kick one explicit refresh to upload this generation now.
+        try {
+            shard.refresh("mv_hydrate_publish");
+        } catch (Exception e) {
+            logger.debug("mv_pull hydrate: post-publish refresh failed for [{}]: {}", shard.shardId(), e.toString());
+        }
 
         long hopMs = System.currentTimeMillis() - pub.publishedEpochMs();
         // Same shape as the direct-write line (parsed by the lag tooling) + hop_ms.
@@ -168,6 +175,7 @@ public final class MVHydrateArtifactBuilder implements DerivedArtifactBuilder {
         }
         MVBuilderOutbox.Publication pub = request.publication();
         ReentrantLock lock = lockFor(shard.shardId());
+        final Applied result;
         lock.lock();
         try {
             long applied = ensureRecovered(shard, sourceShardId);
@@ -195,15 +203,57 @@ public final class MVHydrateArtifactBuilder implements DerivedArtifactBuilder {
             long t0 = System.nanoTime();
             outbox.download(pub, staged);
             long downloadMs = (System.nanoTime() - t0) / 1_000_000;
-            Applied result = publishStaged(shard, sourceShardId, pub, staged, "hydrate-push download_ms=" + downloadMs);
-            return new MVBuilderPublishAction.Response(
-                result.outcome() != Outcome.GAP,
-                result.watermark(),
-                result.publishNanos() / 1_000_000,
-                result.outcome().name().toLowerCase(java.util.Locale.ROOT)
-            );
+            result = publishStaged(shard, sourceShardId, pub, staged, "hydrate-push download_ms=" + downloadMs);
         } finally {
             lock.unlock();
+        }
+        // Outside the lock: the next publication may publish while this one's upload is confirmed.
+        boolean remoteSynced = result.outcome() != Outcome.GAP && waitForRemoteSync(shard, REMOTE_SYNC_WAIT_MS);
+        return new MVBuilderPublishAction.Response(
+            result.outcome() != Outcome.GAP,
+            result.watermark(),
+            result.publishNanos() / 1_000_000,
+            result.outcome().name().toLowerCase(java.util.Locale.ROOT) + (remoteSynced ? "" : " upload-pending"),
+            remoteSynced
+        );
+    }
+
+    /** Upper bound on waiting for the follower's own remote upload before acknowledging (the ack gates outbox trimming). */
+    static final long REMOTE_SYNC_WAIT_MS = Long.getLong("opensearch.mv_pull.hydrate.remote_sync_wait_ms", 60_000L);
+
+    /**
+     * Block (bounded) until every file in the shard's catalog is present in its remote
+     * directory — i.e. the published generation has been uploaded. False on timeout or
+     * when the shard is not remote-store backed; the leader then keeps the outbox copy.
+     */
+    static boolean waitForRemoteSync(IndexShard shard, long maxWaitMs) {
+        if (shard.indexSettings().isAssignedOnRemoteNode() == false) {
+            return false;
+        }
+        long deadline = System.nanoTime() + maxWaitMs * 1_000_000L;
+        int polls = 0;
+        while (true) {
+            try {
+                if (shard.isRemoteSegmentStoreInSync()) {
+                    return true;
+                }
+                if (++polls % 40 == 0) {
+                    shard.refresh("mv_hydrate_ack_retry"); // every ~2 s: re-kick the listener if an upload cycle was missed
+                }
+            } catch (Exception e) {
+                logger.debug("mv_pull hydrate: remote sync check failed for [{}]: {}", shard.shardId(), e.toString());
+                return false;
+            }
+            if (System.nanoTime() >= deadline) {
+                logger.warn("mv_pull HYDRATE_UPLOAD_PENDING target=[{}] after {} ms; outbox copy retained", shard.shardId(), maxWaitMs);
+                return false;
+            }
+            try {
+                Thread.sleep(50L);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
         }
     }
 

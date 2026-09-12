@@ -154,6 +154,27 @@ public class MVBuilderOutboxTests extends OpenSearchTestCase {
         assertEquals(pub.crc32(), outbox.read(7L).crc32());
     }
 
+    public void testTrimDeletesStateAndManifestButKeepsLatest() throws IOException {
+        MVBuilderOutbox.Publication a = outbox.publish(stateFile("a"), -1L, 10L, 1L, 1L, 1L, -1L, "l");
+        MVBuilderOutbox.Publication b = outbox.publish(stateFile("bb"), 10L, 20L, 1L, 2L, 2L, 10L, "l");
+        assertEquals(5, outbox.listBlobs().size()); // 2 states + 2 manifests + latest
+        outbox.trim(a);
+        List<String> left = outbox.listBlobs();
+        assertEquals(3, left.size());
+        assertFalse(left.contains(a.stateBlob()));
+        assertFalse(left.contains(a.manifestBlob()));
+        assertTrue(left.contains(b.stateBlob()));
+        assertTrue(left.contains(MVBuilderOutbox.LATEST));
+        // a follower already at the newest watermark still reads "nothing new"
+        assertTrue(outbox.since(20L).isEmpty());
+        // a follower behind the trimmed range cannot be served from the outbox any more (retention exceeded)
+        IOException e = expectThrows(IOException.class, () -> outbox.since(-1L));
+        assertTrue(e.getMessage(), e.getMessage().contains("broken chain"));
+        // trimming twice is harmless
+        outbox.trim(a);
+        assertEquals(3, outbox.listBlobs().size());
+    }
+
     public void testPublicationWireRoundTrip() throws IOException {
         MVBuilderOutbox.Publication pub = new MVBuilderOutbox.Publication(
             -1L,

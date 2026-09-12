@@ -47,7 +47,8 @@ public class MVBuilderPublishActionTests extends OpenSearchTestCase {
         for (MVBuilderPublishAction.Response r : new MVBuilderPublishAction.Response[] {
             new MVBuilderPublishAction.Response(true, 20L, 441L, "published"),
             new MVBuilderPublishAction.Response(false, -1L, 0L, "gap"),
-            new MVBuilderPublishAction.Response(true, 20L, 0L, null) }) {
+            new MVBuilderPublishAction.Response(true, 20L, 0L, null),
+            new MVBuilderPublishAction.Response(true, 20L, 12L, "published", true) }) {
             try (BytesStreamOutput out = new BytesStreamOutput()) {
                 r.writeTo(out);
                 try (StreamInput in = out.bytes().streamInput()) {
@@ -56,6 +57,7 @@ public class MVBuilderPublishActionTests extends OpenSearchTestCase {
                     assertEquals(r.appliedWatermark(), copy.appliedWatermark());
                     assertEquals(r.publishMillis(), copy.publishMillis());
                     assertEquals(r.detail(), copy.detail());
+                    assertEquals(r.remoteSynced(), copy.remoteSynced());
                 }
             }
         }
