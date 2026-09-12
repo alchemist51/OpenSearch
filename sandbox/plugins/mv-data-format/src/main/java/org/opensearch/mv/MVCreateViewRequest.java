@@ -40,6 +40,7 @@ public class MVCreateViewRequest extends ActionRequest {
     static final String F_SQL = "sql";
     static final String F_TARGET_INDEX = "target_index";
     static final String F_POLL_INTERVAL = "poll_interval";
+    static final String F_BUILDER_VIEW = "builder_view";
 
     private final String name;
     private final String sourceIndex;
@@ -48,6 +49,7 @@ public class MVCreateViewRequest extends ActionRequest {
     private final String sql;            // nullable
     private final String targetIndex;    // nullable -> default
     private final String pollInterval;   // nullable
+    private final String builderView;    // nullable -> direct-write target; set -> hydrate from this leader view
 
     public MVCreateViewRequest(
         String name,
@@ -58,6 +60,19 @@ public class MVCreateViewRequest extends ActionRequest {
         String targetIndex,
         String pollInterval
     ) {
+        this(name, sourceIndex, descriptorJson, ppl, sql, targetIndex, pollInterval, null);
+    }
+
+    public MVCreateViewRequest(
+        String name,
+        String sourceIndex,
+        String descriptorJson,
+        String ppl,
+        String sql,
+        String targetIndex,
+        String pollInterval,
+        String builderView
+    ) {
         this.name = name;
         this.sourceIndex = sourceIndex;
         this.descriptorJson = descriptorJson;
@@ -65,6 +80,7 @@ public class MVCreateViewRequest extends ActionRequest {
         this.sql = sql;
         this.targetIndex = targetIndex;
         this.pollInterval = pollInterval;
+        this.builderView = builderView;
     }
 
     public MVCreateViewRequest(StreamInput in) throws IOException {
@@ -76,6 +92,7 @@ public class MVCreateViewRequest extends ActionRequest {
         this.sql = in.readOptionalString();
         this.targetIndex = in.readOptionalString();
         this.pollInterval = in.readOptionalString();
+        this.builderView = in.readOptionalString();
     }
 
     @Override
@@ -88,6 +105,7 @@ public class MVCreateViewRequest extends ActionRequest {
         out.writeOptionalString(sql);
         out.writeOptionalString(targetIndex);
         out.writeOptionalString(pollInterval);
+        out.writeOptionalString(builderView);
     }
 
     public String name() {
@@ -131,6 +149,11 @@ public class MVCreateViewRequest extends ActionRequest {
         return pollInterval;
     }
 
+    /** Leader view name whose builder folds this view's definition; {@code null} for a direct-write target. */
+    public String builderView() {
+        return builderView;
+    }
+
     @Override
     public ActionRequestValidationException validate() {
         ActionRequestValidationException e = null;
@@ -166,6 +189,7 @@ public class MVCreateViewRequest extends ActionRequest {
         String sql = null;
         String targetIndex = null;
         String pollInterval = null;
+        String builderView = null;
 
         XContentParser.Token token = parser.currentToken();
         if (token == null) {
@@ -192,9 +216,10 @@ public class MVCreateViewRequest extends ActionRequest {
                 case F_SQL -> sql = parser.text();
                 case F_TARGET_INDEX -> targetIndex = parser.text();
                 case F_POLL_INTERVAL -> pollInterval = parser.text();
+                case F_BUILDER_VIEW -> builderView = parser.text();
                 default -> throw new IllegalArgumentException("unknown field [" + fieldName + "] in _mv/views create request");
             }
         }
-        return new MVCreateViewRequest(name, sourceIndex, descriptorJson, ppl, sql, targetIndex, pollInterval);
+        return new MVCreateViewRequest(name, sourceIndex, descriptorJson, ppl, sql, targetIndex, pollInterval, builderView);
     }
 }

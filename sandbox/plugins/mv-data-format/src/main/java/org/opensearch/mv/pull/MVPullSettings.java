@@ -53,6 +53,43 @@ public final class MVPullSettings {
         Setting.Property.Final
     );
 
+    // ── Builder-shard emulation ────────────────────────────────────────────
+
+    /** Pull mode {@code build}: this target polls the source and folds its own definition (direct write). */
+    public static final String MODE_BUILD = "build";
+    /**
+     * Pull mode {@code hydrate}: this target does not touch the source. A
+     * leader target ({@link #BUILDER_VIEW}) folds this view's definition for
+     * it and publishes the state to a per-follower outbox in the remote
+     * repository; this target polls the outbox and publishes what it finds.
+     */
+    public static final String MODE_HYDRATE = "hydrate";
+
+    /**
+     * How this MV target obtains its state: {@link #MODE_BUILD} (default) or
+     * {@link #MODE_HYDRATE}. Emulates the builder-shard design on top of the
+     * direct-write poller: the leader is the builder, followers hydrate.
+     */
+    public static final Setting<String> PULL_MODE = Setting.simpleString("index.mv_pull.mode", MODE_BUILD, value -> {
+        if (MODE_BUILD.equals(value) == false && MODE_HYDRATE.equals(value) == false) {
+            throw new IllegalArgumentException(
+                "[index.mv_pull.mode] must be [" + MODE_BUILD + "] or [" + MODE_HYDRATE + "], got [" + value + "]"
+            );
+        }
+    }, Setting.Property.IndexScope, Setting.Property.Final);
+
+    /**
+     * Follower only: the target index name of the leader view that folds this
+     * view's definition and feeds its outbox. The leader discovers its
+     * followers by scanning cluster state for targets naming it here.
+     */
+    public static final Setting<String> BUILDER_VIEW = Setting.simpleString(
+        "index.mv_pull.builder_view",
+        "",
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
     /**
      * Persisted hash of the {@link org.opensearch.mv.MVCompiledDefinition}
      * used to create this MV index. Validated at startup, poll, search, and

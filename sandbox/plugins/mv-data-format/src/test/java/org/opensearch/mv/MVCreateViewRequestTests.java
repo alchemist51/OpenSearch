@@ -84,5 +84,111 @@ public class MVCreateViewRequestTests extends OpenSearchTestCase {
         MVCreateViewRequest req = new MVCreateViewRequest("q9", "clickbench", descriptorJson, null, null, null, null);
         Settings s = TransportMVCreateViewAction.buildSettings(req, 1, def, descriptorJson);
         assertNull(s.get(MVPullSettings.PULL_INTERVAL.getKey()));
+        // a direct-write target carries no builder-emulation keys at all
+        assertNull(s.get(MVPullSettings.PULL_MODE.getKey()));
+        assertNull(s.get(MVPullSettings.BUILDER_VIEW.getKey()));
+    }
+
+    // ── Builder-shard emulation: builder_view ────────────────────────────────
+
+    public void testFromXContentBuilderView() throws Exception {
+        String body = "{\"source_index\":\"clickbench\",\"descriptor\":" + descriptorJson() + ",\"builder_view\":\"cb_q9\"}";
+        try (XContentParser p = createParser(JsonXContent.jsonXContent, body)) {
+            MVCreateViewRequest req = MVCreateViewRequest.fromXContent("cb_q9_follower", p);
+            assertEquals("cb_q9", req.builderView());
+            assertNull(req.validate());
+        }
+    }
+
+    public void testWireRoundTripCarriesBuilderView() throws Exception {
+        MVCreateViewRequest req = new MVCreateViewRequest("f1", "clickbench", descriptorJson(), null, null, null, null, "cb_q9");
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            req.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                MVCreateViewRequest copy = new MVCreateViewRequest(in);
+                assertEquals("cb_q9", copy.builderView());
+                assertEquals("f1", copy.resolvedTargetIndex());
+            }
+        }
+        // the 7-arg constructor means "no leader"
+        assertNull(new MVCreateViewRequest("f1", "clickbench", descriptorJson(), null, null, null, null).builderView());
+    }
+
+    public void testBuildSettingsStampsHydrateModeForFollowers() {
+        MVCompiledDefinition def = MVCompiledDefinition.compiledFor("clickbench_100m");
+        String descriptorJson = MVDefinitionResolver.serialize(def.toDescriptor());
+        MVCreateViewRequest req = new MVCreateViewRequest("f1", "clickbench", descriptorJson, null, null, null, "1s", "cb_q9");
+        Settings s = TransportMVCreateViewAction.buildSettings(req, 3, def, descriptorJson);
+        assertEquals(MVPullSettings.MODE_HYDRATE, s.get(MVPullSettings.PULL_MODE.getKey()));
+        assertEquals("cb_q9", s.get(MVPullSettings.BUILDER_VIEW.getKey()));
+        assertEquals("1s", s.get(MVPullSettings.PULL_INTERVAL.getKey()));
+        assertEquals("3", s.get("index.number_of_shards"));
+        // the setting itself accepts both modes and nothing else
+        assertEquals(MVPullSettings.MODE_HYDRATE, MVPullSettings.PULL_MODE.get(s));
+        assertEquals(MVPullSettings.MODE_BUILD, MVPullSettings.PULL_MODE.get(Settings.EMPTY));
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> MVPullSettings.PULL_MODE.get(Settings.builder().put(MVPullSettings.PULL_MODE.getKey(), "push").build())
+        );
+    }
+
+    public void testValidateBuilderViewRequiresExistingBuildModeLeaderOnSameSource() {
+        String descriptorJson = descriptorJson();
+        Settings leaderSettings = Settings.builder()
+            .put(org.opensearch.cluster.metadata.DerivedIndexBinding.KEY_SOURCE_NAME, "clickbench")
+            .put("index.version.created", org.opensearch.Version.CURRENT)
+            .put("index.number_of_shards", 1)
+            .put("index.number_of_replicas", 0)
+            .build();
+        Settings followerLeaderSettings = Settings.builder()
+            .put(leaderSettings)
+            .put(MVPullSettings.PULL_MODE.getKey(), MVPullSettings.MODE_HYDRATE)
+            .put(MVPullSettings.BUILDER_VIEW.getKey(), "cb_q9")
+            .build();
+        org.opensearch.cluster.metadata.Metadata metadata = org.opensearch.cluster.metadata.Metadata.builder()
+            .put(org.opensearch.cluster.metadata.IndexMetadata.builder("cb_q9").settings(leaderSettings))
+            .put(org.opensearch.cluster.metadata.IndexMetadata.builder("cb_f0").settings(followerLeaderSettings))
+            .build();
+
+        // no builder_view: nothing to validate
+        TransportMVCreateViewAction.validateBuilderView(
+            new MVCreateViewRequest("f1", "clickbench", descriptorJson, null, null, null, null),
+            metadata
+        );
+        // happy path: existing build-mode leader on the same source
+        TransportMVCreateViewAction.validateBuilderView(
+            new MVCreateViewRequest("f1", "clickbench", descriptorJson, null, null, null, null, "cb_q9"),
+            metadata
+        );
+        // missing leader
+        assertTrue(
+            expectThrows(
+                IllegalArgumentException.class,
+                () -> TransportMVCreateViewAction.validateBuilderView(
+                    new MVCreateViewRequest("f1", "clickbench", descriptorJson, null, null, null, null, "nope"),
+                    metadata
+                )
+            ).getMessage().contains("does not exist")
+        );
+        // leader bound to another source
+        assertTrue(
+            expectThrows(
+                IllegalArgumentException.class,
+                () -> TransportMVCreateViewAction.validateBuilderView(
+                    new MVCreateViewRequest("f1", "other_source", descriptorJson, null, null, null, null, "cb_q9"),
+                    metadata
+                )
+            ).getMessage().contains("bound to source")
+        );
+        // leader that is itself a follower
+        assertTrue(
+            expectThrows(
+                IllegalArgumentException.class,
+                () -> TransportMVCreateViewAction.validateBuilderView(
+                    new MVCreateViewRequest("f1", "clickbench", descriptorJson, null, null, null, null, "cb_f0"),
+                    metadata
+                )
+            ).getMessage().contains("itself a hydrating follower")
+        );
     }
 }

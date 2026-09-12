@@ -51,11 +51,22 @@ public final class MVDerivedPullFormat implements DerivedPullFormat {
 
     @Override
     public DerivedSourceReader createReader(Settings nodeSettings, IndexSettings indexSettings) {
+        if (isHydrate(indexSettings)) {
+            return new MVBuilderOutboxReader(indexSettings, services);
+        }
         return new MVDerivedSourceReader(indexSettings, services);
     }
 
     @Override
     public DerivedArtifactBuilder createArtifactBuilder(Settings nodeSettings, IndexSettings indexSettings) {
+        if (isHydrate(indexSettings)) {
+            return new MVHydrateArtifactBuilder(indexSettings, services);
+        }
         return new MVDerivedArtifactBuilder(indexSettings, services);
+    }
+
+    /** Builder-shard emulation: follower targets hydrate from their leader's outbox instead of polling the source. */
+    static boolean isHydrate(IndexSettings indexSettings) {
+        return MVPullSettings.MODE_HYDRATE.equals(MVPullSettings.PULL_MODE.get(indexSettings.getSettings()));
     }
 }

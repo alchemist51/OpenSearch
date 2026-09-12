@@ -12,6 +12,7 @@ import org.opensearch.ResourceNotFoundException;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.cluster.metadata.DerivedIndexBinding;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
@@ -47,7 +48,13 @@ public class TransportMVCreateViewAction extends HandledTransportAction<MVCreate
         ClusterService clusterService,
         Client client
     ) {
-        super(MVCreateViewAction.NAME, transportService, actionFilters, MVCreateViewRequest::new, org.opensearch.threadpool.ThreadPool.Names.MANAGEMENT);
+        super(
+            MVCreateViewAction.NAME,
+            transportService,
+            actionFilters,
+            MVCreateViewRequest::new,
+            org.opensearch.threadpool.ThreadPool.Names.MANAGEMENT
+        );
         this.clusterService = clusterService;
         this.client = client;
     }
@@ -88,19 +95,26 @@ public class TransportMVCreateViewAction extends HandledTransportAction<MVCreate
             }
 
             String canonicalDescriptorJson = MVDefinitionResolver.serialize(def.toDescriptor());
+            try {
+                validateBuilderView(request, clusterService.state().metadata());
+            } catch (IllegalArgumentException e) {
+                listener.onFailure(e);
+                return;
+            }
             Settings settings = buildSettings(request, sourceMetadata.getNumberOfShards(), def, canonicalDescriptorJson);
 
             // Fail closed BEFORE submitting (same gate as the auto-creation path).
             try {
                 MVDefinitionResolver.validateCreation(settings);
             } catch (RuntimeException e) {
-                listener.onFailure(new IllegalArgumentException("[" + MVValidationReasons.CREATION_VALIDATION_FAILED + "] " + e.getMessage()));
+                listener.onFailure(
+                    new IllegalArgumentException("[" + MVValidationReasons.CREATION_VALIDATION_FAILED + "] " + e.getMessage())
+                );
                 return;
             }
 
             String target = request.resolvedTargetIndex();
-            CreateIndexRequest createRequest = new CreateIndexRequest(target).settings(settings)
-                .mapping(MVViewCreation.targetMapping(def));
+            CreateIndexRequest createRequest = new CreateIndexRequest(target).settings(settings).mapping(MVViewCreation.targetMapping(def));
 
             client.admin()
                 .indices()
@@ -133,9 +147,41 @@ public class TransportMVCreateViewAction extends HandledTransportAction<MVCreate
      */
     static Settings buildSettings(MVCreateViewRequest request, int sourceShards, MVCompiledDefinition def, String canonicalDescriptorJson) {
         Settings base = MVViewCreation.buildTargetSettings(request.sourceIndex(), sourceShards, def, canonicalDescriptorJson);
-        if (request.pollInterval() == null || request.pollInterval().isBlank()) {
-            return base;
+        Settings.Builder builder = Settings.builder().put(base);
+        if (request.pollInterval() != null && request.pollInterval().isBlank() == false) {
+            builder.put(MVPullSettings.PULL_INTERVAL.getKey(), request.pollInterval());
         }
-        return Settings.builder().put(base).put(MVPullSettings.PULL_INTERVAL.getKey(), request.pollInterval()).build();
+        if (request.builderView() != null && request.builderView().isBlank() == false) {
+            // Builder-shard emulation: this target hydrates from the leader's outbox instead of polling the source.
+            builder.put(MVPullSettings.PULL_MODE.getKey(), MVPullSettings.MODE_HYDRATE);
+            builder.put(MVPullSettings.BUILDER_VIEW.getKey(), request.builderView());
+        }
+        return builder.build();
+    }
+
+    /**
+     * Builder-shard emulation: a follower's leader must already exist, be an MV
+     * target of the same source, and itself be a direct-write ({@code build})
+     * target — followers of followers are not supported.
+     */
+    static void validateBuilderView(MVCreateViewRequest request, org.opensearch.cluster.metadata.Metadata metadata) {
+        String leader = request.builderView();
+        if (leader == null || leader.isBlank()) {
+            return;
+        }
+        IndexMetadata leaderMetadata = metadata.index(leader);
+        if (leaderMetadata == null) {
+            throw new IllegalArgumentException("[builder_view] leader target index [" + leader + "] does not exist");
+        }
+        Settings leaderSettings = leaderMetadata.getSettings();
+        String leaderSource = leaderSettings.get(DerivedIndexBinding.KEY_SOURCE_NAME);
+        if (request.sourceIndex().equals(leaderSource) == false) {
+            throw new IllegalArgumentException(
+                "[builder_view] leader [" + leader + "] is bound to source [" + leaderSource + "], not [" + request.sourceIndex() + "]"
+            );
+        }
+        if (MVPullSettings.MODE_BUILD.equals(MVPullSettings.PULL_MODE.get(leaderSettings)) == false) {
+            throw new IllegalArgumentException("[builder_view] leader [" + leader + "] is itself a hydrating follower");
+        }
     }
 }

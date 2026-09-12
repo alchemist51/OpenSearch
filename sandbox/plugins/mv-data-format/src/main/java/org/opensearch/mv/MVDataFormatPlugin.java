@@ -266,6 +266,9 @@ public class MVDataFormatPlugin extends Plugin
             MVPullSettings.SOURCE_INDEX,
             MVPullSettings.PULL_INTERVAL,
             MVPullSettings.DEFINITION_HASH,
+            // Builder-shard emulation: leader/follower wiring
+            MVPullSettings.PULL_MODE,
+            MVPullSettings.BUILDER_VIEW,
             // Stage 2: managed build runtime settings
             MVBuildRuntime.MV_SPILL_BUDGET_BYTES,
             MVBuildRuntime.MV_SPILL_FILE_COUNT_LIMIT,
