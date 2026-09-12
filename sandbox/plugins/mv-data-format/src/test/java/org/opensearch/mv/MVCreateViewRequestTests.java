@@ -132,6 +132,56 @@ public class MVCreateViewRequestTests extends OpenSearchTestCase {
         );
     }
 
+    public void testHydrateTransportParsesAndDefaultsToPushWithRecoveryPoll() throws Exception {
+        MVCompiledDefinition def = MVCompiledDefinition.compiledFor("clickbench_100m");
+        String descriptorJson = MVDefinitionResolver.serialize(def.toDescriptor());
+        // default: push + 10s recovery poll
+        MVCreateViewRequest pushed = new MVCreateViewRequest("f1", "clickbench", descriptorJson, null, null, null, null, "cb_q9");
+        Settings s1 = TransportMVCreateViewAction.buildSettings(pushed, 1, def, descriptorJson);
+        assertEquals(MVPullSettings.TRANSPORT_PUSH, s1.get(MVPullSettings.HYDRATE_TRANSPORT.getKey()));
+        assertEquals("10s", s1.get(MVPullSettings.PULL_INTERVAL.getKey()));
+        // explicit poll keeps the default cadence
+        String body = "{\"source_index\":\"clickbench\",\"descriptor\":"
+            + descriptorJson
+            + ",\"builder_view\":\"cb_q9\",\"hydrate_transport\":\"poll\"}";
+        try (XContentParser p = createParser(JsonXContent.jsonXContent, body)) {
+            MVCreateViewRequest polled = MVCreateViewRequest.fromXContent("f2", p);
+            assertEquals("poll", polled.hydrateTransport());
+            Settings s2 = TransportMVCreateViewAction.buildSettings(polled, 1, def, descriptorJson);
+            assertEquals(MVPullSettings.TRANSPORT_POLL, s2.get(MVPullSettings.HYDRATE_TRANSPORT.getKey()));
+            assertNull(s2.get(MVPullSettings.PULL_INTERVAL.getKey()));
+        }
+        // an explicit poll_interval always wins
+        MVCreateViewRequest explicit = new MVCreateViewRequest(
+            "f3",
+            "clickbench",
+            descriptorJson,
+            null,
+            null,
+            null,
+            "500ms",
+            "cb_q9",
+            "push"
+        );
+        assertEquals(
+            "500ms",
+            TransportMVCreateViewAction.buildSettings(explicit, 1, def, descriptorJson).get(MVPullSettings.PULL_INTERVAL.getKey())
+        );
+        // the setting rejects anything but poll|push; direct-write targets carry no transport key
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> MVPullSettings.HYDRATE_TRANSPORT.get(Settings.builder().put(MVPullSettings.HYDRATE_TRANSPORT.getKey(), "smoke").build())
+        );
+        assertNull(
+            TransportMVCreateViewAction.buildSettings(
+                new MVCreateViewRequest("q9", "clickbench", descriptorJson, null, null, null, null),
+                1,
+                def,
+                descriptorJson
+            ).get(MVPullSettings.HYDRATE_TRANSPORT.getKey())
+        );
+    }
+
     public void testValidateBuilderViewRequiresExistingBuildModeLeaderOnSameSource() {
         String descriptorJson = descriptorJson();
         Settings leaderSettings = Settings.builder()

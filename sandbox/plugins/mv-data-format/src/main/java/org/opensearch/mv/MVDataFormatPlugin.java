@@ -180,6 +180,7 @@ public class MVDataFormatPlugin extends Plugin
             mvPullBreaker,
             client
         );
+        MVPullSettings.Services.register(mvServices);
         MVDerivedPullFormat mvFormat = new MVDerivedPullFormat(mvServices);
         // Engine-driven compaction of pull targets: the target's merge scheduler
         // hands published generations to the definition-aware state merger.
@@ -269,6 +270,8 @@ public class MVDataFormatPlugin extends Plugin
             // Builder-shard emulation: leader/follower wiring
             MVPullSettings.PULL_MODE,
             MVPullSettings.BUILDER_VIEW,
+            MVPullSettings.HYDRATE_TRANSPORT,
+            MVPullSettings.BOUND_TO_GLOBAL_CHECKPOINT,
             // Stage 2: managed build runtime settings
             MVBuildRuntime.MV_SPILL_BUDGET_BYTES,
             MVBuildRuntime.MV_SPILL_FILE_COUNT_LIMIT,
@@ -305,6 +308,7 @@ public class MVDataFormatPlugin extends Plugin
         return java.util.List.of(
             // Checkpoint request: target request-driven checkpoint fetch from source.
             new ActionHandler<>(MVCheckpointRequestAction.INSTANCE, MVCheckpointRequestTransportHandler.class),
+            new ActionHandler<>(MVBuilderPublishAction.INSTANCE, MVBuilderPublishTransportHandler.class),
             // Stage 5: MV definition control plane (validate + view CRUD).
             new ActionHandler<>(MVValidateAction.INSTANCE, TransportMVValidateAction.class),
             new ActionHandler<>(MVCreateViewAction.INSTANCE, TransportMVCreateViewAction.class),

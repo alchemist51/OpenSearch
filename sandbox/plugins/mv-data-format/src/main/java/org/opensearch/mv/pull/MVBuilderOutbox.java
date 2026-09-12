@@ -56,7 +56,7 @@ public final class MVBuilderOutbox {
 
     /** One publication: the state file for source range {@code (fromExclusive, toInclusive]}. */
     public record Publication(long fromExclusive, long toInclusive, long primaryTerm, long infosVersion, long rows, long stateBytes,
-        long prevToInclusive, long publishedEpochMs, String leaderIndex) {
+        long prevToInclusive, long publishedEpochMs, String leaderIndex, long crc32) {
         public String stateBlob() {
             return stateBlobFor(toInclusive);
         }
@@ -89,6 +89,7 @@ public final class MVBuilderOutbox {
                 b.field("prev", prevToInclusive);
                 b.field("published_epoch_ms", publishedEpochMs);
                 b.field("leader", leaderIndex);
+                b.field("crc32", crc32);
                 b.endObject();
                 return BytesReference.toBytes(BytesReference.bytes(b));
             }
@@ -112,9 +113,39 @@ public final class MVBuilderOutbox {
                     num(m, "state_bytes"),
                     num(m, "prev"),
                     num(m, "published_epoch_ms"),
-                    String.valueOf(m.get("leader"))
+                    String.valueOf(m.get("leader")),
+                    m.get("crc32") instanceof Number n ? n.longValue() : 0L
                 );
             }
+        }
+
+        /** Binary wire form (D1): what the leader pushes to a follower primary. */
+        public void writeTo(org.opensearch.core.common.io.stream.StreamOutput out) throws IOException {
+            out.writeZLong(fromExclusive);
+            out.writeZLong(toInclusive);
+            out.writeZLong(primaryTerm);
+            out.writeZLong(infosVersion);
+            out.writeVLong(rows);
+            out.writeVLong(stateBytes);
+            out.writeZLong(prevToInclusive);
+            out.writeVLong(publishedEpochMs);
+            out.writeString(leaderIndex);
+            out.writeVLong(crc32);
+        }
+
+        public static Publication readFrom(org.opensearch.core.common.io.stream.StreamInput in) throws IOException {
+            return new Publication(
+                in.readZLong(),
+                in.readZLong(),
+                in.readZLong(),
+                in.readZLong(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readZLong(),
+                in.readVLong(),
+                in.readString(),
+                in.readVLong()
+            );
         }
 
         private static long num(Map<String, Object> m, String key) throws IOException {
@@ -180,7 +211,8 @@ public final class MVBuilderOutbox {
             size,
             prevToInclusive,
             System.currentTimeMillis(),
-            leaderIndex
+            leaderIndex,
+            crc32(stateFile)
         );
         try (InputStream in = Files.newInputStream(stateFile)) {
             container.writeBlob(pub.stateBlob(), in, size, false);
@@ -247,7 +279,34 @@ public final class MVBuilderOutbox {
             Files.deleteIfExists(tmp);
             throw new IOException("mv_builder outbox: state [" + pub.stateBlob() + "] size " + size + " != manifest " + pub.stateBytes());
         }
+        if (pub.crc32() != 0L) {
+            long crc = crc32(tmp);
+            if (crc != pub.crc32()) {
+                Files.deleteIfExists(tmp);
+                throw new IOException(
+                    "mv_builder outbox: state ["
+                        + pub.stateBlob()
+                        + "] crc32 "
+                        + Long.toHexString(crc)
+                        + " != manifest "
+                        + Long.toHexString(pub.crc32())
+                );
+            }
+        }
         Files.move(tmp, dest, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    /** CRC32 of a whole file — one sequential read; state files are at most tens of MB per round. */
+    public static long crc32(Path file) throws IOException {
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        try (InputStream in = Files.newInputStream(file)) {
+            byte[] buf = new byte[1 << 16];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                crc.update(buf, 0, n);
+            }
+        }
+        return crc.getValue();
     }
 
     private Publication readManifest(String blob) throws IOException {

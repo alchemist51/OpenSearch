@@ -78,6 +78,43 @@ public final class MVPullSettings {
         }
     }, Setting.Property.IndexScope, Setting.Property.Final);
 
+    /** Hydrate transport {@code poll}: the follower polls the outbox manifest every {@link #PULL_INTERVAL}. */
+    public static final String TRANSPORT_POLL = "poll";
+    /**
+     * Hydrate transport {@code push} (D1): the leader pushes each publication to the
+     * follower primary as a binary transport request carrying the file to fetch; the
+     * follower's poll survives only as a slow recovery floor.
+     */
+    public static final String TRANSPORT_PUSH = "push";
+
+    /** Follower only: how publications reach this target — {@link #TRANSPORT_PUSH} (default) or {@link #TRANSPORT_POLL}. */
+    public static final Setting<String> HYDRATE_TRANSPORT = Setting.simpleString(
+        "index.mv_pull.hydrate_transport",
+        TRANSPORT_PUSH,
+        value -> {
+            if (TRANSPORT_POLL.equals(value) == false && TRANSPORT_PUSH.equals(value) == false) {
+                throw new IllegalArgumentException(
+                    "[index.mv_pull.hydrate_transport] must be [" + TRANSPORT_POLL + "] or [" + TRANSPORT_PUSH + "], got [" + value + "]"
+                );
+            }
+        },
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
+    /**
+     * Leader only (D2 measurement): when true, a round folds no further than the
+     * source primary's last known global checkpoint. Off by default — with a
+     * remote-store-backed source the global checkpoint lags by the replica's
+     * segment-replication lag; every round logs the gap either way.
+     */
+    public static final Setting<Boolean> BOUND_TO_GLOBAL_CHECKPOINT = Setting.boolSetting(
+        "index.mv_pull.bound_to_global_checkpoint",
+        false,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
     /**
      * Follower only: the target index name of the leader view that folds this
      * view's definition and feeds its outbox. The leader discovers its
@@ -255,6 +292,17 @@ public final class MVPullSettings {
          */
         public Services(ClusterService clusterService, ThreadPool threadPool, Supplier<RepositoriesService> repositoriesService) {
             this(clusterService, threadPool, repositoriesService, 0L, null, null);
+        }
+
+        /** Node-wide instance for transport handlers that are constructed by injection rather than by the plugin (D1 push). */
+        private static volatile Services CURRENT;
+
+        public static void register(Services services) {
+            CURRENT = services;
+        }
+
+        public static Services current() {
+            return CURRENT;
         }
 
         /**

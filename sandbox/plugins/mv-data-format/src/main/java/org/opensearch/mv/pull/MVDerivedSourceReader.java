@@ -78,9 +78,7 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
         int sourceShardId = binding.resolveSourceShard(shard.shardId().id());
 
         // ── Send checkpoint request to source primary ────────────────────
-        MVReplicationCheckpoint response = sendCheckpointRequest(
-            sourceIndexName, sourceShardId, shard, sinceWatermark
-        );
+        MVReplicationCheckpoint response = sendCheckpointRequest(sourceIndexName, sourceShardId, shard, sinceWatermark);
 
         if (response != null) {
             // CHECKPOINT_REPLY with data → build
@@ -126,10 +124,7 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
                 .shardRoutingTable(sourceIndexName, sourceShardId)
                 .primaryShard();
             if (sourceRouting == null || !sourceRouting.active()) {
-                logger.debug(
-                    "CHECKPOINT_REQUEST: source primary not available for [{}][{}]",
-                    sourceIndexName, sourceShardId
-                );
+                logger.debug("CHECKPOINT_REQUEST: source primary not available for [{}][{}]", sourceIndexName, sourceShardId);
                 return null;
             }
 
@@ -150,10 +145,8 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
                 sinceWatermark
             );
 
-            MVCheckpointRequestAction.Response response = client.execute(
-                MVCheckpointRequestAction.INSTANCE,
-                request
-            ).actionGet(CHECKPOINT_REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            MVCheckpointRequestAction.Response response = client.execute(MVCheckpointRequestAction.INSTANCE, request)
+                .actionGet(CHECKPOINT_REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             if (response.available() && response.checkpoint() != null) {
                 logger.info(
@@ -235,7 +228,9 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
                 if (actualCrc32 != expectedCrc32) {
                     logger.warn(
                         "CHECKSUM_MISMATCH file=[{}] expected={} actual={} — deleting and retrying",
-                        fileName, expectedCrc32, actualCrc32
+                        fileName,
+                        expectedCrc32,
+                        actualCrc32
                     );
                     MVBuildMetrics.INSTANCE.recordCrcVerifyFailed();
                     Files.deleteIfExists(downloaded);
@@ -248,10 +243,7 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
                     Path retriedPath = retried.get(0);
                     long retryCrc32 = computeFileCrc32(retriedPath);
                     if (retryCrc32 != expectedCrc32) {
-                        logger.error(
-                            "CHECKSUM_MISMATCH_PERSISTENT file=[{}] expected={} retried={}",
-                            fileName, expectedCrc32, retryCrc32
-                        );
+                        logger.error("CHECKSUM_MISMATCH_PERSISTENT file=[{}] expected={} retried={}", fileName, expectedCrc32, retryCrc32);
                         MVBuildMetrics.INSTANCE.recordCrcVerifyFailed();
                         Files.deleteIfExists(retriedPath);
                         // Fail the round — return null to let the poller retry
@@ -279,7 +271,8 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
             checkpoint.primaryTerm(),
             checkpoint.infosVersion(),
             verifiedFiles,
-            checkpoint.noopSeqNos()
+            checkpoint.noopSeqNos(),
+            checkpoint.globalCheckpoint()
         );
     }
 
@@ -352,7 +345,23 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
             this(shardId, maxSeqNo, primaryTerm, infosVersion, parquetFiles, new long[0]);
         }
 
+        /** Source global checkpoint at reply time (-1 unknown); see MVReplicationCheckpoint#globalCheckpoint. */
+        private final long globalCheckpoint;
+
         MVSourceSnapshot(String shardId, long maxSeqNo, long primaryTerm, long infosVersion, List<Path> parquetFiles, long[] noopSeqNos) {
+            this(shardId, maxSeqNo, primaryTerm, infosVersion, parquetFiles, noopSeqNos, -1L);
+        }
+
+        MVSourceSnapshot(
+            String shardId,
+            long maxSeqNo,
+            long primaryTerm,
+            long infosVersion,
+            List<Path> parquetFiles,
+            long[] noopSeqNos,
+            long globalCheckpoint
+        ) {
+            this.globalCheckpoint = globalCheckpoint;
             this.shardId = shardId;
             this.maxSeqNo = maxSeqNo;
             this.primaryTerm = primaryTerm;
@@ -390,6 +399,10 @@ final class MVDerivedSourceReader implements DerivedSourceReader {
 
         long[] noopSeqNos() {
             return noopSeqNos;
+        }
+
+        long globalCheckpoint() {
+            return globalCheckpoint;
         }
     }
 }

@@ -155,6 +155,14 @@ public class TransportMVCreateViewAction extends HandledTransportAction<MVCreate
             // Builder-shard emulation: this target hydrates from the leader's outbox instead of polling the source.
             builder.put(MVPullSettings.PULL_MODE.getKey(), MVPullSettings.MODE_HYDRATE);
             builder.put(MVPullSettings.BUILDER_VIEW.getKey(), request.builderView());
+            String transport = request.hydrateTransport() == null || request.hydrateTransport().isBlank()
+                ? MVPullSettings.TRANSPORT_PUSH
+                : request.hydrateTransport();
+            builder.put(MVPullSettings.HYDRATE_TRANSPORT.getKey(), transport);
+            if (MVPullSettings.TRANSPORT_PUSH.equals(transport) && (request.pollInterval() == null || request.pollInterval().isBlank())) {
+                // D1: pushed followers keep polling only as a slow recovery floor.
+                builder.put(MVPullSettings.PULL_INTERVAL.getKey(), "10s");
+            }
         }
         return builder.build();
     }

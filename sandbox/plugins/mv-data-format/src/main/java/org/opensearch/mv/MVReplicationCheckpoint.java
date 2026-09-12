@@ -64,6 +64,8 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
      * {@code expected = rangeSize - noopCount}.</p>
      */
     private final long[] noopSeqNos;
+    /** Source primary's last known global checkpoint at reply time; -1 when unknown (D2: commit-line measurement). */
+    private final long globalCheckpoint;
 
     /**
      * Full constructor.
@@ -93,6 +95,21 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
         long createdTimeStampMillis,
         long[] noopSeqNos
     ) {
+        this(sourceIndex, sourceShard, primaryTerm, maxSeqNo, infosVersion, fileMetadata, createdTimeStampMillis, noopSeqNos, -1L);
+    }
+
+    public MVReplicationCheckpoint(
+        String sourceIndex,
+        int sourceShard,
+        long primaryTerm,
+        long maxSeqNo,
+        long infosVersion,
+        Map<String, MVFileMetadata> fileMetadata,
+        long createdTimeStampMillis,
+        long[] noopSeqNos,
+        long globalCheckpoint
+    ) {
+        this.globalCheckpoint = globalCheckpoint;
         this.sourceIndex = sourceIndex;
         this.sourceShard = sourceShard;
         this.primaryTerm = primaryTerm;
@@ -111,7 +128,14 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
      */
     public static MVReplicationCheckpoint empty(String sourceIndex, int sourceShard) {
         return new MVReplicationCheckpoint(
-            sourceIndex, sourceShard, 0L, -1L, -1L, Collections.emptyMap(), System.currentTimeMillis(), EMPTY_NOOPS
+            sourceIndex,
+            sourceShard,
+            0L,
+            -1L,
+            -1L,
+            Collections.emptyMap(),
+            System.currentTimeMillis(),
+            EMPTY_NOOPS
         );
     }
 
@@ -153,6 +177,7 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
                 this.noopSeqNos[i] = prev;
             }
         }
+        this.globalCheckpoint = in.readZLong();
     }
 
     @Override
@@ -175,6 +200,7 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
             out.writeVLong(seqNo - prev);
             prev = seqNo;
         }
+        out.writeZLong(globalCheckpoint);
     }
 
     // ── Ordering ─────────────────────────────────────────────────────────
@@ -275,16 +301,31 @@ public final class MVReplicationCheckpoint implements Writeable, Comparable<MVRe
         return noopSeqNos;
     }
 
+    /** Source primary's last known global checkpoint when the reply was built, or -1 if unknown. */
+    public long globalCheckpoint() {
+        return globalCheckpoint;
+    }
+
     @Override
     public String toString() {
         return "MVReplicationCheckpoint{"
-            + "source=" + sourceIndex + "[" + sourceShard + "]"
-            + ", term=" + primaryTerm
-            + ", maxSeqNo=" + maxSeqNo
-            + ", infosVersion=" + infosVersion
-            + ", files=" + fileMetadata.size()
-            + ", noops=" + noopSeqNos.length
-            + ", ts=" + createdTimeStampMillis
+            + "source="
+            + sourceIndex
+            + "["
+            + sourceShard
+            + "]"
+            + ", term="
+            + primaryTerm
+            + ", maxSeqNo="
+            + maxSeqNo
+            + ", infosVersion="
+            + infosVersion
+            + ", files="
+            + fileMetadata.size()
+            + ", noops="
+            + noopSeqNos.length
+            + ", ts="
+            + createdTimeStampMillis
             + '}';
     }
 }

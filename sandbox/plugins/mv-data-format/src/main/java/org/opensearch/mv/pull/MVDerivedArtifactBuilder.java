@@ -236,7 +236,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         long maxDocsPerRound = Math.min(MVPullSettings.MAX_DOCS_PER_ROUND.get(admissionSettings), adaptiveCapDocs);
         final long snapshotWatermark = mvSnapshot.watermark();
         final long totalLag = snapshotWatermark - current.seqNo();
-        final long roundWatermark;
+        long roundWatermark;
         final boolean roundCapped;
         if (maxDocsPerRound < Long.MAX_VALUE && totalLag > maxDocsPerRound) {
             roundWatermark = current.seqNo() + maxDocsPerRound;
@@ -253,6 +253,25 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         } else {
             roundWatermark = snapshotWatermark;
             roundCapped = false;
+        }
+        // D2 measurement: how far the source's global checkpoint trails what the remote store already exposes.
+        final long globalCheckpoint = mvSnapshot.globalCheckpoint();
+        final boolean boundToGcp = MVPullSettings.BOUND_TO_GLOBAL_CHECKPOINT.get(admissionSettings);
+        if (globalCheckpoint >= 0) {
+            logger.info(
+                "mv_pull GCP shard=[{}] snapshot_max_seqno={} global_checkpoint={} gcp_lag={} bound_enabled={}",
+                shard.shardId(),
+                snapshotWatermark,
+                globalCheckpoint,
+                snapshotWatermark - globalCheckpoint,
+                boundToGcp
+            );
+        }
+        if (boundToGcp && globalCheckpoint >= 0 && globalCheckpoint < roundWatermark) {
+            if (globalCheckpoint <= current.seqNo()) {
+                return new MVBuildResult(false, "gcp-not-advanced", Map.of("global_checkpoint", globalCheckpoint));
+            }
+            roundWatermark = globalCheckpoint;
         }
 
         // ── Pull-round admission gate (Stage 5, criteria H) ─────────────
@@ -548,11 +567,15 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         MVBuilderOutbox outbox;
         long lastTo = Long.MIN_VALUE; // MIN_VALUE = cursor not yet initialised from the outbox
         boolean broken;
+        /** D1: push each publication to the follower primary over transport (else the follower polls the outbox). */
+        final boolean push;
+        String sourceIndexUuid;
 
-        Follower(String index, MVCompiledDefinition definition) {
+        Follower(String index, MVCompiledDefinition definition, boolean push) {
             this.index = index;
             this.definition = definition;
             this.ordering = definition.groupByOrdering();
+            this.push = push;
         }
     }
 
@@ -578,8 +601,14 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             seen.add(name);
             if (followers.containsKey(name) == false) {
                 try {
-                    followers.put(name, new Follower(name, MVDefinitionResolver.resolve(s)));
-                    logger.info("mv_pull FOLLOWER_ATTACH leader=[{}] follower=[{}]", leaderIndex, name);
+                    boolean push = MVPullSettings.TRANSPORT_PUSH.equals(MVPullSettings.HYDRATE_TRANSPORT.get(s));
+                    followers.put(name, new Follower(name, MVDefinitionResolver.resolve(s), push));
+                    logger.info(
+                        "mv_pull FOLLOWER_ATTACH leader=[{}] follower=[{}] transport={}",
+                        leaderIndex,
+                        name,
+                        push ? "push" : "poll"
+                    );
                 } catch (RuntimeException e) {
                     logger.error("mv_pull FOLLOWER_REJECTED leader=[{}] follower=[{}]: {}", leaderIndex, name, e.getMessage());
                 }
@@ -633,13 +662,8 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
                     org.opensearch.cluster.metadata.IndexMetadata source = services.sourceIndexMetadata(binding.sourceName());
                     String repository = source.getSettings()
                         .get(org.opensearch.cluster.metadata.IndexMetadata.SETTING_REMOTE_SEGMENT_STORE_REPOSITORY);
-                    f.outbox = MVBuilderOutbox.open(
-                        services.repositoriesService(),
-                        repository,
-                        source.getIndexUUID(),
-                        sourceShardId,
-                        f.index
-                    );
+                    f.sourceIndexUuid = source.getIndexUUID();
+                    f.outbox = MVBuilderOutbox.open(services.repositoriesService(), repository, f.sourceIndexUuid, sourceShardId, f.index);
                     MVBuilderOutbox.Publication latest = f.outbox.latest();
                     f.lastTo = latest == null ? -1L : latest.toInclusive();
                 }
@@ -681,7 +705,7 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
                 }
 
                 long t1 = System.nanoTime();
-                f.outbox.publish(
+                MVBuilderOutbox.Publication pub = f.outbox.publish(
                     tmp,
                     fromExclusive,
                     toInclusive,
@@ -695,6 +719,9 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
                 f.lastTo = toInclusive;
                 rowsTotal += rows;
                 published++;
+                if (f.push) {
+                    pushToFollower(f, shard.shardId().id(), sourceShardId, pub);
+                }
             } catch (Exception e) {
                 f.broken = true;
                 broken++;
@@ -736,6 +763,83 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         stats.put("fanout_native_nanos", nativeNanos);
         stats.put("fanout_upload_nanos", uploadNanos);
         return stats;
+    }
+
+    /**
+     * D1: hand the publication to the follower primary over transport, asynchronously
+     * (the leader's round never waits on a follower). A "gap" reply means the follower
+     * is behind — resend everything after its applied watermark from the outbox chain.
+     */
+    private void pushToFollower(Follower f, int followerShardId, int sourceShardId, MVBuilderOutbox.Publication pub) {
+        org.opensearch.transport.client.Client client = services.client();
+        if (client == null) {
+            logger.warn("mv_pull PUSH_SKIPPED follower=[{}] no client on this node; follower will poll", f.index);
+            return;
+        }
+        String leaderIndex = indexSettings.getIndex().getName();
+        long t0 = System.nanoTime();
+        org.opensearch.mv.MVBuilderPublishAction.Request request = new org.opensearch.mv.MVBuilderPublishAction.Request(
+            f.index,
+            followerShardId,
+            f.sourceIndexUuid,
+            sourceShardId,
+            pub
+        );
+        client.execute(org.opensearch.mv.MVBuilderPublishAction.INSTANCE, request, org.opensearch.core.action.ActionListener.wrap(resp -> {
+            long rttMs = (System.nanoTime() - t0) / 1_000_000;
+            logger.info(
+                "mv_pull PUSH_ACK leader=[{}] follower=[{}] range=({}, {}] applied={} applied_wm={} publish_ms={} rtt_ms={} detail={}",
+                leaderIndex,
+                f.index,
+                pub.fromExclusive(),
+                pub.toInclusive(),
+                resp.applied(),
+                resp.appliedWatermark(),
+                resp.publishMillis(),
+                rttMs,
+                resp.detail()
+            );
+            if (resp.applied() == false && resp.appliedWatermark() < pub.toInclusive()) {
+                services.threadPool().generic().execute(() -> resyncFollower(f, followerShardId, sourceShardId, resp.appliedWatermark()));
+            }
+        },
+            e -> logger.warn(
+                "mv_pull PUSH_FAILED leader=[{}] follower=[{}] range=({}, {}] (follower will poll): {}",
+                leaderIndex,
+                f.index,
+                pub.fromExclusive(),
+                pub.toInclusive(),
+                e.toString()
+            )
+        ));
+    }
+
+    /** Resend, in order and synchronously on the generic pool, every publication the follower has not applied yet. */
+    private void resyncFollower(Follower f, int followerShardId, int sourceShardId, long appliedWatermark) {
+        org.opensearch.transport.client.Client client = services.client();
+        try {
+            java.util.List<MVBuilderOutbox.Publication> missing = f.outbox.since(appliedWatermark);
+            logger.info("mv_pull PUSH_RESYNC follower=[{}] applied_wm={} missing={}", f.index, appliedWatermark, missing.size());
+            for (MVBuilderOutbox.Publication p : missing) {
+                org.opensearch.mv.MVBuilderPublishAction.Response r = client.execute(
+                    org.opensearch.mv.MVBuilderPublishAction.INSTANCE,
+                    new org.opensearch.mv.MVBuilderPublishAction.Request(f.index, followerShardId, f.sourceIndexUuid, sourceShardId, p)
+                ).actionGet(org.opensearch.common.unit.TimeValue.timeValueSeconds(120));
+                if (r.applied() == false) {
+                    logger.warn(
+                        "mv_pull PUSH_RESYNC_STOPPED follower=[{}] at=({}, {}] detail={} applied_wm={}",
+                        f.index,
+                        p.fromExclusive(),
+                        p.toInclusive(),
+                        r.detail(),
+                        r.appliedWatermark()
+                    );
+                    return;
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("mv_pull PUSH_RESYNC_FAILED follower=[{}] (follower will poll): {}", f.index, e.toString());
+        }
     }
 
     /**

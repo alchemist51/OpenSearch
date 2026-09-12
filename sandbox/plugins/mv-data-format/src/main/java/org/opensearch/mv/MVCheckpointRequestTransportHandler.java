@@ -166,15 +166,7 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
                                     maxSeq = r[1];
                                 }
                             }
-                            allFileMetadata.put(
-                                remoteKey,
-                                new MVFileMetadata(
-                                    size,
-                                    minSeq,
-                                    maxSeq,
-                                    MVFileMetadata.CRC32_UNKNOWN
-                                )
-                            );
+                            allFileMetadata.put(remoteKey, new MVFileMetadata(size, minSeq, maxSeq, MVFileMetadata.CRC32_UNKNOWN));
                         }
                     }
                 }
@@ -292,7 +284,8 @@ public final class MVCheckpointRequestTransportHandler extends org.opensearch.ac
                 infosVersion,
                 scopedFiles,
                 System.currentTimeMillis(),
-                scopedNoops
+                scopedNoops,
+                shard.getLastKnownGlobalCheckpoint()
             );
 
             logger.info(

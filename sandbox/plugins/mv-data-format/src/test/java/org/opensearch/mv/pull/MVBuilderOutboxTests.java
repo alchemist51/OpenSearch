@@ -118,11 +118,60 @@ public class MVBuilderOutboxTests extends OpenSearchTestCase {
             pub.stateBytes() + 1,
             pub.prevToInclusive(),
             pub.publishedEpochMs(),
-            pub.leaderIndex()
+            pub.leaderIndex(),
+            pub.crc32()
         );
         Path dest2 = createTempDir().resolve("again.parquet");
         IOException e = expectThrows(IOException.class, () -> outbox.download(lying, dest2));
         assertTrue(e.getMessage(), e.getMessage().contains("size"));
         assertFalse(Files.exists(dest2));
+
+        // right size, wrong checksum -> refused as well
+        MVBuilderOutbox.Publication corrupt = new MVBuilderOutbox.Publication(
+            pub.fromExclusive(),
+            pub.toInclusive(),
+            pub.primaryTerm(),
+            pub.infosVersion(),
+            pub.rows(),
+            pub.stateBytes(),
+            pub.prevToInclusive(),
+            pub.publishedEpochMs(),
+            pub.leaderIndex(),
+            pub.crc32() ^ 1L
+        );
+        Path dest3 = createTempDir().resolve("corrupt.parquet");
+        IOException e2 = expectThrows(IOException.class, () -> outbox.download(corrupt, dest3));
+        assertTrue(e2.getMessage(), e2.getMessage().contains("crc32"));
+        assertFalse(Files.exists(dest3));
+    }
+
+    public void testPublishRecordsCrc32AndManifestCarriesIt() throws IOException {
+        Path f = stateFile("checksum me");
+        MVBuilderOutbox.Publication pub = outbox.publish(f, -1L, 7L, 1L, 1L, 2L, -1L, "l");
+        assertEquals(MVBuilderOutbox.crc32(f), pub.crc32());
+        assertTrue(pub.crc32() != 0L);
+        assertEquals(pub.crc32(), outbox.latest().crc32());
+        assertEquals(pub.crc32(), outbox.read(7L).crc32());
+    }
+
+    public void testPublicationWireRoundTrip() throws IOException {
+        MVBuilderOutbox.Publication pub = new MVBuilderOutbox.Publication(
+            -1L,
+            99L,
+            3L,
+            7L,
+            12L,
+            3L,
+            -1L,
+            1_700_000_000_000L,
+            "mv_leader",
+            0xCAFEL
+        );
+        try (org.opensearch.common.io.stream.BytesStreamOutput out = new org.opensearch.common.io.stream.BytesStreamOutput()) {
+            pub.writeTo(out);
+            try (org.opensearch.core.common.io.stream.StreamInput in = out.bytes().streamInput()) {
+                assertEquals(pub, MVBuilderOutbox.Publication.readFrom(in));
+            }
+        }
     }
 }

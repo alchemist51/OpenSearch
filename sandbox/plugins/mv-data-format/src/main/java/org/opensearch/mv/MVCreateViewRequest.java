@@ -41,6 +41,7 @@ public class MVCreateViewRequest extends ActionRequest {
     static final String F_TARGET_INDEX = "target_index";
     static final String F_POLL_INTERVAL = "poll_interval";
     static final String F_BUILDER_VIEW = "builder_view";
+    static final String F_HYDRATE_TRANSPORT = "hydrate_transport";
 
     private final String name;
     private final String sourceIndex;
@@ -50,6 +51,7 @@ public class MVCreateViewRequest extends ActionRequest {
     private final String targetIndex;    // nullable -> default
     private final String pollInterval;   // nullable
     private final String builderView;    // nullable -> direct-write target; set -> hydrate from this leader view
+    private final String hydrateTransport; // nullable -> default (push); follower only
 
     public MVCreateViewRequest(
         String name,
@@ -73,6 +75,20 @@ public class MVCreateViewRequest extends ActionRequest {
         String pollInterval,
         String builderView
     ) {
+        this(name, sourceIndex, descriptorJson, ppl, sql, targetIndex, pollInterval, builderView, null);
+    }
+
+    public MVCreateViewRequest(
+        String name,
+        String sourceIndex,
+        String descriptorJson,
+        String ppl,
+        String sql,
+        String targetIndex,
+        String pollInterval,
+        String builderView,
+        String hydrateTransport
+    ) {
         this.name = name;
         this.sourceIndex = sourceIndex;
         this.descriptorJson = descriptorJson;
@@ -81,6 +97,7 @@ public class MVCreateViewRequest extends ActionRequest {
         this.targetIndex = targetIndex;
         this.pollInterval = pollInterval;
         this.builderView = builderView;
+        this.hydrateTransport = hydrateTransport;
     }
 
     public MVCreateViewRequest(StreamInput in) throws IOException {
@@ -93,6 +110,7 @@ public class MVCreateViewRequest extends ActionRequest {
         this.targetIndex = in.readOptionalString();
         this.pollInterval = in.readOptionalString();
         this.builderView = in.readOptionalString();
+        this.hydrateTransport = in.readOptionalString();
     }
 
     @Override
@@ -106,6 +124,7 @@ public class MVCreateViewRequest extends ActionRequest {
         out.writeOptionalString(targetIndex);
         out.writeOptionalString(pollInterval);
         out.writeOptionalString(builderView);
+        out.writeOptionalString(hydrateTransport);
     }
 
     public String name() {
@@ -154,6 +173,11 @@ public class MVCreateViewRequest extends ActionRequest {
         return builderView;
     }
 
+    /** Follower only: {@code poll} or {@code push}; {@code null} means the setting default (push). */
+    public String hydrateTransport() {
+        return hydrateTransport;
+    }
+
     @Override
     public ActionRequestValidationException validate() {
         ActionRequestValidationException e = null;
@@ -190,6 +214,7 @@ public class MVCreateViewRequest extends ActionRequest {
         String targetIndex = null;
         String pollInterval = null;
         String builderView = null;
+        String hydrateTransport = null;
 
         XContentParser.Token token = parser.currentToken();
         if (token == null) {
@@ -217,9 +242,20 @@ public class MVCreateViewRequest extends ActionRequest {
                 case F_TARGET_INDEX -> targetIndex = parser.text();
                 case F_POLL_INTERVAL -> pollInterval = parser.text();
                 case F_BUILDER_VIEW -> builderView = parser.text();
+                case F_HYDRATE_TRANSPORT -> hydrateTransport = parser.text();
                 default -> throw new IllegalArgumentException("unknown field [" + fieldName + "] in _mv/views create request");
             }
         }
-        return new MVCreateViewRequest(name, sourceIndex, descriptorJson, ppl, sql, targetIndex, pollInterval, builderView);
+        return new MVCreateViewRequest(
+            name,
+            sourceIndex,
+            descriptorJson,
+            ppl,
+            sql,
+            targetIndex,
+            pollInterval,
+            builderView,
+            hydrateTransport
+        );
     }
 }
