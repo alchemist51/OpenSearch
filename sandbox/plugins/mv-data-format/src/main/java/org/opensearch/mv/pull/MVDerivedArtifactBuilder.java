@@ -513,7 +513,14 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
             // ── Builder-shard emulation: fold every follower view over the same staged
             // files and hand each its state through its outbox. Runs after this
             // leader's own publish so the leader's lag is the zero-hop reference.
-            Map<String, Object> fanOutStats = fanOutToFollowers(stagedParquet, current.seqNo(), appliedThrough, mvSnapshot, shard);
+            Map<String, Object> fanOutStats = fanOutToFollowers(
+                stagedParquet,
+                parquetFiles,
+                current.seqNo(),
+                appliedThrough,
+                mvSnapshot,
+                shard
+            );
 
             logger.info(
                 "mv_pull published generation={} rows={} range=({}, {}] watermark={} "
@@ -567,6 +574,8 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         MVBuilderOutbox outbox;
         long lastTo = Long.MIN_VALUE; // MIN_VALUE = cursor not yet initialised from the outbox
         boolean broken;
+        /** Rows produced by the last fold — the cost estimate for cheapest-first scheduling (0 = unknown, goes first). */
+        volatile long lastRows;
         /** D1: push each publication to the follower primary over transport (else the follower polls the outbox). */
         final boolean push;
         String sourceIndexUuid;
@@ -618,15 +627,41 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         followersMetadataVersion = version;
     }
 
+    /** Per-follower state for ordering: rows produced by its last fold (cheapest-first scheduling). */
+    private final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.Future<?>> fanOutInFlight =
+        new java.util.concurrent.atomic.AtomicReference<>();
+    private volatile java.util.List<MVBuildRuntime> fanOutRuntimes;
+
+    private java.util.List<MVBuildRuntime> fanOutRuntimes(int slots) {
+        java.util.List<MVBuildRuntime> r = fanOutRuntimes;
+        if (r == null || r.size() < slots) {
+            r = new java.util.ArrayList<>();
+            for (int i = 0; i < slots; i++) {
+                r.add(createBuildRuntime());
+            }
+            fanOutRuntimes = r;
+        }
+        return r;
+    }
+
     /**
      * Fold every follower's definition over the leader's staged files for
      * {@code (fromExclusive, toInclusive]} and publish each result to that
      * follower's outbox. Never fails the leader's round; a follower whose fold
      * or upload fails is marked broken and no longer fed (its lag then grows
      * visibly) rather than being handed a chain with a gap.
+     *
+     * <p>Fan-out v2: followers run cheapest-first with {@code fanout_concurrency}
+     * folds in flight (each on its own native runtime handle, outside the shard
+     * build lock); with {@code fanout_async} the staged source files are moved to a
+     * hand-off directory and the fan-out runs on the generic pool while the leader
+     * starts its next round. At most one fan-out is in flight so every follower
+     * receives its publications in order; a round whose predecessor is still
+     * fanning out waits for it (logged as FANOUT_BACKPRESSURE).
      */
     private Map<String, Object> fanOutToFollowers(
         Path stagedParquet,
+        java.util.List<Path> parquetFiles,
         long fromExclusive,
         long toInclusive,
         MVDerivedSourceReader.MVSourceSnapshot mvSnapshot,
@@ -641,128 +676,294 @@ final class MVDerivedArtifactBuilder implements DerivedArtifactBuilder {
         if (followers.isEmpty()) {
             return stats;
         }
-        DerivedIndexBinding binding = DerivedIndexBinding.fromSettings(indexSettings.getSettings());
-        int sourceShardId = binding != null ? binding.resolveSourceShard(shard.shardId().id()) : shard.shardId().id();
-        String leaderIndex = indexSettings.getIndex().getName();
-        long nativeNanos = 0L;
-        long uploadNanos = 0L;
-        long rowsTotal = 0L;
-        int published = 0;
-        int broken = 0;
-        Path outDir = shard.shardPath().getDataPath().resolve("mv_builder_outbox");
+        Settings settings = indexSettings.getSettings();
+        final int concurrency = MVPullSettings.FANOUT_CONCURRENCY.get(settings);
+        final boolean async = MVPullSettings.FANOUT_ASYNC.get(settings);
+        final boolean cheapestFirst = "discovery".equals(MVPullSettings.FANOUT_ORDER.get(settings)) == false;
+        final long primaryTerm = mvSnapshot.primaryTerm();
+        final long infosVersion = mvSnapshot.infosVersion();
 
-        for (Follower f : followers.values()) {
-            if (f.broken) {
-                broken++;
-                continue;
-            }
-            Path tmp = null;
+        // Ordering guarantee: wait for the previous fan-out before starting this one.
+        java.util.concurrent.Future<?> previous = fanOutInFlight.get();
+        if (previous != null && previous.isDone() == false) {
+            long tw = System.nanoTime();
             try {
-                if (f.outbox == null) {
-                    org.opensearch.cluster.metadata.IndexMetadata source = services.sourceIndexMetadata(binding.sourceName());
-                    String repository = source.getSettings()
-                        .get(org.opensearch.cluster.metadata.IndexMetadata.SETTING_REMOTE_SEGMENT_STORE_REPOSITORY);
-                    f.sourceIndexUuid = source.getIndexUUID();
-                    f.outbox = MVBuilderOutbox.open(services.repositoriesService(), repository, f.sourceIndexUuid, sourceShardId, f.index);
-                    MVBuilderOutbox.Publication latest = f.outbox.latest();
-                    f.lastTo = latest == null ? -1L : latest.toInclusive();
-                }
-                if (f.lastTo >= 0 && f.lastTo != fromExclusive) {
-                    // We cannot fold (lastTo, fromExclusive] from this round's staging: those rows are not staged.
-                    logger.error(
-                        "mv_pull FOLLOWER_BROKEN leader=[{}] follower=[{}] last_published_to={} this_round_from={} — cursor gap, stop feeding",
-                        leaderIndex,
-                        f.index,
-                        f.lastTo,
-                        fromExclusive
-                    );
-                    f.broken = true;
-                    broken++;
-                    continue;
-                }
-                Files.createDirectories(outDir.resolve(f.index));
-                tmp = outDir.resolve(f.index).resolve(MVBuilderOutbox.Publication.stateBlobFor(toInclusive) + ".tmp-" + UUID.randomUUID());
-                String sql = wrapWithSeqNoFilter(f.definition.buildPartialSql(MVConstants.INPUT_TABLE), fromExclusive, toInclusive);
-
-                long t0 = System.nanoTime();
-                java.util.concurrent.locks.ReentrantLock buildLock = MVShardBuildLock.forShard(shard.shardId());
-                buildLock.lock();
-                final long rows;
-                try {
-                    rows = buildRuntime.buildStreamingArtifact(
-                        stagedParquet.toString(),
-                        MVConstants.INPUT_TABLE,
-                        sql,
-                        tmp.toString(),
-                        f.ordering
-                    ).rowCount();
-                } finally {
-                    buildLock.unlock();
-                }
-                nativeNanos += System.nanoTime() - t0;
-                if (rows <= 0L) {
-                    throw new IOException("follower fold produced no state rows for range (" + fromExclusive + ", " + toInclusive + "]");
-                }
-
-                long t1 = System.nanoTime();
-                MVBuilderOutbox.Publication pub = f.outbox.publish(
-                    tmp,
-                    fromExclusive,
-                    toInclusive,
-                    mvSnapshot.primaryTerm(),
-                    mvSnapshot.infosVersion(),
-                    rows,
-                    f.lastTo,
-                    leaderIndex
-                );
-                uploadNanos += System.nanoTime() - t1;
-                f.lastTo = toInclusive;
-                rowsTotal += rows;
-                published++;
-                if (f.push) {
-                    pushToFollower(f, shard.shardId().id(), sourceShardId, pub);
-                }
+                previous.get(10, java.util.concurrent.TimeUnit.MINUTES);
             } catch (Exception e) {
-                f.broken = true;
-                broken++;
-                logger.error(
-                    "mv_pull FOLLOWER_BROKEN leader=[{}] follower=[{}] range=({}, {}] stop feeding: {}",
-                    leaderIndex,
-                    f.index,
-                    fromExclusive,
-                    toInclusive,
-                    e.getMessage(),
-                    e
-                );
-            } finally {
-                if (tmp != null) {
+                logger.warn("mv_pull FANOUT previous fan-out did not finish cleanly: {}", e.toString());
+            }
+            long waitedMs = (System.nanoTime() - tw) / 1_000_000;
+            stats.put("fanout_backpressure_ms", waitedMs);
+            logger.info("mv_pull FANOUT_BACKPRESSURE shard=[{}] waited_ms={} (previous fan-out still running)", shard.shardId(), waitedMs);
+        }
+
+        java.util.List<Follower> order = new java.util.ArrayList<>();
+        for (Follower f : followers.values()) {
+            if (f.broken == false) {
+                order.add(f);
+            }
+        }
+        if (cheapestFirst) {
+            order.sort(java.util.Comparator.comparingLong(f -> f.lastRows));
+        }
+        final int broken = followers.size() - order.size();
+
+        if (async == false) {
+            Map<String, Object> r = runFanOut(
+                order,
+                stagedParquet,
+                fromExclusive,
+                toInclusive,
+                primaryTerm,
+                infosVersion,
+                shard,
+                concurrency,
+                broken,
+                false
+            );
+            stats.putAll(r);
+            return stats;
+        }
+        // Async: take the staged source files out of the round's stage directory so the poller's cleanup cannot remove them.
+        try {
+            Path handoff = shard.shardPath().getDataPath().resolve("mv_builder_fanout").resolve("range-" + toInclusive);
+            Files.createDirectories(handoff);
+            java.util.List<Path> moved = new java.util.ArrayList<>();
+            int i = 0;
+            for (Path f : parquetFiles) {
+                Path dest = handoff.resolve(String.format(java.util.Locale.ROOT, "%06d.parquet", i++));
+                Files.move(f, dest, StandardCopyOption.REPLACE_EXISTING);
+                moved.add(dest);
+            }
+            final Path table = handoff; // a directory of plain parquet files is a valid DataFusion listing table
+            java.util.concurrent.Future<?> fut = services.threadPool().generic().submit(() -> {
+                try {
+                    runFanOut(order, table, fromExclusive, toInclusive, primaryTerm, infosVersion, shard, concurrency, broken, true);
+                } finally {
+                    for (Path m : moved) {
+                        try {
+                            Files.deleteIfExists(m);
+                        } catch (IOException ignored) {
+                            // best effort
+                        }
+                    }
                     try {
-                        Files.deleteIfExists(tmp);
+                        Files.deleteIfExists(handoff);
                     } catch (IOException ignored) {
                         // best effort
                     }
                 }
+            });
+            fanOutInFlight.set(fut);
+            stats.put("fanout_followers", (long) order.size());
+            stats.put("fanout_async", true);
+            logger.info(
+                "mv_pull FANOUT_HANDOFF shard=[{}] range=({}, {}] followers={} concurrency={} files={}",
+                shard.shardId(),
+                fromExclusive,
+                toInclusive,
+                order.size(),
+                concurrency,
+                moved.size()
+            );
+        } catch (IOException e) {
+            logger.error(
+                "mv_pull FANOUT_HANDOFF_FAILED shard=[{}] range=({}, {}]: {}",
+                shard.shardId(),
+                fromExclusive,
+                toInclusive,
+                e.toString()
+            );
+        }
+        return stats;
+    }
+
+    /** Fold + publish for an ordered list of followers with bounded concurrency; returns the round's fan-out stats. */
+    private Map<String, Object> runFanOut(
+        java.util.List<Follower> order,
+        Path table,
+        long fromExclusive,
+        long toInclusive,
+        long primaryTerm,
+        long infosVersion,
+        IndexShard shard,
+        int concurrency,
+        int brokenBefore,
+        boolean async
+    ) {
+        long t0 = System.nanoTime();
+        final java.util.concurrent.atomic.AtomicLong nativeNanos = new java.util.concurrent.atomic.AtomicLong();
+        final java.util.concurrent.atomic.AtomicLong uploadNanos = new java.util.concurrent.atomic.AtomicLong();
+        final java.util.concurrent.atomic.AtomicLong rowsTotal = new java.util.concurrent.atomic.AtomicLong();
+        final java.util.concurrent.atomic.AtomicInteger published = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicInteger broken = new java.util.concurrent.atomic.AtomicInteger(brokenBefore);
+        int slots = Math.max(1, Math.min(concurrency, order.size()));
+        java.util.List<MVBuildRuntime> runtimes = fanOutRuntimes(slots);
+        java.util.concurrent.Semaphore permits = new java.util.concurrent.Semaphore(slots);
+        java.util.concurrent.ConcurrentLinkedQueue<Integer> freeSlots = new java.util.concurrent.ConcurrentLinkedQueue<>();
+        for (int i = 0; i < slots; i++) {
+            freeSlots.add(i);
+        }
+        java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(order.size());
+        for (Follower f : order) {
+            Runnable task = () -> {
+                Integer slot = null;
+                try {
+                    permits.acquire();
+                    slot = freeSlots.poll();
+                    MVBuildRuntime rt = runtimes.get(slot == null ? 0 : slot);
+                    long[] res = foldAndPublishFollower(f, rt, table, fromExclusive, toInclusive, primaryTerm, infosVersion, shard);
+                    if (res != null) {
+                        nativeNanos.addAndGet(res[0]);
+                        uploadNanos.addAndGet(res[1]);
+                        rowsTotal.addAndGet(res[2]);
+                        published.incrementAndGet();
+                    } else {
+                        broken.incrementAndGet();
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    if (slot != null) {
+                        freeSlots.add(slot);
+                    }
+                    permits.release();
+                    done.countDown();
+                }
+            };
+            if (slots > 1) {
+                services.threadPool().generic().execute(task);
+            } else {
+                task.run();
             }
         }
+        try {
+            done.await(30, java.util.concurrent.TimeUnit.MINUTES);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+        long wallNanos = System.nanoTime() - t0;
         logger.info(
-            "mv_pull FANOUT shard=[{}] range=({}, {}] followers={} published={} broken={} rows={} native_ms={} upload_ms={}",
+            "mv_pull FANOUT shard=[{}] range=({}, {}] followers={} published={} broken={} rows={} native_ms={} upload_ms={} wall_ms={} concurrency={} async={}",
             shard.shardId(),
             fromExclusive,
             toInclusive,
-            followers.size(),
-            published,
-            broken,
-            rowsTotal,
-            nativeNanos / 1_000_000,
-            uploadNanos / 1_000_000
+            order.size() + brokenBefore,
+            published.get(),
+            broken.get(),
+            rowsTotal.get(),
+            nativeNanos.get() / 1_000_000,
+            uploadNanos.get() / 1_000_000,
+            wallNanos / 1_000_000,
+            slots,
+            async
         );
-        stats.put("fanout_followers", (long) followers.size());
-        stats.put("fanout_published", (long) published);
-        stats.put("fanout_broken", (long) broken);
-        stats.put("fanout_rows", rowsTotal);
-        stats.put("fanout_native_nanos", nativeNanos);
-        stats.put("fanout_upload_nanos", uploadNanos);
+        Map<String, Object> stats = new java.util.LinkedHashMap<>();
+        stats.put("fanout_followers", (long) (order.size() + brokenBefore));
+        stats.put("fanout_published", (long) published.get());
+        stats.put("fanout_broken", (long) broken.get());
+        stats.put("fanout_rows", rowsTotal.get());
+        stats.put("fanout_native_nanos", nativeNanos.get());
+        stats.put("fanout_upload_nanos", uploadNanos.get());
+        stats.put("fanout_wall_nanos", wallNanos);
         return stats;
+    }
+
+    /** One follower: fold over the staged table and publish to its outbox (+ push). Returns {nativeNanos, uploadNanos, rows} or null when the follower broke. */
+    private long[] foldAndPublishFollower(
+        Follower f,
+        MVBuildRuntime rt,
+        Path table,
+        long fromExclusive,
+        long toInclusive,
+        long primaryTerm,
+        long infosVersion,
+        IndexShard shard
+    ) {
+        DerivedIndexBinding binding = DerivedIndexBinding.fromSettings(indexSettings.getSettings());
+        int sourceShardId = binding != null ? binding.resolveSourceShard(shard.shardId().id()) : shard.shardId().id();
+        String leaderIndex = indexSettings.getIndex().getName();
+        Path outDir = shard.shardPath().getDataPath().resolve("mv_builder_outbox");
+        Path tmp = null;
+        try {
+            if (f.outbox == null) {
+                org.opensearch.cluster.metadata.IndexMetadata source = services.sourceIndexMetadata(binding.sourceName());
+                String repository = source.getSettings()
+                    .get(org.opensearch.cluster.metadata.IndexMetadata.SETTING_REMOTE_SEGMENT_STORE_REPOSITORY);
+                f.sourceIndexUuid = source.getIndexUUID();
+                f.outbox = MVBuilderOutbox.open(services.repositoriesService(), repository, f.sourceIndexUuid, sourceShardId, f.index);
+                MVBuilderOutbox.Publication latest = f.outbox.latest();
+                f.lastTo = latest == null ? -1L : latest.toInclusive();
+            }
+            if (f.lastTo >= 0 && f.lastTo != fromExclusive) {
+                logger.error(
+                    "mv_pull FOLLOWER_BROKEN leader=[{}] follower=[{}] last_published_to={} this_round_from={} — cursor gap, stop feeding",
+                    leaderIndex,
+                    f.index,
+                    f.lastTo,
+                    fromExclusive
+                );
+                f.broken = true;
+                return null;
+            }
+            Files.createDirectories(outDir.resolve(f.index));
+            tmp = outDir.resolve(f.index).resolve(MVBuilderOutbox.Publication.stateBlobFor(toInclusive) + ".tmp-" + UUID.randomUUID());
+            String sql = wrapWithSeqNoFilter(f.definition.buildPartialSql(MVConstants.INPUT_TABLE), fromExclusive, toInclusive);
+            long t0 = System.nanoTime();
+            long rows = rt.buildStreamingArtifact(table.toString(), MVConstants.INPUT_TABLE, sql, tmp.toString(), f.ordering).rowCount();
+            long nativeNanos = System.nanoTime() - t0;
+            if (rows <= 0L) {
+                throw new IOException("follower fold produced no state rows for range (" + fromExclusive + ", " + toInclusive + "]");
+            }
+            long t1 = System.nanoTime();
+            MVBuilderOutbox.Publication pub = f.outbox.publish(
+                tmp,
+                fromExclusive,
+                toInclusive,
+                primaryTerm,
+                infosVersion,
+                rows,
+                f.lastTo,
+                leaderIndex
+            );
+            long uploadNanos = System.nanoTime() - t1;
+            f.lastTo = toInclusive;
+            f.lastRows = rows;
+            logger.info(
+                "mv_pull FANOUT_FOLLOWER leader=[{}] follower=[{}] range=({}, {}] rows={} fold_ms={} upload_ms={}",
+                leaderIndex,
+                f.index,
+                fromExclusive,
+                toInclusive,
+                rows,
+                nativeNanos / 1_000_000,
+                uploadNanos / 1_000_000
+            );
+            if (f.push) {
+                pushToFollower(f, shard.shardId().id(), sourceShardId, pub);
+            }
+            return new long[] { nativeNanos, uploadNanos, rows };
+        } catch (Exception e) {
+            f.broken = true;
+            logger.error(
+                "mv_pull FOLLOWER_BROKEN leader=[{}] follower=[{}] range=({}, {}] stop feeding: {}",
+                leaderIndex,
+                f.index,
+                fromExclusive,
+                toInclusive,
+                e.getMessage(),
+                e
+            );
+            return null;
+        } finally {
+            if (tmp != null) {
+                try {
+                    Files.deleteIfExists(tmp);
+                } catch (IOException ignored) {
+                    // best effort
+                }
+            }
+        }
     }
 
     /**

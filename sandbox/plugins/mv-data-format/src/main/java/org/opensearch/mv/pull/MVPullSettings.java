@@ -115,6 +115,37 @@ public final class MVPullSettings {
         Setting.Property.Final
     );
 
+    /** Leader only: how many follower folds run concurrently in the fan-out (each on its own native runtime handle). */
+    public static final Setting<Integer> FANOUT_CONCURRENCY = Setting.intSetting(
+        "index.mv_pull.fanout_concurrency",
+        1,
+        1,
+        16,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
+    /**
+     * Leader only: when true the fan-out runs off the poll round — the leader hands the
+     * staged files to a background task right after its own publish and starts the next
+     * round; at most one fan-out is in flight (publications stay ordered per follower),
+     * and a round whose predecessor's fan-out is still running waits for it.
+     */
+    public static final Setting<Boolean> FANOUT_ASYNC = Setting.boolSetting(
+        "index.mv_pull.fanout_async",
+        false,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
+    /** Leader only: {@code cheapest_first} (by the follower's last fold size) or {@code discovery} order. */
+    public static final Setting<String> FANOUT_ORDER = Setting.simpleString(
+        "index.mv_pull.fanout_order",
+        "cheapest_first",
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
     /**
      * Follower only: the target index name of the leader view that folds this
      * view's definition and feeds its outbox. The leader discovers its

@@ -272,6 +272,9 @@ public class MVDataFormatPlugin extends Plugin
             MVPullSettings.BUILDER_VIEW,
             MVPullSettings.HYDRATE_TRANSPORT,
             MVPullSettings.BOUND_TO_GLOBAL_CHECKPOINT,
+            MVPullSettings.FANOUT_CONCURRENCY,
+            MVPullSettings.FANOUT_ASYNC,
+            MVPullSettings.FANOUT_ORDER,
             // Stage 2: managed build runtime settings
             MVBuildRuntime.MV_SPILL_BUDGET_BYTES,
             MVBuildRuntime.MV_SPILL_FILE_COUNT_LIMIT,

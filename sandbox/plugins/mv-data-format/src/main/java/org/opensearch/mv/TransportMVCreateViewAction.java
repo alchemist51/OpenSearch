@@ -151,6 +151,12 @@ public class TransportMVCreateViewAction extends HandledTransportAction<MVCreate
         if (request.pollInterval() != null && request.pollInterval().isBlank() == false) {
             builder.put(MVPullSettings.PULL_INTERVAL.getKey(), request.pollInterval());
         }
+        if (request.fanoutConcurrency() != null) {
+            builder.put(MVPullSettings.FANOUT_CONCURRENCY.getKey(), request.fanoutConcurrency());
+        }
+        if (request.fanoutAsync() != null) {
+            builder.put(MVPullSettings.FANOUT_ASYNC.getKey(), request.fanoutAsync());
+        }
         if (request.builderView() != null && request.builderView().isBlank() == false) {
             // Builder-shard emulation: this target hydrates from the leader's outbox instead of polling the source.
             builder.put(MVPullSettings.PULL_MODE.getKey(), MVPullSettings.MODE_HYDRATE);

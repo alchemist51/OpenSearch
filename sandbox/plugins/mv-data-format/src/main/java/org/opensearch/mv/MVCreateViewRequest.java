@@ -42,6 +42,8 @@ public class MVCreateViewRequest extends ActionRequest {
     static final String F_POLL_INTERVAL = "poll_interval";
     static final String F_BUILDER_VIEW = "builder_view";
     static final String F_HYDRATE_TRANSPORT = "hydrate_transport";
+    static final String F_FANOUT_CONCURRENCY = "fanout_concurrency";
+    static final String F_FANOUT_ASYNC = "fanout_async";
 
     private final String name;
     private final String sourceIndex;
@@ -52,6 +54,8 @@ public class MVCreateViewRequest extends ActionRequest {
     private final String pollInterval;   // nullable
     private final String builderView;    // nullable -> direct-write target; set -> hydrate from this leader view
     private final String hydrateTransport; // nullable -> default (push); follower only
+    private final Integer fanoutConcurrency; // nullable; leader only
+    private final Boolean fanoutAsync;       // nullable; leader only
 
     public MVCreateViewRequest(
         String name,
@@ -89,6 +93,22 @@ public class MVCreateViewRequest extends ActionRequest {
         String builderView,
         String hydrateTransport
     ) {
+        this(name, sourceIndex, descriptorJson, ppl, sql, targetIndex, pollInterval, builderView, hydrateTransport, null, null);
+    }
+
+    public MVCreateViewRequest(
+        String name,
+        String sourceIndex,
+        String descriptorJson,
+        String ppl,
+        String sql,
+        String targetIndex,
+        String pollInterval,
+        String builderView,
+        String hydrateTransport,
+        Integer fanoutConcurrency,
+        Boolean fanoutAsync
+    ) {
         this.name = name;
         this.sourceIndex = sourceIndex;
         this.descriptorJson = descriptorJson;
@@ -98,6 +118,8 @@ public class MVCreateViewRequest extends ActionRequest {
         this.pollInterval = pollInterval;
         this.builderView = builderView;
         this.hydrateTransport = hydrateTransport;
+        this.fanoutConcurrency = fanoutConcurrency;
+        this.fanoutAsync = fanoutAsync;
     }
 
     public MVCreateViewRequest(StreamInput in) throws IOException {
@@ -111,6 +133,8 @@ public class MVCreateViewRequest extends ActionRequest {
         this.pollInterval = in.readOptionalString();
         this.builderView = in.readOptionalString();
         this.hydrateTransport = in.readOptionalString();
+        this.fanoutConcurrency = in.readOptionalVInt();
+        this.fanoutAsync = in.readOptionalBoolean();
     }
 
     @Override
@@ -125,6 +149,8 @@ public class MVCreateViewRequest extends ActionRequest {
         out.writeOptionalString(pollInterval);
         out.writeOptionalString(builderView);
         out.writeOptionalString(hydrateTransport);
+        out.writeOptionalVInt(fanoutConcurrency);
+        out.writeOptionalBoolean(fanoutAsync);
     }
 
     public String name() {
@@ -178,6 +204,16 @@ public class MVCreateViewRequest extends ActionRequest {
         return hydrateTransport;
     }
 
+    /** Leader only: fan-out concurrency override; {@code null} means the setting default (1). */
+    public Integer fanoutConcurrency() {
+        return fanoutConcurrency;
+    }
+
+    /** Leader only: asynchronous fan-out override; {@code null} means the setting default (false). */
+    public Boolean fanoutAsync() {
+        return fanoutAsync;
+    }
+
     @Override
     public ActionRequestValidationException validate() {
         ActionRequestValidationException e = null;
@@ -215,6 +251,8 @@ public class MVCreateViewRequest extends ActionRequest {
         String pollInterval = null;
         String builderView = null;
         String hydrateTransport = null;
+        Integer fanoutConcurrency = null;
+        Boolean fanoutAsync = null;
 
         XContentParser.Token token = parser.currentToken();
         if (token == null) {
@@ -243,6 +281,8 @@ public class MVCreateViewRequest extends ActionRequest {
                 case F_POLL_INTERVAL -> pollInterval = parser.text();
                 case F_BUILDER_VIEW -> builderView = parser.text();
                 case F_HYDRATE_TRANSPORT -> hydrateTransport = parser.text();
+                case F_FANOUT_CONCURRENCY -> fanoutConcurrency = parser.intValue();
+                case F_FANOUT_ASYNC -> fanoutAsync = parser.booleanValue();
                 default -> throw new IllegalArgumentException("unknown field [" + fieldName + "] in _mv/views create request");
             }
         }
@@ -255,7 +295,9 @@ public class MVCreateViewRequest extends ActionRequest {
             targetIndex,
             pollInterval,
             builderView,
-            hydrateTransport
+            hydrateTransport,
+            fanoutConcurrency,
+            fanoutAsync
         );
     }
 }

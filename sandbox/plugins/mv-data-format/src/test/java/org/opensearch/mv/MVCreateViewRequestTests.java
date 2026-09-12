@@ -182,6 +182,41 @@ public class MVCreateViewRequestTests extends OpenSearchTestCase {
         );
     }
 
+    public void testLeaderFanoutOptionsParseAndLandInSettings() throws Exception {
+        MVCompiledDefinition def = MVCompiledDefinition.compiledFor("clickbench_100m");
+        String descriptorJson = MVDefinitionResolver.serialize(def.toDescriptor());
+        String body = "{\"source_index\":\"clickbench\",\"descriptor\":"
+            + descriptorJson
+            + ",\"fanout_concurrency\":4,\"fanout_async\":true}";
+        try (XContentParser p = createParser(JsonXContent.jsonXContent, body)) {
+            MVCreateViewRequest leader = MVCreateViewRequest.fromXContent("cb_q9", p);
+            assertEquals(Integer.valueOf(4), leader.fanoutConcurrency());
+            assertEquals(Boolean.TRUE, leader.fanoutAsync());
+            Settings s = TransportMVCreateViewAction.buildSettings(leader, 1, def, descriptorJson);
+            assertEquals(Integer.valueOf(4), MVPullSettings.FANOUT_CONCURRENCY.get(s));
+            assertTrue(MVPullSettings.FANOUT_ASYNC.get(s));
+            try (BytesStreamOutput out = new BytesStreamOutput()) {
+                leader.writeTo(out);
+                try (StreamInput in = out.bytes().streamInput()) {
+                    MVCreateViewRequest copy = new MVCreateViewRequest(in);
+                    assertEquals(Integer.valueOf(4), copy.fanoutConcurrency());
+                    assertEquals(Boolean.TRUE, copy.fanoutAsync());
+                }
+            }
+        }
+        // absent -> setting defaults (1, false), and no keys stamped
+        Settings d = TransportMVCreateViewAction.buildSettings(
+            new MVCreateViewRequest("q9", "clickbench", descriptorJson, null, null, null, null),
+            1,
+            def,
+            descriptorJson
+        );
+        assertNull(d.get(MVPullSettings.FANOUT_CONCURRENCY.getKey()));
+        assertEquals(Integer.valueOf(1), MVPullSettings.FANOUT_CONCURRENCY.get(d));
+        assertFalse(MVPullSettings.FANOUT_ASYNC.get(d));
+        assertEquals("cheapest_first", MVPullSettings.FANOUT_ORDER.get(d));
+    }
+
     public void testValidateBuilderViewRequiresExistingBuildModeLeaderOnSameSource() {
         String descriptorJson = descriptorJson();
         Settings leaderSettings = Settings.builder()
